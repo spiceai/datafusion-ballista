@@ -166,7 +166,7 @@ pub async fn start_executor_process(
     let work_dir = opt
         .work_dir
         .clone()
-        .unwrap_or(TempDir::new()?.path().to_str().unwrap().to_string());
+        .unwrap_or_else(|| TempDir::new().unwrap().path().to_str().unwrap().to_string());
 
     let concurrent_tasks = if opt.concurrent_tasks == 0 {
         // use all available cores if no concurrency level is specified
