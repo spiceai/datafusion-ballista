@@ -45,7 +45,7 @@ use crate::execution_plans::{
     BallistaExplainExec, BallistaPlanType, BallistaStringifiedPlan, ShuffleReaderExec,
     ShuffleWriterExec, UnresolvedShuffleExec,
 };
-use crate::remote_catalog::table_provider::RemoteTableProvider;
+use crate::remote_catalog::remote_table_provider::RemoteTableProvider;
 use crate::serde::protobuf::ballista_physical_plan_node::PhysicalPlanType;
 use crate::serde::scheduler::PartitionLocation;
 use datafusion::catalog::TableProvider;
