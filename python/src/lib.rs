@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::utils::wait_for_future;
+use crate::utils::{to_pyerr, wait_for_future};
 use ballista::prelude::*;
 use cluster::{PyExecutor, PyScheduler};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use datafusion_python::context::PySessionContext;
-use pyo3::prelude::*;
+use pyo3::{prelude::*, IntoPyObjectExt};
 
 mod cluster;
 #[allow(dead_code)]
@@ -64,7 +64,7 @@ impl PyBallistaBuilder {
     ) -> PyResult<PyObject> {
         let _ = slf.session_config.options_mut().set(key, value);
 
-        Ok(slf.into_py(py))
+        slf.into_py_any(py)
     }
 
     /// Construct the standalone instance from the SessionContext
@@ -74,7 +74,8 @@ impl PyBallistaBuilder {
             .with_default_features()
             .build();
 
-        let ctx = wait_for_future(py, SessionContext::standalone_with_state(state))?;
+        let ctx = wait_for_future(py, SessionContext::standalone_with_state(state))
+            .map_err(to_pyerr)?;
 
         Ok(ctx.into())
     }
@@ -86,7 +87,8 @@ impl PyBallistaBuilder {
             .with_default_features()
             .build();
 
-        let ctx = wait_for_future(py, SessionContext::remote_with_state(url, state))?;
+        let ctx = wait_for_future(py, SessionContext::remote_with_state(url, state))
+            .map_err(to_pyerr)?;
 
         Ok(ctx.into())
     }

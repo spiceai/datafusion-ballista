@@ -16,7 +16,7 @@
 # under the License.
 
 [workspace]
-exclude = ["dev/msrvcheck", "python"]
+exclude = ["dev/msrvcheck"]
 members = [
     "ballista-cli",
     "ballista/client",
@@ -25,6 +25,7 @@ members = [
     "ballista/scheduler",
     "benchmarks",
     "examples",
+    "python",
 ]
 resolver = "2"
 
