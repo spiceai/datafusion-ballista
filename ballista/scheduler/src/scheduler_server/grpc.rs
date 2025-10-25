@@ -18,6 +18,7 @@
 use axum::extract::ConnectInfo;
 use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::extension::SessionConfigHelperExt;
+use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
 use ballista_core::serde::protobuf::execute_query_params::Query;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
 use ballista_core::serde::protobuf::{
@@ -25,10 +26,11 @@ use ballista_core::serde::protobuf::{
     CancelJobParams, CancelJobResult, CleanJobDataParams, CleanJobDataResult,
     CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryFailureResult,
     ExecuteQueryParams, ExecuteQueryResult, ExecuteQuerySuccessResult, ExecutorHeartbeat,
-    ExecutorStoppedParams, ExecutorStoppedResult, GetJobStatusParams, GetJobStatusResult,
-    HeartBeatParams, HeartBeatResult, PollWorkParams, PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    ExecutorStoppedParams, ExecutorStoppedResult, GetCatalogParams, GetCatalogResult,
+    GetJobStatusParams, GetJobStatusResult, HeartBeatParams, HeartBeatResult,
+    PollWorkParams, PollWorkResult, RegisterExecutorParams, RegisterExecutorResult,
+    RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
+    UpdateTaskStatusResult,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -525,6 +527,26 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 Status::internal(msg)
             })?;
         Ok(Response::new(CleanJobDataResult {}))
+    }
+
+    async fn get_catalog(
+        &self,
+        request: Request<GetCatalogParams>,
+    ) -> Result<Response<GetCatalogResult>, Status> {
+        let GetCatalogParams { session_id } = request.into_inner();
+        let ctx = self
+            .state
+            .session_manager
+            .create_or_update_session(
+                session_id.as_str(),
+                &self.state.session_manager.produce_config(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Error creating session {e}")))?;
+
+        Ok(Response::new(GetCatalogResult {
+            catalogs: ctx.serialize_catalogs().await,
+        }))
     }
 }
 
