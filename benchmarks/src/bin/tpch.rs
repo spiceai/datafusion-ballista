@@ -855,6 +855,7 @@ async fn get_table(
         collect_stat: true,
         table_partition_cols: vec![],
         file_sort_order: vec![],
+        metadata_cols: vec![],
     };
 
     let url = ListingTableUrl::parse(path)?;
