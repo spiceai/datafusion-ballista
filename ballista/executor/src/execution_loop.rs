@@ -36,12 +36,14 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use futures::FutureExt;
 use log::{debug, error, info, warn};
 use std::any::Any;
+use std::cell::LazyCell;
 use std::convert::TryInto;
 use std::error::Error;
 use std::ops::Deref;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
+use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 
@@ -49,6 +51,7 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     mut scheduler: SchedulerGrpcClient<Channel>,
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
+    readiness: Option<OneShotSender<String>>,
 ) -> Result<(), BallistaError> {
     let executor_specification: ExecutorSpecification = executor
         .metadata
@@ -66,6 +69,13 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.task_slots as usize);
+
+    let report_ready = LazyCell::new(|| {
+        if let Some(chan) = readiness {
+            chan.send(executor.metadata.id.clone())
+                .expect("Must send readiness")
+        }
+    });
 
     loop {
         // Wait for task slots to be available before asking for new work
@@ -88,6 +98,8 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     task_status,
                 })
                 .await;
+
+        *report_ready;
 
         match poll_work_result {
             Ok(result) => {
