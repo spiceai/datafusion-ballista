@@ -16,17 +16,19 @@
 // under the License.
 
 use crate::client::BallistaClient;
-use crate::config::BallistaConfig;
+use crate::config::{BallistaConfig, SPICE_API_KEY};
 use crate::serde::protobuf::SuccessfulJob;
 use crate::serde::protobuf::{
     execute_query_params::Query, execute_query_result, job_status,
     scheduler_grpc_client::SchedulerGrpcClient, ExecuteQueryParams, GetJobStatusParams,
     GetJobStatusResult, KeyValuePair, PartitionLocation,
 };
+use crate::serde::scheduler;
 use crate::utils::create_grpc_client_connection;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::exec_err;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::LogicalPlan;
@@ -237,7 +239,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.scheduler_url.clone(),
                 self.session_id.clone(),
                 query,
-                self.config.default_grpc_client_max_message_size(),
+                self.config.clone(),
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -273,7 +275,7 @@ async fn execute_query(
     scheduler_url: String,
     session_id: String,
     query: ExecuteQueryParams,
-    max_message_size: usize,
+    config: BallistaConfig,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     info!("Connecting to Ballista scheduler at {scheduler_url}");
     // TODO reuse the scheduler to avoid connecting to the Ballista scheduler again and again
@@ -281,9 +283,27 @@ async fn execute_query(
         .await
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
-    let mut scheduler = SchedulerGrpcClient::new(connection)
-        .max_encoding_message_size(max_message_size)
-        .max_decoding_message_size(max_message_size);
+    let Some(api_key) = config.settings().get(SPICE_API_KEY) else {
+        return exec_err!("Missing `{SPICE_API_KEY}` in config");
+    };
+
+    let max_message_size = config.default_grpc_client_max_message_size();
+
+    let mut scheduler = SchedulerGrpcClient::with_interceptor(
+        connection,
+        move |mut req: tonic::Request<_>| {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {api_key}")
+                    .parse()
+                    .expect("Must serialize API key"),
+            );
+
+            Ok(req)
+        },
+    )
+    .max_encoding_message_size(max_message_size)
+    .max_decoding_message_size(max_message_size);
 
     let query_result = scheduler
         .execute_query(query)
