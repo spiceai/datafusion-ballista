@@ -24,11 +24,11 @@ use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
 };
 use datafusion::execution::FunctionRegistry;
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::{
     error::DataFusionError, execution::SessionState, prelude::SessionContext,
 };
 use std::sync::Arc;
-use datafusion::logical_expr::ScalarUDF;
 use url::Url;
 
 const DEFAULT_SCHEDULER_PORT: u16 = 50050;
@@ -133,6 +133,8 @@ impl SessionContextExt for SessionContext {
 
         // Populate local catalog from scheduler
         ctx.populate_catalog_from_scheduler(&scheduler_url).await?;
+        ctx.populate_functions_from_scheduler(&scheduler_url)
+            .await?;
 
         Ok(ctx)
     }
@@ -154,6 +156,8 @@ impl SessionContextExt for SessionContext {
 
         // Populate local catalog from scheduler
         ctx.populate_catalog_from_scheduler(&scheduler_url).await?;
+        ctx.populate_functions_from_scheduler(&scheduler_url)
+            .await?;
 
         Ok(ctx)
     }
@@ -296,9 +300,7 @@ impl SessionContextExt for SessionContext {
                 continue;
             }
 
-            self.state()
-                .register_udf(Arc::new(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf))))
-                .expect("Must register udf");
+            self.register_udf(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf)))
         }
 
         Ok(())
