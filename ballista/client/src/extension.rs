@@ -16,16 +16,19 @@
 // under the License.
 
 pub use ballista_core::extension::{SessionConfigExt, SessionStateExt};
+use ballista_core::remote_catalog::remote_scalar_udf::RemoteScalarUDF;
 use ballista_core::remote_catalog::remote_table_provider::RemoteTableProvider;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
-use ballista_core::serde::protobuf::GetCatalogParams;
+use ballista_core::serde::protobuf::{GetCatalogParams, GetRemoteFunctionsParams};
 use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
 };
+use datafusion::execution::FunctionRegistry;
 use datafusion::{
     error::DataFusionError, execution::SessionState, prelude::SessionContext,
 };
 use std::sync::Arc;
+use datafusion::logical_expr::ScalarUDF;
 use url::Url;
 
 const DEFAULT_SCHEDULER_PORT: u16 = 50050;
@@ -96,6 +99,12 @@ pub trait SessionContextExt {
     /// Populates the local catalog with metadata from the remote scheduler.
     /// This allows catalog queries like SHOW TABLES to work on the client.
     async fn populate_catalog_from_scheduler(
+        &self,
+        scheduler_url: &str,
+    ) -> datafusion::error::Result<()>;
+
+    /// Populates local context with functions from the scheduler.
+    async fn populate_functions_from_scheduler(
         &self,
         scheduler_url: &str,
     ) -> datafusion::error::Result<()>;
@@ -255,6 +264,41 @@ impl SessionContextExt for SessionContext {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn populate_functions_from_scheduler(
+        &self,
+        scheduler_url: &str,
+    ) -> datafusion::common::Result<()> {
+        let mut client = SchedulerGrpcClient::connect(scheduler_url.to_string())
+            .await
+            .map_err(|e| {
+                DataFusionError::External(
+                    format!("Failed to connect to scheduler: {}", e).into(),
+                )
+            })?;
+
+        let request = tonic::Request::new(GetRemoteFunctionsParams {
+            session_id: self.state().session_id().to_string(),
+        });
+
+        let response = client.get_remote_functions(request).await.map_err(|e| {
+            DataFusionError::External(format!("Failed to fetch catalog: {}", e).into())
+        })?;
+
+        let remote_functions = response.into_inner();
+
+        for udf in remote_functions.udfs {
+            if let Ok(_) = self.state().udf(&udf.name) {
+                continue;
+            }
+
+            self.state()
+                .register_udf(Arc::new(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf))))
+                .expect("Must register udf");
         }
 
         Ok(())
