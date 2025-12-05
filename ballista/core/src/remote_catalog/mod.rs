@@ -20,3 +20,4 @@ pub mod catalog_serialize_ext;
 pub mod function_serialize_ext;
 pub mod remote_scalar_udf;
 pub mod remote_table_provider;
+pub mod remote_udtf;

@@ -566,6 +566,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
         Ok(Response::new(GetRemoteFunctionsResult {
             udfs: ctx.serialize_udfs(),
+            udtfs: ctx.serialize_udtfs(),
         }))
     }
 }

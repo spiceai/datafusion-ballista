@@ -745,6 +745,11 @@ message RemoteTableProviderNode {
   datafusion_common.Schema schema = 4;
 }
 
+message RemoteTableFunctionNode {
+  string name = 1;
+  datafusion.LogicalExprNodeCollection args = 2;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Remote UDF Metadata
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -755,6 +760,7 @@ message GetRemoteFunctionsParams {
 
 message GetRemoteFunctionsResult {
   repeated ScalarUDFInfo udfs = 1;
+  repeated string udtfs = 2;
 }
 
 message ScalarUDFInfo {

@@ -1118,6 +1118,15 @@ pub struct RemoteTableProviderNode {
     pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemoteTableFunctionNode {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub args: ::core::option::Option<
+        ::datafusion_proto::protobuf::LogicalExprNodeCollection,
+    >,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetRemoteFunctionsParams {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
@@ -1126,6 +1135,8 @@ pub struct GetRemoteFunctionsParams {
 pub struct GetRemoteFunctionsResult {
     #[prost(message, repeated, tag = "1")]
     pub udfs: ::prost::alloc::vec::Vec<ScalarUdfInfo>,
+    #[prost(string, repeated, tag = "2")]
+    pub udtfs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScalarUdfInfo {

@@ -30,6 +30,8 @@ use datafusion_proto::logical_plan::file_formats::{
     ArrowLogicalExtensionCodec, AvroLogicalExtensionCodec, CsvLogicalExtensionCodec,
     JsonLogicalExtensionCodec, ParquetLogicalExtensionCodec,
 };
+use datafusion_proto::logical_plan::from_proto::parse_expr;
+use datafusion_proto::logical_plan::to_proto::serialize_expr;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
 use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
@@ -50,7 +52,7 @@ use crate::remote_catalog::remote_table_provider::RemoteTableProvider;
 use crate::serde::protobuf::ballista_physical_plan_node::PhysicalPlanType;
 use crate::serde::scheduler::PartitionLocation;
 use datafusion::catalog::TableProvider;
-use datafusion::logical_expr::UserDefinedLogicalNode;
+use datafusion::logical_expr::{Expr, UserDefinedLogicalNode};
 pub use generated::ballista as protobuf;
 use prost::Message;
 use std::fmt::Debug;
@@ -59,6 +61,7 @@ use std::sync::Arc;
 use std::{convert::TryInto, io::Cursor};
 use tokio::runtime::Handle;
 use tokio::task;
+use crate::remote_catalog::remote_udtf::RemoteTableFunction;
 
 pub mod from_proto;
 pub mod generated;
@@ -243,6 +246,29 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
                     table.schema()
                 );
             }
+        } else if let Ok(remote_udtf) = protobuf::RemoteTableFunctionNode::decode(buf) {
+            let udtf = ctx.table_function(&remote_udtf.name)?;
+
+            let args: Vec<Expr> = remote_udtf
+                .args
+                .map(|arg_collection| {
+                    arg_collection
+                        .logical_expr_nodes
+                        .into_iter()
+                        .map(|expr_node| {
+                            parse_expr(
+                                &expr_node,
+                                ctx,
+                                self.default_codec.as_ref(),
+                            )
+                            .map_err(|e| DataFusionError::Internal(format!("Failed to parse expr: {}", e)))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+
+            return udtf.function().call(&args);
         }
 
         self.default_codec
@@ -271,6 +297,37 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
                     "Failed to encode RemoteTableProviderNode: {}",
+                    e
+                ))
+            })?;
+
+            return Ok(());
+        } else if let Some(remote_udtf) = node.as_any().downcast_ref::<RemoteTableFunction>() {
+            let args = if remote_udtf.args.is_empty() {
+                None
+            } else {
+                let expr_nodes = remote_udtf
+                    .args
+                    .iter()
+                    .map(|expr| {
+                        serialize_expr(expr, self.default_codec.as_ref())
+                            .map_err(|e| DataFusionError::Internal(format!("Failed to serialize expr: {}", e)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Some(datafusion_proto::protobuf::LogicalExprNodeCollection {
+                    logical_expr_nodes: expr_nodes,
+                })
+            };
+
+            let proto = protobuf::RemoteTableFunctionNode {
+                name: remote_udtf.name.clone(),
+                args,
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "Failed to encode RemoteTableFunctionNode: {}",
                     e
                 ))
             })?;

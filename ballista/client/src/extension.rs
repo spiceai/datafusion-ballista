@@ -30,6 +30,7 @@ use datafusion::{
 };
 use std::sync::Arc;
 use url::Url;
+use ballista_core::remote_catalog::remote_udtf::{RemoteTableFunction};
 
 const DEFAULT_SCHEDULER_PORT: u16 = 50050;
 
@@ -301,6 +302,14 @@ impl SessionContextExt for SessionContext {
             }
 
             self.register_udf(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf)))
+        }
+
+        for udtf in remote_functions.udtfs {
+            if self.state().table_functions().contains_key(&udtf) {
+                continue;
+            }
+
+            self.register_udtf(&udtf, RemoteTableFunction::new(&udtf));
         }
 
         Ok(())

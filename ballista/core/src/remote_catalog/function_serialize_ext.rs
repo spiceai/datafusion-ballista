@@ -29,6 +29,7 @@ use std::collections::HashSet;
 /// Used to serialize function shapes to ship to Ballista clients
 pub trait FunctionSerializeExt {
     fn serialize_udfs(&self) -> Vec<ScalarUdfInfo>;
+    fn serialize_udtfs(&self) -> Vec<String>;
 }
 
 fn try_derive_return_type(udf: &ScalarUDF, types: &[DataType]) -> Option<DataType> {
@@ -52,6 +53,10 @@ fn try_derive_return_type(udf: &ScalarUDF, types: &[DataType]) -> Option<DataTyp
 }
 
 impl FunctionSerializeExt for SessionContext {
+    fn serialize_udtfs(&self) -> Vec<String> {
+        self.state().table_functions().keys().cloned().collect()
+    }
+
     fn serialize_udfs(&self) -> Vec<ScalarUdfInfo> {
         let mut udfs = vec![];
 
