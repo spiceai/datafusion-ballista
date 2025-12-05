@@ -30,14 +30,14 @@ include = ["/src", "/ballista", "/LICENSE.txt", "pyproject.toml", "Cargo.toml", 
 publish = false
 
 [dependencies]
-async-trait = "0.1.89"
-ballista = { version = "49.0.0" }
-ballista-core = { version = "49.0.0" }
-ballista-executor = { version = "49.0.0", default-features = false }
-ballista-scheduler = { version = "49.0.0", default-features = false }
-datafusion = { version = "49", features = ["pyarrow", "avro"] }
-datafusion-proto = { version = "49" }
-datafusion-python = { version = "49" }
+async-trait = "0.1.77"
+ballista = { path = "../ballista/client", version = "50.0.0" }
+ballista-core = { path = "../ballista/core", version = "50.0.0" }
+ballista-executor = { path = "../ballista/executor", version = "50.0.0" }
+ballista-scheduler = { path = "../ballista/scheduler", version = "50.0.0" }
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+datafusion-python = "50.1.0"
 
 pyo3 = { version = "0.24", features = ["extension-module", "abi3", "abi3-py39"] }
 pyo3-log = "0.12"

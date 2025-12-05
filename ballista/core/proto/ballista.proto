@@ -710,6 +710,75 @@ message RunningTaskInfo {
   uint32 partition_id = 4;;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Catalog Metadata
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+message GetCatalogParams {
+  string session_id = 1;
+}
+
+message GetCatalogResult {
+  repeated CatalogInfo catalogs = 1;
+}
+
+message CatalogInfo {
+  string catalog_name = 1;
+  repeated SchemaInfo schemas = 2;
+}
+
+message SchemaInfo {
+  string schema_name = 1;
+  repeated TableInfo tables = 2;
+}
+
+message TableInfo {
+  string table_name = 1;
+  datafusion_common.Schema schema = 2;
+}
+
+message RemoteTableProviderNode {
+  string catalog_name = 1;
+  string schema_name = 2;
+  string table_name = 3;
+  datafusion_common.Schema schema = 4;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Remote UDF Metadata
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+message GetRemoteFunctionsParams {
+  string session_id = 1;
+}
+
+message GetRemoteFunctionsResult {
+  repeated ScalarUDFInfo udfs = 1;
+}
+
+message ScalarUDFInfo {
+  string name = 1;
+  optional ScalarUDFDocumentation documentation = 2;
+  repeated ScalarUDFTypeSignature signatures = 3;
+}
+
+message ScalarUDFTypeSignature {
+  repeated datafusion_common.ArrowType arity = 1;
+  datafusion_common.ArrowType return_type = 2;
+}
+
+message ScalarUDFDocumentation {
+  string description = 1;
+  string syntax_example = 2;
+  optional string sql_example = 3;
+  repeated ScalarUDFDocumentationArgument arguments = 4;
+}
+
+message ScalarUDFDocumentationArgument {
+  string argument = 1;
+  string description = 2;
+}
+
 service SchedulerGrpc {
   // Executors must poll the scheduler for heartbeat and to receive tasks
   rpc PollWork (PollWorkParams) returns (PollWorkResult) {}
@@ -736,6 +805,12 @@ service SchedulerGrpc {
   rpc CancelJob (CancelJobParams) returns (CancelJobResult) {}
 
   rpc CleanJobData (CleanJobDataParams) returns (CleanJobDataResult) {}
+
+  // Get catalog metadata for a session
+  rpc GetCatalog (GetCatalogParams) returns (GetCatalogResult) {}
+
+  // Get catalog metadata for a session
+  rpc GetRemoteFunctions (GetRemoteFunctionsParams) returns (GetRemoteFunctionsResult) {}
 }
 
 service ExecutorGrpc {
