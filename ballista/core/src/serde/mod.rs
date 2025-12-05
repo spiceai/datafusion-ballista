@@ -50,7 +50,6 @@ use crate::remote_catalog::remote_table_provider::RemoteTableProvider;
 use crate::serde::protobuf::ballista_physical_plan_node::PhysicalPlanType;
 use crate::serde::scheduler::PartitionLocation;
 use datafusion::catalog::TableProvider;
-use datafusion::logical_expr::UserDefinedLogicalNode;
 pub use generated::ballista as protobuf;
 use prost::Message;
 use std::fmt::Debug;

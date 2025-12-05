@@ -27,10 +27,10 @@ use ballista_core::serde::protobuf::{
     CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryFailureResult,
     ExecuteQueryParams, ExecuteQueryResult, ExecuteQuerySuccessResult, ExecutorHeartbeat,
     ExecutorStoppedParams, ExecutorStoppedResult, GetCatalogParams, GetCatalogResult,
-    GetJobStatusParams, GetJobStatusResult, HeartBeatParams, HeartBeatResult,
-    PollWorkParams, PollWorkResult, RegisterExecutorParams, RegisterExecutorResult,
-    RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
-    UpdateTaskStatusResult,
+    GetJobStatusParams, GetJobStatusResult, GetRemoteFunctionsParams,
+    GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult, PollWorkParams,
+    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -43,10 +43,10 @@ use std::ops::Deref;
 use crate::cluster::{bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
+use crate::scheduler_server::SchedulerServer;
+use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
-
-use crate::scheduler_server::SchedulerServer;
 
 #[tonic::async_trait]
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
@@ -546,6 +546,26 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
         Ok(Response::new(GetCatalogResult {
             catalogs: ctx.serialize_catalogs().await,
+        }))
+    }
+
+    async fn get_remote_functions(
+        &self,
+        request: Request<GetRemoteFunctionsParams>,
+    ) -> Result<Response<GetRemoteFunctionsResult>, Status> {
+        let GetRemoteFunctionsParams { session_id } = request.into_inner();
+        let ctx = self
+            .state
+            .session_manager
+            .create_or_update_session(
+                session_id.as_str(),
+                &self.state.session_manager.produce_config(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Error creating session {e}")))?;
+
+        Ok(Response::new(GetRemoteFunctionsResult {
+            udfs: ctx.serialize_udfs(),
         }))
     }
 }

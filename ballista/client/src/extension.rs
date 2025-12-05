@@ -16,12 +16,15 @@
 // under the License.
 
 pub use ballista_core::extension::{SessionConfigExt, SessionStateExt};
+use ballista_core::remote_catalog::remote_scalar_udf::RemoteScalarUDF;
 use ballista_core::remote_catalog::remote_table_provider::RemoteTableProvider;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
-use ballista_core::serde::protobuf::GetCatalogParams;
+use ballista_core::serde::protobuf::{GetCatalogParams, GetRemoteFunctionsParams};
 use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
 };
+use datafusion::execution::FunctionRegistry;
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::{
     error::DataFusionError, execution::SessionState, prelude::SessionContext,
 };
@@ -99,6 +102,12 @@ pub trait SessionContextExt {
         &self,
         scheduler_url: &str,
     ) -> datafusion::error::Result<()>;
+
+    /// Populates local context with functions from the scheduler.
+    async fn populate_functions_from_scheduler(
+        &self,
+        scheduler_url: &str,
+    ) -> datafusion::error::Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -124,6 +133,8 @@ impl SessionContextExt for SessionContext {
 
         // Populate local catalog from scheduler
         ctx.populate_catalog_from_scheduler(&scheduler_url).await?;
+        ctx.populate_functions_from_scheduler(&scheduler_url)
+            .await?;
 
         Ok(ctx)
     }
@@ -145,6 +156,8 @@ impl SessionContextExt for SessionContext {
 
         // Populate local catalog from scheduler
         ctx.populate_catalog_from_scheduler(&scheduler_url).await?;
+        ctx.populate_functions_from_scheduler(&scheduler_url)
+            .await?;
 
         Ok(ctx)
     }
@@ -255,6 +268,39 @@ impl SessionContextExt for SessionContext {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn populate_functions_from_scheduler(
+        &self,
+        scheduler_url: &str,
+    ) -> datafusion::common::Result<()> {
+        let mut client = SchedulerGrpcClient::connect(scheduler_url.to_string())
+            .await
+            .map_err(|e| {
+                DataFusionError::External(
+                    format!("Failed to connect to scheduler: {}", e).into(),
+                )
+            })?;
+
+        let request = tonic::Request::new(GetRemoteFunctionsParams {
+            session_id: self.state().session_id().to_string(),
+        });
+
+        let response = client.get_remote_functions(request).await.map_err(|e| {
+            DataFusionError::External(format!("Failed to fetch catalog: {}", e).into())
+        })?;
+
+        let remote_functions = response.into_inner();
+
+        for udf in remote_functions.udfs {
+            if self.state().udf(&udf.name).is_ok() {
+                continue;
+            }
+
+            self.register_udf(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf)?))
         }
 
         Ok(())

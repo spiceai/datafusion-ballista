@@ -42,15 +42,13 @@ impl CatalogSerializeExt for SessionContext {
         let catalog_names = self.state().catalog_list().catalog_names();
 
         stream::iter(catalog_names.iter())
-            .filter_map(|catalog_name| self.serialize_catalog(&catalog_name))
+            .filter_map(|catalog_name| self.serialize_catalog(catalog_name))
             .collect::<Vec<_>>()
             .await
     }
 
     async fn serialize_catalog(&self, name: &str) -> Option<CatalogInfo> {
-        let Some(catalog) = self.catalog(name) else {
-            return None;
-        };
+        let catalog = self.catalog(name)?;
 
         let schemas = stream::iter(catalog.schema_names().iter())
             .filter_map(|schema_name| self.serialize_schema(schema_name, &catalog))
@@ -68,9 +66,7 @@ impl CatalogSerializeExt for SessionContext {
         name: &str,
         catalog: &Arc<dyn CatalogProvider>,
     ) -> Option<SchemaInfo> {
-        let Some(schema) = catalog.schema(name) else {
-            return None;
-        };
+        let schema = catalog.schema(name)?;
 
         let tables = stream::iter(schema.table_names())
             .filter_map(|table_name| async {

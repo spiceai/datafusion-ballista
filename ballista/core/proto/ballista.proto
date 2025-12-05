@@ -745,6 +745,41 @@ message RemoteTableProviderNode {
   datafusion_common.Schema schema = 4;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Remote UDF Metadata
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+message GetRemoteFunctionsParams {
+  string session_id = 1;
+}
+
+message GetRemoteFunctionsResult {
+  repeated ScalarUDFInfo udfs = 1;
+}
+
+message ScalarUDFInfo {
+  string name = 1;
+  optional ScalarUDFDocumentation documentation = 2;
+  repeated ScalarUDFTypeSignature signatures = 3;
+}
+
+message ScalarUDFTypeSignature {
+  repeated datafusion_common.ArrowType arity = 1;
+  datafusion_common.ArrowType return_type = 2;
+}
+
+message ScalarUDFDocumentation {
+  string description = 1;
+  string syntax_example = 2;
+  optional string sql_example = 3;
+  repeated ScalarUDFDocumentationArgument arguments = 4;
+}
+
+message ScalarUDFDocumentationArgument {
+  string argument = 1;
+  string description = 2;
+}
+
 service SchedulerGrpc {
   // Executors must poll the scheduler for heartbeat and to receive tasks
   rpc PollWork (PollWorkParams) returns (PollWorkResult) {}
@@ -774,6 +809,9 @@ service SchedulerGrpc {
 
   // Get catalog metadata for a session
   rpc GetCatalog (GetCatalogParams) returns (GetCatalogResult) {}
+
+  // Get catalog metadata for a session
+  rpc GetRemoteFunctions (GetRemoteFunctionsParams) returns (GetRemoteFunctionsResult) {}
 }
 
 service ExecutorGrpc {

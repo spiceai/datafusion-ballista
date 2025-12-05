@@ -36,8 +36,8 @@ datafusion = { workspace = true }
 log = { workspace = true }
 
 tokio = { workspace = true }
-url = { workspace = true }
 tonic = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 ballista-executor = { path = "../executor", version = "50.0.0" }
