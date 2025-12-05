@@ -296,7 +296,7 @@ impl SessionContextExt for SessionContext {
         let remote_functions = response.into_inner();
 
         for udf in remote_functions.udfs {
-            if let Ok(_) = self.state().udf(&udf.name) {
+            if self.state().udf(&udf.name).is_ok() {
                 continue;
             }
 
