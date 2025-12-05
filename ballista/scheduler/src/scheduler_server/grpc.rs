@@ -44,7 +44,7 @@ use crate::cluster::{bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::SchedulerServer;
-use ballista_core::remote_catalog::function_serialize_ext::FunctionSerializeExt;
+use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 

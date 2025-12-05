@@ -300,7 +300,7 @@ impl SessionContextExt for SessionContext {
                 continue;
             }
 
-            self.register_udf(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf)))
+            self.register_udf(ScalarUDF::new_from_impl(RemoteScalarUDF::new(udf)?))
         }
 
         Ok(())

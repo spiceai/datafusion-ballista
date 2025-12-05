@@ -18,6 +18,7 @@
 
 use crate::serde::protobuf::ScalarUdfInfo;
 use arrow::datatypes::DataType;
+use datafusion::common::Result;
 use datafusion::common::{exec_err, plan_err, DataFusionError};
 use datafusion::logical_expr::{
     ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -55,36 +56,40 @@ impl PartialEq for RemoteScalarUDF {
 impl Eq for RemoteScalarUDF {}
 
 impl RemoteScalarUDF {
-    pub fn new(meta: ScalarUdfInfo) -> Self {
-        let arities = meta
-            .signatures
-            .iter()
-            .map(|signature| {
-                signature
-                    .arity
-                    .iter()
-                    .map(|t| t.try_into())
-                    .collect::<Result<Vec<DataType>, _>>()
-                    .expect("Must deserialize arities")
-            })
-            .collect();
+    pub fn new(meta: ScalarUdfInfo) -> Result<Self> {
+        let mut arities = vec![];
+
+        for signature in &meta.signatures {
+            let signature_types = signature
+                .arity
+                .iter()
+                .map(|t| t.try_into())
+                .collect::<Result<Vec<DataType>, _>>()?;
+
+            arities.push(signature_types);
+        }
 
         let documentation = meta.documentation.clone().map(|d| Documentation {
             doc_section: Default::default(),
             description: d.description.clone(),
             syntax_example: d.syntax_example.clone(),
             sql_example: d.sql_example.clone(),
-            arguments: None,
+            arguments: Some(
+                d.arguments
+                    .iter()
+                    .map(|a| (a.argument.clone(), a.description.clone()))
+                    .collect(),
+            ),
             alternative_syntax: None,
             related_udfs: None,
         });
 
-        Self {
+        Ok(Self {
             arities,
             documentation,
             meta,
             signature: Signature::new(TypeSignature::VariadicAny, Volatility::Volatile),
-        }
+        })
     }
 }
 
@@ -126,7 +131,7 @@ impl ScalarUDFImpl for RemoteScalarUDF {
 
     fn invoke_with_args(
         &self,
-        args: ScalarFunctionArgs,
+        _args: ScalarFunctionArgs,
     ) -> datafusion::common::Result<ColumnarValue> {
         exec_err!("This is a stub function and should never be called on the client")
     }

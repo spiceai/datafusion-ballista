@@ -1151,6 +1151,15 @@ pub struct ScalarUdfDocumentation {
     pub syntax_example: ::prost::alloc::string::String,
     #[prost(string, optional, tag = "3")]
     pub sql_example: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub arguments: ::prost::alloc::vec::Vec<ScalarUdfDocumentationArgument>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarUdfDocumentationArgument {
+    #[prost(string, tag = "1")]
+    pub argument: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub description: ::prost::alloc::string::String,
 }
 /// Generated client implementations.
 pub mod scheduler_grpc_client {

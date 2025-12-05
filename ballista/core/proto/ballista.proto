@@ -772,6 +772,12 @@ message ScalarUDFDocumentation {
   string description = 1;
   string syntax_example = 2;
   optional string sql_example = 3;
+  repeated ScalarUDFDocumentationArgument arguments = 4;
+}
+
+message ScalarUDFDocumentationArgument {
+  string argument = 1;
+  string description = 2;
 }
 
 service SchedulerGrpc {

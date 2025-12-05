@@ -16,42 +16,21 @@
 // under the License.
 
 use crate::serde::protobuf::{
-    ScalarUdfDocumentation, ScalarUdfInfo, ScalarUdfTypeSignature,
+    ScalarUdfDocumentation, ScalarUdfDocumentationArgument, ScalarUdfInfo,
+    ScalarUdfTypeSignature,
 };
-use arrow::datatypes::DataType;
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::all_default_functions;
-use datafusion::logical_expr::{ScalarUDF, UserDefinedLogicalNode};
 use datafusion::prelude::SessionContext;
 use datafusion_proto_common::ArrowType;
 use std::collections::HashSet;
 
 /// Used to serialize function shapes to ship to Ballista clients
-pub trait FunctionSerializeExt {
+pub trait RemoteFunctionSerializeExt {
     fn serialize_udfs(&self) -> Vec<ScalarUdfInfo>;
 }
 
-fn try_derive_return_type(udf: &ScalarUDF, types: &[DataType]) -> Option<DataType> {
-    if let Ok(return_type) = udf.return_type(&types) {
-        return Some(return_type);
-    }
-
-    // TODO: try to serialize these with dummy values
-    // let fields = types.iter().enumerate().map(|(i, t)| Arc::new(Field::new(
-    //     format!("Field{}", i),
-    //     t.clone(),
-    //     true
-    // ))).collect::<Vec<_>>();
-    //
-    // let return_type = f.return_field_from_args(ReturnFieldArgs {
-    //     arg_fields: &fields,
-    //     scalar_arguments: &vec![None; fields.len()],
-    // }).expect("Must have return type");
-
-    None
-}
-
-impl FunctionSerializeExt for SessionContext {
+impl RemoteFunctionSerializeExt for SessionContext {
     fn serialize_udfs(&self) -> Vec<ScalarUdfInfo> {
         let mut udfs = vec![];
 
@@ -78,26 +57,34 @@ impl FunctionSerializeExt for SessionContext {
                         .collect::<Result<Vec<ArrowType>, _>>()
                         .expect("Must serialize data types");
 
-                    if let Some(ref return_type) = try_derive_return_type(f.as_ref(), &t)
-                    {
-                        Some(ScalarUdfTypeSignature {
+                    // TODO: some functions use `ScalarUDF::return_field_from_args`, which this does not support
+                    f.return_type(&t)
+                        .ok()
+                        .and_then(|ref return_type| return_type.try_into().ok())
+                        .map(|arrow_return_type| ScalarUdfTypeSignature {
                             arity,
-                            return_type: Some(
-                                return_type
-                                    .try_into()
-                                    .expect("Must serialize return type"),
-                            ),
+                            return_type: Some(arrow_return_type),
                         })
-                    } else {
-                        None
-                    }
                 })
                 .collect::<Vec<_>>();
 
-            let docs = f.documentation().map(|d| ScalarUdfDocumentation {
-                description: d.description.clone(),
-                syntax_example: d.syntax_example.clone(),
-                sql_example: d.sql_example.clone(),
+            let docs = f.documentation().map(|d| {
+                let arguments = d
+                    .arguments
+                    .iter()
+                    .flatten()
+                    .map(|(arg, desc)| ScalarUdfDocumentationArgument {
+                        argument: arg.clone(),
+                        description: desc.clone(),
+                    })
+                    .collect::<Vec<_>>();
+
+                ScalarUdfDocumentation {
+                    description: d.description.clone(),
+                    syntax_example: d.syntax_example.clone(),
+                    sql_example: d.sql_example.clone(),
+                    arguments,
+                }
             });
 
             udfs.push(ScalarUdfInfo {
