@@ -29,7 +29,12 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::LogicalPlanNode;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tonic::codegen::http::HeaderName;
+use tonic::metadata::MetadataMap;
+use tonic::service::Interceptor;
+use tonic::{Request, Status};
 
 /// Provides methods which adapt [SessionState]
 /// for Ballista usage
@@ -140,6 +145,8 @@ pub trait SessionConfigExt {
         self,
         prefer_flight: bool,
     ) -> Self;
+
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -386,6 +393,11 @@ impl SessionConfigExt for SessionConfig {
                 .set_bool(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, prefer_flight)
         }
     }
+
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
+        let extension = BallistaGrpcMetadataInterceptor::new(metadata);
+        self.with_extension(Arc::new(extension))
+    }
 }
 
 impl SessionConfigHelperExt for SessionConfig {
@@ -522,6 +534,39 @@ impl BallistaQueryPlannerExtension {
     }
     fn planner(&self) -> Arc<dyn QueryPlanner + Send + Sync + 'static> {
         self.planner.clone()
+    }
+}
+
+/// Wrapper allowing additional metadata keys to be decorated to the scheduler
+/// gRPC request
+#[derive(Default, Clone)]
+pub struct BallistaGrpcMetadataInterceptor {
+    additional_metadata: HashMap<String, String>,
+}
+
+impl BallistaGrpcMetadataInterceptor {
+    pub fn new(additional_metadata: HashMap<String, String>) -> Self {
+        Self {
+            additional_metadata,
+        }
+    }
+}
+
+impl Interceptor for BallistaGrpcMetadataInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if self.additional_metadata.is_empty() {
+            Ok(request)
+        } else {
+            let mut request_headers = request.metadata().clone().into_headers();
+            for (k, v) in &self.additional_metadata {
+                request_headers.insert(
+                    HeaderName::from_bytes(k.as_bytes()).expect("Valid header name"),
+                    v.parse().expect("Valid header value"),
+                );
+            }
+            *request.metadata_mut() = MetadataMap::from_headers(request_headers);
+            Ok(request)
+        }
     }
 }
 

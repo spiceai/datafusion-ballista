@@ -39,8 +39,6 @@ pub const BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ: &str =
 pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
     "ballista.shuffle.remote_read_prefer_flight";
 
-pub const SPICE_API_KEY: &str = "ballista.spice.api_key";
-
 pub type ParseResult<T> = result::Result<T, String>;
 use std::sync::LazyLock;
 
@@ -68,10 +66,6 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
-        ConfigEntry::new(SPICE_API_KEY.to_string(),
-                         "Spice AI API key for authenticated cluster RPC".to_string(),
-                         DataType::Utf8,
-                         None)
 
     ];
     entries
