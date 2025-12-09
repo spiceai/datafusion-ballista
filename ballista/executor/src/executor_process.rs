@@ -52,7 +52,7 @@ use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
 use ballista_core::utils::{
-    create_grpc_client_connection, create_grpc_server, default_config_producer,
+    create_grpc_client_endpoint, create_grpc_server, default_config_producer,
     get_time_before,
 };
 use ballista_core::{ConfigProducer, RuntimeProducer, BALLISTA_VERSION};
@@ -246,7 +246,13 @@ pub async fn start_executor_process(
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
     let connection = if connect_timeout == 0 {
-        create_grpc_client_connection(scheduler_url)
+        create_grpc_client_endpoint(scheduler_url)
+            .map_err(|_| {
+                BallistaError::GrpcConnectionError(
+                    "Could not create endpoint to scheduler".to_string(),
+                )
+            })?
+            .connect()
             .await
             .map_err(|_| {
                 BallistaError::GrpcConnectionError(
@@ -262,20 +268,22 @@ pub async fn start_executor_process(
         while x.is_none()
             && Instant::now().elapsed().as_secs() - start_time < connect_timeout
         {
-            match create_grpc_client_connection(scheduler_url.clone())
-                .await
-                .map_err(|_| {
-                    BallistaError::GrpcConnectionError(
-                        "Could not connect to scheduler".to_string(),
-                    )
-                }) {
-                Ok(connection) => {
-                    info!("Connected to scheduler at {scheduler_url}");
-                    x = Some(connection);
-                }
+            match create_grpc_client_endpoint(scheduler_url.clone()) {
+                Ok(endpoint) => match endpoint.connect().await {
+                    Ok(connection) => {
+                        info!("Connected to scheduler at {scheduler_url}");
+                        x = Some(connection);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to connect to scheduler at {scheduler_url} ({e}); retrying ..."
+                        );
+                        tokio::time::sleep(time::Duration::from_millis(500)).await;
+                    }
+                },
                 Err(e) => {
                     warn!(
-                        "Failed to connect to scheduler at {scheduler_url} ({e}); retrying ..."
+                        "Failed to create endpoint to scheduler at {scheduler_url} ({e}); retrying ..."
                     );
                     tokio::time::sleep(time::Duration::from_millis(500)).await;
                 }

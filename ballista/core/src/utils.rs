@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
-use tonic::transport::{Channel, Error, Server};
+use tonic::transport::{Endpoint, Error, Server};
 
 /// Default session builder using the provided configuration
 pub fn default_session_builder(
@@ -104,9 +104,7 @@ pub async fn collect_stream(
     Ok(batches)
 }
 
-pub async fn create_grpc_client_connection<D>(
-    dst: D,
-) -> std::result::Result<Channel, Error>
+pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<Endpoint, Error>
 where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
@@ -120,7 +118,8 @@ where
         .http2_keep_alive_interval(Duration::from_secs(300))
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true);
-    endpoint.connect().await
+
+    Ok(endpoint)
 }
 
 pub fn create_grpc_server() -> Server {

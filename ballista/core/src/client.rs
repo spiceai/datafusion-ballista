@@ -45,7 +45,7 @@ use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 
 use crate::serde::protobuf;
-use crate::utils::create_grpc_client_connection;
+use crate::utils::create_grpc_client_endpoint;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
 use log::{debug, warn};
@@ -73,7 +73,13 @@ impl BallistaClient {
         let addr = format!("http://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
         let connection =
-            create_grpc_client_connection(addr.clone())
+            create_grpc_client_endpoint(addr.clone())
+                .map_err(|e| {
+                    BallistaError::GrpcConnectionError(format!(
+                    "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
+                ))
+                })?
+                .connect()
                 .await
                 .map_err(|e| {
                     BallistaError::GrpcConnectionError(format!(

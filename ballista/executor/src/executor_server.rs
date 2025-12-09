@@ -43,7 +43,7 @@ use ballista_core::serde::scheduler::from_proto::{
 use ballista_core::serde::scheduler::PartitionId;
 use ballista_core::serde::scheduler::TaskDefinition;
 use ballista_core::serde::BallistaCodec;
-use ballista_core::utils::{create_grpc_client_connection, create_grpc_server};
+use ballista_core::utils::{create_grpc_client_endpoint, create_grpc_server};
 use dashmap::DashMap;
 use datafusion::execution::TaskContext;
 use datafusion_proto::{logical_plan::AsLogicalPlan, physical_plan::AsExecutionPlan};
@@ -235,7 +235,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             Ok(scheduler)
         } else {
             let scheduler_url = format!("http://{scheduler_id}");
-            let connection = create_grpc_client_connection(scheduler_url).await?;
+            let connection = create_grpc_client_endpoint(scheduler_url)?
+                .connect()
+                .await?;
             let scheduler = SchedulerGrpcClient::new(connection)
                 .max_encoding_message_size(self.grpc_max_encoding_message_size)
                 .max_decoding_message_size(self.grpc_max_decoding_message_size);
