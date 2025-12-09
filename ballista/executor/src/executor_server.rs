@@ -184,8 +184,9 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     schedulers: SchedulerClients,
     grpc_max_encoding_message_size: usize,
     grpc_max_decoding_message_size: usize,
-    override_create_grpc_client_endpoint:
-        Option<Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>>,
+    override_create_grpc_client_endpoint: Option<
+        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
+    >,
 }
 
 #[derive(Clone)]

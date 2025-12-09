@@ -429,7 +429,9 @@ impl ExecutorManager {
             );
             let mut endpoint = create_grpc_client_endpoint(executor_url)?;
 
-            if let Some(ref override_fn) = self.config.override_create_grpc_client_endpoint {
+            if let Some(ref override_fn) =
+                self.config.override_create_grpc_client_endpoint
+            {
                 endpoint = override_fn(endpoint)?;
             }
 

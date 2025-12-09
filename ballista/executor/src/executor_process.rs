@@ -106,8 +106,9 @@ pub struct ExecutorProcessConfig {
     /// [ArrowFlightServerProvider] implementation override option
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
     /// Override function for customizing gRPC client endpoints before they are used
-    pub override_create_grpc_client_endpoint:
-        Option<Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>>,
+    pub override_create_grpc_client_endpoint: Option<
+        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
+    >,
 }
 
 impl ExecutorProcessConfig {
@@ -251,12 +252,11 @@ pub async fn start_executor_process(
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
     let connection = if connect_timeout == 0 {
-        let mut endpoint = create_grpc_client_endpoint(scheduler_url)
-            .map_err(|_| {
-                BallistaError::GrpcConnectionError(
-                    "Could not create endpoint to scheduler".to_string(),
-                )
-            })?;
+        let mut endpoint = create_grpc_client_endpoint(scheduler_url).map_err(|_| {
+            BallistaError::GrpcConnectionError(
+                "Could not create endpoint to scheduler".to_string(),
+            )
+        })?;
 
         if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
             endpoint = override_fn(endpoint).map_err(|_| {
@@ -266,14 +266,11 @@ pub async fn start_executor_process(
             })?;
         }
 
-        endpoint
-            .connect()
-            .await
-            .map_err(|_| {
-                BallistaError::GrpcConnectionError(
-                    "Could not connect to scheduler".to_string(),
-                )
-            })
+        endpoint.connect().await.map_err(|_| {
+            BallistaError::GrpcConnectionError(
+                "Could not connect to scheduler".to_string(),
+            )
+        })
     } else {
         // this feature was added to support docker-compose so that we can have the executor
         // wait for the scheduler to start, or at least run for 10 seconds before failing so
@@ -285,14 +282,17 @@ pub async fn start_executor_process(
         {
             match create_grpc_client_endpoint(scheduler_url.clone()) {
                 Ok(mut endpoint) => {
-                    if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
+                    if let Some(ref override_fn) =
+                        opt.override_create_grpc_client_endpoint
+                    {
                         match override_fn(endpoint) {
                             Ok(overridden_endpoint) => endpoint = overridden_endpoint,
                             Err(e) => {
                                 warn!(
                                     "Failed to apply endpoint override to scheduler at {scheduler_url} ({e}); retrying ..."
                                 );
-                                tokio::time::sleep(time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(time::Duration::from_millis(500))
+                                    .await;
                                 continue;
                             }
                         }
@@ -310,7 +310,7 @@ pub async fn start_executor_process(
                             tokio::time::sleep(time::Duration::from_millis(500)).await;
                         }
                     }
-                },
+                }
                 Err(e) => {
                     warn!(
                         "Failed to create endpoint to scheduler at {scheduler_url} ({e}); retrying ..."

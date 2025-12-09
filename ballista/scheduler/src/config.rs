@@ -217,8 +217,9 @@ pub struct SchedulerConfig {
     /// [PhysicalExtensionCodec] override option
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// Override function for customizing gRPC client endpoints before they are used
-    pub override_create_grpc_client_endpoint:
-        Option<Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>>,
+    pub override_create_grpc_client_endpoint: Option<
+        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
+    >,
 }
 
 impl Default for SchedulerConfig {
@@ -351,7 +352,9 @@ impl SchedulerConfig {
 
     pub fn with_override_create_grpc_client_endpoint(
         mut self,
-        override_fn: Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
+        override_fn: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync,
+        >,
     ) -> Self {
         self.override_create_grpc_client_endpoint = Some(override_fn);
         self
