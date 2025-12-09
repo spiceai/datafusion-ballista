@@ -56,6 +56,7 @@ use ballista_core::utils::{
     get_time_before,
 };
 use ballista_core::{ConfigProducer, RuntimeProducer, BALLISTA_VERSION};
+use tonic::transport::{Endpoint, Error as TonicTransportError};
 
 use crate::execution_engine::ExecutionEngine;
 use crate::executor::{Executor, TasksDrainedFuture};
@@ -104,6 +105,9 @@ pub struct ExecutorProcessConfig {
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// [ArrowFlightServerProvider] implementation override option
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
+    /// Override function for customizing gRPC client endpoints before they are used
+    pub override_create_grpc_client_endpoint:
+        Option<Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>>,
 }
 
 impl ExecutorProcessConfig {
@@ -147,6 +151,7 @@ impl Default for ExecutorProcessConfig {
             override_logical_codec: None,
             override_physical_codec: None,
             override_arrow_flight_service: None,
+            override_create_grpc_client_endpoint: None,
         }
     }
 }
@@ -246,12 +251,22 @@ pub async fn start_executor_process(
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
     let connection = if connect_timeout == 0 {
-        create_grpc_client_endpoint(scheduler_url)
+        let mut endpoint = create_grpc_client_endpoint(scheduler_url)
             .map_err(|_| {
                 BallistaError::GrpcConnectionError(
                     "Could not create endpoint to scheduler".to_string(),
                 )
-            })?
+            })?;
+
+        if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
+            endpoint = override_fn(endpoint).map_err(|_| {
+                BallistaError::GrpcConnectionError(
+                    "Failed to apply endpoint override".to_string(),
+                )
+            })?;
+        }
+
+        endpoint
             .connect()
             .await
             .map_err(|_| {
@@ -269,16 +284,31 @@ pub async fn start_executor_process(
             && Instant::now().elapsed().as_secs() - start_time < connect_timeout
         {
             match create_grpc_client_endpoint(scheduler_url.clone()) {
-                Ok(endpoint) => match endpoint.connect().await {
-                    Ok(connection) => {
-                        info!("Connected to scheduler at {scheduler_url}");
-                        x = Some(connection);
+                Ok(mut endpoint) => {
+                    if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
+                        match override_fn(endpoint) {
+                            Ok(overridden_endpoint) => endpoint = overridden_endpoint,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to apply endpoint override to scheduler at {scheduler_url} ({e}); retrying ..."
+                                );
+                                tokio::time::sleep(time::Duration::from_millis(500)).await;
+                                continue;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to connect to scheduler at {scheduler_url} ({e}); retrying ..."
-                        );
-                        tokio::time::sleep(time::Duration::from_millis(500)).await;
+
+                    match endpoint.connect().await {
+                        Ok(connection) => {
+                            info!("Connected to scheduler at {scheduler_url}");
+                            x = Some(connection);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to connect to scheduler at {scheduler_url} ({e}); retrying ..."
+                            );
+                            tokio::time::sleep(time::Duration::from_millis(500)).await;
+                        }
                     }
                 },
                 Err(e) => {

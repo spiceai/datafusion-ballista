@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use log::{debug, error, info, warn};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint, Error as TonicTransportError};
 use tonic::{Request, Response, Status};
 
 use ballista_core::error::BallistaError;
@@ -97,6 +97,7 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         codec,
         config.grpc_max_encoding_message_size as usize,
         config.grpc_max_decoding_message_size as usize,
+        config.override_create_grpc_client_endpoint.clone(),
     );
 
     // 1. Start executor grpc service
@@ -183,6 +184,8 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     schedulers: SchedulerClients,
     grpc_max_encoding_message_size: usize,
     grpc_max_decoding_message_size: usize,
+    override_create_grpc_client_endpoint:
+        Option<Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -209,6 +212,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         codec: BallistaCodec<T, U>,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
+        override_create_grpc_client_endpoint: Option<
+            Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
+        >,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
@@ -222,6 +228,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             schedulers: Default::default(),
             grpc_max_encoding_message_size,
             grpc_max_decoding_message_size,
+            override_create_grpc_client_endpoint,
         }
     }
 
@@ -235,9 +242,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             Ok(scheduler)
         } else {
             let scheduler_url = format!("http://{scheduler_id}");
-            let connection = create_grpc_client_endpoint(scheduler_url)?
-                .connect()
-                .await?;
+            let mut endpoint = create_grpc_client_endpoint(scheduler_url)?;
+
+            if let Some(ref override_fn) = self.override_create_grpc_client_endpoint {
+                endpoint = override_fn(endpoint)?;
+            }
+
+            let connection = endpoint.connect().await?;
             let scheduler = SchedulerGrpcClient::new(connection)
                 .max_encoding_message_size(self.grpc_max_encoding_message_size)
                 .max_decoding_message_size(self.grpc_max_decoding_message_size);
