@@ -30,10 +30,12 @@ use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::LogicalPlanNode;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
 use tonic::codegen::http::HeaderName;
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
+use tonic::transport::Endpoint;
 use tonic::{Request, Status};
 
 /// Provides methods which adapt [SessionState]
@@ -146,7 +148,24 @@ pub trait SessionConfigExt {
         prefer_flight: bool,
     ) -> Self;
 
+    /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
+
+    /// Get a `tonic` interceptor configured to decorate the provided metadata keys
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor>;
+
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self;
+
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -398,6 +417,29 @@ impl SessionConfigExt for SessionConfig {
         let extension = BallistaGrpcMetadataInterceptor::new(metadata);
         self.with_extension(Arc::new(extension))
     }
+
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor> {
+        self.get_extension::<BallistaGrpcMetadataInterceptor>()
+            .unwrap_or_default()
+    }
+
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        let extension = BallistaConfigGrpcEndpoint::new(override_f);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>> {
+        self.get_extension::<BallistaConfigGrpcEndpoint>()
+    }
 }
 
 impl SessionConfigHelperExt for SessionConfig {
@@ -567,6 +609,32 @@ impl Interceptor for BallistaGrpcMetadataInterceptor {
             *request.metadata_mut() = MetadataMap::from_headers(request_headers);
             Ok(request)
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct BallistaConfigGrpcEndpoint {
+    override_f: Arc<
+        dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>> + Send + Sync,
+    >,
+}
+
+impl BallistaConfigGrpcEndpoint {
+    pub fn new(
+        override_f: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        Self { override_f }
+    }
+
+    pub fn configure_endpoint(
+        &self,
+        endpoint: Endpoint,
+    ) -> Result<Endpoint, Box<dyn Error + Send + Sync>> {
+        (self.override_f)(endpoint)
     }
 }
 

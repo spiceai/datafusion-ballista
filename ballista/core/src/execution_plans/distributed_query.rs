@@ -17,7 +17,9 @@
 
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
-use crate::extension::BallistaGrpcMetadataInterceptor;
+use crate::extension::{
+    BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor, SessionConfigExt,
+};
 use crate::serde::protobuf::SuccessfulJob;
 use crate::serde::protobuf::{
     execute_query_params::Query, execute_query_result, job_status,
@@ -50,6 +52,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
+use tonic::transport::Endpoint;
 
 /// This operator sends a logical plan to a Ballista scheduler for execution and
 /// polls the scheduler until the query is complete and then fetches the resulting
@@ -234,10 +237,11 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         let metric_total_bytes =
             MetricBuilder::new(&self.metrics).counter("transferred_bytes", partition);
 
-        let interceptor = context
+        let interceptor = context.session_config().ballista_grpc_interceptor();
+
+        let customize_endpoint = context
             .session_config()
-            .get_extension::<BallistaGrpcMetadataInterceptor>()
-            .unwrap_or_default();
+            .ballista_override_create_grpc_client_endpoint();
 
         let stream = futures::stream::once(
             execute_query(
@@ -246,6 +250,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 query,
                 self.config.clone(),
                 interceptor,
+                customize_endpoint,
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -283,11 +288,20 @@ async fn execute_query(
     query: ExecuteQueryParams,
     config: BallistaConfig,
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     info!("Connecting to Ballista scheduler at {scheduler_url}");
     // TODO reuse the scheduler to avoid connecting to the Ballista scheduler again and again
-    let connection = create_grpc_client_endpoint(scheduler_url)
-        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?
+    let mut endpoint = create_grpc_client_endpoint(scheduler_url)
+        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+
+    if let Some(customize) = customize_endpoint {
+        endpoint = customize
+            .configure_endpoint(endpoint)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    }
+
+    let connection = endpoint
         .connect()
         .await
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
