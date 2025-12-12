@@ -487,7 +487,9 @@ pub struct ExecutorRegistration {
     pub port: u32,
     #[prost(uint32, tag = "4")]
     pub grpc_port: u32,
-    #[prost(message, optional, tag = "5")]
+    #[prost(bool, tag = "5")]
+    pub use_tls: bool,
+    #[prost(message, optional, tag = "6")]
     pub specification: ::core::option::Option<ExecutorSpecification>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
