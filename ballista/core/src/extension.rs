@@ -602,8 +602,13 @@ impl Interceptor for BallistaGrpcMetadataInterceptor {
             let mut request_headers = request.metadata().clone().into_headers();
             for (k, v) in &self.additional_metadata {
                 request_headers.insert(
-                    HeaderName::from_bytes(k.as_bytes()).expect("Valid header name"),
-                    v.parse().expect("Valid header value"),
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?,
+                    v.parse().map_err(|_e| {
+                        Status::invalid_argument(format!(
+                            "{v} is not a valid header value"
+                        ))
+                    })?,
                 );
             }
             *request.metadata_mut() = MetadataMap::from_headers(request_headers);
