@@ -83,6 +83,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
+                    use_tls: false,
                 };
                 if let Err(e) = self
                     .state
@@ -178,6 +179,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 port: metadata.port as u16,
                 grpc_port: metadata.grpc_port as u16,
                 specification: metadata.specification.unwrap().into(),
+                use_tls: false,
             };
 
             self.do_register_executor(metadata).await.map_err(|e| {
@@ -223,6 +225,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
+                    use_tls: false,
                 };
 
                 self.do_register_executor(metadata).await.map_err(|e| {

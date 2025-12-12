@@ -442,6 +442,7 @@ impl SchedulerTest {
                 specification: ExecutorSpecification {
                     task_slots: task_slots as u32,
                 },
+                use_tls: false,
             };
 
             let executor_data = ExecutorData {
@@ -1103,6 +1104,7 @@ pub fn mock_executor(executor_id: String) -> ExecutorMetadata {
         port: 8080,
         grpc_port: 9090,
         specification: ExecutorSpecification { task_slots: 1 },
+        use_tls: false,
     }
 }
 

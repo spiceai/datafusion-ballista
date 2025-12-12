@@ -236,6 +236,7 @@ impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
             port: self.port as u16,
             grpc_port: self.grpc_port as u16,
             specification: self.specification.unwrap().into(),
+            use_tls: self.use_tls,
         }
     }
 }

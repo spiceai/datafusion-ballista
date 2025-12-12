@@ -207,6 +207,7 @@ impl Into<protobuf::ExecutorMetadata> for ExecutorMetadata {
             port: self.port as u32,
             grpc_port: self.grpc_port as u32,
             specification: Some(self.specification.into()),
+            use_tls: self.use_tls,
         }
     }
 }

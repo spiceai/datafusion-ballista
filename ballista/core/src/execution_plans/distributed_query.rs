@@ -295,7 +295,7 @@ async fn execute_query(
     let mut endpoint = create_grpc_client_endpoint(scheduler_url)
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
-    if let Some(customize) = customize_endpoint {
+    if let Some(ref customize) = customize_endpoint {
         endpoint = customize
             .configure_endpoint(endpoint)
             .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
@@ -387,8 +387,13 @@ async fn execute_query(
 
                 info!("Job {job_id} finished executing in {duration:?} ");
                 let streams = partition_location.into_iter().map(move |partition| {
-                    let f = fetch_partition(partition, max_message_size, true)
-                        .map_err(|e| ArrowError::ExternalError(Box::new(e)));
+                    let f = fetch_partition(
+                        partition,
+                        max_message_size,
+                        true,
+                        customize_endpoint.clone(),
+                    )
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
                     futures::stream::once(f).try_flatten()
                 });
@@ -403,6 +408,7 @@ async fn fetch_partition(
     location: PartitionLocation,
     max_message_size: usize,
     flight_transport: bool,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
 ) -> Result<SendableRecordBatchStream> {
     let metadata = location.executor_meta.ok_or_else(|| {
         DataFusionError::Internal("Received empty executor metadata".to_owned())
@@ -412,9 +418,15 @@ async fn fetch_partition(
     })?;
     let host = metadata.host.as_str();
     let port = metadata.port as u16;
-    let mut ballista_client = BallistaClient::try_new(host, port, max_message_size)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    let mut ballista_client = BallistaClient::try_new(
+        host,
+        port,
+        max_message_size,
+        metadata.use_tls,
+        customize_endpoint,
+    )
+    .await
+    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
     ballista_client
         .fetch_partition(
             &metadata.id,
