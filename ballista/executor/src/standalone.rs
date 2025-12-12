@@ -98,6 +98,7 @@ pub async fn new_standalone_executor_from_builder(
             }
             .into(),
         ),
+        use_tls: false,
     };
 
     let config = config_producer();

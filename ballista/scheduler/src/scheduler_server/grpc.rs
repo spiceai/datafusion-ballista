@@ -625,6 +625,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            use_tls: false,
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
@@ -713,6 +714,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            use_tls: false,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -798,6 +800,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            use_tls: false,
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -851,6 +854,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            use_tls: false,
         };
 
         let request: Request<RegisterExecutorParams> =
