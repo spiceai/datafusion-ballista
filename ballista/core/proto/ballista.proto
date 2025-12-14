@@ -305,8 +305,7 @@ message ExecutorMetadata {
   string host = 2;
   uint32 port = 3;
   uint32 grpc_port = 4;
-  bool   use_tls = 5;
-  ExecutorSpecification specification = 6;
+  ExecutorSpecification specification = 5;
 }
 
 
@@ -317,8 +316,7 @@ message ExecutorRegistration {
   optional string host = 2;
   uint32 port = 3;
   uint32 grpc_port = 4;
-  bool   use_tls = 5;
-  ExecutorSpecification specification = 6;
+  ExecutorSpecification specification = 5;
 }
 
 message ExecutorHeartbeat {

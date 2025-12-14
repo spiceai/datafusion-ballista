@@ -163,6 +163,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         let force_remote_read = config.ballista_shuffle_reader_force_remote_read();
         let prefer_flight = config.ballista_shuffle_reader_remote_prefer_flight();
         let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
+        let use_tls = config.ballista_use_tls();
 
         if force_remote_read {
             debug!(
@@ -197,6 +198,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             force_remote_read,
             prefer_flight,
             customize_endpoint,
+            use_tls,
         );
 
         let result = RecordBatchStreamAdapter::new(
@@ -392,6 +394,7 @@ fn send_fetch_partitions(
     force_remote_read: bool,
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
     let semaphore = Arc::new(Semaphore::new(max_request_num));
@@ -417,6 +420,7 @@ fn send_fetch_partitions(
                     max_message_size,
                     flight_transport,
                     customize_endpoint_c.clone(),
+                    use_tls,
                 )
                 .await;
             if let Err(e) = response_sender_c.send(r).await {
@@ -438,6 +442,7 @@ fn send_fetch_partitions(
                     max_message_size,
                     flight_transport,
                     customize_endpoint_c,
+                    use_tls,
                 )
                 .await;
             // Block if the channel buffer is full.
@@ -466,6 +471,7 @@ trait PartitionReader: Send + Sync + Clone {
         max_message_size: usize,
         flight_transport: bool,
         customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+        use_tls: bool,
     ) -> result::Result<SendableRecordBatchStream, BallistaError>;
 }
 
@@ -486,6 +492,7 @@ impl PartitionReader for PartitionReaderEnum {
         max_message_size: usize,
         flight_transport: bool,
         customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+        use_tls: bool,
     ) -> result::Result<SendableRecordBatchStream, BallistaError> {
         match self {
             PartitionReaderEnum::FlightRemote => {
@@ -494,6 +501,7 @@ impl PartitionReader for PartitionReaderEnum {
                     max_message_size,
                     flight_transport,
                     customize_endpoint,
+                    use_tls,
                 )
                 .await
             }
@@ -510,6 +518,7 @@ async fn fetch_partition_remote(
     max_message_size: usize,
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
@@ -521,7 +530,7 @@ async fn fetch_partition_remote(
         host,
         port,
         max_message_size,
-        metadata.use_tls,
+        use_tls,
         customize_endpoint,
     )
     .await
@@ -696,7 +705,6 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
-                    use_tls: false,
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -746,7 +754,6 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
-                    use_tls: false,
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -797,7 +804,6 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
-                    use_tls: false,
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -848,7 +854,6 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
-                    use_tls: false,
                 },
                 partition_stats: Default::default(),
                 path: "test_path".to_string(),
@@ -985,6 +990,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
 
         let stream = RecordBatchStreamAdapter::new(
@@ -1011,7 +1017,6 @@ mod tests {
                     port: 50051,
                     grpc_port: 50052,
                     specification: ExecutorSpecification { task_slots: 12 },
-                    use_tls: false,
                 },
                 partition_stats: Default::default(),
                 path: path.clone(),

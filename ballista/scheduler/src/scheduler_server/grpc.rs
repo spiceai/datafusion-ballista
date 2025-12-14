@@ -83,7 +83,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
-                    use_tls: metadata.use_tls,
                 };
                 if let Err(e) = self
                     .state
@@ -179,7 +178,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 port: metadata.port as u16,
                 grpc_port: metadata.grpc_port as u16,
                 specification: metadata.specification.unwrap().into(),
-                use_tls: false,
             };
 
             self.do_register_executor(metadata).await.map_err(|e| {
@@ -225,7 +223,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
-                    use_tls: false,
                 };
 
                 self.do_register_executor(metadata).await.map_err(|e| {
@@ -625,7 +622,6 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            use_tls: false,
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
@@ -714,7 +710,6 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            use_tls: false,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -800,7 +795,6 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            use_tls: false,
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -854,7 +848,6 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            use_tls: false,
         };
 
         let request: Request<RegisterExecutorParams> =

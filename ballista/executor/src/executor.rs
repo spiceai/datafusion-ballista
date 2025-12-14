@@ -357,7 +357,6 @@ mod test {
             grpc_port: 0,
             specification: None,
             host: None,
-            use_tls: false,
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();

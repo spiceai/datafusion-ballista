@@ -166,6 +166,12 @@ pub trait SessionConfigExt {
     fn ballista_override_create_grpc_client_endpoint(
         &self,
     ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
+
+    /// Set whether to use TLS for executor connections (cluster-wide setting)
+    fn with_ballista_use_tls(self, use_tls: bool) -> Self;
+
+    /// Get whether to use TLS for executor connections
+    fn ballista_use_tls(&self) -> bool;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -440,6 +446,16 @@ impl SessionConfigExt for SessionConfig {
     ) -> Option<Arc<BallistaConfigGrpcEndpoint>> {
         self.get_extension::<BallistaConfigGrpcEndpoint>()
     }
+
+    fn with_ballista_use_tls(self, use_tls: bool) -> Self {
+        self.with_extension(Arc::new(BallistaUseTls(use_tls)))
+    }
+
+    fn ballista_use_tls(&self) -> bool {
+        self.get_extension::<BallistaUseTls>()
+            .map(|ext| ext.0)
+            .unwrap_or(false)
+    }
 }
 
 impl SessionConfigHelperExt for SessionConfig {
@@ -642,6 +658,10 @@ impl BallistaConfigGrpcEndpoint {
         (self.override_f)(endpoint)
     }
 }
+
+/// Wrapper for cluster-wide TLS configuration
+#[derive(Clone, Copy)]
+pub struct BallistaUseTls(pub bool);
 
 #[cfg(test)]
 mod test {

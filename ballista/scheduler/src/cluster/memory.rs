@@ -677,7 +677,6 @@ mod test {
             port: 50055,
             grpc_port: 50050,
             specification: ExecutorSpecification { task_slots: 2 },
-            use_tls: false,
         };
 
         cluster_state

@@ -80,7 +80,6 @@ pub struct ExecutorMetadata {
     pub port: u16,
     pub grpc_port: u16,
     pub specification: ExecutorSpecification,
-    pub use_tls: bool,
 }
 
 /// Specification of an executor, indicting executor resources, like total task slots

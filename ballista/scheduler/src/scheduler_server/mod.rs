@@ -713,7 +713,6 @@ mod test {
                     port: 8080,
                     grpc_port: 9090,
                     specification: ExecutorSpecification { task_slots },
-                    use_tls: false,
                 },
                 ExecutorData {
                     executor_id: "executor-1".to_owned(),
@@ -730,7 +729,6 @@ mod test {
                     specification: ExecutorSpecification {
                         task_slots: num_partitions as u32 - task_slots,
                     },
-                    use_tls: false,
                 },
                 ExecutorData {
                     executor_id: "executor-2".to_owned(),

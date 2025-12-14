@@ -242,6 +242,8 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
             .session_config()
             .ballista_override_create_grpc_client_endpoint();
 
+        let use_tls = context.session_config().ballista_use_tls();
+
         let stream = futures::stream::once(
             execute_query(
                 self.scheduler_url.clone(),
@@ -250,6 +252,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.config.clone(),
                 interceptor,
                 customize_endpoint,
+                use_tls,
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -288,6 +291,7 @@ async fn execute_query(
     config: BallistaConfig,
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     info!("Connecting to Ballista scheduler at {scheduler_url}");
     // TODO reuse the scheduler to avoid connecting to the Ballista scheduler again and again
@@ -391,6 +395,7 @@ async fn execute_query(
                         max_message_size,
                         true,
                         customize_endpoint.clone(),
+                        use_tls,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
@@ -408,6 +413,7 @@ async fn fetch_partition(
     max_message_size: usize,
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> Result<SendableRecordBatchStream> {
     let metadata = location.executor_meta.ok_or_else(|| {
         DataFusionError::Internal("Received empty executor metadata".to_owned())
@@ -421,7 +427,7 @@ async fn fetch_partition(
         host,
         port,
         max_message_size,
-        metadata.use_tls,
+        use_tls,
         customize_endpoint,
     )
     .await

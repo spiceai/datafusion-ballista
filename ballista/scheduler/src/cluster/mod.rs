@@ -965,7 +965,6 @@ mod test {
             port: 50051,
             grpc_port: 50052,
             specification: ExecutorSpecification { task_slots: 32 },
-            use_tls: false,
         };
 
         // complete first stage

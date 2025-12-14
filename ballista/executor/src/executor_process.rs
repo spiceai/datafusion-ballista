@@ -204,8 +204,6 @@ pub async fn start_executor_process(
                 resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
             }],
         }),
-        // TODO: tls is only supported when manually starting a scheduler and its flight service
-        use_tls: false,
     };
 
     // put them to session config
@@ -471,8 +469,6 @@ pub async fn start_executor_process(
                             resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
                         }],
                     }),
-                    // TODO: tls is only supported when manually starting an executor poll loop and its flight service
-                    use_tls: false,
                 }),
             })
             .await
