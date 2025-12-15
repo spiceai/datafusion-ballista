@@ -58,6 +58,10 @@ use ballista_core::utils::{
 use ballista_core::{ConfigProducer, RuntimeProducer, BALLISTA_VERSION};
 use tonic::transport::{Endpoint, Error as TonicTransportError};
 
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
+
 use crate::execution_engine::ExecutionEngine;
 use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;
@@ -106,9 +110,7 @@ pub struct ExecutorProcessConfig {
     /// [ArrowFlightServerProvider] implementation override option
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
     /// Override function for customizing gRPC client endpoints before they are used
-    pub override_create_grpc_client_endpoint: Option<
-        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
-    >,
+    pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
 impl ExecutorProcessConfig {

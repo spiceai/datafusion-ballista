@@ -38,6 +38,10 @@ use tonic::service::Interceptor;
 use tonic::transport::Endpoint;
 use tonic::{Request, Status};
 
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>> + Send + Sync>;
+
 /// Provides methods which adapt [SessionState]
 /// for Ballista usage
 pub trait SessionStateExt {
@@ -156,11 +160,7 @@ pub trait SessionConfigExt {
 
     fn with_ballista_override_create_grpc_client_endpoint(
         self,
-        override_f: Arc<
-            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
-                + Send
-                + Sync,
-        >,
+        override_f: EndpointOverrideFn,
     ) -> Self;
 
     fn ballista_override_create_grpc_client_endpoint(
@@ -635,19 +635,11 @@ impl Interceptor for BallistaGrpcMetadataInterceptor {
 
 #[derive(Clone)]
 pub struct BallistaConfigGrpcEndpoint {
-    override_f: Arc<
-        dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>> + Send + Sync,
-    >,
+    override_f: EndpointOverrideFn,
 }
 
 impl BallistaConfigGrpcEndpoint {
-    pub fn new(
-        override_f: Arc<
-            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn new(override_f: EndpointOverrideFn) -> Self {
         Self { override_f }
     }
 

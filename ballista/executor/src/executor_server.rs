@@ -27,6 +27,10 @@ use log::{debug, error, info, warn};
 use tonic::transport::{Channel, Endpoint, Error as TonicTransportError};
 use tonic::{Request, Response, Status};
 
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
+
 use ballista_core::error::BallistaError;
 use ballista_core::serde::protobuf::{
     executor_grpc_server::{ExecutorGrpc, ExecutorGrpcServer},
@@ -184,9 +188,7 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     schedulers: SchedulerClients,
     grpc_max_encoding_message_size: usize,
     grpc_max_decoding_message_size: usize,
-    override_create_grpc_client_endpoint: Option<
-        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
-    >,
+    override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
 #[derive(Clone)]
@@ -213,9 +215,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         codec: BallistaCodec<T, U>,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
-        override_create_grpc_client_endpoint: Option<
-            Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
-        >,
+        override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()

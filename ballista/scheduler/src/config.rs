@@ -34,6 +34,10 @@ use std::fmt::Display;
 use std::sync::Arc;
 use tonic::transport::{Endpoint, Error as TonicTransportError};
 
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
+
 /// Configuration of the application
 #[cfg(feature = "build-binary")]
 #[derive(clap::Parser, Debug)]
@@ -217,9 +221,7 @@ pub struct SchedulerConfig {
     /// [PhysicalExtensionCodec] override option
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// Override function for customizing gRPC client endpoints before they are used
-    pub override_create_grpc_client_endpoint: Option<
-        Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>,
-    >,
+    pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
 impl Default for SchedulerConfig {
