@@ -17,13 +17,16 @@
 
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
+use crate::extension::{
+    BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor, SessionConfigExt,
+};
 use crate::serde::protobuf::SuccessfulJob;
 use crate::serde::protobuf::{
     execute_query_params::Query, execute_query_result, job_status,
     scheduler_grpc_client::SchedulerGrpcClient, ExecuteQueryParams, GetJobStatusParams,
     GetJobStatusResult, KeyValuePair, PartitionLocation,
 };
-use crate::utils::create_grpc_client_connection;
+use crate::utils::create_grpc_client_endpoint;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -232,12 +235,24 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         let metric_row_count = MetricBuilder::new(&self.metrics).output_rows(partition);
         let metric_total_bytes =
             MetricBuilder::new(&self.metrics).counter("transferred_bytes", partition);
+
+        let interceptor = context.session_config().ballista_grpc_interceptor();
+
+        let customize_endpoint = context
+            .session_config()
+            .ballista_override_create_grpc_client_endpoint();
+
+        let use_tls = context.session_config().ballista_use_tls();
+
         let stream = futures::stream::once(
             execute_query(
                 self.scheduler_url.clone(),
                 self.session_id.clone(),
                 query,
-                self.config.default_grpc_client_max_message_size(),
+                self.config.clone(),
+                interceptor,
+                customize_endpoint,
+                use_tls,
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -273,17 +288,35 @@ async fn execute_query(
     scheduler_url: String,
     session_id: String,
     query: ExecuteQueryParams,
-    max_message_size: usize,
+    config: BallistaConfig,
+    grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     info!("Connecting to Ballista scheduler at {scheduler_url}");
     // TODO reuse the scheduler to avoid connecting to the Ballista scheduler again and again
-    let connection = create_grpc_client_connection(scheduler_url)
+    let mut endpoint = create_grpc_client_endpoint(scheduler_url)
+        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+
+    if let Some(ref customize) = customize_endpoint {
+        endpoint = customize
+            .configure_endpoint(endpoint)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    }
+
+    let connection = endpoint
+        .connect()
         .await
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
-    let mut scheduler = SchedulerGrpcClient::new(connection)
-        .max_encoding_message_size(max_message_size)
-        .max_decoding_message_size(max_message_size);
+    let max_message_size = config.default_grpc_client_max_message_size();
+
+    let mut scheduler = SchedulerGrpcClient::with_interceptor(
+        connection,
+        grpc_interceptor.as_ref().clone(),
+    )
+    .max_encoding_message_size(max_message_size)
+    .max_decoding_message_size(max_message_size);
 
     let query_result = scheduler
         .execute_query(query)
@@ -357,8 +390,14 @@ async fn execute_query(
 
                 info!("Job {job_id} finished executing in {duration:?} ");
                 let streams = partition_location.into_iter().map(move |partition| {
-                    let f = fetch_partition(partition, max_message_size, true)
-                        .map_err(|e| ArrowError::ExternalError(Box::new(e)));
+                    let f = fetch_partition(
+                        partition,
+                        max_message_size,
+                        true,
+                        customize_endpoint.clone(),
+                        use_tls,
+                    )
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
                     futures::stream::once(f).try_flatten()
                 });
@@ -373,6 +412,8 @@ async fn fetch_partition(
     location: PartitionLocation,
     max_message_size: usize,
     flight_transport: bool,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    use_tls: bool,
 ) -> Result<SendableRecordBatchStream> {
     let metadata = location.executor_meta.ok_or_else(|| {
         DataFusionError::Internal("Received empty executor metadata".to_owned())
@@ -382,9 +423,15 @@ async fn fetch_partition(
     })?;
     let host = metadata.host.as_str();
     let port = metadata.port as u16;
-    let mut ballista_client = BallistaClient::try_new(host, port, max_message_size)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    let mut ballista_client = BallistaClient::try_new(
+        host,
+        port,
+        max_message_size,
+        use_tls,
+        customize_endpoint,
+    )
+    .await
+    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
     ballista_client
         .fetch_partition(
             &metadata.id,

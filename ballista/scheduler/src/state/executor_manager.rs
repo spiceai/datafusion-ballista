@@ -33,7 +33,7 @@ use ballista_core::serde::protobuf::{
     RemoveJobDataParams, StopExecutorParams,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
-use ballista_core::utils::{create_grpc_client_connection, get_time_before};
+use ballista_core::utils::{create_grpc_client_endpoint, get_time_before};
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -427,7 +427,15 @@ impl ExecutorManager {
                 "http://{}:{}",
                 executor_metadata.host, executor_metadata.grpc_port
             );
-            let connection = create_grpc_client_connection(executor_url).await?;
+            let mut endpoint = create_grpc_client_endpoint(executor_url)?;
+
+            if let Some(ref override_fn) =
+                self.config.override_create_grpc_client_endpoint
+            {
+                endpoint = override_fn(endpoint)?;
+            }
+
+            let connection = endpoint.connect().await?;
             let client = ExecutorGrpcClient::new(connection);
 
             {
