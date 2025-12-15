@@ -32,6 +32,11 @@ use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use std::fmt::Display;
 use std::sync::Arc;
+use tonic::transport::{Endpoint, Error as TonicTransportError};
+
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
 
 /// Command-line configuration for the scheduler binary.
 #[cfg(feature = "build-binary")]
@@ -238,6 +243,8 @@ pub struct SchedulerConfig {
     pub override_logical_codec: Option<Arc<dyn LogicalExtensionCodec>>,
     /// [PhysicalExtensionCodec] override option
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
+    /// Override function for customizing gRPC client endpoints before they are used
+    pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
 impl Default for SchedulerConfig {
@@ -264,6 +271,7 @@ impl Default for SchedulerConfig {
             override_session_builder: None,
             override_logical_codec: None,
             override_physical_codec: None,
+            override_create_grpc_client_endpoint: None,
         }
     }
 }
@@ -383,6 +391,16 @@ impl SchedulerConfig {
         self.override_session_builder = Some(override_session_builder);
         self
     }
+
+    pub fn with_override_create_grpc_client_endpoint(
+        mut self,
+        override_fn: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync,
+        >,
+    ) -> Self {
+        self.override_create_grpc_client_endpoint = Some(override_fn);
+        self
+    }
 }
 
 /// Policy of distributing tasks to available executor slots
@@ -493,6 +511,7 @@ impl TryFrom<Config> for SchedulerConfig {
             override_logical_codec: None,
             override_physical_codec: None,
             override_session_builder: None,
+            override_create_grpc_client_endpoint: None,
         };
 
         Ok(config)

@@ -48,7 +48,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::transport::Channel;
+use tonic::codegen::{Body, Bytes, StdError};
+
 
 /// Main execution loop that polls the scheduler for available tasks.
 ///
@@ -60,10 +61,20 @@ use tonic::transport::Channel;
 /// ensuring no more than the configured number of tasks run simultaneously.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     mut scheduler: SchedulerGrpcClient<Channel>,
+
+pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
+    mut scheduler: SchedulerGrpcClient<C>,
+
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
     readiness: Option<OneShotSender<String>>,
-) -> Result<(), BallistaError> {
+) -> Result<(), BallistaError>
+where
+    C: tonic::client::GrpcService<tonic::body::Body>,
+    C::Error: Into<StdError>,
+    C::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <C::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
     let executor_specification: ExecutorSpecification = executor
         .metadata
         .specification

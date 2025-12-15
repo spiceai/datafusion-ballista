@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
-use tonic::transport::{Channel, Error, Server};
+use tonic::transport::{Endpoint, Error, Server};
 
 /// Configuration for gRPC client connections.
 ///
@@ -196,11 +196,15 @@ pub async fn collect_stream(
     Ok(batches)
 }
 
+
 /// Creates a gRPC client connection with the specified configuration.
 pub async fn create_grpc_client_connection<D>(
     dst: D,
     config: &GrpcClientConfig,
 ) -> std::result::Result<Channel, Error>
+
+pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<Endpoint, Error>
+
 where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
@@ -218,7 +222,8 @@ where
         // since this is a standalone configuration
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true);
-    endpoint.connect().await
+
+    Ok(endpoint)
 }
 
 /// Creates a gRPC server builder with the specified configuration.
