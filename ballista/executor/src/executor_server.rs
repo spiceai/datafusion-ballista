@@ -78,31 +78,22 @@ struct CuratorTaskStatus {
 }
 
 pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
-    mut scheduler: SchedulerGrpcClient<Channel>,
+    scheduler: SchedulerGrpcClient<Channel>,
     config: Arc<ExecutorProcessConfig>,
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
     stop_send: mpsc::Sender<bool>,
     shutdown_noti: &ShutdownNotifier,
 ) -> Result<ServerHandle, BallistaError> {
-    let channel_buf_size = executor.concurrent_tasks * 50;
-    let (tx_task, rx_task) = mpsc::channel::<CuratorTaskDefinition>(channel_buf_size);
-    let (tx_task_status, rx_task_status) =
-        mpsc::channel::<CuratorTaskStatus>(channel_buf_size);
-
-    let executor_server = ExecutorServer::new(
+    let executor_server = create_executor_server(
         scheduler.clone(),
+        Arc::clone(&config),
         executor.clone(),
-        ExecutorEnv {
-            tx_task,
-            tx_task_status,
-            tx_stop: stop_send,
-        },
         codec,
-        config.grpc_max_encoding_message_size as usize,
-        config.grpc_max_decoding_message_size as usize,
-        config.override_create_grpc_client_endpoint.clone(),
-    );
+        stop_send,
+        shutdown_noti,
+    )
+    .await?;
 
     // 1. Start executor grpc service
     let server = {
@@ -113,7 +104,7 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         info!(
             "Ballista v{BALLISTA_VERSION} Rust Executor Grpc Server listening on {addr:?}"
         );
-        let server = ExecutorGrpcServer::new(executor_server.clone())
+        let server = ExecutorGrpcServer::new(executor_server.as_ref().clone())
             .max_encoding_message_size(config.grpc_max_encoding_message_size as usize)
             .max_decoding_message_size(config.grpc_max_decoding_message_size as usize);
         let mut grpc_shutdown = shutdown_noti.subscribe_for_shutdown();
@@ -129,34 +120,89 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         })
     };
 
-    // 2. Do executor registration
-    // TODO the executor registration should happen only after the executor grpc server started.
-    let executor_server = Arc::new(executor_server);
-    match register_executor(&mut scheduler, executor.clone()).await {
+    Ok(server)
+}
+
+pub async fn create_executor_server<
+    T: 'static + AsLogicalPlan,
+    U: 'static + AsExecutionPlan,
+>(
+    scheduler: SchedulerGrpcClient<Channel>,
+    config: Arc<ExecutorProcessConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<T, U>,
+    stop_send: mpsc::Sender<bool>,
+    shutdown_noti: &ShutdownNotifier,
+) -> Result<Arc<ExecutorServer<T, U>>, BallistaError> {
+    let mut scheduler = scheduler;
+    let executor_server = create_executor_server_without_registration(
+        scheduler.clone(),
+        config,
+        executor.clone(),
+        codec,
+        stop_send,
+        shutdown_noti,
+    )
+    .await?;
+    register_executor_with_scheduler(&mut scheduler, executor).await?;
+    Ok(executor_server)
+}
+
+pub async fn create_executor_server_without_registration<
+    T: 'static + AsLogicalPlan,
+    U: 'static + AsExecutionPlan,
+>(
+    scheduler: SchedulerGrpcClient<Channel>,
+    config: Arc<ExecutorProcessConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<T, U>,
+    stop_send: mpsc::Sender<bool>,
+    shutdown_noti: &ShutdownNotifier,
+) -> Result<Arc<ExecutorServer<T, U>>, BallistaError> {
+    let channel_buf_size = executor.concurrent_tasks * 50;
+    let (tx_task, rx_task) = mpsc::channel::<CuratorTaskDefinition>(channel_buf_size);
+    let (tx_task_status, rx_task_status) =
+        mpsc::channel::<CuratorTaskStatus>(channel_buf_size);
+
+    let executor_server = Arc::new(ExecutorServer::new(
+        scheduler,
+        executor.clone(),
+        ExecutorEnv {
+            tx_task,
+            tx_task_status,
+            tx_stop: stop_send,
+        },
+        codec,
+        config.grpc_max_encoding_message_size as usize,
+        config.grpc_max_decoding_message_size as usize,
+        config.override_create_grpc_client_endpoint.clone(),
+        !config.disable_task_status_push,
+        !config.disable_scheduler_heartbeats,
+    ));
+
+    let heartbeater = Heartbeater::new(Arc::clone(&executor_server));
+    heartbeater.start(shutdown_noti, config.executor_heartbeat_interval_seconds);
+
+    let task_runner_pool = TaskRunnerPool::new(Arc::clone(&executor_server));
+    task_runner_pool.start(rx_task, rx_task_status, shutdown_noti);
+
+    Ok(executor_server)
+}
+
+pub async fn register_executor_with_scheduler(
+    scheduler: &mut SchedulerGrpcClient<Channel>,
+    executor: Arc<Executor>,
+) -> Result<(), BallistaError> {
+    match register_executor(scheduler, executor).await {
         Ok(_) => {
             info!("Executor registration succeed");
+            Ok(())
         }
         Err(error) => {
             error!("Executor registration failed due to: {error}");
-            // abort the Executor Grpc Future
-            server.abort();
-            return Err(error);
+            Err(error)
         }
-    };
-
-    // 3. Start Heartbeater loop
-    {
-        let heartbeater = Heartbeater::new(executor_server.clone());
-        heartbeater.start(shutdown_noti, config.executor_heartbeat_interval_seconds);
     }
-
-    // 4. Start TaskRunnerPool loop
-    {
-        let task_runner_pool = TaskRunnerPool::new(executor_server.clone());
-        task_runner_pool.start(rx_task, rx_task_status, shutdown_noti);
-    }
-
-    Ok(server)
 }
 
 #[allow(clippy::clone_on_copy)]
@@ -189,6 +235,8 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     grpc_max_encoding_message_size: usize,
     grpc_max_decoding_message_size: usize,
     override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    push_task_status: bool,
+    send_heartbeats: bool,
 }
 
 #[derive(Clone)]
@@ -208,6 +256,7 @@ unsafe impl Sync for ExecutorEnv {}
 pub static TERMINATING: AtomicBool = AtomicBool::new(false);
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T, U> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         scheduler_to_register: SchedulerGrpcClient<Channel>,
         executor: Arc<Executor>,
@@ -216,6 +265,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
         override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+        push_task_status: bool,
+        send_heartbeats: bool,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
@@ -230,6 +281,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             grpc_max_encoding_message_size,
             grpc_max_decoding_message_size,
             override_create_grpc_client_endpoint,
+            push_task_status,
+            send_heartbeats,
         }
     }
 
@@ -407,14 +460,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         );
 
         let scheduler_id = curator_task.scheduler_id;
-        let task_status_sender = self.executor_env.tx_task_status.clone();
-        task_status_sender
-            .send(CuratorTaskStatus {
-                scheduler_id,
-                task_status,
-            })
-            .await
-            .unwrap();
+        self.executor
+            .status_store()
+            .record_task_status(scheduler_id.clone(), task_status.clone());
+        if self.push_task_status {
+            let task_status_sender = self.executor_env.tx_task_status.clone();
+            if let Err(e) = task_status_sender
+                .send(CuratorTaskStatus {
+                    scheduler_id,
+                    task_status,
+                })
+                .await
+            {
+                warn!("Failed to enqueue task status for scheduler push: {e:?}");
+            }
+        }
     }
 
     // TODO populate with real metrics
@@ -442,6 +502,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> Heartbeater<T, U>
         shutdown_noti: &ShutdownNotifier,
         executor_heartbeat_interval_seconds: u64,
     ) {
+        if !self.executor_server.send_heartbeats {
+            return;
+        }
         let executor_server = self.executor_server.clone();
         let mut heartbeat_shutdown = shutdown_noti.subscribe_for_shutdown();
         let heartbeat_complete = shutdown_noti.shutdown_complete_tx.clone();
@@ -482,89 +545,95 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
         mut rx_task_status: mpsc::Receiver<CuratorTaskStatus>,
         shutdown_noti: &ShutdownNotifier,
     ) {
-        //1. loop for task status reporting
-        let executor_server = self.executor_server.clone();
-        let mut tasks_status_shutdown = shutdown_noti.subscribe_for_shutdown();
-        let tasks_status_complete = shutdown_noti.shutdown_complete_tx.clone();
-        tokio::spawn(async move {
-            info!("Starting the task status reporter");
-            // As long as the shutdown notification has not been received
-            while !tasks_status_shutdown.is_shutdown() {
-                let mut curator_task_status_map: HashMap<String, Vec<TaskStatus>> =
-                    HashMap::new();
-                // First try to fetch task status from the channel in *blocking* mode
-                let maybe_task_status: Option<CuratorTaskStatus> = tokio::select! {
-                     task_status = rx_task_status.recv() => task_status,
-                    _ = tasks_status_shutdown.recv() => {
-                        info!("Stop task status reporting loop");
-                        drop(tasks_status_complete);
-                        return;
-                    }
-                };
-
-                let mut fetched_task_num = 0usize;
-                if let Some(task_status) = maybe_task_status {
-                    let task_status_vec = curator_task_status_map
-                        .entry(task_status.scheduler_id)
-                        .or_default();
-                    task_status_vec.push(task_status.task_status);
-                    fetched_task_num += 1;
-                } else {
-                    info!("Channel is closed and will exit the task status report loop.");
-                    drop(tasks_status_complete);
-                    return;
-                }
-
-                // Then try to fetch by non-blocking mode to fetch as much finished tasks as possible
-                loop {
-                    match rx_task_status.try_recv() {
-                        Ok(task_status) => {
-                            let task_status_vec = curator_task_status_map
-                                .entry(task_status.scheduler_id)
-                                .or_default();
-                            task_status_vec.push(task_status.task_status);
-                            fetched_task_num += 1;
-                        }
-                        Err(TryRecvError::Empty) => {
-                            info!("Fetched {fetched_task_num} tasks status to report");
-                            break;
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            info!("Channel is closed and will exit the task status report loop");
+        if self.executor_server.push_task_status {
+            //1. loop for task status reporting
+            let executor_server = self.executor_server.clone();
+            let mut tasks_status_shutdown = shutdown_noti.subscribe_for_shutdown();
+            let tasks_status_complete = shutdown_noti.shutdown_complete_tx.clone();
+            tokio::spawn(async move {
+                info!("Starting the task status reporter");
+                // As long as the shutdown notification has not been received
+                while !tasks_status_shutdown.is_shutdown() {
+                    let mut curator_task_status_map: HashMap<String, Vec<TaskStatus>> =
+                        HashMap::new();
+                    // First try to fetch task status from the channel in *blocking* mode
+                    let maybe_task_status: Option<CuratorTaskStatus> = tokio::select! {
+                         task_status = rx_task_status.recv() => task_status,
+                        _ = tasks_status_shutdown.recv() => {
+                            info!("Stop task status reporting loop");
                             drop(tasks_status_complete);
                             return;
                         }
-                    }
-                }
+                    };
 
-                for (scheduler_id, tasks_status) in curator_task_status_map.into_iter() {
-                    match executor_server.get_scheduler_client(&scheduler_id).await {
-                        Ok(mut scheduler) => {
-                            if let Err(e) = scheduler
-                                .update_task_status(UpdateTaskStatusParams {
-                                    executor_id: executor_server
-                                        .executor
-                                        .metadata
-                                        .id
-                                        .clone(),
-                                    task_status: tasks_status.clone(),
-                                })
-                                .await
-                            {
+                    let mut fetched_task_num = 0usize;
+                    if let Some(task_status) = maybe_task_status {
+                        let task_status_vec = curator_task_status_map
+                            .entry(task_status.scheduler_id)
+                            .or_default();
+                        task_status_vec.push(task_status.task_status);
+                        fetched_task_num += 1;
+                    } else {
+                        info!("Channel is closed and will exit the task status report loop.");
+                        drop(tasks_status_complete);
+                        return;
+                    }
+
+                    // Then try to fetch by non-blocking mode to fetch as much finished tasks as possible
+                    loop {
+                        match rx_task_status.try_recv() {
+                            Ok(task_status) => {
+                                let task_status_vec = curator_task_status_map
+                                    .entry(task_status.scheduler_id)
+                                    .or_default();
+                                task_status_vec.push(task_status.task_status);
+                                fetched_task_num += 1;
+                            }
+                            Err(TryRecvError::Empty) => {
+                                info!(
+                                    "Fetched {fetched_task_num} tasks status to report"
+                                );
+                                break;
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                info!("Channel is closed and will exit the task status report loop");
+                                drop(tasks_status_complete);
+                                return;
+                            }
+                        }
+                    }
+
+                    for (scheduler_id, tasks_status) in
+                        curator_task_status_map.into_iter()
+                    {
+                        match executor_server.get_scheduler_client(&scheduler_id).await {
+                            Ok(mut scheduler) => {
+                                if let Err(e) = scheduler
+                                    .update_task_status(UpdateTaskStatusParams {
+                                        executor_id: executor_server
+                                            .executor
+                                            .metadata
+                                            .id
+                                            .clone(),
+                                        task_status: tasks_status.clone(),
+                                    })
+                                    .await
+                                {
+                                    error!(
+                                        "Fail to update tasks {tasks_status:?} due to {e:?}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
                                 error!(
-                                    "Fail to update tasks {tasks_status:?} due to {e:?}"
+                                    "Fail to connect to scheduler {scheduler_id} due to {e:?}"
                                 );
                             }
                         }
-                        Err(e) => {
-                            error!(
-                                "Fail to connect to scheduler {scheduler_id} due to {e:?}"
-                            );
-                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         //2. loop for task fetching and running
         let executor_server = self.executor_server.clone();

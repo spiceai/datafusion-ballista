@@ -94,6 +94,10 @@ pub struct ExecutorProcessConfig {
     /// The maximum size of an encoded message
     pub grpc_max_encoding_message_size: u32,
     pub executor_heartbeat_interval_seconds: u64,
+    /// Disable outbound scheduler heartbeats for polling-based health.
+    pub disable_scheduler_heartbeats: bool,
+    /// Disable outbound task status updates for polling-based status.
+    pub disable_task_status_push: bool,
     /// Optional execution engine to use to execute physical plans, will default to
     /// DataFusion if none is provided.
     pub override_execution_engine: Option<Arc<dyn ExecutionEngine>>,
@@ -147,6 +151,8 @@ impl Default for ExecutorProcessConfig {
             grpc_max_decoding_message_size: 16777216,
             grpc_max_encoding_message_size: 16777216,
             executor_heartbeat_interval_seconds: 60,
+            disable_scheduler_heartbeats: false,
+            disable_task_status_push: false,
             override_execution_engine: None,
             override_function_registry: None,
             override_runtime_producer: None,

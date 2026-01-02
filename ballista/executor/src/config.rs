@@ -140,6 +140,8 @@ impl TryFrom<Config> for ExecutorProcessConfig {
             grpc_max_decoding_message_size: opt.grpc_server_max_decoding_message_size,
             grpc_max_encoding_message_size: opt.grpc_server_max_encoding_message_size,
             executor_heartbeat_interval_seconds: opt.executor_heartbeat_interval_seconds,
+            disable_scheduler_heartbeats: false,
+            disable_task_status_push: false,
             override_execution_engine: None,
             override_function_registry: None,
             override_config_producer: None,

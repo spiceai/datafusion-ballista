@@ -207,6 +207,8 @@ pub struct SchedulerConfig {
     pub grpc_server_max_decoding_message_size: u32,
     /// The maximum size of an encoded message at the grpc server side.
     pub grpc_server_max_encoding_message_size: u32,
+    /// Whether to use TLS when connecting to executor gRPC services.
+    pub executor_grpc_use_tls: bool,
     /// The executor timeout in seconds. It should be longer than executor's heartbeat intervals.
     pub executor_timeout_seconds: u64,
     /// The interval to check expired or dead executors
@@ -242,6 +244,7 @@ impl Default for SchedulerConfig {
             scheduler_event_expected_processing_duration: 0,
             grpc_server_max_decoding_message_size: 16777216,
             grpc_server_max_encoding_message_size: 16777216,
+            executor_grpc_use_tls: false,
             executor_timeout_seconds: 180,
             expire_dead_executor_interval_seconds: 15,
             override_config_producer: None,
@@ -313,6 +316,11 @@ impl SchedulerConfig {
 
     pub fn with_task_distribution(mut self, policy: TaskDistributionPolicy) -> Self {
         self.task_distribution = policy;
+        self
+    }
+
+    pub fn with_executor_grpc_use_tls(mut self, use_tls: bool) -> Self {
+        self.executor_grpc_use_tls = use_tls;
         self
     }
 
@@ -461,6 +469,7 @@ impl TryFrom<Config> for SchedulerConfig {
                 .grpc_server_max_decoding_message_size,
             grpc_server_max_encoding_message_size: opt
                 .grpc_server_max_encoding_message_size,
+            executor_grpc_use_tls: false,
             executor_timeout_seconds: opt.executor_timeout_seconds,
             expire_dead_executor_interval_seconds: opt
                 .expire_dead_executor_interval_seconds,

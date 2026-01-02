@@ -22,6 +22,7 @@ use crate::execution_engine::ExecutionEngine;
 use crate::execution_engine::QueryStageExecutor;
 use crate::metrics::ExecutorMetricsCollector;
 use crate::metrics::LoggingMetricsCollector;
+use crate::status_store::ExecutorStatusStore;
 use ballista_core::error::BallistaError;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf;
@@ -85,6 +86,9 @@ pub struct Executor {
     /// Execution engine that the executor will delegate to
     /// for executing query stages
     pub(crate) execution_engine: Arc<dyn ExecutionEngine>,
+
+    /// Stores task status updates for scheduler polling.
+    status_store: Arc<ExecutorStatusStore>,
 }
 
 impl Executor {
@@ -133,6 +137,7 @@ impl Executor {
             abort_handles: Default::default(),
             execution_engine: execution_engine
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine {})),
+            status_store: Arc::new(ExecutorStatusStore::new()),
         }
     }
 }
@@ -147,6 +152,11 @@ impl Executor {
 
     pub fn produce_config(&self) -> SessionConfig {
         (self.config_producer)()
+    }
+
+    #[must_use]
+    pub fn status_store(&self) -> Arc<ExecutorStatusStore> {
+        Arc::clone(&self.status_store)
     }
 
     /// Execute one partition of a query stage and persist the result to disk in IPC format. On

@@ -251,7 +251,7 @@ impl ExecutorManager {
             metadata.id, specification.total_task_slots
         );
 
-        ExecutorManager::test_connectivity(&metadata).await?;
+        self.test_connectivity(&metadata).await?;
 
         self.cluster_state
             .register_executor(metadata, specification)
@@ -330,7 +330,7 @@ impl ExecutorManager {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn save_executor_heartbeat(
+    pub async fn save_executor_heartbeat(
         &self,
         heartbeat: ExecutorHeartbeat,
     ) -> Result<()> {
@@ -423,10 +423,7 @@ impl ExecutorManager {
             Ok(client)
         } else {
             let executor_metadata = self.get_executor_metadata(executor_id).await?;
-            let executor_url = format!(
-                "http://{}:{}",
-                executor_metadata.host, executor_metadata.grpc_port
-            );
+            let executor_url = self.executor_url(&executor_metadata);
             let mut endpoint = create_grpc_client_endpoint(executor_url)?;
 
             if let Some(ref override_fn) =
@@ -446,22 +443,33 @@ impl ExecutorManager {
     }
 
     #[cfg(not(test))]
-    async fn test_connectivity(metadata: &ExecutorMetadata) -> Result<()> {
-        let executor_url = format!("http://{}:{}", metadata.host, metadata.grpc_port);
+    async fn test_connectivity(&self, metadata: &ExecutorMetadata) -> Result<()> {
+        let executor_url = self.executor_url(metadata);
         debug!("Connecting to executor {executor_url:?}");
-        let _ = protobuf::executor_grpc_client::ExecutorGrpcClient::connect(executor_url)
-            .await
-            .map_err(|e| {
-                BallistaError::Internal(format!(
-                    "Failed to register executor at {}:{}, could not connect: {:?}",
-                    metadata.host, metadata.grpc_port, e
-                ))
-            })?;
+        let mut endpoint = create_grpc_client_endpoint(executor_url)?;
+        if let Some(ref override_fn) = self.config.override_create_grpc_client_endpoint {
+            endpoint = override_fn(endpoint)?;
+        }
+        let _ = endpoint.connect().await.map_err(|e| {
+            BallistaError::Internal(format!(
+                "Failed to register executor at {}:{}, could not connect: {:?}",
+                metadata.host, metadata.grpc_port, e
+            ))
+        })?;
         Ok(())
     }
 
     #[cfg(test)]
-    async fn test_connectivity(_metadata: &ExecutorMetadata) -> Result<()> {
+    async fn test_connectivity(&self, _metadata: &ExecutorMetadata) -> Result<()> {
         Ok(())
+    }
+
+    fn executor_url(&self, metadata: &ExecutorMetadata) -> String {
+        let scheme = if self.config.executor_grpc_use_tls {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{}://{}:{}", scheme, metadata.host, metadata.grpc_port)
     }
 }
