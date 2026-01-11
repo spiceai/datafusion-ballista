@@ -17,7 +17,7 @@
 //
 
 use crate::serde::protobuf::ScalarUdfInfo;
-use arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::common::{exec_err, plan_err, DataFusionError};
 use datafusion::logical_expr::{

@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use ballista_core::error::BallistaError;
+use ballista_core::utils::GrpcClientConfig;
 use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
 use log::trace;

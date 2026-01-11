@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::utils::GrpcServerConfig;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::StreamExt;

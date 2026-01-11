@@ -51,6 +51,7 @@ use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::SchedulerServer;
 use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
+use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 

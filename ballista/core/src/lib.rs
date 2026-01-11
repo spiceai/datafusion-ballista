@@ -54,7 +54,11 @@ pub mod planner;
 pub mod registry;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+
 /// General utility functions for Ballista operations.
+
+pub mod remote_catalog;
+
 pub mod utils;
 
 ///

@@ -830,8 +830,15 @@ pub mod execute_query_params {
     pub enum Query {
         #[prost(bytes, tag = "1")]
         LogicalPlan(::prost::alloc::vec::Vec<u8>),
+
         #[prost(bytes, tag = "6")]
         SubstraitPlan(::prost::alloc::vec::Vec<u8>),
+
+        /// I'd suggest to remove this, if SQL needed use `flight-sql`
+        #[deprecated]
+        #[prost(string, tag = "2")]
+        Sql(::prost::alloc::string::String),
+
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1062,7 +1069,7 @@ pub struct RunningTaskInfo {
     #[prost(uint32, tag = "4")]
     pub partition_id: u32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetCatalogParams {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
@@ -1104,7 +1111,7 @@ pub struct RemoteTableProviderNode {
     #[prost(message, optional, tag = "4")]
     pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetRemoteFunctionsParams {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
@@ -1141,7 +1148,7 @@ pub struct ScalarUdfDocumentation {
     #[prost(message, repeated, tag = "4")]
     pub arguments: ::prost::alloc::vec::Vec<ScalarUdfDocumentationArgument>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScalarUdfDocumentationArgument {
     #[prost(string, tag = "1")]
     pub argument: ::prost::alloc::string::String,
@@ -1550,7 +1557,7 @@ pub mod scheduler_grpc_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/ballista.protobuf.SchedulerGrpc/GetCatalog",
             );
@@ -1577,7 +1584,7 @@ pub mod scheduler_grpc_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/ballista.protobuf.SchedulerGrpc/GetRemoteFunctions",
             );
@@ -1588,227 +1595,6 @@ pub mod scheduler_grpc_client {
                         "ballista.protobuf.SchedulerGrpc",
                         "GetRemoteFunctions",
                     ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Generated client implementations.
-pub mod executor_grpc_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    #[derive(Debug, Clone)]
-    pub struct ExecutorGrpcClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl ExecutorGrpcClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
-    }
-    impl<T> ExecutorGrpcClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> ExecutorGrpcClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            ExecutorGrpcClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        pub async fn launch_task(
-            &mut self,
-            request: impl tonic::IntoRequest<super::LaunchTaskParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::LaunchTaskResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.ExecutorGrpc/LaunchTask",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("ballista.protobuf.ExecutorGrpc", "LaunchTask"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn launch_multi_task(
-            &mut self,
-            request: impl tonic::IntoRequest<super::LaunchMultiTaskParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::LaunchMultiTaskResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.ExecutorGrpc/LaunchMultiTask",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("ballista.protobuf.ExecutorGrpc", "LaunchMultiTask"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn stop_executor(
-            &mut self,
-            request: impl tonic::IntoRequest<super::StopExecutorParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::StopExecutorResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.ExecutorGrpc/StopExecutor",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("ballista.protobuf.ExecutorGrpc", "StopExecutor"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn cancel_tasks(
-            &mut self,
-            request: impl tonic::IntoRequest<super::CancelTasksParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::CancelTasksResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.ExecutorGrpc/CancelTasks",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("ballista.protobuf.ExecutorGrpc", "CancelTasks"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn remove_job_data(
-            &mut self,
-            request: impl tonic::IntoRequest<super::RemoveJobDataParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::RemoveJobDataResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.ExecutorGrpc/RemoveJobData",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("ballista.protobuf.ExecutorGrpc", "RemoveJobData"),
                 );
             self.inner.unary(req, path, codec).await
         }
@@ -2495,6 +2281,51 @@ pub mod scheduler_grpc_server {
                     };
                     Box::pin(fut)
                 }
+                "/ballista.protobuf.SchedulerGrpc/GetCatalog" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCatalogSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::GetCatalogParams>
+                    for GetCatalogSvc<T> {
+                        type Response = super::GetCatalogResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCatalogParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::get_catalog(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCatalogSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/ballista.protobuf.SchedulerGrpc/GetRemoteFunctions" => {
                     #[allow(non_camel_case_types)]
                     struct GetRemoteFunctionsSvc<T: SchedulerGrpc>(pub Arc<T>);
@@ -2526,7 +2357,7 @@ pub mod scheduler_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetRemoteFunctionsSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
