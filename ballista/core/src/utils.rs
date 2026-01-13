@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
-use tonic::transport::{Channel, Endpoint, Error, Server};
+use tonic::transport::{Channel, Error, Server};
 
 /// Configuration for gRPC client connections.
 ///
@@ -196,21 +196,11 @@ pub async fn collect_stream(
     Ok(batches)
 }
 
-
-
 /// Creates a gRPC client connection with the specified configuration.
-
-
 pub async fn create_grpc_client_connection<D>(
     dst: D,
     config: &GrpcClientConfig,
 ) -> std::result::Result<Channel, Error>
-
-
-pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<Endpoint, Error>
-
-
-
 where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
@@ -229,6 +219,26 @@ where
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true);
     endpoint.connect().await
+}
+
+/// Creates a gRPC client endpoint (returns Endpoint without connecting).
+/// Used for TLS/API key customization before establishing connection.
+pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<tonic::transport::Endpoint, Error>
+where
+    D: std::convert::TryInto<tonic::transport::Endpoint>,
+    D::Error: Into<StdError>,
+{
+    let endpoint = tonic::transport::Endpoint::new(dst)?
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20))
+        // Disable Nagle's Algorithm since we don't want packets to wait
+        .tcp_nodelay(true)
+        .tcp_keepalive(Option::Some(Duration::from_secs(3600)))
+        .http2_keep_alive_interval(Duration::from_secs(300))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true);
+
+    Ok(endpoint)
 }
 
 /// Creates a gRPC server builder with the specified configuration.
@@ -269,25 +279,4 @@ pub fn get_time_before(interval_seconds: u64) -> u64 {
         .checked_sub(Duration::from_secs(interval_seconds))
         .unwrap_or_else(|| Duration::from_secs(0))
         .as_secs()
-}
-
-/// Create a gRPC client endpoint with configurable settings
-///
-/// This is used by Spice extensions for customizing gRPC endpoint creation
-pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<Endpoint, Error>
-where
-    D: std::convert::TryInto<tonic::transport::Endpoint>,
-    D::Error: Into<StdError>,
-{
-    let endpoint = tonic::transport::Endpoint::new(dst)?
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(20))
-        // Disable Nagle's Algorithm since we don't want packets to wait
-        .tcp_nodelay(true)
-        .tcp_keepalive(Option::Some(Duration::from_secs(3600)))
-        .http2_keep_alive_interval(Duration::from_secs(300))
-        .keep_alive_timeout(Duration::from_secs(20))
-        .keep_alive_while_idle(true);
-
-    Ok(endpoint)
 }

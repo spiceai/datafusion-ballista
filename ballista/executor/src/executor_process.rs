@@ -25,7 +25,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::utils::GrpcServerConfig;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::StreamExt;
@@ -54,23 +53,15 @@ use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
 use ballista_core::utils::{
-
-    GrpcServerConfig, create_grpc_client_connection, create_grpc_server,
-    default_config_producer, get_time_before,
+    GrpcServerConfig, create_grpc_client_connection, create_grpc_client_endpoint,
+    create_grpc_server, default_config_producer, get_time_before,
 };
 use ballista_core::{BALLISTA_VERSION, ConfigProducer, RuntimeProducer};
-
-    create_grpc_client_endpoint, create_grpc_server, default_config_producer,
-    get_time_before,
-};
-use ballista_core::{ConfigProducer, RuntimeProducer, BALLISTA_VERSION};
 use tonic::transport::{Endpoint, Error as TonicTransportError};
 
 /// Type alias for the endpoint override function used in gRPC client configuration
 pub type EndpointOverrideFn =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
-
-
 use crate::execution_engine::ExecutionEngine;
 use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;

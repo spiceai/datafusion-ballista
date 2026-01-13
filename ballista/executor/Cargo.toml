@@ -40,7 +40,11 @@ default = ["build-binary", "mimalloc"]
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
+
 ballista-core = { path = "../core", version = "51.0.0" }
+
+backoff = { workspace = true }
+
 clap = { workspace = true, optional = true }
 dashmap = { workspace = true }
 datafusion = { workspace = true }

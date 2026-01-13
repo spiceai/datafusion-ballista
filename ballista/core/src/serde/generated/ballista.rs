@@ -830,15 +830,8 @@ pub mod execute_query_params {
     pub enum Query {
         #[prost(bytes, tag = "1")]
         LogicalPlan(::prost::alloc::vec::Vec<u8>),
-
         #[prost(bytes, tag = "6")]
         SubstraitPlan(::prost::alloc::vec::Vec<u8>),
-
-        /// I'd suggest to remove this, if SQL needed use `flight-sql`
-        #[deprecated]
-        #[prost(string, tag = "2")]
-        Sql(::prost::alloc::string::String),
-
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
