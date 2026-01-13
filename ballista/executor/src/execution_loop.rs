@@ -19,6 +19,8 @@ use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::remove_job_dir;
 use crate::{as_task_status, TaskExecutionTimes};
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoff;
 use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::protobuf::{
@@ -41,11 +43,14 @@ use std::convert::TryInto;
 use std::error::Error;
 use std::ops::Deref;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
+
+/// Number of consecutive failures before reducing log level from WARN to DEBUG.
+const QUIET_AFTER_FAILURES: u32 = 5;
 
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
@@ -83,15 +88,20 @@ where
         }
     });
 
+    // Track consecutive scheduler connection failures for backoff and log suppression
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff = ExponentialBackoff {
+        initial_interval: Duration::from_millis(100),
+        max_interval: Duration::from_secs(30),
+        max_elapsed_time: None, // Never give up
+        ..ExponentialBackoff::default()
+    };
+
     loop {
         // Wait for task slots to be available before asking for new work
         let permit = available_task_slots.acquire().await.unwrap();
         // Make the slot available again
         drop(permit);
-
-        // Keeps track of whether we received task in last iteration
-        // to avoid going in sleep mode between polling
-        let mut active_job = false;
 
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;
@@ -107,8 +117,21 @@ where
 
         *report_ready;
 
+        // Keeps track of whether we received task in last iteration
+        // to avoid going in sleep mode between polling
+        let active_job;
+
         match poll_work_result {
             Ok(result) => {
+                // Reset backoff state on successful connection
+                if consecutive_failures > 0 {
+                    info!(
+                        "Scheduler connection restored after {consecutive_failures} failed attempts"
+                    );
+                }
+                consecutive_failures = 0;
+                backoff.reset();
+
                 let PollWorkResult {
                     tasks,
                     jobs_to_clean,
@@ -197,7 +220,24 @@ where
                 }
             }
             Err(error) => {
-                warn!("Executor poll work loop failed. If this continues to happen the Scheduler might be marked as dead. Error: {error}");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+
+                // Log at WARN level for first few failures, then reduce to DEBUG to avoid log spam
+                if consecutive_failures <= QUIET_AFTER_FAILURES {
+                    warn!(
+                        "Executor poll work loop failed (attempt {consecutive_failures}). If this continues, the scheduler might be unavailable. Error: {error}"
+                    );
+                } else {
+                    debug!(
+                        "Executor poll work loop failed (attempt {consecutive_failures}). Error: {error}"
+                    );
+                }
+
+                // Apply exponential backoff before retrying
+                if let Some(duration) = backoff.next_backoff() {
+                    tokio::time::sleep(duration).await;
+                }
+                continue;
             }
         }
 
