@@ -27,6 +27,7 @@
 
 use crate::SessionBuilder;
 use crate::cluster::DistributionPolicy;
+use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::{ConfigProducer, config::TaskSchedulingPolicy};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
@@ -245,6 +246,8 @@ pub struct SchedulerConfig {
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// Override function for customizing gRPC client endpoints before they are used
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// [SchedulerMetricsCollector] override option
+    pub override_metrics_collector: Option<Arc<dyn SchedulerMetricsCollector>>,
 }
 
 impl Default for SchedulerConfig {
@@ -272,6 +275,7 @@ impl Default for SchedulerConfig {
             override_logical_codec: None,
             override_physical_codec: None,
             override_create_grpc_client_endpoint: None,
+            override_metrics_collector: None,
         }
     }
 }
@@ -401,6 +405,15 @@ impl SchedulerConfig {
         self.override_create_grpc_client_endpoint = Some(override_fn);
         self
     }
+
+    /// Sets a custom metrics collector.
+    pub fn with_override_metrics_collector(
+        mut self,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+    ) -> Self {
+        self.override_metrics_collector = Some(metrics_collector);
+        self
+    }
 }
 
 /// Policy of distributing tasks to available executor slots
@@ -512,6 +525,7 @@ impl TryFrom<Config> for SchedulerConfig {
             override_physical_codec: None,
             override_session_builder: None,
             override_create_grpc_client_endpoint: None,
+            override_metrics_collector: None,
         };
 
         Ok(config)

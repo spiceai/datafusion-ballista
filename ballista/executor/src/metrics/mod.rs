@@ -19,37 +19,142 @@ use crate::execution_engine::QueryStageExecutor;
 use log::info;
 use std::sync::Arc;
 
-/// `ExecutorMetricsCollector` records metrics for `ShuffleWriteExec`
-/// after they are executed.
+/// `ExecutorMetricsCollector` records metrics for task execution on an executor.
 ///
-/// After each stage completes, `ShuffleWriteExec::record_stage` will be
-/// called.
+/// This trait provides hooks for recording metrics at various points during
+/// task execution, including task start, completion, failure, and shuffle operations.
+///
+/// Implementations can use these hooks to integrate with metrics systems like
+/// Prometheus, OpenTelemetry, or custom monitoring solutions.
 pub trait ExecutorMetricsCollector: Send + Sync {
-    /// Record metrics for stage after it is executed
+    /// Record that a task has started execution.
+    ///
+    /// Called when a task begins executing on this executor. Use this to track
+    /// active task counts and task start times.
+    fn record_task_started(&self, job_id: &str, stage_id: usize, partition: usize);
+
+    /// Record metrics for a stage/task after successful execution.
+    ///
+    /// Called when a task completes successfully. The `plan` contains execution
+    /// metrics from DataFusion, and `duration_ms` is the wall-clock execution time.
     fn record_stage(
         &self,
         job_id: &str,
         stage_id: usize,
         partition: usize,
         plan: Arc<dyn QueryStageExecutor>,
+        duration_ms: u64,
     );
+
+    /// Record that a task has failed.
+    ///
+    /// Called when a task fails with an error. The `error_type` is a categorized
+    /// error string suitable for use as a metric label.
+    fn record_task_failed(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        error_type: &str,
+    );
+
+    /// Record shuffle write metrics.
+    ///
+    /// Called after shuffle data is written. Tracks bytes, rows, and duration
+    /// for shuffle write operations.
+    fn record_shuffle_write(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
+    /// Record shuffle read metrics.
+    ///
+    /// Called after shuffle data is read. Tracks bytes, rows, and duration
+    /// for shuffle read operations.
+    fn record_shuffle_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
+    /// Record executor memory availability.
+    ///
+    /// Called periodically (e.g., during heartbeat) to report the executor's
+    /// available memory. This helps with capacity planning and load balancing.
+    fn record_memory_available(&self, available_bytes: u64);
 }
 
 /// Implementation of `ExecutorMetricsCollector` which logs the completed
-/// plan to stdout.
+/// plan to stdout. Useful for debugging and development.
 #[derive(Default)]
 pub struct LoggingMetricsCollector {}
 
 impl ExecutorMetricsCollector for LoggingMetricsCollector {
+    fn record_task_started(&self, job_id: &str, stage_id: usize, partition: usize) {
+        info!("=== [{job_id}/{stage_id}/{partition}] Task started ===");
+    }
+
     fn record_stage(
         &self,
         job_id: &str,
         stage_id: usize,
         partition: usize,
         plan: Arc<dyn QueryStageExecutor>,
+        duration_ms: u64,
     ) {
         info!(
-            "=== [{job_id}/{stage_id}/{partition}] Physical plan with metrics ===\n{plan}\n"
+            "=== [{job_id}/{stage_id}/{partition}] Task completed in {duration_ms}ms ===\n{plan}\n"
         );
+    }
+
+    fn record_task_failed(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        error_type: &str,
+    ) {
+        info!("=== [{job_id}/{stage_id}/{partition}] Task failed: {error_type} ===");
+    }
+
+    fn record_shuffle_write(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        info!(
+            "=== [{job_id}/{stage_id}/{partition}] Shuffle write: {bytes} bytes, {rows} rows in {duration_ms}ms ==="
+        );
+    }
+
+    fn record_shuffle_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        info!(
+            "=== [{job_id}/{stage_id}/{partition}] Shuffle read: {bytes} bytes, {rows} rows in {duration_ms}ms ==="
+        );
+    }
+
+    fn record_memory_available(&self, available_bytes: u64) {
+        info!("=== Executor memory available: {available_bytes} bytes ===");
     }
 }
