@@ -161,17 +161,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             }
 
             let mut tasks = vec![];
+            let now_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+
             for (_, task) in binding_result.bound_tasks {
                 let job_id = task.partition.job_id.clone();
                 let stage_id = task.partition.stage_id;
 
-                // Record task scheduling metric
-                // Note: latency_ms is 0 since we don't currently track when tasks became schedulable.
+                // Record task scheduling metric with actual latency
+                let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
                 self.state.metrics_collector.record_task_scheduled(
                     &job_id,
                     stage_id,
                     &executor_id,
-                    0,
+                    latency_ms as u64,
                 );
 
                 match self.state.task_manager.prepare_task_definition(task) {

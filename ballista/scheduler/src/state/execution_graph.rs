@@ -1135,7 +1135,8 @@ impl ExecutionGraph {
                     task_id,
                     task_attempt,
                     plan: stage.plan.clone(),
-                    session_config: self.session_config.clone()
+                    session_config: self.session_config.clone(),
+                    schedulable_time_millis: stage.stage_running_time,
                 })
             } else {
                 Err(BallistaError::General(format!("Stage {stage_id} is not a running stage")))
@@ -1728,6 +1729,9 @@ pub struct TaskDescription {
     pub plan: Arc<dyn ExecutionPlan>,
     /// Session configuration for this task's execution context.
     pub session_config: Arc<SessionConfig>,
+    /// Timestamp (millis since epoch) when this task became schedulable.
+    /// This is when the stage transitioned to running state.
+    pub schedulable_time_millis: u128,
 }
 
 impl Debug for TaskDescription {

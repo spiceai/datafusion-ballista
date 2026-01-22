@@ -512,6 +512,7 @@ pub(crate) async fn bind_task_bias(
                     task_attempt: running_stage.task_failure_numbers[partition_id],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
+                    schedulable_time_millis: running_stage.stage_running_time,
                 };
                 result.bound_tasks.push((executor_id, task_desc));
 
@@ -614,6 +615,7 @@ pub(crate) async fn bind_task_round_robin(
                     task_attempt: running_stage.task_failure_numbers[partition_id],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
+                    schedulable_time_millis: running_stage.stage_running_time,
                 };
                 result.bound_tasks.push((executor_id, task_desc));
 
@@ -762,6 +764,7 @@ pub(crate) async fn bind_task_consistent_hash(
                                 [partition_id],
                             plan: running_stage.plan.clone(),
                             session_config: running_stage.session_config.clone(),
+                            schedulable_time_millis: running_stage.stage_running_time,
                         };
                         result.bound_tasks.push((executor_id, task_desc));
 

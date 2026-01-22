@@ -23,7 +23,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
@@ -302,15 +302,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         bound_tasks: Vec<BoundTask>,
     ) -> Result<Vec<ExecutorSlot>> {
+        // Get current time once for all latency calculations
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
         // Record task scheduling metrics for each task
         for (executor_id, task) in &bound_tasks {
-            // Note: latency_ms is 0 since we don't currently track when tasks became schedulable.
-            // This could be enhanced by adding a schedulable_time field to TaskDescription.
+            // Calculate scheduling latency: time from when task became schedulable to now
+            let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
             self.metrics_collector.record_task_scheduled(
                 &task.partition.job_id,
                 task.partition.stage_id,
                 executor_id,
-                0, // latency_ms placeholder
+                latency_ms as u64,
             );
         }
 
