@@ -37,6 +37,7 @@ use crate::state::task_manager::{TaskLauncher, TaskManager};
 
 use crate::cluster::{BallistaCluster, BoundTask, ExecutorSlot};
 use crate::config::SchedulerConfig;
+use crate::metrics::SchedulerMetricsCollector;
 use crate::state::execution_graph::TaskDescription;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
@@ -117,6 +118,8 @@ pub struct SchedulerState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     pub codec: BallistaCodec<T, U>,
     /// Scheduler configuration.
     pub config: Arc<SchedulerConfig>,
+    /// Metrics collector for recording scheduler metrics.
+    pub metrics_collector: Arc<dyn SchedulerMetricsCollector>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T, U> {
@@ -126,6 +129,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         codec: BallistaCodec<T, U>,
         scheduler_name: String,
         config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
     ) -> Self {
         Self {
             executor_manager: ExecutorManager::new(
@@ -140,6 +144,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             session_manager: SessionManager::new(cluster.job_state()),
             codec,
             config,
+            metrics_collector,
         }
     }
 
@@ -148,9 +153,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
     pub fn new_with_default_scheduler_name(
         cluster: BallistaCluster,
         codec: BallistaCodec<T, U>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
     ) -> Self {
         let config = Arc::new(SchedulerConfig::default());
-        SchedulerState::new(cluster, codec, "localhost:50050".to_owned(), config)
+        SchedulerState::new(
+            cluster,
+            codec,
+            "localhost:50050".to_owned(),
+            config,
+            metrics_collector,
+        )
     }
 
     #[allow(dead_code)]
@@ -159,6 +171,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         codec: BallistaCodec<T, U>,
         scheduler_name: String,
         config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         dispatcher: Arc<dyn TaskLauncher>,
     ) -> Self {
         Self {
@@ -175,6 +188,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             session_manager: SessionManager::new(cluster.job_state()),
             codec,
             config,
+            metrics_collector,
         }
     }
 
@@ -490,6 +504,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .await?;
 
         let elapsed = start.elapsed();
+
+        // Record planning duration metric
+        self.metrics_collector
+            .record_planning_duration(job_id, elapsed.as_millis() as u64);
 
         info!("Planned job {job_id} in {elapsed:?}");
 

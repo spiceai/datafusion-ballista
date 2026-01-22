@@ -48,10 +48,10 @@ use std::ops::Deref;
 
 use crate::cluster::{bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::SchedulerServer;
-use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
+use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
+use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
@@ -490,6 +490,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         );
 
         let executor_manager = self.state.executor_manager.clone();
+        let metrics_collector = self.state.metrics_collector.clone();
         let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
             let msg = format!("Get query stage event loop error due to {e:?}");
             error!("{msg}");
@@ -499,6 +500,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         Self::remove_executor(
             executor_manager,
             event_sender,
+            metrics_collector,
             &executor_id,
             Some(reason),
             self.config.executor_termination_grace_period,
@@ -665,6 +667,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 
@@ -697,6 +700,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 
