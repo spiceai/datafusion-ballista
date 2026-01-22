@@ -134,6 +134,32 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// stage-level retries and tracks individual task retry attempts.
     fn record_task_retry(&self, job_id: &str, stage_id: usize);
 
+    /// Record a shuffle affinity hit - task was assigned to an executor that has
+    /// local shuffle data from a parent stage.
+    ///
+    /// Called when the scheduler assigns a task to an executor that already has
+    /// the required shuffle partitions from upstream stages stored locally.
+    /// This indicates the task can read shuffle data without network transfer.
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        executor_id: &str,
+    );
+
+    /// Record a shuffle affinity miss - task was assigned to an executor that does
+    /// NOT have local shuffle data from a parent stage.
+    ///
+    /// Called when the scheduler assigns a task to an executor that does not have
+    /// the required shuffle partitions locally. This indicates the task will need
+    /// to fetch shuffle data over the network from other executors.
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        executor_id: &str,
+    );
+
     // =========================================================================
     // Executor management events (new)
     // =========================================================================
@@ -207,6 +233,20 @@ impl SchedulerMetricsCollector for NoopMetricsCollector {
     ) {
     }
     fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
 
     // Executor management
     fn set_active_executor_count(&self, _count: usize) {}

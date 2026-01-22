@@ -18,7 +18,8 @@
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
 use crate::extension::{
-    BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor, SessionConfigExt,
+    BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor,
+    ResultFetchMetricsCallback, SessionConfigExt,
 };
 use crate::serde::protobuf::SuccessfulJob;
 use crate::serde::protobuf::{
@@ -248,8 +249,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         let metric_total_bytes =
             MetricBuilder::new(&self.metrics).counter("transferred_bytes", partition);
 
-
-
         let interceptor = context.session_config().ballista_grpc_interceptor();
 
         let customize_endpoint = context
@@ -258,23 +257,24 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 
         let use_tls = context.session_config().ballista_use_tls();
 
+        let result_fetch_callback = context
+            .session_config()
+            .ballista_result_fetch_metrics_callback();
 
         let stream = futures::stream::once(
             execute_query(
                 self.scheduler_url.clone(),
                 self.session_id.clone(),
                 query,
-
                 self.config.default_grpc_client_max_message_size(),
                 GrpcClientConfig::from(&self.config),
                 Arc::new(self.metrics.clone()),
                 partition,
-
                 self.config.clone(),
                 interceptor,
                 customize_endpoint,
                 use_tls,
-
+                result_fetch_callback,
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -320,7 +320,7 @@ async fn execute_query(
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
-
+    result_fetch_callback: Option<Arc<dyn ResultFetchMetricsCallback>>,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     // Capture query submission time for total_query_time_ms
     let query_start_time = std::time::Instant::now();
@@ -450,12 +450,14 @@ async fn execute_query(
                 // This could be added in a future enhancement by wrapping the stream.
 
                 let streams = partition_location.into_iter().map(move |partition| {
+                    let callback = result_fetch_callback.clone();
                     let f = fetch_partition(
                         partition,
                         max_message_size,
                         true,
                         customize_endpoint.clone(),
                         use_tls,
+                        callback,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
@@ -474,13 +476,29 @@ async fn fetch_partition(
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
+    metrics_callback: Option<Arc<dyn ResultFetchMetricsCallback>>,
 ) -> Result<SendableRecordBatchStream> {
+    let start_time = std::time::Instant::now();
+
     let metadata = location.executor_meta.ok_or_else(|| {
         DataFusionError::Internal("Received empty executor metadata".to_owned())
     })?;
     let partition_id = location.partition_id.ok_or_else(|| {
         DataFusionError::Internal("Received empty partition id".to_owned())
     })?;
+
+    // Extract stats before consuming location
+    let stats = location.partition_stats.as_ref();
+    #[expect(clippy::cast_sign_loss)]
+    let expected_bytes = stats.map(|s| s.num_bytes as u64).unwrap_or(0);
+    #[expect(clippy::cast_sign_loss)]
+    let expected_rows = stats.map(|s| s.num_rows as u64).unwrap_or(0);
+
+    let job_id = partition_id.job_id.clone();
+    let stage_id = partition_id.stage_id as usize;
+    let partition = partition_id.partition_id as usize;
+    let executor_id = metadata.id.clone();
+
     let host = metadata.host.as_str();
     let port = metadata.port as u16;
     let mut ballista_client = BallistaClient::try_new(
@@ -492,7 +510,8 @@ async fn fetch_partition(
     )
     .await
     .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-    ballista_client
+
+    let stream = ballista_client
         .fetch_partition(
             &metadata.id,
             &partition_id.into(),
@@ -502,5 +521,21 @@ async fn fetch_partition(
             flight_transport,
         )
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Record metrics after successful fetch
+    if let Some(callback) = metrics_callback {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        callback.record_result_fetch(
+            &job_id,
+            stage_id,
+            partition,
+            &executor_id,
+            expected_bytes,
+            expected_rows,
+            duration_ms,
+        );
+    }
+
+    Ok(stream)
 }

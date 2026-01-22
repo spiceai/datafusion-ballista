@@ -86,6 +86,36 @@ pub trait ExecutorMetricsCollector: Send + Sync {
         duration_ms: u64,
     );
 
+    /// Record local shuffle read metrics (data read from local disk).
+    ///
+    /// Called when shuffle data is read from a local file. This means the partition
+    /// was written by this same executor in a previous stage, avoiding network transfer.
+    fn record_shuffle_read_local(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
+    /// Record remote shuffle read metrics (data fetched from another executor).
+    ///
+    /// Called when shuffle data must be fetched over the network from another
+    /// executor that produced the partition. The `source_executor_id` identifies
+    /// the executor that holds the shuffle data.
+    fn record_shuffle_read_remote(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
     /// Record executor memory availability.
     ///
     /// Called periodically (e.g., during heartbeat) to report the executor's
@@ -151,6 +181,35 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
     ) {
         info!(
             "=== [{job_id}/{stage_id}/{partition}] Shuffle read: {bytes} bytes, {rows} rows in {duration_ms}ms ==="
+        );
+    }
+
+    fn record_shuffle_read_local(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        info!(
+            "=== [{job_id}/{stage_id}/{partition}] Local shuffle read: {bytes} bytes, {rows} rows in {duration_ms}ms ==="
+        );
+    }
+
+    fn record_shuffle_read_remote(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        info!(
+            "=== [{job_id}/{stage_id}/{partition}] Remote shuffle read from {source_executor_id}: {bytes} bytes, {rows} rows in {duration_ms}ms ==="
         );
     }
 
