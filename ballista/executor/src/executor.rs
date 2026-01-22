@@ -89,8 +89,9 @@ fn categorize_datafusion_error(error: &datafusion::error::DataFusionError) -> St
         DataFusionError::ObjectStore(_) => "object_store".to_string(),
         DataFusionError::ExecutionJoin(_) => "execution_join".to_string(),
         DataFusionError::Shared(_) => "shared".to_string(),
-        // Catch-all for any new variants added in future versions
-        _ => "unknown".to_string(),
+        // Catch-all for feature-gated variants (e.g., AvroError when avro feature is enabled)
+        #[allow(unreachable_patterns)]
+        _ => "other".to_string(),
     }
 }
 
@@ -102,7 +103,7 @@ fn extract_shuffle_write_metrics(
 ) -> Option<(u64, u64, u64)> {
     let metrics_sets = query_stage_exec.collect_plan_metrics();
 
-    let mut total_bytes = 0u64;
+    let total_bytes = 0u64;
     let mut total_rows = 0u64;
     let mut total_write_time_nanos = 0u64;
 

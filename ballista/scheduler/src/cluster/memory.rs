@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::cluster::{
-    BindingResult, BoundTask, ClusterState, ExecutorSlot, JobState, JobStateEvent,
+    BindingResult, ClusterState, ExecutorSlot, JobState, JobStateEvent,
     JobStateEventStream, JobStatus, TaskDistributionPolicy, TopologyNode, bind_task_bias,
     bind_task_consistent_hash, bind_task_round_robin, get_scan_files,
     is_skip_consistent_hash,

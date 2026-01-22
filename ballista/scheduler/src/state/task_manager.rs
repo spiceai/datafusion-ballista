@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::planner::DefaultDistributedPlanner;
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
 use crate::state::execution_graph::{
     ExecutionGraph, ExecutionStage, RunningTaskInfo, TaskDescription,

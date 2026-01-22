@@ -105,6 +105,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// Called when shuffle data must be fetched over the network from another
     /// executor that produced the partition. The `source_executor_id` identifies
     /// the executor that holds the shuffle data.
+    #[allow(clippy::too_many_arguments)]
     fn record_shuffle_read_remote(
         &self,
         job_id: &str,

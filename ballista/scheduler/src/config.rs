@@ -396,6 +396,7 @@ impl SchedulerConfig {
         self
     }
 
+    /// Sets an override function for creating gRPC client endpoints.
     pub fn with_override_create_grpc_client_endpoint(
         mut self,
         override_fn: Arc<

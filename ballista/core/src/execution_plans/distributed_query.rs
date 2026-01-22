@@ -28,8 +28,6 @@ use crate::serde::protobuf::{
     scheduler_grpc_client::SchedulerGrpcClient,
 };
 
-use crate::utils::{GrpcClientConfig, create_grpc_client_connection};
-
 use crate::utils::create_grpc_client_endpoint;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -266,8 +264,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.scheduler_url.clone(),
                 self.session_id.clone(),
                 query,
-                self.config.default_grpc_client_max_message_size(),
-                GrpcClientConfig::from(&self.config),
                 Arc::new(self.metrics.clone()),
                 partition,
                 self.config.clone(),
@@ -306,16 +302,13 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_query(
     scheduler_url: String,
     session_id: String,
     query: ExecuteQueryParams,
-
-    max_message_size: usize,
-    grpc_config: GrpcClientConfig,
     metrics: Arc<ExecutionPlanMetricsSet>,
     partition: usize,
-
     config: BallistaConfig,
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,

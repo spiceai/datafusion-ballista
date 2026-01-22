@@ -223,7 +223,9 @@ where
 
 /// Creates a gRPC client endpoint (returns Endpoint without connecting).
 /// Used for TLS/API key customization before establishing connection.
-pub fn create_grpc_client_endpoint<D>(dst: D) -> std::result::Result<tonic::transport::Endpoint, Error>
+pub fn create_grpc_client_endpoint<D>(
+    dst: D,
+) -> std::result::Result<tonic::transport::Endpoint, Error>
 where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,

@@ -392,6 +392,7 @@ fn local_remote_read_split(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_fetch_partitions(
     partition_locations: Vec<PartitionLocation>,
     max_request_num: usize,
@@ -433,21 +434,21 @@ fn send_fetch_partitions(
                 .await;
 
             // Record local read metrics if callback is set and read succeeded
-            if r.is_ok() {
-                if let Some(ref callback) = metrics_callback_c {
-                    let duration_ms = start_time.elapsed().as_millis() as u64;
-                    let bytes = p.partition_stats.num_bytes().unwrap_or(0);
-                    let rows = p.partition_stats.num_rows().unwrap_or(0);
-                    callback.record_local_read(
-                        &p.partition_id.job_id,
-                        p.partition_id.stage_id,
-                        p.partition_id.partition_id,
-                        &p.executor_meta.id,
-                        bytes,
-                        rows,
-                        duration_ms,
-                    );
-                }
+            if r.is_ok()
+                && let Some(ref callback) = metrics_callback_c
+            {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let bytes = p.partition_stats.num_bytes().unwrap_or(0);
+                let rows = p.partition_stats.num_rows().unwrap_or(0);
+                callback.record_local_read(
+                    &p.partition_id.job_id,
+                    p.partition_id.stage_id,
+                    p.partition_id.partition_id,
+                    &p.executor_meta.id,
+                    bytes,
+                    rows,
+                    duration_ms,
+                );
             }
 
             if let Err(e) = response_sender_c.send(r).await {
@@ -476,21 +477,21 @@ fn send_fetch_partitions(
                 .await;
 
             // Record remote read metrics if callback is set and read succeeded
-            if r.is_ok() {
-                if let Some(ref callback) = metrics_callback_c {
-                    let duration_ms = start_time.elapsed().as_millis() as u64;
-                    let bytes = p.partition_stats.num_bytes().unwrap_or(0);
-                    let rows = p.partition_stats.num_rows().unwrap_or(0);
-                    callback.record_remote_read(
-                        &p.partition_id.job_id,
-                        p.partition_id.stage_id,
-                        p.partition_id.partition_id,
-                        &p.executor_meta.id,
-                        bytes,
-                        rows,
-                        duration_ms,
-                    );
-                }
+            if r.is_ok()
+                && let Some(ref callback) = metrics_callback_c
+            {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let bytes = p.partition_stats.num_bytes().unwrap_or(0);
+                let rows = p.partition_stats.num_rows().unwrap_or(0);
+                callback.record_remote_read(
+                    &p.partition_id.job_id,
+                    p.partition_id.stage_id,
+                    p.partition_id.partition_id,
+                    &p.executor_meta.id,
+                    bytes,
+                    rows,
+                    duration_ms,
+                );
             }
 
             // Block if the channel buffer is full.

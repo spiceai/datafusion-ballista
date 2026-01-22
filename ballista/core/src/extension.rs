@@ -161,11 +161,13 @@ pub trait SessionConfigExt {
     /// Get a `tonic` interceptor configured to decorate the provided metadata keys
     fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor>;
 
+    /// Set an override function for creating gRPC client endpoints.
     fn with_ballista_override_create_grpc_client_endpoint(
         self,
         override_f: EndpointOverrideFn,
     ) -> Self;
 
+    /// Get the override function for creating gRPC client endpoints.
     fn ballista_override_create_grpc_client_endpoint(
         &self,
     ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
@@ -664,6 +666,7 @@ pub struct BallistaGrpcMetadataInterceptor {
 }
 
 impl BallistaGrpcMetadataInterceptor {
+    /// Create a new interceptor with additional metadata to be added to requests.
     pub fn new(additional_metadata: HashMap<String, String>) -> Self {
         Self {
             additional_metadata,
@@ -694,16 +697,19 @@ impl Interceptor for BallistaGrpcMetadataInterceptor {
     }
 }
 
+/// Wrapper for gRPC endpoint configuration override function.
 #[derive(Clone)]
 pub struct BallistaConfigGrpcEndpoint {
     override_f: EndpointOverrideFn,
 }
 
 impl BallistaConfigGrpcEndpoint {
+    /// Create a new endpoint configuration with the given override function.
     pub fn new(override_f: EndpointOverrideFn) -> Self {
         Self { override_f }
     }
 
+    /// Configure an endpoint using the override function.
     pub fn configure_endpoint(
         &self,
         endpoint: Endpoint,
@@ -735,6 +741,7 @@ pub trait ShuffleReadMetricsCallback: Send + Sync {
     /// * `bytes` - Number of bytes read
     /// * `rows` - Number of rows read
     /// * `duration_ms` - Time taken to read the partition
+    #[allow(clippy::too_many_arguments)]
     fn record_local_read(
         &self,
         job_id: &str,
@@ -759,6 +766,7 @@ pub trait ShuffleReadMetricsCallback: Send + Sync {
     /// * `bytes` - Number of bytes read
     /// * `rows` - Number of rows read
     /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
     fn record_remote_read(
         &self,
         job_id: &str,
@@ -810,6 +818,7 @@ pub trait ResultFetchMetricsCallback: Send + Sync {
     /// * `bytes` - Number of bytes fetched
     /// * `rows` - Number of rows fetched
     /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
     fn record_result_fetch(
         &self,
         job_id: &str,

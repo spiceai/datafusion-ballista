@@ -27,8 +27,8 @@ use crate::executor_process::remove_job_dir;
 
 use crate::{TaskExecutionTimes, as_task_status};
 
-use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
 
 use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigHelperExt;
@@ -48,14 +48,12 @@ use std::any::Any;
 use std::cell::LazyCell;
 use std::convert::TryInto;
 use std::error::Error;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
-
-
 
 /// Main execution loop that polls the scheduler for available tasks.
 ///
@@ -68,7 +66,10 @@ use tonic::codegen::{Body, Bytes, StdError};
 /// Number of consecutive failures before reducing log level from WARN to DEBUG.
 const QUIET_AFTER_FAILURES: u32 = 5;
 
-
+/// Main polling loop for executor task execution.
+///
+/// This function polls the scheduler for new tasks to execute and runs them,
+/// ensuring no more than the configured number of tasks run simultaneously.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,
@@ -237,7 +238,6 @@ where
                 }
             }
             Err(error) => {
-
                 warn!(
                     "Executor poll work loop failed. If this continues to happen the Scheduler might be marked as dead. Error: {error}"
                 );
@@ -260,7 +260,6 @@ where
                     tokio::time::sleep(duration).await;
                 }
                 continue;
-
             }
         }
 
