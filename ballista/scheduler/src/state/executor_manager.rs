@@ -22,7 +22,7 @@ use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
 use log::trace;
 
-use crate::cluster::{BoundTask, ClusterState, ExecutorSlot};
+use crate::cluster::{BindingResult, BoundTask, ClusterState, ExecutorSlot};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;
@@ -102,19 +102,19 @@ impl ExecutorManager {
 
     /// Binds ready-to-run tasks from active jobs to available executor slots.
     ///
-    /// Returns a list of bound tasks that can be launched on executors.
+    /// Returns a binding result containing bound tasks and shuffle affinity info.
     pub async fn bind_schedulable_tasks(
         &self,
         running_jobs: Arc<HashMap<String, JobInfoCache>>,
-    ) -> Result<Vec<BoundTask>> {
+    ) -> Result<BindingResult> {
         if running_jobs.is_empty() {
             debug!("There's no active jobs for binding tasks");
-            return Ok(vec![]);
+            return Ok(BindingResult::new());
         }
         let alive_executors = self.get_alive_executors();
         if alive_executors.is_empty() {
             debug!("There's no alive executors for binding tasks");
-            return Ok(vec![]);
+            return Ok(BindingResult::new());
         }
         self.cluster_state
             .bind_schedulable_tasks(

@@ -263,6 +263,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         self.active_job_cache.len()
     }
 
+    /// Get the total number of pending tasks across all active jobs.
+    ///
+    /// A pending task is a task that is available to schedule on an executor
+    /// but cannot be scheduled because no resources are available.
+    pub async fn total_pending_tasks(&self) -> usize {
+        let mut total = 0;
+        for entry in self.active_job_cache.iter() {
+            let graph = entry.value().execution_graph.read().await;
+            total += graph.available_tasks();
+        }
+        total
+    }
+
     /// Generate an ExecutionGraph for the job and save it to the persistent state.
     /// By default, this job will be curated by the scheduler which receives it.
     /// Then we will also save it to the active execution graph

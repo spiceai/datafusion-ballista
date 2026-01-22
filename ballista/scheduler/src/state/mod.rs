@@ -201,15 +201,33 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         sender: EventSender<QueryStageSchedulerEvent>,
     ) -> Result<()> {
-        let schedulable_tasks = self
+        let binding_result = self
             .executor_manager
             .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
             .await?;
-        if schedulable_tasks.is_empty() {
+        if binding_result.bound_tasks.is_empty() {
             debug!("No schedulable tasks found to be launched");
             return Ok(());
         }
 
+        // Record shuffle affinity metrics
+        for affinity in &binding_result.shuffle_affinity {
+            if affinity.has_local_data {
+                self.metrics_collector.record_task_shuffle_affinity_hit(
+                    &affinity.job_id,
+                    affinity.stage_id,
+                    &affinity.executor_id,
+                );
+            } else {
+                self.metrics_collector.record_task_shuffle_affinity_miss(
+                    &affinity.job_id,
+                    affinity.stage_id,
+                    &affinity.executor_id,
+                );
+            }
+        }
+
+        let schedulable_tasks = binding_result.bound_tasks;
         let state = self.clone();
         tokio::spawn(async move {
             let mut if_revive = false;
@@ -284,6 +302,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         bound_tasks: Vec<BoundTask>,
     ) -> Result<Vec<ExecutorSlot>> {
+        // Record task scheduling metrics for each task
+        for (executor_id, task) in &bound_tasks {
+            // Note: latency_ms is 0 since we don't currently track when tasks became schedulable.
+            // This could be enhanced by adding a schedulable_time field to TaskDescription.
+            self.metrics_collector.record_task_scheduled(
+                &task.partition.job_id,
+                task.partition.stage_id,
+                executor_id,
+                0, // latency_ms placeholder
+            );
+        }
+
         // Put tasks to the same executor together
         // And put tasks belonging to the same stage together for creating MultiTaskDefinition
         let mut executor_stage_assignments: HashMap<

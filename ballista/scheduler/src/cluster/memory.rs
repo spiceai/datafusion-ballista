@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::cluster::{
-    BoundTask, ClusterState, ExecutorSlot, JobState, JobStateEvent, JobStateEventStream,
-    JobStatus, TaskDistributionPolicy, TopologyNode, bind_task_bias,
+    BindingResult, BoundTask, ClusterState, ExecutorSlot, JobState, JobStateEvent,
+    JobStateEventStream, JobStatus, TaskDistributionPolicy, TopologyNode, bind_task_bias,
     bind_task_consistent_hash, bind_task_round_robin, get_scan_files,
     is_skip_consistent_hash,
 };
@@ -111,7 +111,7 @@ impl ClusterState for InMemoryClusterState {
         distribution: TaskDistributionPolicy,
         active_jobs: Arc<HashMap<String, JobInfoCache>>,
         executors: Option<HashSet<String>>,
-    ) -> Result<Vec<BoundTask>> {
+    ) -> Result<BindingResult> {
         let mut guard = self.task_slots.lock().await;
 
         let available_slots: Vec<&mut AvailableTaskSlots> = guard
@@ -126,7 +126,7 @@ impl ClusterState for InMemoryClusterState {
             })
             .collect();
 
-        let bound_tasks = match distribution {
+        let result = match distribution {
             TaskDistributionPolicy::Bias => {
                 bind_task_bias(available_slots, active_jobs, |_| false).await
             }
@@ -137,7 +137,7 @@ impl ClusterState for InMemoryClusterState {
                 num_replicas,
                 tolerance,
             } => {
-                let mut bound_tasks = bind_task_round_robin(
+                let mut result = bind_task_round_robin(
                     available_slots,
                     active_jobs.clone(),
                     |stage_plan: Arc<dyn ExecutionPlan>| {
@@ -150,22 +150,24 @@ impl ClusterState for InMemoryClusterState {
                     },
                 )
                 .await;
-                info!("{} tasks bound by round robin policy", bound_tasks.len());
-                let (bound_tasks_consistent_hash, ch_topology) =
-                    bind_task_consistent_hash(
-                        self.get_topology_nodes(&guard, executors),
-                        num_replicas,
-                        tolerance,
-                        active_jobs,
-                        |_, plan| get_scan_files(plan),
-                    )
-                    .await?;
+                info!(
+                    "{} tasks bound by round robin policy",
+                    result.bound_tasks.len()
+                );
+                let (consistent_hash_result, ch_topology) = bind_task_consistent_hash(
+                    self.get_topology_nodes(&guard, executors),
+                    num_replicas,
+                    tolerance,
+                    active_jobs,
+                    |_, plan| get_scan_files(plan),
+                )
+                .await?;
                 info!(
                     "{} tasks bound by consistent hashing policy",
-                    bound_tasks_consistent_hash.len()
+                    consistent_hash_result.bound_tasks.len()
                 );
-                if !bound_tasks_consistent_hash.is_empty() {
-                    bound_tasks.extend(bound_tasks_consistent_hash);
+                if !consistent_hash_result.bound_tasks.is_empty() {
+                    result.extend(consistent_hash_result);
                     // Update the available slots
                     let ch_topology = ch_topology.unwrap();
                     for node in ch_topology.nodes() {
@@ -176,14 +178,17 @@ impl ClusterState for InMemoryClusterState {
                         }
                     }
                 }
-                bound_tasks
+                result
             }
             TaskDistributionPolicy::Custom(ref policy) => {
-                policy.bind_tasks(available_slots, active_jobs).await?
+                // Custom policies don't support affinity tracking yet
+                BindingResult::from_tasks(
+                    policy.bind_tasks(available_slots, active_jobs).await?,
+                )
             }
         };
 
-        Ok(bound_tasks)
+        Ok(result)
     }
 
     async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
