@@ -22,11 +22,20 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::pin::Pin;
 use std::result;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+#[cfg(feature = "build-binary")]
+use object_store::aws::AmazonS3Builder;
+#[cfg(feature = "build-binary")]
+use object_store::azure::MicrosoftAzureBuilder;
+#[cfg(feature = "build-binary")]
+use object_store::ObjectStore;
+#[cfg(feature = "build-binary")]
+use url::Url;
 
 use crate::client::BallistaClient;
 use crate::extension::{BallistaConfigGrpcEndpoint, SessionConfigExt};
@@ -371,21 +380,32 @@ impl Stream for AbortableReceiverStream {
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))
     }
 }
-/// Splits the provided partition locations into local and remote partitions.
+/// Splits the provided partition locations into local, object store, and remote partitions.
 /// Local partitions are read directly from local Arrow IPC files,
+/// object store partitions are read via the object store client,
 /// while remote partitions are fetched using the Arrow Flight client.
 /// If `force_remote_read` is true, all partitions are treated as remote.
 fn local_remote_read_split(
     partition_locations: Vec<PartitionLocation>,
     force_remote_read: bool,
-) -> (Vec<PartitionLocation>, Vec<PartitionLocation>) {
+) -> (Vec<PartitionLocation>, Vec<PartitionLocation>, Vec<PartitionLocation>) {
     if !force_remote_read {
-        partition_locations
+        let (local, non_local): (Vec<_>, Vec<_>) = partition_locations
             .into_iter()
-            .partition(check_is_local_location)
+            .partition(check_is_local_location);
+        let (object_store, remote): (Vec<_>, Vec<_>) = non_local
+            .into_iter()
+            .partition(check_is_object_store_location);
+        (local, object_store, remote)
     } else {
-        (vec![], partition_locations)
+        (vec![], vec![], partition_locations)
     }
+}
+
+/// Check if the location is an object store path (S3 or Azure).
+fn check_is_object_store_location(location: &PartitionLocation) -> bool {
+    let path = location.path.as_str();
+    path.starts_with("s3://") || path.starts_with("abfs://") || path.starts_with("az://")
 }
 
 fn send_fetch_partitions(
@@ -401,12 +421,13 @@ fn send_fetch_partitions(
     let semaphore = Arc::new(Semaphore::new(max_request_num));
     let mut spawned_tasks: Vec<SpawnedTask<()>> = vec![];
 
-    let (local_locations, remote_locations): (Vec<_>, Vec<_>) =
+    let (local_locations, object_store_locations, remote_locations): (Vec<_>, Vec<_>, Vec<_>) =
         local_remote_read_split(partition_locations, force_remote_read);
 
     debug!(
-        "local shuffle file counts:{}, remote shuffle file count:{}.",
+        "local shuffle file counts:{}, object store shuffle file count:{}, remote shuffle file count:{}.",
         local_locations.len(),
+        object_store_locations.len(),
         remote_locations.len()
     );
 
@@ -429,6 +450,31 @@ fn send_fetch_partitions(
             }
         }
     }));
+
+    // Handle object store partitions with concurrency control
+    for p in object_store_locations.into_iter() {
+        let semaphore = semaphore.clone();
+        let response_sender = response_sender.clone();
+        spawned_tasks.push(SpawnedTask::spawn(async move {
+            // Block if exceeds max request number.
+            let permit = semaphore.acquire_owned().await.unwrap();
+            let r = PartitionReaderEnum::ObjectStoreRemote
+                .fetch_partition(
+                    &p,
+                    max_message_size,
+                    false, // flight_transport not used for object store
+                    None,  // customize_endpoint not used for object store
+                    false, // use_tls not used for object store
+                )
+                .await;
+            // Block if the channel buffer is full.
+            if let Err(e) = response_sender.send(r).await {
+                error!("Fail to send response event to the channel due to {e}");
+            }
+            // Increase semaphore by dropping existing permits.
+            drop(permit);
+        }));
+    }
 
     for p in remote_locations.into_iter() {
         let semaphore = semaphore.clone();
@@ -590,12 +636,141 @@ fn fetch_partition_local_inner(
     Ok(reader)
 }
 
+#[cfg(feature = "build-binary")]
+async fn fetch_partition_object_store(
+    location: &PartitionLocation,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    debug!("Fetching shuffle partition from object store: {}", path);
+
+    let batches = fetch_partition_object_store_inner(path).await.map_err(|e| {
+        // return BallistaError::FetchFailed may let scheduler retry this task.
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            e.to_string(),
+        )
+    })?;
+
+    if batches.is_empty() {
+        return Err(BallistaError::General(format!(
+            "No batches found in shuffle partition at {}",
+            path
+        )));
+    }
+
+    let schema = batches[0].schema();
+    let stream = futures::stream::iter(batches.into_iter().map(Ok));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
+#[cfg(not(feature = "build-binary"))]
 async fn fetch_partition_object_store(
     _location: &PartitionLocation,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     Err(BallistaError::NotImplemented(
-        "Should not use ObjectStorePartitionReader".to_string(),
+        "Object store support requires 'build-binary' feature".to_string(),
     ))
+}
+
+#[cfg(feature = "build-binary")]
+async fn fetch_partition_object_store_inner(
+    path: &str,
+) -> result::Result<Vec<RecordBatch>, BallistaError> {
+    use object_store::path::Path as ObjectPath;
+
+    let url = Url::parse(path).map_err(|e| {
+        BallistaError::General(format!("Failed to parse object store URL '{}': {:?}", path, e))
+    })?;
+
+    let scheme = url.scheme();
+    let store: Arc<dyn ObjectStore> = match scheme {
+        "s3" => {
+            let bucket = url.host_str().ok_or_else(|| {
+                BallistaError::General(format!("No bucket in S3 URL: {}", path))
+            })?;
+            let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            Arc::new(builder.build().map_err(|e| {
+                BallistaError::General(format!("Failed to create S3 client: {:?}", e))
+            })?)
+        }
+        "abfs" | "az" => {
+            // Parse Azure URL: abfs://container@account.dfs.core.windows.net/path
+            let host = url.host_str().ok_or_else(|| {
+                BallistaError::General(format!("No host in Azure URL: {}", path))
+            })?;
+            
+            // Extract container from username portion
+            let container = url.username();
+            if container.is_empty() {
+                return Err(BallistaError::General(format!(
+                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {}",
+                    path
+                )));
+            }
+
+            // Extract account from host (account.dfs.core.windows.net)
+            let account = host.split('.').next().ok_or_else(|| {
+                BallistaError::General(format!("No account in Azure URL: {}", path))
+            })?;
+
+            let builder = MicrosoftAzureBuilder::from_env()
+                .with_account(account)
+                .with_container_name(container);
+            Arc::new(builder.build().map_err(|e| {
+                BallistaError::General(format!("Failed to create Azure client: {:?}", e))
+            })?)
+        }
+        _ => {
+            return Err(BallistaError::General(format!(
+                "Unsupported object store scheme: {}. Supported: s3, abfs, az",
+                scheme
+            )));
+        }
+    };
+
+    // Extract the object path from the URL
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    debug!("Reading object from path: {:?}", object_path);
+
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to read object from {}: {:?}",
+            path, e
+        ))
+    })?;
+
+    let bytes = get_result.bytes().await.map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to read bytes from {}: {:?}",
+            path, e
+        ))
+    })?;
+
+    let cursor = Cursor::new(bytes.to_vec());
+    let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to create Arrow stream reader for {}: {:?}",
+            path, e
+        ))
+    })?;
+
+    let mut batches = Vec::new();
+    for batch_result in stream_reader {
+        batches.push(batch_result.map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to read batch from {}: {:?}",
+                path, e
+            ))
+        })?);
+    }
+
+    Ok(batches)
 }
 
 #[cfg(test)]
@@ -955,14 +1130,16 @@ mod tests {
         let partition_locations =
             get_test_partition_locations(1, file_path.to_str().unwrap().to_string());
 
-        let (local, remote) = local_remote_read_split(partition_locations.clone(), false);
+        let (local, object_store, remote) = local_remote_read_split(partition_locations.clone(), false);
 
         assert!(!local.is_empty());
+        assert!(object_store.is_empty());
         assert!(remote.is_empty());
 
-        let (local, remote) = local_remote_read_split(partition_locations, true);
+        let (local, object_store, remote) = local_remote_read_split(partition_locations, true);
 
         assert!(local.is_empty());
+        assert!(object_store.is_empty());
         assert!(!remote.is_empty());
     }
 

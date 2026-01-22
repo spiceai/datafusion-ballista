@@ -43,6 +43,10 @@ pub const BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ: &str =
 /// Configuration key to prefer Flight protocol for remote shuffle reads.
 pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
     "ballista.shuffle.remote_read_prefer_flight";
+/// Configuration key for shuffle storage type (local, s3, azure).
+pub const BALLISTA_SHUFFLE_STORAGE_TYPE: &str = "ballista.shuffle.storage_type";
+/// Configuration key for shuffle storage base URL/path.
+pub const BALLISTA_SHUFFLE_STORAGE_URL: &str = "ballista.shuffle.storage_url";
 
 /// Configuration key for gRPC client connection timeout in seconds.
 pub const BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS: &str =
@@ -85,6 +89,14 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_STORAGE_TYPE.to_string(),
+                         "Storage type for shuffle data: 'local' (default), 's3', or 'azure'".to_string(),
+                         DataType::Utf8,
+                         Some("local".to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_STORAGE_URL.to_string(),
+                         "Base URL/path for shuffle storage. For local: file path; For S3: s3://bucket/prefix; For Azure: abfs://container@account.dfs.core.windows.net/prefix".to_string(),
+                         DataType::Utf8,
+                         None),
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS.to_string(),
                          "Connection timeout for gRPC client in seconds".to_string(),
                          DataType::UInt64,
@@ -262,6 +274,16 @@ impl BallistaConfig {
     /// Block protocol is usually more performant than flight protocol
     pub fn shuffle_reader_remote_prefer_flight(&self) -> bool {
         self.get_bool_setting(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT)
+    }
+
+    /// Returns the shuffle storage type (local, s3, azure).
+    pub fn shuffle_storage_type(&self) -> String {
+        self.get_string_setting(BALLISTA_SHUFFLE_STORAGE_TYPE)
+    }
+
+    /// Returns the shuffle storage base URL/path if configured.
+    pub fn shuffle_storage_url(&self) -> Option<String> {
+        self.settings.get(BALLISTA_SHUFFLE_STORAGE_URL).cloned()
     }
 
     fn get_usize_setting(&self, key: &str) -> usize {

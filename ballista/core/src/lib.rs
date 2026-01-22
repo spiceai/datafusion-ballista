@@ -54,6 +54,9 @@ pub mod planner;
 pub mod registry;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+/// Shuffle storage abstraction for local and object store backends.
+#[cfg(feature = "build-binary")]
+pub mod shuffle_storage;
 
 /// General utility functions for Ballista operations.
 
