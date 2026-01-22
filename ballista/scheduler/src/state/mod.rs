@@ -380,9 +380,53 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .get_executor_metadata(executor_id)
             .await?;
 
-        self.task_manager
+        let result = self
+            .task_manager
             .update_task_statuses(&executor, tasks_status)
-            .await
+            .await?;
+
+        // Record stage lifecycle metrics
+        for (job_id, stage_id, task_count, _started_at_ms) in
+            &result.metrics_info.stages_started
+        {
+            self.metrics_collector
+                .record_stage_started(job_id, *stage_id, *task_count);
+        }
+        for (job_id, stage_id, duration_ms) in &result.metrics_info.stages_completed {
+            self.metrics_collector.record_stage_completed(
+                job_id,
+                *stage_id,
+                *duration_ms,
+            );
+        }
+        for (job_id, stage_id, error_type) in &result.metrics_info.stages_failed {
+            self.metrics_collector
+                .record_stage_failed(job_id, *stage_id, error_type);
+        }
+        for (job_id, stage_id) in &result.metrics_info.stages_retried {
+            self.metrics_collector.record_stage_retry(job_id, *stage_id);
+        }
+
+        // Record task lifecycle metrics
+        for (job_id, stage_id, executor_id) in &result.metrics_info.tasks_completed {
+            self.metrics_collector
+                .record_task_completed(job_id, *stage_id, executor_id);
+        }
+        for (job_id, stage_id, executor_id, error_type) in
+            &result.metrics_info.tasks_failed
+        {
+            self.metrics_collector.record_task_failed(
+                job_id,
+                *stage_id,
+                executor_id,
+                error_type,
+            );
+        }
+        for (job_id, stage_id) in &result.metrics_info.tasks_retried {
+            self.metrics_collector.record_task_retry(job_id, *stage_id);
+        }
+
+        Ok(result.events)
     }
 
     pub(crate) async fn submit_job(
