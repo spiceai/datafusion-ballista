@@ -19,7 +19,7 @@
 use crate::serde::protobuf::ScalarUdfInfo;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
-use datafusion::common::{exec_err, plan_err, DataFusionError};
+use datafusion::common::{DataFusionError, exec_err, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
     TypeSignature, Volatility,

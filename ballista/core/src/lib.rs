@@ -56,7 +56,6 @@ pub mod registry;
 pub mod serde;
 
 /// General utility functions for Ballista operations.
-
 pub mod remote_catalog;
 
 pub mod utils;

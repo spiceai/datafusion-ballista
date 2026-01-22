@@ -17,9 +17,9 @@
 
 use crate::config::{
     BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME,
-    BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
-    BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
-    BallistaConfig,
+    BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
+    BALLISTA_SHUFFLE_READER_MAX_REQUESTS, BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT,
+    BALLISTA_STANDALONE_PARALLELISM, BallistaConfig,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -154,6 +154,12 @@ pub trait SessionConfigExt {
         self,
         prefer_flight: bool,
     ) -> Self;
+
+    /// Returns whether in-memory shuffle mode is enabled.
+    fn ballista_shuffle_memory_mode(&self) -> bool;
+
+    /// Sets whether to use in-memory shuffle mode.
+    fn with_ballista_shuffle_memory_mode(self, memory_mode: bool) -> Self;
 
     /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
@@ -419,6 +425,23 @@ impl SessionConfigExt for SessionConfig {
         } else {
             self.with_option_extension(BallistaConfig::default())
                 .set_bool(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, prefer_flight)
+        }
+    }
+
+    fn ballista_shuffle_memory_mode(&self) -> bool {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.shuffle_memory_mode())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_memory_mode())
+    }
+
+    fn with_ballista_shuffle_memory_mode(self, memory_mode: bool) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_bool(BALLISTA_SHUFFLE_MEMORY_MODE, memory_mode)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_bool(BALLISTA_SHUFFLE_MEMORY_MODE, memory_mode)
         }
     }
 

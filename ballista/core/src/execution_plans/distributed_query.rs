@@ -248,8 +248,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         let metric_total_bytes =
             MetricBuilder::new(&self.metrics).counter("transferred_bytes", partition);
 
-
-
         let interceptor = context.session_config().ballista_grpc_interceptor();
 
         let customize_endpoint = context
@@ -258,23 +256,19 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 
         let use_tls = context.session_config().ballista_use_tls();
 
-
         let stream = futures::stream::once(
             execute_query(
                 self.scheduler_url.clone(),
                 self.session_id.clone(),
                 query,
-
                 self.config.default_grpc_client_max_message_size(),
                 GrpcClientConfig::from(&self.config),
                 Arc::new(self.metrics.clone()),
                 partition,
-
                 self.config.clone(),
                 interceptor,
                 customize_endpoint,
                 use_tls,
-
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e))),
         )
@@ -320,7 +314,6 @@ async fn execute_query(
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
-
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     // Capture query submission time for total_query_time_ms
     let query_start_time = std::time::Instant::now();

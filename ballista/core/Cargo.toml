@@ -50,6 +50,7 @@ clap = { workspace = true, optional = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 datafusion-proto-common = { workspace = true }
+dashmap = "6"
 futures = { workspace = true }
 itertools = "0.14"
 log = { workspace = true }
