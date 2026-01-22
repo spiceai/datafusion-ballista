@@ -39,6 +39,8 @@ build-binary = ["aws-config", "aws-credential-types", "clap", "object_store"]
 docsrs = []
 # Used for testing ONLY: causes all values to hash to the same value (test for collisions)
 force_hash_collisions = ["datafusion/force_hash_collisions"]
+# Enable Vortex columnar format support for shuffles
+vortex = ["vortex-array", "vortex-buffer", "vortex-dtype", "vortex-error", "vortex-ipc"]
 
 [dependencies]
 arrow-flight = { workspace = true }
@@ -66,6 +68,13 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+# Vortex columnar format dependencies (optional)
+vortex-array = { workspace = true, optional = true }
+vortex-buffer = { workspace = true, optional = true }
+vortex-dtype = { workspace = true, optional = true }
+vortex-error = { workspace = true, optional = true }
+vortex-ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

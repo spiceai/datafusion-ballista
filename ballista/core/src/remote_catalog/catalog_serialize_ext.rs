@@ -18,8 +18,8 @@
 use crate::serde::generated::ballista::{CatalogInfo, SchemaInfo, TableInfo};
 use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::SessionContext;
-use futures::stream;
 use futures::StreamExt;
+use futures::stream;
 use std::sync::Arc;
 
 /// Used to serialize catalog schemas and names to ship to Ballista clients

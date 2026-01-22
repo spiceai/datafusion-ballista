@@ -20,6 +20,7 @@ use std::time::Duration;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
+use ballista_core::utils::GrpcClientConfig;
 use log::trace;
 
 use crate::cluster::{BoundTask, ClusterState, ExecutorSlot};
@@ -36,9 +37,9 @@ use ballista_core::serde::protobuf::{
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 
 use ballista_core::utils::{
-    GrpcClientConfig, create_grpc_client_connection, create_grpc_client_endpoint, get_time_before,
+    GrpcClientConfig, create_grpc_client_connection, create_grpc_client_endpoint,
+    get_time_before,
 };
-
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};

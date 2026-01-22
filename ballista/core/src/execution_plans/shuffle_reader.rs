@@ -565,19 +565,48 @@ async fn fetch_partition_local(
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
 
-    let reader = fetch_partition_local_inner(path).map_err(|e| {
-        // return BallistaError::FetchFailed may let scheduler retry this task.
-        BallistaError::FetchFailed(
-            metadata.id.clone(),
-            partition_id.stage_id,
-            partition_id.partition_id,
-            e.to_string(),
-        )
-    })?;
-    Ok(Box::pin(LocalShuffleStream::new(reader)))
+    // Detect format from file extension
+    let is_vortex = path.ends_with(".vortex");
+
+    if is_vortex {
+        #[cfg(feature = "vortex")]
+        {
+            // For Vortex files, we need the schema. Get it from partition stats or infer.
+            // For now, we'll create a stream that reads the vortex file.
+            // Note: Vortex IPC format is self-describing, so we can read the schema from the file.
+            let stream = fetch_partition_local_vortex(path).map_err(|e| {
+                BallistaError::FetchFailed(
+                    metadata.id.clone(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    e.to_string(),
+                )
+            })?;
+            Ok(stream)
+        }
+        #[cfg(not(feature = "vortex"))]
+        {
+            Err(BallistaError::General(
+                "Vortex format files found but 'vortex' feature is not enabled"
+                    .to_string(),
+            ))
+        }
+    } else {
+        // Arrow IPC format
+        let reader = fetch_partition_local_arrow(path).map_err(|e| {
+            BallistaError::FetchFailed(
+                metadata.id.clone(),
+                partition_id.stage_id,
+                partition_id.partition_id,
+                e.to_string(),
+            )
+        })?;
+        Ok(Box::pin(LocalShuffleStream::new(reader)))
+    }
 }
 
-fn fetch_partition_local_inner(
+/// Fetch partition from local Arrow IPC file
+fn fetch_partition_local_arrow(
     path: &str,
 ) -> result::Result<StreamReader<BufReader<File>>, BallistaError> {
     let file = File::open(path).map_err(|e| {
@@ -585,9 +614,28 @@ fn fetch_partition_local_inner(
     })?;
     let file = BufReader::new(file);
     let reader = StreamReader::try_new(file, None).map_err(|e| {
-        BallistaError::General(format!("Failed to new arrow FileReader at {path}: {e:?}"))
+        BallistaError::General(format!(
+            "Failed to create Arrow IPC reader at {path}: {e:?}"
+        ))
     })?;
     Ok(reader)
+}
+
+/// Fetch partition from local Vortex file
+#[cfg(feature = "vortex")]
+fn fetch_partition_local_vortex(
+    path: &str,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    use super::vortex_shuffle::LocalVortexShuffleStream;
+
+    // Vortex IPC format is self-describing, but we need a schema for the stream interface.
+    // For now, use an empty schema - the actual data schema will come from the Vortex arrays.
+    // TODO: Consider storing schema metadata in the Vortex file or a sidecar file.
+    let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty());
+
+    // Create the stream - it handles reading and converting Vortex arrays to Arrow
+    let stream = LocalVortexShuffleStream::try_new(path, schema)?;
+    Ok(Box::pin(stream))
 }
 
 async fn fetch_partition_object_store(
@@ -920,7 +968,7 @@ mod tests {
 
         // from to input partitions test the first one with two batches
         let file_path = path.value(0);
-        let reader = fetch_partition_local_inner(file_path).unwrap();
+        let reader = fetch_partition_local_arrow(file_path).unwrap();
 
         let mut stream: Pin<Box<dyn RecordBatchStream + Send>> =
             async { Box::pin(LocalShuffleStream::new(reader)) }.await;
