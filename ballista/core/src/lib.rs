@@ -45,7 +45,6 @@ pub mod event_loop;
 pub mod execution_plans;
 /// Extension traits and utilities for DataFusion integration.
 pub mod extension;
-#[cfg(feature = "build-binary")]
 /// Object store configuration and utilities for distributed file access.
 pub mod object_store;
 /// Query planning utilities for distributed execution.
@@ -56,6 +55,8 @@ pub mod registry;
 pub mod remote_catalog;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+/// Shuffle storage abstraction for local and object store backends.
+pub mod shuffle_storage;
 /// General utility functions for Ballista operations.
 pub mod utils;
 

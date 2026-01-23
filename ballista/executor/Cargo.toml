@@ -33,7 +33,7 @@ path = "src/bin/main.rs"
 required-features = ["build-binary"]
 
 [features]
-build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing", "ballista-core/build-binary"]
+build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing"]
 default = ["build-binary", "mimalloc"]
 vortex = ["ballista-core/vortex", "vortex-array", "vortex-ipc"]
 

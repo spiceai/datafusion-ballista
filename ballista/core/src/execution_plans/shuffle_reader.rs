@@ -22,11 +22,16 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::pin::Pin;
 use std::result;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
+use url::Url;
 
 use crate::client::BallistaClient;
 use crate::execution_plans::shuffle_manager::global_shuffle_manager;
@@ -737,14 +742,6 @@ fn fetch_partition_local_vortex(
     Ok(Box::pin(stream))
 }
 
-async fn fetch_partition_object_store(
-    _location: &PartitionLocation,
-) -> result::Result<SendableRecordBatchStream, BallistaError> {
-    Err(BallistaError::NotImplemented(
-        "Should not use ObjectStorePartitionReader".to_string(),
-    ))
-}
-
 /// Fetch partition data from in-memory shuffle storage.
 ///
 /// After successfully fetching the data, the partition is removed from memory
@@ -831,6 +828,137 @@ impl RecordBatchStream for InMemoryShuffleStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+/// Check if the location is an object store path (S3 or Azure).
+#[allow(dead_code)]
+fn check_is_object_store_location(location: &PartitionLocation) -> bool {
+    let path = location.path.as_str();
+    path.starts_with("s3://") || path.starts_with("abfs://") || path.starts_with("az://")
+}
+
+async fn fetch_partition_object_store(
+    location: &PartitionLocation,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    debug!("Fetching shuffle partition from object store: {}", path);
+
+    let batches = fetch_partition_object_store_inner(path)
+        .await
+        .map_err(|e| {
+            // return BallistaError::FetchFailed may let scheduler retry this task.
+            BallistaError::FetchFailed(
+                metadata.id.clone(),
+                partition_id.stage_id,
+                partition_id.partition_id,
+                e.to_string(),
+            )
+        })?;
+
+    if batches.is_empty() {
+        return Err(BallistaError::General(format!(
+            "No batches found in shuffle partition at {}",
+            path
+        )));
+    }
+
+    let schema = batches[0].schema();
+    let stream = futures::stream::iter(batches.into_iter().map(Ok));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
+async fn fetch_partition_object_store_inner(
+    path: &str,
+) -> result::Result<Vec<RecordBatch>, BallistaError> {
+    use object_store::path::Path as ObjectPath;
+
+    let url = Url::parse(path).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{}': {:?}",
+            path, e
+        ))
+    })?;
+
+    let scheme = url.scheme();
+    let store: Arc<dyn ObjectStore> = match scheme {
+        "s3" => {
+            let bucket = url.host_str().ok_or_else(|| {
+                BallistaError::General(format!("No bucket in S3 URL: {}", path))
+            })?;
+            let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            Arc::new(builder.build().map_err(|e| {
+                BallistaError::General(format!("Failed to create S3 client: {:?}", e))
+            })?)
+        }
+        "abfs" | "az" => {
+            // Parse Azure URL: abfs://container@account.dfs.core.windows.net/path
+            let host = url.host_str().ok_or_else(|| {
+                BallistaError::General(format!("No host in Azure URL: {}", path))
+            })?;
+
+            // Extract container from username portion
+            let container = url.username();
+            if container.is_empty() {
+                return Err(BallistaError::General(format!(
+                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {}",
+                    path
+                )));
+            }
+
+            // Extract account from host (account.dfs.core.windows.net)
+            let account = host.split('.').next().ok_or_else(|| {
+                BallistaError::General(format!("No account in Azure URL: {}", path))
+            })?;
+
+            let builder = MicrosoftAzureBuilder::from_env()
+                .with_account(account)
+                .with_container_name(container);
+            Arc::new(builder.build().map_err(|e| {
+                BallistaError::General(format!("Failed to create Azure client: {:?}", e))
+            })?)
+        }
+        _ => {
+            return Err(BallistaError::General(format!(
+                "Unsupported object store scheme: {}. Supported: s3, abfs, az",
+                scheme
+            )));
+        }
+    };
+
+    // Extract the object path from the URL
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    debug!("Reading object from path: {:?}", object_path);
+
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        BallistaError::General(format!("Failed to read object from {}: {:?}", path, e))
+    })?;
+
+    let bytes = get_result.bytes().await.map_err(|e| {
+        BallistaError::General(format!("Failed to read bytes from {}: {:?}", path, e))
+    })?;
+
+    let cursor = Cursor::new(bytes.to_vec());
+    let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to create Arrow stream reader for {}: {:?}",
+            path, e
+        ))
+    })?;
+
+    let mut batches = Vec::new();
+    for batch_result in stream_reader {
+        batches.push(batch_result.map_err(|e| {
+            BallistaError::General(format!("Failed to read batch from {}: {:?}", path, e))
+        })?);
+    }
+
+    Ok(batches)
 }
 
 #[cfg(test)]

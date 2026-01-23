@@ -44,9 +44,14 @@ pub const BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ: &str =
 /// Configuration key to prefer Flight protocol for remote shuffle reads.
 pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
     "ballista.shuffle.remote_read_prefer_flight";
+/// Configuration key for shuffle storage type (local, s3, azure).
+pub const BALLISTA_SHUFFLE_STORAGE_TYPE: &str = "ballista.shuffle.storage_type";
+/// Configuration key for shuffle storage base URL/path.
+pub const BALLISTA_SHUFFLE_STORAGE_URL: &str = "ballista.shuffle.storage_url";
 /// Configuration key for shuffle storage mode (disk or memory).
 pub const BALLISTA_SHUFFLE_MEMORY_MODE: &str = "ballista.shuffle.memory_mode";
-/// Configuration key indicating if this is the final output stage.
+/// Internal configuration key indicating if this is the final output stage.
+/// This is set by the scheduler based on stage topology, NOT user-configurable.
 /// When true, shuffle data is always written to disk regardless of memory_mode setting.
 pub const BALLISTA_IS_FINAL_STAGE: &str = "ballista.shuffle.is_final_stage";
 /// Shuffle format configuration: "arrow_ipc" or "vortex"
@@ -93,14 +98,21 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_STORAGE_TYPE.to_string(),
+                         "Storage type for shuffle data: 'local' (default), 's3', or 'azure'".to_string(),
+                         DataType::Utf8,
+                         Some("local".to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_STORAGE_URL.to_string(),
+                         "Base URL/path for shuffle storage. For local: file path; For S3: s3://bucket/prefix; For Azure: abfs://container@account.dfs.core.windows.net/prefix".to_string(),
+                         DataType::Utf8,
+                         None),
         ConfigEntry::new(BALLISTA_SHUFFLE_MEMORY_MODE.to_string(),
                          "When enabled, shuffle data is kept in memory on executors instead of being written to disk. This can improve performance for workloads with sufficient memory.".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
-        ConfigEntry::new(BALLISTA_IS_FINAL_STAGE.to_string(),
-                         "When true, indicates this is the final output stage. Final stages always write to disk regardless of memory_mode setting to ensure proper cleanup.".to_string(),
-                         DataType::Boolean,
-                         Some((false).to_string())),
+        // Note: BALLISTA_IS_FINAL_STAGE is intentionally NOT in CONFIG_ENTRIES.
+        // It's an internal flag set by the scheduler based on stage topology,
+        // not a user-configurable setting.
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS.to_string(),
                          "Connection timeout for gRPC client in seconds".to_string(),
                          DataType::UInt64,
@@ -320,6 +332,16 @@ impl BallistaConfig {
         self.get_bool_setting(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT)
     }
 
+    /// Returns the shuffle storage type (local, s3, azure).
+    pub fn shuffle_storage_type(&self) -> String {
+        self.get_string_setting(BALLISTA_SHUFFLE_STORAGE_TYPE)
+    }
+
+    /// Returns the shuffle storage base URL/path if configured.
+    pub fn shuffle_storage_url(&self) -> Option<String> {
+        self.settings.get(BALLISTA_SHUFFLE_STORAGE_URL).cloned()
+    }
+
     /// Returns whether in-memory shuffle mode is enabled.
     ///
     /// When enabled, shuffle data is kept in memory on executors instead of
@@ -330,9 +352,21 @@ impl BallistaConfig {
     }
 
     /// Returns whether this is the final output stage.
+    /// This is an internal flag set by the scheduler, not user-configurable.
     /// Final stages always write to disk regardless of memory_mode setting.
     pub fn is_final_stage(&self) -> bool {
-        self.get_bool_setting(BALLISTA_IS_FINAL_STAGE)
+        self.settings
+            .get(BALLISTA_IS_FINAL_STAGE)
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false)
+    }
+
+    /// Sets the internal is_final_stage flag.
+    /// This should only be called by the scheduler when creating task configurations.
+    pub fn with_is_final_stage(mut self, is_final: bool) -> Self {
+        self.settings
+            .insert(BALLISTA_IS_FINAL_STAGE.to_string(), is_final.to_string());
+        self
     }
 
     /// Returns the configured shuffle format (ArrowIpc or Vortex)
@@ -434,7 +468,6 @@ impl datafusion::config::ConfigExtension for BallistaConfig {
 /// Ballista supports both push-based and pull-based task scheduling.
 /// It is recommended that you try both to determine which is the best for your use case.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
-#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum TaskSchedulingPolicy {
     /// Pull-based scheduling works in a similar way to Apache Spark
     #[default]
@@ -451,18 +484,23 @@ impl Display for TaskSchedulingPolicy {
     }
 }
 
-#[cfg(feature = "build-binary")]
 impl std::str::FromStr for TaskSchedulingPolicy {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        clap::ValueEnum::from_str(s, true)
+        match s.to_lowercase().as_str() {
+            "pull-staged" | "pullstaged" => Ok(TaskSchedulingPolicy::PullStaged),
+            "push-staged" | "pushstaged" => Ok(TaskSchedulingPolicy::PushStaged),
+            _ => Err(format!(
+                "Invalid scheduling policy '{}'. Valid options: 'pull-staged', 'push-staged'",
+                s
+            )),
+        }
     }
 }
 
 /// Configures the log file rotation policy.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
-#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum LogRotationPolicy {
     /// Rotate log files every minute.
     Minutely,
@@ -486,12 +524,20 @@ impl Display for LogRotationPolicy {
     }
 }
 
-#[cfg(feature = "build-binary")]
 impl std::str::FromStr for LogRotationPolicy {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        clap::ValueEnum::from_str(s, true)
+        match s.to_lowercase().as_str() {
+            "minutely" => Ok(LogRotationPolicy::Minutely),
+            "hourly" => Ok(LogRotationPolicy::Hourly),
+            "daily" => Ok(LogRotationPolicy::Daily),
+            "never" => Ok(LogRotationPolicy::Never),
+            _ => Err(format!(
+                "Invalid rotation policy '{}'. Valid options: 'minutely', 'hourly', 'daily', 'never'",
+                s
+            )),
+        }
     }
 }
 

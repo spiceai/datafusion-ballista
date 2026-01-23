@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::config::{
-    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_IS_FINAL_STAGE, BALLISTA_JOB_NAME,
-    BALLISTA_SHUFFLE_FORMAT, BALLISTA_SHUFFLE_MEMORY_MODE,
-    BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
-    BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
-    BallistaConfig, ShuffleFormat,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME, BALLISTA_SHUFFLE_FORMAT,
+    BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
+    BALLISTA_SHUFFLE_READER_MAX_REQUESTS, BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT,
+    BALLISTA_SHUFFLE_STORAGE_TYPE, BALLISTA_SHUFFLE_STORAGE_URL,
+    BALLISTA_STANDALONE_PARALLELISM, BallistaConfig, ShuffleFormat,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -191,6 +191,18 @@ pub trait SessionConfigExt {
 
     /// Get whether to use TLS for executor connections
     fn ballista_use_tls(&self) -> bool;
+
+    /// Returns the shuffle storage type (local, s3, azure).
+    fn ballista_shuffle_storage_type(&self) -> String;
+
+    /// Sets the shuffle storage type.
+    fn with_ballista_shuffle_storage_type(self, storage_type: &str) -> Self;
+
+    /// Returns the shuffle storage base URL/path if configured.
+    fn ballista_shuffle_storage_url(&self) -> Option<String>;
+
+    /// Sets the shuffle storage base URL/path.
+    fn with_ballista_shuffle_storage_url(self, url: &str) -> Self;
 
     /// Get the shuffle format (ArrowIpc or Vortex)
     ///
@@ -500,16 +512,20 @@ impl SessionConfigExt for SessionConfig {
             .extensions
             .get::<BallistaConfig>()
             .map(|c| c.is_final_stage())
-            .unwrap_or_else(|| BallistaConfig::default().is_final_stage())
+            .unwrap_or(false)
     }
 
     fn with_ballista_is_final_stage(self, is_final: bool) -> Self {
-        if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_bool(BALLISTA_IS_FINAL_STAGE, is_final)
-        } else {
-            self.with_option_extension(BallistaConfig::default())
-                .set_bool(BALLISTA_IS_FINAL_STAGE, is_final)
-        }
+        // is_final_stage is an internal flag, not a user-configurable setting,
+        // so we modify the BallistaConfig directly instead of using set_bool
+        let ballista_config = self
+            .options()
+            .extensions
+            .get::<BallistaConfig>()
+            .cloned()
+            .unwrap_or_default()
+            .with_is_final_stage(is_final);
+        self.with_option_extension(ballista_config)
     }
 
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
@@ -548,6 +564,39 @@ impl SessionConfigExt for SessionConfig {
         self.get_extension::<BallistaUseTls>()
             .map(|ext| ext.0)
             .unwrap_or(false)
+    }
+
+    fn ballista_shuffle_storage_type(&self) -> String {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.shuffle_storage_type())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_storage_type())
+    }
+
+    fn with_ballista_shuffle_storage_type(self, storage_type: &str) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_str(BALLISTA_SHUFFLE_STORAGE_TYPE, storage_type)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_str(BALLISTA_SHUFFLE_STORAGE_TYPE, storage_type)
+        }
+    }
+
+    fn ballista_shuffle_storage_url(&self) -> Option<String> {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .and_then(|c| c.shuffle_storage_url())
+    }
+
+    fn with_ballista_shuffle_storage_url(self, url: &str) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_str(BALLISTA_SHUFFLE_STORAGE_URL, url)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_str(BALLISTA_SHUFFLE_STORAGE_URL, url)
+        }
     }
 
     fn ballista_shuffle_format(&self) -> ShuffleFormat {
@@ -934,7 +983,7 @@ mod test {
     };
 
     use crate::{
-        config::BALLISTA_JOB_NAME,
+        config::{BALLISTA_JOB_NAME, BallistaConfig},
         extension::{SessionConfigExt, SessionConfigHelperExt, SessionStateExt},
     };
 
@@ -1019,17 +1068,21 @@ mod test {
     }
 
     #[test]
-    fn test_is_final_stage_serialization() {
-        use crate::config::BALLISTA_IS_FINAL_STAGE;
-
-        // Test that is_final_stage is included in key-value pairs
+    fn test_is_final_stage_internal_setting() {
+        // Test that is_final_stage is properly stored in BallistaConfig
         let config =
             SessionConfig::new_with_ballista().with_ballista_is_final_stage(true);
-        let pairs = config.to_key_value_pairs();
 
-        let is_final_pair = pairs.iter().find(|p| p.key == BALLISTA_IS_FINAL_STAGE);
-        assert!(is_final_pair.is_some());
-        assert_eq!(is_final_pair.unwrap().value, Some("true".to_string()));
+        // Verify via the getter
+        assert!(config.ballista_is_final_stage());
+
+        // Verify the internal BallistaConfig has the setting
+        let ballista_config = config
+            .options()
+            .extensions
+            .get::<BallistaConfig>()
+            .expect("BallistaConfig should exist");
+        assert!(ballista_config.is_final_stage());
     }
 
     #[test]
