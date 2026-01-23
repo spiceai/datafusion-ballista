@@ -1077,6 +1077,8 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "vortex-array",
+ "vortex-ipc",
 ]
 
 [[package]]
