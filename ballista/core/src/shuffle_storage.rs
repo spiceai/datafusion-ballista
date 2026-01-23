@@ -23,16 +23,16 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::arrow::ipc::writer::StreamWriter;
-use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::metrics;
 use futures::StreamExt;
 use log::{debug, error};
-use object_store::azure::MicrosoftAzureBuilder;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use std::fmt::{Debug, Display};
@@ -160,7 +160,10 @@ impl ShuffleStorageConfig {
     /// Creates a new Azure Blob Storage configuration.
     pub fn new_azure(account: &str, container: &str, prefix: Option<&str>) -> Self {
         let base_url = match prefix {
-            Some(p) => format!("abfs://{}@{}.dfs.core.windows.net/{}", container, account, p),
+            Some(p) => format!(
+                "abfs://{}@{}.dfs.core.windows.net/{}",
+                container, account, p
+            ),
             None => format!("abfs://{}@{}.dfs.core.windows.net", container, account),
         };
         Self {
@@ -178,6 +181,7 @@ impl ShuffleStorageConfig {
 
 /// Trait for shuffle storage operations.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ShuffleStorage: Send + Sync + Debug {
     /// Write a record batch to storage and return the path where it was written.
     async fn write_shuffle_data(
@@ -256,7 +260,8 @@ impl ShuffleStorage for LocalShuffleStorage {
         let options = IpcWriteOptions::default()
             .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
 
-        let mut writer = StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
+        let mut writer =
+            StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
 
         let mut num_rows = 0;
         let mut num_batches = 0;
@@ -283,7 +288,10 @@ impl ShuffleStorage for LocalShuffleStorage {
 
     async fn read_shuffle_data(&self, path: &str) -> Result<Vec<RecordBatch>> {
         let file = File::open(path).map_err(|e| {
-            BallistaError::General(format!("Failed to open shuffle file at {}: {:?}", path, e))
+            BallistaError::General(format!(
+                "Failed to open shuffle file at {}: {:?}",
+                path, e
+            ))
         })?;
         let reader = BufReader::new(file);
         let stream_reader = StreamReader::try_new(reader, None)?;
@@ -311,7 +319,9 @@ impl ShuffleStorage for LocalShuffleStorage {
 
     fn can_handle(&self, path: &str) -> bool {
         // Local storage can handle paths that don't start with a URL scheme
-        !path.starts_with("s3://") && !path.starts_with("abfs://") && !path.starts_with("az://")
+        !path.starts_with("s3://")
+            && !path.starts_with("abfs://")
+            && !path.starts_with("az://")
     }
 }
 
@@ -396,7 +406,9 @@ impl ObjectStoreShuffleStorage {
                 .filter_map(|pair| {
                     let mut parts = pair.splitn(2, '=');
                     match (parts.next(), parts.next()) {
-                        (Some(key), Some(value)) => Some((key.to_string(), value.to_string())),
+                        (Some(key), Some(value)) => {
+                            Some((key.to_string(), value.to_string()))
+                        }
                         _ => None,
                     }
                 })
@@ -405,7 +417,10 @@ impl ObjectStoreShuffleStorage {
         }
 
         let store = builder.build().map_err(|e| {
-            BallistaError::General(format!("Failed to create Azure object store: {:?}", e))
+            BallistaError::General(format!(
+                "Failed to create Azure object store: {:?}",
+                e
+            ))
         })?;
 
         let base_url = config.base_url.clone().unwrap_or_else(|| {
@@ -430,7 +445,13 @@ impl ObjectStoreShuffleStorage {
         }
     }
 
-    fn make_path(&self, job_id: &str, stage_id: usize, partition_id: usize, input_partition: usize) -> String {
+    fn make_path(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition_id: usize,
+        input_partition: usize,
+    ) -> String {
         let filename = if input_partition == partition_id {
             "data.arrow".to_string()
         } else {
@@ -452,9 +473,10 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         schema: SchemaRef,
         write_metric: &metrics::Time,
     ) -> Result<(String, PartitionStats)> {
-        let relative_path = self.make_path(job_id, stage_id, partition_id, input_partition);
+        let relative_path =
+            self.make_path(job_id, stage_id, partition_id, input_partition);
         let full_url = format!("{}/{}", self.base_url, relative_path);
-        
+
         debug!("Writing shuffle data to object store: {}", full_url);
 
         let timer = write_metric.timer();
@@ -463,8 +485,8 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         let mut buffer = Vec::new();
         let options = IpcWriteOptions::default()
             .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-        
-        let (total_rows, total_batches) = {
+
+        let (_total_rows, _total_batches) = {
             let mut writer = StreamWriter::try_new_with_options(
                 Cursor::new(&mut buffer),
                 schema.as_ref(),
@@ -489,7 +511,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         // Upload to object store
         let object_path = ObjectPath::from(relative_path);
         let payload = PutPayload::from(Bytes::from(buffer));
-        
+
         self.store.put(&object_path, payload).await.map_err(|e| {
             BallistaError::General(format!(
                 "Failed to upload shuffle data to {}: {:?}",
@@ -511,7 +533,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
     async fn read_shuffle_data(&self, path: &str) -> Result<Vec<RecordBatch>> {
         // Extract the object path from the full URL
         let object_path = self.extract_object_path(path)?;
-        
+
         debug!("Reading shuffle data from object store: {}", path);
 
         let get_result = self.store.get(&object_path).await.map_err(|e| {
@@ -522,10 +544,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         })?;
 
         let bytes = get_result.bytes().await.map_err(|e| {
-            BallistaError::General(format!(
-                "Failed to read bytes from {}: {:?}",
-                path, e
-            ))
+            BallistaError::General(format!("Failed to read bytes from {}: {:?}", path, e))
         })?;
 
         let cursor = Cursor::new(bytes.to_vec());
@@ -541,7 +560,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
 
     async fn delete_job_data(&self, job_id: &str) -> Result<()> {
         let prefix = ObjectPath::from(job_id.to_string());
-        
+
         // List all objects with the job_id prefix
         let mut list_stream = self.store.list(Some(&prefix));
         let mut objects_to_delete = Vec::new();
@@ -607,10 +626,9 @@ impl ShuffleStorageFactory {
     pub fn create(config: &ShuffleStorageConfig) -> Result<Arc<dyn ShuffleStorage>> {
         match config.storage_type {
             ShuffleStorageType::Local => {
-                let work_dir = config
-                    .base_url
-                    .as_ref()
-                    .ok_or_else(|| BallistaError::General("Work directory not configured".to_string()))?;
+                let work_dir = config.base_url.as_ref().ok_or_else(|| {
+                    BallistaError::General("Work directory not configured".to_string())
+                })?;
                 Ok(Arc::new(LocalShuffleStorage::new(work_dir)))
             }
             ShuffleStorageType::S3 => {
@@ -637,9 +655,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_batch() -> (RecordBatch, SchemaRef) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -655,7 +671,8 @@ mod tests {
 
         let (batch, schema) = create_test_batch();
         let metrics = ExecutionPlanMetricsSet::new();
-        let time_metric = metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
+        let time_metric =
+            metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
 
         let (path, stats) = storage
             .write_shuffle_data(
@@ -686,18 +703,11 @@ mod tests {
 
         let (batch, schema) = create_test_batch();
         let metrics = ExecutionPlanMetricsSet::new();
-        let time_metric = metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
+        let time_metric =
+            metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
 
         let (path, _) = storage
-            .write_shuffle_data(
-                "test_job",
-                1,
-                0,
-                0,
-                vec![batch],
-                schema,
-                &time_metric,
-            )
+            .write_shuffle_data("test_job", 1, 0, 0, vec![batch], schema, &time_metric)
             .await
             .unwrap();
 
@@ -736,7 +746,8 @@ mod tests {
 
     #[test]
     fn test_storage_config_new_s3() {
-        let config = ShuffleStorageConfig::new_s3("my-bucket", Some("shuffle"), Some("us-east-1"));
+        let config =
+            ShuffleStorageConfig::new_s3("my-bucket", Some("shuffle"), Some("us-east-1"));
         assert_eq!(config.storage_type, ShuffleStorageType::S3);
         assert_eq!(config.base_url, Some("s3://my-bucket/shuffle".to_string()));
         assert_eq!(config.s3_config.bucket, Some("my-bucket".to_string()));
@@ -745,7 +756,8 @@ mod tests {
 
     #[test]
     fn test_storage_config_new_azure() {
-        let config = ShuffleStorageConfig::new_azure("myaccount", "mycontainer", Some("shuffle"));
+        let config =
+            ShuffleStorageConfig::new_azure("myaccount", "mycontainer", Some("shuffle"));
         assert_eq!(config.storage_type, ShuffleStorageType::Azure);
         assert_eq!(
             config.base_url,
