@@ -43,9 +43,9 @@ arrow-flight = { workspace = true }
 async-trait = { workspace = true }
 
 backoff = { workspace = true }
-bytes = "1"
 
 ballista-core = { path = "../core", version = "51.0.0" }
+bytes = "1"
 
 clap = { workspace = true, optional = true }
 dashmap = { workspace = true }
