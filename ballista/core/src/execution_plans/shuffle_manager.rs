@@ -27,29 +27,43 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
+use crate::config::ShuffleFormat;
 use crate::error::{BallistaError, Result};
 
 /// Key for identifying a shuffle partition in the in-memory store.
 /// Format: "{job_id}/{stage_id}/{partition_id}" or "{job_id}/{stage_id}/{output_partition}/{input_partition}"
 pub type ShufflePartitionKey = String;
 
+/// In-memory representation of shuffle data.
+/// Supports both Arrow RecordBatch and Vortex formats.
+#[derive(Debug, Clone)]
+pub enum InMemoryShuffleData {
+    /// Arrow RecordBatch format (default)
+    Arrow(Vec<RecordBatch>),
+    /// Vortex columnar format (requires 'vortex' feature)
+    #[cfg(feature = "vortex")]
+    Vortex(Vec<vortex_array::ArrayRef>),
+}
+
 /// Data stored for a single shuffle partition.
 #[derive(Debug, Clone)]
 pub struct ShufflePartitionData {
     /// The schema of the record batches
     pub schema: SchemaRef,
-    /// The record batches for this partition
-    pub batches: Vec<RecordBatch>,
+    /// The data for this partition (Arrow or Vortex format)
+    pub data: InMemoryShuffleData,
     /// Total number of rows across all batches
     pub num_rows: u64,
     /// Total number of batches
     pub num_batches: u64,
     /// Approximate size in bytes (based on array memory size)
     pub num_bytes: u64,
+    /// The format of the data
+    pub format: ShuffleFormat,
 }
 
 impl ShufflePartitionData {
-    /// Creates a new ShufflePartitionData from a schema and batches.
+    /// Creates a new ShufflePartitionData from a schema and Arrow batches.
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
         let num_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let num_batches = batches.len() as u64;
@@ -60,10 +74,63 @@ impl ShufflePartitionData {
 
         Self {
             schema,
-            batches,
+            data: InMemoryShuffleData::Arrow(batches),
             num_rows,
             num_batches,
             num_bytes,
+            format: ShuffleFormat::ArrowIpc,
+        }
+    }
+
+    /// Creates a new ShufflePartitionData from a schema and Vortex arrays.
+    #[cfg(feature = "vortex")]
+    pub fn new_vortex(
+        schema: SchemaRef,
+        arrays: Vec<vortex_array::ArrayRef>,
+        num_rows: u64,
+        num_bytes: u64,
+    ) -> Self {
+        let num_batches = arrays.len() as u64;
+
+        Self {
+            schema,
+            data: InMemoryShuffleData::Vortex(arrays),
+            num_rows,
+            num_batches,
+            num_bytes,
+            format: ShuffleFormat::Vortex,
+        }
+    }
+
+    /// Returns the batches if stored in Arrow format, otherwise converts from Vortex.
+    pub fn to_batches(&self) -> Result<Vec<RecordBatch>> {
+        match &self.data {
+            InMemoryShuffleData::Arrow(batches) => Ok(batches.clone()),
+            #[cfg(feature = "vortex")]
+            InMemoryShuffleData::Vortex(arrays) => {
+                use vortex_array::arrow::IntoArrowArray;
+                arrays
+                    .iter()
+                    .map(|array| {
+                        let arrow_array =
+                            array.clone().into_arrow_preferred().map_err(|e| {
+                                BallistaError::General(format!(
+                                    "Failed to convert Vortex array to Arrow: {e}"
+                                ))
+                            })?;
+                        let struct_array = arrow_array
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::StructArray>()
+                            .ok_or_else(|| {
+                                BallistaError::General(
+                                    "Expected StructArray from Vortex conversion"
+                                        .to_string(),
+                                )
+                            })?;
+                        Ok(RecordBatch::from(struct_array))
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -229,7 +296,8 @@ mod tests {
         let retrieved = manager.get_partition(&key).unwrap();
         assert_eq!(retrieved.num_rows, 3);
         assert_eq!(retrieved.num_batches, 1);
-        assert_eq!(retrieved.batches.len(), 1);
+        let batches = retrieved.to_batches().unwrap();
+        assert_eq!(batches.len(), 1);
     }
 
     #[test]

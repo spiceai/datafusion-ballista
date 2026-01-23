@@ -321,7 +321,7 @@ impl ShuffleWriterExec {
             let mut stream = plan.execute(input_partition, context)?;
 
             if memory_mode {
-                // Use in-memory shuffle storage
+                // Use in-memory shuffle storage with configurable format
                 Self::execute_shuffle_write_memory(
                     &job_id,
                     stage_id,
@@ -330,6 +330,7 @@ impl ShuffleWriterExec {
                     output_partitioning,
                     write_metrics,
                     now,
+                    shuffle_format,
                 )
                 .await
             } else {
@@ -499,6 +500,7 @@ impl ShuffleWriterExec {
     }
 
     /// Executes shuffle write to in-memory storage.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_shuffle_write_memory(
         job_id: &str,
         stage_id: usize,
@@ -509,6 +511,7 @@ impl ShuffleWriterExec {
         output_partitioning: Option<Partitioning>,
         write_metrics: ShuffleWriteMetrics,
         now: Instant,
+        shuffle_format: ShuffleFormat,
     ) -> Result<Vec<ShuffleWritePartition>> {
         let shuffle_manager = global_shuffle_manager();
         let schema = stream.schema();
@@ -538,14 +541,15 @@ impl ShuffleWriterExec {
                     input_partition,
                 );
 
-                // Store in the global shuffle manager
-                let data = ShufflePartitionData::new(schema.clone(), batches);
+                // Store in the global shuffle manager using the configured format
+                let data =
+                    Self::create_partition_data(schema.clone(), batches, shuffle_format)?;
                 shuffle_manager.store_partition(key.clone(), data);
 
                 timer.done();
 
                 info!(
-                    "Executed partition {} to memory in {} seconds. Batches: {}, Rows: {}, Bytes: {}",
+                    "Executed partition {} to memory ({shuffle_format}) in {} seconds. Batches: {}, Rows: {}, Bytes: {}",
                     input_partition,
                     now.elapsed().as_secs(),
                     num_batches,
@@ -622,12 +626,16 @@ impl ShuffleWriterExec {
                 for (i, w) in mem_writers.into_iter().enumerate() {
                     if let Some(w) = w {
                         debug!(
-                            "Finished writing shuffle partition {} to memory. Batches: {}. Rows: {}. Bytes: {}.",
+                            "Finished writing shuffle partition {} to memory ({shuffle_format}). Batches: {}. Rows: {}. Bytes: {}.",
                             i, w.num_batches, w.num_rows, w.num_bytes
                         );
 
-                        // Store in the global shuffle manager
-                        let data = ShufflePartitionData::new(schema.clone(), w.batches);
+                        // Store in the global shuffle manager using the configured format
+                        let data = Self::create_partition_data(
+                            schema.clone(),
+                            w.batches,
+                            shuffle_format,
+                        )?;
                         shuffle_manager.store_partition(w.key.clone(), data);
 
                         part_locs.push(ShuffleWritePartition {
@@ -644,6 +652,45 @@ impl ShuffleWriterExec {
 
             _ => Err(DataFusionError::Execution(
                 "Invalid shuffle partitioning scheme".to_owned(),
+            )),
+        }
+    }
+
+    /// Creates partition data in the specified format (Arrow or Vortex).
+    fn create_partition_data(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        format: ShuffleFormat,
+    ) -> Result<ShufflePartitionData> {
+        match format {
+            ShuffleFormat::ArrowIpc => Ok(ShufflePartitionData::new(schema, batches)),
+            #[cfg(feature = "vortex")]
+            ShuffleFormat::Vortex => {
+                use vortex_array::ArrayRef;
+                use vortex_array::arrow::FromArrowArray;
+
+                let mut arrays = Vec::with_capacity(batches.len());
+                let mut total_rows = 0u64;
+                let mut total_bytes = 0u64;
+
+                for batch in batches {
+                    total_rows += batch.num_rows() as u64;
+                    // Convert Arrow RecordBatch to Vortex Array
+                    let vortex_array = ArrayRef::from_arrow(&batch, false);
+                    total_bytes += vortex_array.nbytes();
+                    arrays.push(vortex_array);
+                }
+
+                Ok(ShufflePartitionData::new_vortex(
+                    schema,
+                    arrays,
+                    total_rows,
+                    total_bytes,
+                ))
+            }
+            #[cfg(not(feature = "vortex"))]
+            ShuffleFormat::Vortex => Err(DataFusionError::NotImplemented(
+                "Vortex format requires the 'vortex' feature to be enabled".to_string(),
             )),
         }
     }

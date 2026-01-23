@@ -773,10 +773,16 @@ async fn fetch_partition_memory(
         key, data.num_batches, data.num_rows
     );
 
-    Ok(Box::pin(InMemoryShuffleStream::new(
-        data.schema,
-        data.batches,
-    )))
+    let batches = data.to_batches().map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to convert in-memory partition to batches: {e}"),
+        )
+    })?;
+
+    Ok(Box::pin(InMemoryShuffleStream::new(data.schema, batches)))
 }
 
 /// Stream that reads from in-memory shuffle data

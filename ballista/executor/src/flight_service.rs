@@ -110,13 +110,19 @@ impl FlightService for BallistaFlightService {
                     })?;
 
                     debug!(
-                        "FetchPartition serving in-memory partition: {} ({} batches, {} rows)",
-                        key, data.num_batches, data.num_rows
+                        "FetchPartition serving in-memory partition: {} ({} batches, {} rows, format: {:?})",
+                        key, data.num_batches, data.num_rows, data.format
                     );
 
                     let (tx, rx) = channel(2);
                     let schema = data.schema.clone();
-                    let batches = data.batches;
+
+                    // Convert to batches (handles both Arrow and Vortex formats)
+                    let batches = data.to_batches().map_err(|e| {
+                        Status::internal(format!(
+                            "Failed to convert in-memory partition to batches: {e}"
+                        ))
+                    })?;
 
                     // Stream the batches from memory
                     task::spawn(async move {
@@ -273,9 +279,16 @@ impl FlightService for BallistaFlightService {
                                 })?;
 
                             debug!(
-                                "FetchPartition serving in-memory partition via block transfer: {} ({} batches)",
-                                key, data.num_batches
+                                "FetchPartition serving in-memory partition via block transfer: {} ({} batches, format: {:?})",
+                                key, data.num_batches, data.format
                             );
+
+                            // Convert to batches (handles both Arrow and Vortex formats)
+                            let batches = data.to_batches().map_err(|e| {
+                                Status::internal(format!(
+                                    "Failed to convert in-memory partition to batches: {e}"
+                                ))
+                            })?;
 
                             // Serialize batches to IPC format in memory
                             let mut buffer = Vec::new();
@@ -292,7 +305,7 @@ impl FlightService for BallistaFlightService {
                                 )
                                 .map_err(|e| from_arrow_err(&e))?;
 
-                                for batch in &data.batches {
+                                for batch in &batches {
                                     writer
                                         .write(batch)
                                         .map_err(|e| from_arrow_err(&e))?;
