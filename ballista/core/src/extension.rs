@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::config::{
-    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME, BALLISTA_SHUFFLE_FORMAT,
     BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
     BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_SHUFFLE_STORAGE_TYPE,
     BALLISTA_SHUFFLE_STORAGE_URL, BALLISTA_STANDALONE_PARALLELISM, BallistaConfig,
+    ShuffleFormat,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -189,6 +190,18 @@ pub trait SessionConfigExt {
 
     /// Sets the shuffle storage base URL/path.
     fn with_ballista_shuffle_storage_url(self, url: &str) -> Self;
+
+    /// Get the shuffle format (ArrowIpc or Vortex)
+    ///
+    /// Note: Vortex format requires the 'vortex' feature to be enabled.
+    fn ballista_shuffle_format(&self) -> ShuffleFormat;
+
+    /// Set the shuffle format for intermediate shuffle data
+    ///
+    /// Available formats:
+    /// - `ShuffleFormat::ArrowIpc` (default) - Standard Arrow IPC format
+    /// - `ShuffleFormat::Vortex` - Vortex columnar format (requires 'vortex' feature)
+    fn with_ballista_shuffle_format(self, format: ShuffleFormat) -> Self;
 
     /// Set a callback for recording shuffle read metrics (local vs remote).
     ///
@@ -532,6 +545,23 @@ impl SessionConfigExt for SessionConfig {
         } else {
             self.with_option_extension(BallistaConfig::default())
                 .set_str(BALLISTA_SHUFFLE_STORAGE_URL, url)
+        }
+    }
+
+    fn ballista_shuffle_format(&self) -> ShuffleFormat {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.shuffle_format())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_format())
+    }
+
+    fn with_ballista_shuffle_format(self, format: ShuffleFormat) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_str(BALLISTA_SHUFFLE_FORMAT, &format.to_string())
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_str(BALLISTA_SHUFFLE_FORMAT, &format.to_string())
         }
     }
 
