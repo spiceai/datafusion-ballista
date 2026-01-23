@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::config::BallistaConfig;
+use crate::config::{BallistaConfig, ShuffleFormat};
 use crate::error::{BallistaError, Result};
 use crate::extension::SessionConfigExt;
 use crate::serde::scheduler::PartitionStats;
@@ -194,6 +194,39 @@ pub async fn collect_stream(
         batches.push(batch?);
     }
     Ok(batches)
+}
+
+/// Write stream to disk using the specified shuffle format
+///
+/// This function dispatches to the appropriate writer based on the format:
+/// - ArrowIpc: Uses Arrow IPC streaming format with LZ4 compression
+/// - Vortex: Uses Vortex columnar format (requires 'vortex' feature)
+pub async fn write_stream_to_disk_with_format(
+    stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
+    path: &str,
+    disk_write_metric: &metrics::Time,
+    format: ShuffleFormat,
+) -> Result<PartitionStats> {
+    match format {
+        ShuffleFormat::ArrowIpc => write_stream_to_disk(stream, path, disk_write_metric).await,
+        #[cfg(feature = "vortex")]
+        ShuffleFormat::Vortex => {
+            crate::execution_plans::write_stream_to_disk_vortex(stream, path, disk_write_metric)
+                .await
+        }
+        #[cfg(not(feature = "vortex"))]
+        ShuffleFormat::Vortex => Err(BallistaError::General(
+            "Vortex format is not available. Enable the 'vortex' feature to use Vortex shuffle format.".to_string(),
+        )),
+    }
+}
+
+/// Get the file extension for the given shuffle format
+pub fn shuffle_file_extension(format: ShuffleFormat) -> &'static str {
+    match format {
+        ShuffleFormat::ArrowIpc => "arrow",
+        ShuffleFormat::Vortex => "vortex",
+    }
 }
 
 /// Creates a gRPC client connection with the specified configuration.
