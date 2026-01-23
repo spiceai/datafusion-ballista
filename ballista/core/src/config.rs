@@ -529,10 +529,22 @@ mod tests {
 
     #[test]
     fn test_shuffle_format_parsing() {
-        assert_eq!("arrow_ipc".parse::<ShuffleFormat>().unwrap(), ShuffleFormat::ArrowIpc);
-        assert_eq!("arrow-ipc".parse::<ShuffleFormat>().unwrap(), ShuffleFormat::ArrowIpc);
-        assert_eq!("ipc".parse::<ShuffleFormat>().unwrap(), ShuffleFormat::ArrowIpc);
-        assert_eq!("vortex".parse::<ShuffleFormat>().unwrap(), ShuffleFormat::Vortex);
+        assert_eq!(
+            "arrow_ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "arrow-ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "vortex".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::Vortex
+        );
         assert!("invalid".parse::<ShuffleFormat>().is_err());
     }
 }

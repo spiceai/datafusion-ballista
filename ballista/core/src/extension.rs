@@ -1023,7 +1023,8 @@ mod test {
         use crate::config::BALLISTA_IS_FINAL_STAGE;
 
         // Test that is_final_stage is included in key-value pairs
-        let config = SessionConfig::new_with_ballista().with_ballista_is_final_stage(true);
+        let config =
+            SessionConfig::new_with_ballista().with_ballista_is_final_stage(true);
         let pairs = config.to_key_value_pairs();
 
         let is_final_pair = pairs.iter().find(|p| p.key == BALLISTA_IS_FINAL_STAGE);
