@@ -161,11 +161,13 @@ pub trait SessionConfigExt {
     /// Get a `tonic` interceptor configured to decorate the provided metadata keys
     fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor>;
 
+    /// Set an override function for creating gRPC client endpoints.
     fn with_ballista_override_create_grpc_client_endpoint(
         self,
         override_f: EndpointOverrideFn,
     ) -> Self;
 
+    /// Get the override function for creating gRPC client endpoints.
     fn ballista_override_create_grpc_client_endpoint(
         &self,
     ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
@@ -187,6 +189,34 @@ pub trait SessionConfigExt {
     /// - `ShuffleFormat::ArrowIpc` (default) - Standard Arrow IPC format
     /// - `ShuffleFormat::Vortex` - Vortex columnar format (requires 'vortex' feature)
     fn with_ballista_shuffle_format(self, format: ShuffleFormat) -> Self;
+
+    /// Set a callback for recording shuffle read metrics (local vs remote).
+    ///
+    /// This callback will be invoked by the shuffle reader during execution
+    /// to record detailed metrics about local and remote shuffle reads.
+    fn with_ballista_shuffle_read_metrics_callback(
+        self,
+        callback: Arc<dyn ShuffleReadMetricsCallback>,
+    ) -> Self;
+
+    /// Get the shuffle read metrics callback if one has been set.
+    fn ballista_shuffle_read_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ShuffleReadMetricsCallback>>;
+
+    /// Set a callback for recording result fetch metrics.
+    ///
+    /// This callback will be invoked by `DistributedQueryExec` when fetching
+    /// final query results from executors.
+    fn with_ballista_result_fetch_metrics_callback(
+        self,
+        callback: Arc<dyn ResultFetchMetricsCallback>,
+    ) -> Self;
+
+    /// Get the result fetch metrics callback if one has been set.
+    fn ballista_result_fetch_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ResultFetchMetricsCallback>>;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -488,6 +518,36 @@ impl SessionConfigExt for SessionConfig {
                 .set_str(BALLISTA_SHUFFLE_FORMAT, &format.to_string())
         }
     }
+
+    fn with_ballista_shuffle_read_metrics_callback(
+        self,
+        callback: Arc<dyn ShuffleReadMetricsCallback>,
+    ) -> Self {
+        let extension = ShuffleReadMetricsCallbackExtension::new(callback);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_shuffle_read_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ShuffleReadMetricsCallback>> {
+        self.get_extension::<ShuffleReadMetricsCallbackExtension>()
+            .map(|ext| ext.callback())
+    }
+
+    fn with_ballista_result_fetch_metrics_callback(
+        self,
+        callback: Arc<dyn ResultFetchMetricsCallback>,
+    ) -> Self {
+        let extension = ResultFetchMetricsCallbackExtension::new(callback);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_result_fetch_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ResultFetchMetricsCallback>> {
+        self.get_extension::<ResultFetchMetricsCallbackExtension>()
+            .map(|ext| ext.callback())
+    }
 }
 
 impl SessionConfigHelperExt for SessionConfig {
@@ -635,6 +695,7 @@ pub struct BallistaGrpcMetadataInterceptor {
 }
 
 impl BallistaGrpcMetadataInterceptor {
+    /// Create a new interceptor with additional metadata to be added to requests.
     pub fn new(additional_metadata: HashMap<String, String>) -> Self {
         Self {
             additional_metadata,
@@ -665,16 +726,19 @@ impl Interceptor for BallistaGrpcMetadataInterceptor {
     }
 }
 
+/// Wrapper for gRPC endpoint configuration override function.
 #[derive(Clone)]
 pub struct BallistaConfigGrpcEndpoint {
     override_f: EndpointOverrideFn,
 }
 
 impl BallistaConfigGrpcEndpoint {
+    /// Create a new endpoint configuration with the given override function.
     pub fn new(override_f: EndpointOverrideFn) -> Self {
         Self { override_f }
     }
 
+    /// Configure an endpoint using the override function.
     pub fn configure_endpoint(
         &self,
         endpoint: Endpoint,
@@ -686,6 +750,133 @@ impl BallistaConfigGrpcEndpoint {
 /// Wrapper for cluster-wide TLS configuration
 #[derive(Clone, Copy)]
 pub struct BallistaUseTls(pub bool);
+
+/// Callback trait for recording shuffle read metrics from the shuffle reader.
+///
+/// This trait is designed to be passed via session config extension to the
+/// shuffle reader, allowing external systems (like Spice) to capture detailed
+/// shuffle read locality metrics without creating circular dependencies.
+pub trait ShuffleReadMetricsCallback: Send + Sync {
+    /// Record a local shuffle read operation.
+    ///
+    /// Called when the shuffle reader successfully reads data from a local file
+    /// (i.e., the partition was produced by this executor).
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The stage that is reading the shuffle data
+    /// * `partition` - The partition being read
+    /// * `source_executor_id` - The executor that produced the shuffle data (same as current executor for local reads)
+    /// * `bytes` - Number of bytes read
+    /// * `rows` - Number of rows read
+    /// * `duration_ms` - Time taken to read the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_local_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
+    /// Record a remote shuffle read operation.
+    ///
+    /// Called when the shuffle reader fetches data from a remote executor
+    /// via Arrow Flight.
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The stage that is reading the shuffle data
+    /// * `partition` - The partition being read
+    /// * `source_executor_id` - The executor that produced the shuffle data
+    /// * `bytes` - Number of bytes read
+    /// * `rows` - Number of rows read
+    /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_remote_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+}
+
+/// Session config extension wrapper for the shuffle read metrics callback.
+#[derive(Clone)]
+pub struct ShuffleReadMetricsCallbackExtension {
+    callback: Arc<dyn ShuffleReadMetricsCallback>,
+}
+
+impl ShuffleReadMetricsCallbackExtension {
+    /// Create a new extension wrapping the provided callback.
+    pub fn new(callback: Arc<dyn ShuffleReadMetricsCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Get the callback.
+    pub fn callback(&self) -> Arc<dyn ShuffleReadMetricsCallback> {
+        Arc::clone(&self.callback)
+    }
+}
+
+/// Callback trait for recording result fetch metrics from distributed query execution.
+///
+/// This trait is designed to be passed via session config extension to the
+/// `DistributedQueryExec`, allowing external systems (like Spice) to capture detailed
+/// metrics about fetching final query results from executors.
+///
+/// Note: Result fetching is always "remote" from the client's perspective since
+/// the client (scheduler in Spice's case) always fetches from executors over the network.
+pub trait ResultFetchMetricsCallback: Send + Sync {
+    /// Record a result fetch operation from an executor.
+    ///
+    /// Called when the client successfully fetches final query result data from an executor.
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The final stage that produced the results
+    /// * `partition` - The partition being fetched
+    /// * `source_executor_id` - The executor that produced the result data
+    /// * `bytes` - Number of bytes fetched
+    /// * `rows` - Number of rows fetched
+    /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_result_fetch(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+}
+
+/// Session config extension wrapper for the result fetch metrics callback.
+#[derive(Clone)]
+pub struct ResultFetchMetricsCallbackExtension {
+    callback: Arc<dyn ResultFetchMetricsCallback>,
+}
+
+impl ResultFetchMetricsCallbackExtension {
+    /// Create a new extension wrapping the provided callback.
+    pub fn new(callback: Arc<dyn ResultFetchMetricsCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Get the callback.
+    pub fn callback(&self) -> Arc<dyn ResultFetchMetricsCallback> {
+        Arc::clone(&self.callback)
+    }
+}
 
 #[cfg(test)]
 mod test {

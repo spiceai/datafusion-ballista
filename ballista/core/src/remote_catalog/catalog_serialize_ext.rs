@@ -22,13 +22,16 @@ use futures::StreamExt;
 use futures::stream;
 use std::sync::Arc;
 
-/// Used to serialize catalog schemas and names to ship to Ballista clients
+/// Extension trait for serializing catalog schemas and names to ship to Ballista clients.
 #[async_trait::async_trait]
 pub trait CatalogSerializeExt {
+    /// Serialize all catalogs in the session context.
     async fn serialize_catalogs(&self) -> Vec<CatalogInfo>;
 
+    /// Serialize a specific catalog by name.
     async fn serialize_catalog(&self, name: &str) -> Option<CatalogInfo>;
 
+    /// Serialize a specific schema within a catalog.
     async fn serialize_schema(
         &self,
         name: &str,

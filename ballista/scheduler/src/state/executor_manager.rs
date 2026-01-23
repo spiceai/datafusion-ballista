@@ -22,12 +22,11 @@ use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
 use log::trace;
 
-use crate::cluster::{BoundTask, ClusterState, ExecutorSlot};
+use crate::cluster::{BindingResult, ClusterState, ExecutorSlot};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;
 use crate::state::task_manager::JobInfoCache;
-use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::executor_grpc_client::ExecutorGrpcClient;
 use ballista_core::serde::protobuf::{
     CancelTasksParams, ExecutorHeartbeat, MultiTaskDefinition, RemoveJobDataParams,
@@ -35,9 +34,7 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 
-use ballista_core::utils::{
-    GrpcClientConfig, create_grpc_client_endpoint, get_time_before,
-};
+use ballista_core::utils::{create_grpc_client_endpoint, get_time_before};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
@@ -65,8 +62,6 @@ pub struct ExecutorManager {
     clients: ExecutorClients,
     /// Jobs pending cleanup on each executor.
     pending_cleanup_jobs: Arc<DashMap<String, HashSet<String>>>,
-    /// Configuration for gRPC client connections.
-    grpc_client_config: GrpcClientConfig,
 }
 
 impl ExecutorManager {
@@ -75,20 +70,11 @@ impl ExecutorManager {
         cluster_state: Arc<dyn ClusterState>,
         config: Arc<SchedulerConfig>,
     ) -> Self {
-        let grpc_client_config =
-            if let Some(config_producer) = &config.override_config_producer {
-                let session_config = config_producer();
-                let ballista_config = session_config.ballista_config();
-                GrpcClientConfig::from(&ballista_config)
-            } else {
-                GrpcClientConfig::default()
-            };
         Self {
             cluster_state,
             config,
             clients: Default::default(),
             pending_cleanup_jobs: Default::default(),
-            grpc_client_config,
         }
     }
 
@@ -101,19 +87,19 @@ impl ExecutorManager {
 
     /// Binds ready-to-run tasks from active jobs to available executor slots.
     ///
-    /// Returns a list of bound tasks that can be launched on executors.
+    /// Returns a binding result containing bound tasks and shuffle affinity info.
     pub async fn bind_schedulable_tasks(
         &self,
         running_jobs: Arc<HashMap<String, JobInfoCache>>,
-    ) -> Result<Vec<BoundTask>> {
+    ) -> Result<BindingResult> {
         if running_jobs.is_empty() {
             debug!("There's no active jobs for binding tasks");
-            return Ok(vec![]);
+            return Ok(BindingResult::new());
         }
         let alive_executors = self.get_alive_executors();
         if alive_executors.is_empty() {
             debug!("There's no alive executors for binding tasks");
-            return Ok(vec![]);
+            return Ok(BindingResult::new());
         }
         self.cluster_state
             .bind_schedulable_tasks(
@@ -149,10 +135,7 @@ impl ExecutorManager {
         let executor_manager = self.clone();
         tokio::spawn(async move {
             for (executor_id, infos) in tasks_to_cancel {
-                if let Ok(mut client) = executor_manager
-                    .get_client(&executor_id, &executor_manager.grpc_client_config)
-                    .await
-                {
+                if let Ok(mut client) = executor_manager.get_client(&executor_id).await {
                     if let Err(e) = client
                         .cancel_tasks(CancelTasksParams { task_infos: infos })
                         .await
@@ -209,9 +192,7 @@ impl ExecutorManager {
             let job_id_clone = job_id.to_owned();
 
             if self.config.is_push_staged_scheduling() {
-                if let Ok(mut client) =
-                    self.get_client(&executor, &self.grpc_client_config).await
-                {
+                if let Ok(mut client) = self.get_client(&executor).await {
                     tokio::spawn(async move {
                         if let Err(err) = client
                             .remove_job_data(RemoveJobDataParams {
@@ -310,10 +291,7 @@ impl ExecutorManager {
     /// Sends a stop request to the specified executor.
     pub async fn stop_executor(&self, executor_id: &str, stop_reason: String) {
         let executor_id = executor_id.to_string();
-        match self
-            .get_client(&executor_id, &self.grpc_client_config)
-            .await
-        {
+        match self.get_client(&executor_id).await {
             Ok(mut client) => {
                 tokio::task::spawn(async move {
                     match client
@@ -346,9 +324,7 @@ impl ExecutorManager {
         multi_tasks: Vec<MultiTaskDefinition>,
         scheduler_id: String,
     ) -> Result<()> {
-        let mut client = self
-            .get_client(executor_id, &self.grpc_client_config)
-            .await?;
+        let mut client = self.get_client(executor_id).await?;
         client
             .launch_multi_task(protobuf::LaunchMultiTaskParams {
                 multi_tasks,
@@ -460,11 +436,7 @@ impl ExecutorManager {
             .collect::<Vec<_>>()
     }
 
-    async fn get_client(
-        &self,
-        executor_id: &str,
-        _grpc_client_config: &GrpcClientConfig,
-    ) -> Result<ExecutorGrpcClient<Channel>> {
+    async fn get_client(&self, executor_id: &str) -> Result<ExecutorGrpcClient<Channel>> {
         let client = self.clients.get(executor_id).map(|value| value.clone());
 
         if let Some(client) = client {

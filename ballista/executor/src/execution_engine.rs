@@ -72,6 +72,12 @@ pub trait QueryStageExecutor: Sync + Send + Debug + Display {
 
     /// Collects execution metrics from all operators in the plan.
     fn collect_plan_metrics(&self) -> Vec<MetricsSet>;
+
+    /// Returns a reference to the underlying execution plan.
+    ///
+    /// This is used to walk the plan tree and extract metrics from specific
+    /// operators like ShuffleReaderExec.
+    fn plan(&self) -> &dyn ExecutionPlan;
 }
 
 /// Default execution engine using DataFusion's ShuffleWriterExec.
@@ -161,5 +167,9 @@ impl QueryStageExecutor for DefaultQueryStageExec {
 
     fn collect_plan_metrics(&self) -> Vec<MetricsSet> {
         utils::collect_plan_metrics(&self.shuffle_writer)
+    }
+
+    fn plan(&self) -> &dyn ExecutionPlan {
+        &self.shuffle_writer
     }
 }

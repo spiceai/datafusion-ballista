@@ -25,8 +25,9 @@ use datafusion::prelude::SessionContext;
 use datafusion_proto_common::ArrowType;
 use std::collections::HashSet;
 
-/// Used to serialize function shapes to ship to Ballista clients
+/// Extension trait for serializing function signatures to ship to Ballista clients.
 pub trait RemoteFunctionSerializeExt {
+    /// Serialize all user-defined scalar functions in the session context.
     fn serialize_udfs(&self) -> Vec<ScalarUdfInfo>;
 }
 

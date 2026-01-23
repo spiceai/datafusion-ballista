@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::client::BallistaClient;
-use crate::extension::{BallistaConfigGrpcEndpoint, SessionConfigExt};
+use crate::extension::{
+    BallistaConfigGrpcEndpoint, SessionConfigExt, ShuffleReadMetricsCallback,
+};
 use crate::serde::scheduler::{PartitionLocation, PartitionStats};
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -164,6 +166,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         let prefer_flight = config.ballista_shuffle_reader_remote_prefer_flight();
         let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
         let use_tls = config.ballista_use_tls();
+        let metrics_callback = config.ballista_shuffle_read_metrics_callback();
 
         if force_remote_read {
             debug!(
@@ -199,6 +202,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             prefer_flight,
             customize_endpoint,
             use_tls,
+            metrics_callback,
         );
 
         let result = RecordBatchStreamAdapter::new(
@@ -388,6 +392,7 @@ fn local_remote_read_split(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_fetch_partitions(
     partition_locations: Vec<PartitionLocation>,
     max_request_num: usize,
@@ -396,6 +401,7 @@ fn send_fetch_partitions(
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
+    metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
     let semaphore = Arc::new(Semaphore::new(max_request_num));
@@ -413,8 +419,10 @@ fn send_fetch_partitions(
     // keep local shuffle files reading in serial order for memory control.
     let response_sender_c = response_sender.clone();
     let customize_endpoint_c = customize_endpoint.clone();
+    let metrics_callback_c = metrics_callback.clone();
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in local_locations {
+            let start_time = std::time::Instant::now();
             let r = PartitionReaderEnum::Local
                 .fetch_partition(
                     &p,
@@ -424,6 +432,25 @@ fn send_fetch_partitions(
                     use_tls,
                 )
                 .await;
+
+            // Record local read metrics if callback is set and read succeeded
+            if r.is_ok()
+                && let Some(ref callback) = metrics_callback_c
+            {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let bytes = p.partition_stats.num_bytes().unwrap_or(0);
+                let rows = p.partition_stats.num_rows().unwrap_or(0);
+                callback.record_local_read(
+                    &p.partition_id.job_id,
+                    p.partition_id.stage_id,
+                    p.partition_id.partition_id,
+                    &p.executor_meta.id,
+                    bytes,
+                    rows,
+                    duration_ms,
+                );
+            }
+
             if let Err(e) = response_sender_c.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
@@ -434,9 +461,11 @@ fn send_fetch_partitions(
         let semaphore = semaphore.clone();
         let response_sender = response_sender.clone();
         let customize_endpoint_c = customize_endpoint.clone();
+        let metrics_callback_c = metrics_callback.clone();
         spawned_tasks.push(SpawnedTask::spawn(async move {
             // Block if exceeds max request number.
             let permit = semaphore.acquire_owned().await.unwrap();
+            let start_time = std::time::Instant::now();
             let r = PartitionReaderEnum::FlightRemote
                 .fetch_partition(
                     &p,
@@ -446,6 +475,25 @@ fn send_fetch_partitions(
                     use_tls,
                 )
                 .await;
+
+            // Record remote read metrics if callback is set and read succeeded
+            if r.is_ok()
+                && let Some(ref callback) = metrics_callback_c
+            {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let bytes = p.partition_stats.num_bytes().unwrap_or(0);
+                let rows = p.partition_stats.num_rows().unwrap_or(0);
+                callback.record_remote_read(
+                    &p.partition_id.job_id,
+                    p.partition_id.stage_id,
+                    p.partition_id.partition_id,
+                    &p.executor_meta.id,
+                    bytes,
+                    rows,
+                    duration_ms,
+                );
+            }
+
             // Block if the channel buffer is full.
             if let Err(e) = response_sender.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
@@ -1040,6 +1088,7 @@ mod tests {
             true,
             None,
             false,
+            None, // No metrics callback in tests
         );
 
         let stream = RecordBatchStreamAdapter::new(
