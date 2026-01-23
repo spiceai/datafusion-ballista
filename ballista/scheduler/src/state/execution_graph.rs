@@ -2944,7 +2944,10 @@ mod test {
         }
 
         // Verify we got tasks from multiple stages
-        assert!(!stages_and_flags.is_empty(), "Should have at least one task");
+        assert!(
+            !stages_and_flags.is_empty(),
+            "Should have at least one task"
+        );
 
         // Get unique stage IDs
         let unique_stages: HashSet<usize> =

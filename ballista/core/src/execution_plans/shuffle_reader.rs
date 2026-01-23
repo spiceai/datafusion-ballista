@@ -766,17 +766,20 @@ async fn fetch_partition_memory(
 
     // Remove and retrieve the partition data in one atomic operation
     // This ensures the memory is reclaimed as soon as the data is read
-    let data = shuffle_manager.remove_partition(key).ok_or_else(|| {
-        // If remove fails, try a regular get (for retry scenarios)
-        shuffle_manager.get_partition(key).map_err(|e| {
-            BallistaError::FetchFailed(
-                metadata.id.clone(),
-                partition_id.stage_id,
-                partition_id.partition_id,
-                e.to_string(),
-            )
+    let data = shuffle_manager
+        .remove_partition(key)
+        .ok_or_else(|| {
+            // If remove fails, try a regular get (for retry scenarios)
+            shuffle_manager.get_partition(key).map_err(|e| {
+                BallistaError::FetchFailed(
+                    metadata.id.clone(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    e.to_string(),
+                )
+            })
         })
-    }).or_else(|result| result)?;
+        .or_else(|result| result)?;
 
     debug!(
         "Fetched and removed partition {} from memory: {} batches, {} rows",

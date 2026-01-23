@@ -369,10 +369,8 @@ mod tests {
         // Store partitions for multiple stages in the same job
         for stage in 0..3 {
             for partition in 0..4 {
-                let key =
-                    InMemoryShuffleManager::partition_key("job1", stage, partition);
-                let data =
-                    ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+                let key = InMemoryShuffleManager::partition_key("job1", stage, partition);
+                let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                 manager.store_partition(key, data);
             }
         }
@@ -405,8 +403,7 @@ mod tests {
         for job in ["job1", "job2"] {
             for partition in 0..3 {
                 let key = InMemoryShuffleManager::partition_key(job, 1, partition);
-                let data =
-                    ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+                let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                 manager.store_partition(key, data);
             }
         }
