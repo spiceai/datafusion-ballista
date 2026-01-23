@@ -19,6 +19,7 @@
 //! Ballista configuration
 
 use std::result;
+use std::str::FromStr;
 use std::{collections::HashMap, fmt::Display};
 
 use crate::error::{BallistaError, Result};
@@ -45,6 +46,8 @@ pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
     "ballista.shuffle.remote_read_prefer_flight";
 /// Configuration key for shuffle storage mode (disk or memory).
 pub const BALLISTA_SHUFFLE_MEMORY_MODE: &str = "ballista.shuffle.memory_mode";
+/// Shuffle format configuration: "arrow_ipc" or "vortex"
+pub const BALLISTA_SHUFFLE_FORMAT: &str = "ballista.shuffle.format";
 
 /// Configuration key for gRPC client connection timeout in seconds.
 pub const BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS: &str =
@@ -106,13 +109,53 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL_SECONDS.to_string(),
                          "HTTP/2 keep-alive interval for gRPC client in seconds".to_string(),
                          DataType::UInt64,
-                         Some((300).to_string()))
+                         Some((300).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_FORMAT.to_string(),
+                         "Shuffle data format: 'arrow_ipc' (default) or 'vortex'. Vortex requires the 'vortex' feature to be enabled.".to_string(),
+                         DataType::Utf8,
+                         Some(ShuffleFormat::default().to_string()))
     ];
     entries
         .into_iter()
         .map(|e| (e.name.clone(), e))
         .collect::<HashMap<_, _>>()
 });
+
+/// Shuffle data format for intermediate shuffle files
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize,
+)]
+pub enum ShuffleFormat {
+    /// Arrow IPC format (default, always available)
+    #[default]
+    ArrowIpc,
+    /// Vortex columnar format (requires 'vortex' feature)
+    Vortex,
+}
+
+impl Display for ShuffleFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShuffleFormat::ArrowIpc => f.write_str("arrow_ipc"),
+            ShuffleFormat::Vortex => f.write_str("vortex"),
+        }
+    }
+}
+
+impl FromStr for ShuffleFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "arrow_ipc" | "arrow-ipc" | "arrowips" | "ipc" => Ok(ShuffleFormat::ArrowIpc),
+            "vortex" => Ok(ShuffleFormat::Vortex),
+            _ => Err(format!(
+                "Invalid shuffle format '{}'. Valid options are: 'arrow_ipc', 'vortex'",
+                s
+            )),
+        }
+    }
+}
 
 /// Configuration option meta-data
 #[derive(Debug, Clone)]
@@ -277,6 +320,17 @@ impl BallistaConfig {
     /// with sufficient memory.
     pub fn shuffle_memory_mode(&self) -> bool {
         self.get_bool_setting(BALLISTA_SHUFFLE_MEMORY_MODE)
+    }
+
+    /// Returns the configured shuffle format (ArrowIpc or Vortex)
+    ///
+    /// Note: Vortex format requires the 'vortex' feature to be enabled.
+    /// If Vortex is configured but the feature is not enabled, this will
+    /// still return Vortex, but the shuffle operations will fail at runtime.
+    pub fn shuffle_format(&self) -> ShuffleFormat {
+        self.get_string_setting(BALLISTA_SHUFFLE_FORMAT)
+            .parse()
+            .unwrap_or_default()
     }
 
     fn get_usize_setting(&self, key: &str) -> usize {

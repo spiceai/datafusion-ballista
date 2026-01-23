@@ -17,8 +17,9 @@
 
 //! ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 //! can be executed as one unit with each partition being executed in parallel. The output of each
-//! partition is re-partitioned and streamed to disk in Arrow IPC format. Future stages of the query
-//! will use the ShuffleReaderExec to read these results.
+//! partition is re-partitioned and streamed to disk in Arrow IPC format (default) or Vortex format.
+//! The shuffle format is configurable. Future stages of the query will use the ShuffleReaderExec
+//! to read these results.
 
 use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
@@ -34,6 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::config::ShuffleFormat;
 use crate::execution_plans::shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, global_shuffle_manager,
 };
@@ -106,10 +108,96 @@ impl std::fmt::Display for ShuffleWriterExec {
     }
 }
 
+/// Writer for Arrow IPC format
+pub struct ArrowIpcWriter {
+    writer: StreamWriter<File>,
+}
+
+impl ArrowIpcWriter {
+    pub fn try_new(
+        file: File,
+        schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Result<Self> {
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
+        let writer = StreamWriter::try_new_with_options(file, schema, options)?;
+        Ok(Self { writer })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.writer.write(batch)?;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        self.writer.finish()?;
+        Ok(())
+    }
+}
+
+/// Format-agnostic shuffle writer enum
+pub enum ShuffleFileWriter {
+    ArrowIpc(ArrowIpcWriter),
+    #[cfg(feature = "vortex")]
+    Vortex(super::vortex_shuffle::VortexWriteTracker),
+}
+
+impl ShuffleFileWriter {
+    pub fn try_new_arrow_ipc(
+        path: PathBuf,
+        schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Result<Self> {
+        let file = File::create(&path)?;
+        Ok(Self::ArrowIpc(ArrowIpcWriter::try_new(file, schema)?))
+    }
+
+    #[cfg(feature = "vortex")]
+    pub fn try_new_vortex(
+        path: PathBuf,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+    ) -> Result<Self> {
+        let tracker = super::vortex_shuffle::VortexWriteTracker::try_new(path, schema)?;
+        Ok(Self::Vortex(tracker))
+    }
+
+    pub fn try_new(
+        path: PathBuf,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        format: ShuffleFormat,
+    ) -> Result<Self> {
+        match format {
+            ShuffleFormat::ArrowIpc => Self::try_new_arrow_ipc(path, schema.as_ref()),
+            #[cfg(feature = "vortex")]
+            ShuffleFormat::Vortex => Self::try_new_vortex(path, schema),
+            #[cfg(not(feature = "vortex"))]
+            ShuffleFormat::Vortex => Err(DataFusionError::NotImplemented(
+                "Vortex format requires the 'vortex' feature to be enabled".to_string(),
+            )),
+        }
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        match self {
+            Self::ArrowIpc(w) => w.write(batch),
+            #[cfg(feature = "vortex")]
+            Self::Vortex(w) => w.write(batch),
+        }
+    }
+
+    pub fn finish(self) -> Result<()> {
+        match self {
+            Self::ArrowIpc(mut w) => w.finish(),
+            #[cfg(feature = "vortex")]
+            Self::Vortex(w) => w.finish(),
+        }
+    }
+}
+
+/// Tracks write progress for a partition
 pub struct WriteTracker {
     pub num_batches: usize,
     pub num_rows: usize,
-    pub writer: StreamWriter<File>,
+    pub writer: ShuffleFileWriter,
     pub path: PathBuf,
 }
 
@@ -224,6 +312,10 @@ impl ShuffleWriterExec {
         // Check if memory mode is enabled
         let memory_mode = context.session_config().ballista_shuffle_memory_mode();
 
+        // Get shuffle format from session config
+        let shuffle_format = context.session_config().ballista_shuffle_format();
+        let file_ext = utils::shuffle_file_extension(shuffle_format);
+
         async move {
             let now = Instant::now();
             let mut stream = plan.execute(input_partition, context)?;
@@ -241,7 +333,7 @@ impl ShuffleWriterExec {
                 )
                 .await
             } else {
-                // Use disk-based shuffle storage
+                // Use disk-based shuffle storage with configurable format
                 Self::execute_shuffle_write_disk(
                     path,
                     input_partition,
@@ -249,6 +341,8 @@ impl ShuffleWriterExec {
                     output_partitioning,
                     write_metrics,
                     now,
+                    shuffle_format,
+                    file_ext,
                 )
                 .await
             }
@@ -265,21 +359,27 @@ impl ShuffleWriterExec {
         output_partitioning: Option<Partitioning>,
         write_metrics: ShuffleWriteMetrics,
         now: Instant,
+        shuffle_format: ShuffleFormat,
+        file_ext: &str,
     ) -> Result<Vec<ShuffleWritePartition>> {
         match output_partitioning {
             None => {
                 let timer = write_metrics.write_time.timer();
                 path.push(format!("{input_partition}"));
                 std::fs::create_dir_all(&path)?;
-                path.push("data.arrow");
+                path.push(format!("data.{file_ext}"));
                 let path = path.to_str().unwrap();
-                debug!("Writing results to {path}");
+                debug!("Writing results to {path} (format: {shuffle_format})");
 
-                // stream results to disk
-                let stats =
-                    utils::write_stream_to_disk(stream, path, &write_metrics.write_time)
-                        .await
-                        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+                // stream results to disk using configured format
+                let stats = utils::write_stream_to_disk_with_format(
+                    stream,
+                    path,
+                    &write_metrics.write_time,
+                    shuffle_format,
+                )
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
                 write_metrics
                     .input_rows
@@ -318,6 +418,8 @@ impl ShuffleWriterExec {
                     write_metrics.repart_time.clone(),
                 )?;
 
+                let schema = stream.schema();
+
                 while let Some(result) = stream.next().await {
                     let input_batch = result?;
 
@@ -335,23 +437,19 @@ impl ShuffleWriterExec {
                                     w.writer.write(&output_batch)?;
                                 }
                                 None => {
-                                    let mut path = path.clone();
-                                    path.push(format!("{output_partition}"));
-                                    std::fs::create_dir_all(&path)?;
+                                    let mut file_path = path.clone();
+                                    file_path.push(format!("{output_partition}"));
+                                    std::fs::create_dir_all(&file_path)?;
 
-                                    path.push(format!("data-{input_partition}.arrow"));
-                                    debug!("Writing results to {path:?}");
+                                    file_path.push(format!(
+                                        "data-{input_partition}.{file_ext}"
+                                    ));
+                                    debug!("Writing results to {file_path:?} (format: {shuffle_format})");
 
-                                    let options = IpcWriteOptions::default()
-                                        .try_with_compression(Some(
-                                            CompressionType::LZ4_FRAME,
-                                        ))?;
-
-                                    let file = File::create(path.clone())?;
-                                    let mut writer = StreamWriter::try_new_with_options(
-                                        file,
-                                        stream.schema().as_ref(),
-                                        options,
+                                    let mut writer = ShuffleFileWriter::try_new(
+                                        file_path.clone(),
+                                        schema.clone(),
+                                        shuffle_format,
                                     )?;
 
                                     writer.write(&output_batch)?;
@@ -359,7 +457,7 @@ impl ShuffleWriterExec {
                                         num_batches: 1,
                                         num_rows: output_batch.num_rows(),
                                         writer,
-                                        path,
+                                        path: file_path,
                                     });
                                 }
                             }
@@ -372,8 +470,8 @@ impl ShuffleWriterExec {
 
                 let mut part_locs = vec![];
 
-                for (i, w) in writers.iter_mut().enumerate() {
-                    if let Some(w) = w {
+                for (i, w) in writers.into_iter().enumerate() {
+                    if let Some(mut w) = w {
                         let num_bytes = fs::metadata(&w.path)?.len();
                         w.writer.finish()?;
                         debug!(

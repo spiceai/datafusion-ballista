@@ -62,7 +62,7 @@ use std::{
 use structopt::StructOpt;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "snmalloc")]
+#[cfg(all(feature = "snmalloc", not(feature = "mimalloc")))]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 

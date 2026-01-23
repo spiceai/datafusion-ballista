@@ -24,6 +24,9 @@ mod shuffle_reader;
 mod shuffle_writer;
 mod unresolved_shuffle;
 
+#[cfg(feature = "vortex")]
+pub mod vortex_shuffle;
+
 pub use distributed_query::DistributedQueryExec;
 pub use shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, ShufflePartitionKey,
@@ -32,3 +35,9 @@ pub use shuffle_manager::{
 pub use shuffle_reader::ShuffleReaderExec;
 pub use shuffle_writer::ShuffleWriterExec;
 pub use unresolved_shuffle::UnresolvedShuffleExec;
+
+#[cfg(feature = "vortex")]
+pub use vortex_shuffle::{
+    LocalVortexShuffleStream, VortexWriteTracker, vortex_file_extension,
+    write_stream_to_disk_vortex,
+};

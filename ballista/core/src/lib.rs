@@ -52,12 +52,10 @@ pub mod object_store;
 pub mod planner;
 /// Runtime registry for codec and function registration.
 pub mod registry;
+/// Remote catalog for distributed function and table registration.
+pub mod remote_catalog;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
-
-/// Remote catalog serialization and stub providers for Ballista clients.
-pub mod remote_catalog;
-
 /// General utility functions for Ballista operations.
 pub mod utils;
 

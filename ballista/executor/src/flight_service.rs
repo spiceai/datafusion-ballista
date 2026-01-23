@@ -17,9 +17,11 @@
 
 //! Implementation of the Apache Arrow Flight protocol that wraps an executor.
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
 use std::convert::TryFrom;
 use std::fs::File;
+use std::path::Path;
 use std::pin::Pin;
 use tokio_util::io::ReaderStream;
 
@@ -97,8 +99,6 @@ impl FlightService for BallistaFlightService {
 
         match &action {
             BallistaAction::FetchPartition { path, .. } => {
-                debug!("FetchPartition reading {path}");
-
                 // Check if this is an in-memory partition
                 if let Some(key) = path.strip_prefix("memory://") {
                     // Fetch from in-memory shuffle manager
@@ -142,24 +142,29 @@ impl FlightService for BallistaFlightService {
                 }
 
                 // Handle disk-based partition
-                let file = File::open(path)
-                    .map_err(|e| {
-                        BallistaError::General(format!(
-                            "Failed to open partition file at {path}: {e:?}"
-                        ))
-                    })
-                    .map_err(|e| from_ballista_err(&e))?;
-                let file = BufReader::new(file);
-                let reader =
-                    StreamReader::try_new(file, None).map_err(|e| from_arrow_err(&e))?;
+                // Detect shuffle format based on file extension
+                let is_vortex = Path::new(path)
+                    .extension()
+                    .map(|ext| ext == "vortex")
+                    .unwrap_or(false);
 
-                let (tx, rx) = channel(2);
-                let schema = reader.schema();
-                task::spawn_blocking(move || {
-                    if let Err(e) = read_partition(reader, tx) {
-                        log::warn!("error streaming shuffle partition: {e}");
+                let format = if is_vortex { "vortex" } else { "arrow-ipc" };
+                debug!("FetchPartition reading {path} (format: {format})");
+
+                let (schema, rx) = if is_vortex {
+                    #[cfg(feature = "vortex")]
+                    {
+                        read_vortex_partition(path)?
                     }
-                });
+                    #[cfg(not(feature = "vortex"))]
+                    {
+                        return Err(Status::unimplemented(
+                            "Vortex format is not available. Enable the 'vortex' feature.",
+                        ));
+                    }
+                } else {
+                    read_arrow_ipc_partition(path)?
+                };
 
                 let write_options: IpcWriteOptions = IpcWriteOptions::default()
                     .try_with_compression(Some(CompressionType::LZ4_FRAME))
@@ -370,7 +375,157 @@ impl FlightService for BallistaFlightService {
     }
 }
 
-fn read_partition<T>(
+/// Read an Arrow IPC partition file and return the schema and a receiver for record batches
+fn read_arrow_ipc_partition(
+    path: &str,
+) -> Result<
+    (
+        SchemaRef,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, FlightError>>,
+    ),
+    Status,
+> {
+    let file = File::open(path)
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to open partition file at {path}: {e:?}"
+            ))
+        })
+        .map_err(|e| from_ballista_err(&e))?;
+    let file = BufReader::new(file);
+    let reader = StreamReader::try_new(file, None).map_err(|e| from_arrow_err(&e))?;
+
+    let (tx, rx) = channel(2);
+    let schema = reader.schema();
+    task::spawn_blocking(move || {
+        if let Err(e) = read_arrow_ipc_batches(reader, tx) {
+            log::warn!("error streaming Arrow IPC shuffle partition: {e}");
+        }
+    });
+
+    Ok((schema, rx))
+}
+
+/// Read Vortex partition file and return the schema and a receiver for record batches
+#[cfg(feature = "vortex")]
+fn read_vortex_partition(
+    path: &str,
+) -> Result<
+    (
+        SchemaRef,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, FlightError>>,
+    ),
+    Status,
+> {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use vortex_array::ArrayRef;
+    use vortex_array::iter::ArrayIterator;
+    use vortex_array::session::ArraySession;
+    use vortex_ipc::iterator::SyncIPCReader;
+
+    let file = File::open(path)
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to open Vortex partition file at {path}: {e:?}"
+            ))
+        })
+        .map_err(|e| from_ballista_err(&e))?;
+
+    let mut buf_reader = BufReader::new(file);
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut buf_reader, &mut data).map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to read Vortex file at {path}: {e:?}"
+        )))
+    })?;
+
+    // Create default registry with all canonical encodings
+    let session = ArraySession::default();
+    let registry = session.registry().clone();
+
+    // Read IPC data
+    let cursor = Cursor::new(data);
+    let reader = SyncIPCReader::try_new(cursor, registry).map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to create Vortex IPC reader at {path}: {e:?}"
+        )))
+    })?;
+
+    // Get schema from IPC header via ArrayIterator::dtype() method
+    // This is stored in the Vortex IPC format header, not inferred from data
+    let dtype = reader.dtype().clone();
+    let arrow_schema = dtype.to_arrow_schema().map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to convert Vortex DType to Arrow schema: {e:?}"
+        )))
+    })?;
+    let schema = Arc::new(arrow_schema);
+
+    let arrays: Vec<ArrayRef> = reader
+        .map(|r| {
+            r.map_err(|e| {
+                from_ballista_err(&BallistaError::General(format!(
+                    "Failed to read Vortex array: {e:?}"
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (tx, rx) = channel(2);
+    task::spawn_blocking(move || {
+        if let Err(e) = read_vortex_batches(arrays, tx) {
+            log::warn!("error streaming Vortex shuffle partition: {e}");
+        }
+    });
+
+    Ok((schema, rx))
+}
+
+/// Read Vortex arrays and send them as record batches
+#[cfg(feature = "vortex")]
+fn read_vortex_batches(
+    arrays: Vec<vortex_array::ArrayRef>,
+    tx: Sender<Result<RecordBatch, FlightError>>,
+) -> Result<(), FlightError> {
+    use vortex_array::arrow::IntoArrowArray;
+
+    if tx.is_closed() {
+        return Err(FlightError::Tonic(Box::new(Status::internal(
+            "Can't send a batch, channel is closed",
+        ))));
+    }
+
+    for array in arrays {
+        let arrow_array = array
+            .into_arrow_preferred()
+            .map_err(|e| FlightError::Arrow(ArrowError::ExternalError(Box::new(e))))?;
+
+        let struct_array = arrow_array
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StructArray>()
+            .ok_or_else(|| {
+                FlightError::Arrow(ArrowError::InvalidArgumentError(
+                    "Expected StructArray from Vortex".to_string(),
+                ))
+            })?;
+
+        let batch = RecordBatch::from(struct_array);
+
+        tx.blocking_send(Ok(batch)).map_err(|err| {
+            if let SendError(Err(err)) = err {
+                err
+            } else {
+                FlightError::Tonic(Box::new(Status::internal(format!(
+                    "Can't send a batch, something went wrong: {err:?}"
+                ))))
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn read_arrow_ipc_batches<T>(
     reader: StreamReader<std::io::BufReader<T>>,
     tx: Sender<Result<RecordBatch, FlightError>>,
 ) -> Result<(), FlightError>
