@@ -212,6 +212,31 @@ impl InMemoryShuffleManager {
         log::debug!("Removed all shuffle partitions for job: {job_id}");
     }
 
+    /// Removes all partitions for a given stage within a job.
+    ///
+    /// This is called when a stage's output has been fully consumed by the next stage,
+    /// allowing the memory to be reclaimed immediately rather than waiting for job completion.
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The stage identifier
+    ///
+    /// # Returns
+    /// The number of partitions that were removed
+    pub fn remove_stage_partitions(&self, job_id: &str, stage_id: usize) -> usize {
+        let prefix = format!("{job_id}/{stage_id}/");
+        let initial_count = self.partitions.len();
+        self.partitions.retain(|k, _| !k.starts_with(&prefix));
+        let removed = initial_count - self.partitions.len();
+        log::debug!(
+            "Removed {} shuffle partitions for stage: {}/{}",
+            removed,
+            job_id,
+            stage_id
+        );
+        removed
+    }
+
     /// Returns the total number of partitions stored in memory.
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
@@ -333,5 +358,134 @@ mod tests {
     fn test_hash_partition_key() {
         let key = InMemoryShuffleManager::hash_partition_key("job1", 1, 2, 3);
         assert_eq!(key, "job1/1/2/data-3");
+    }
+
+    #[test]
+    fn test_remove_stage_partitions() {
+        let manager = InMemoryShuffleManager::new();
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        // Store partitions for multiple stages in the same job
+        for stage in 0..3 {
+            for partition in 0..4 {
+                let key =
+                    InMemoryShuffleManager::partition_key("job1", stage, partition);
+                let data =
+                    ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+                manager.store_partition(key, data);
+            }
+        }
+
+        assert_eq!(manager.partition_count(), 12);
+
+        // Remove stage 1 partitions
+        let removed = manager.remove_stage_partitions("job1", 1);
+        assert_eq!(removed, 4);
+        assert_eq!(manager.partition_count(), 8);
+
+        // Verify stage 0 and 2 partitions still exist
+        let key0 = InMemoryShuffleManager::partition_key("job1", 0, 0);
+        let key2 = InMemoryShuffleManager::partition_key("job1", 2, 0);
+        assert!(manager.contains_partition(&key0));
+        assert!(manager.contains_partition(&key2));
+
+        // Verify stage 1 partitions are gone
+        let key1 = InMemoryShuffleManager::partition_key("job1", 1, 0);
+        assert!(!manager.contains_partition(&key1));
+    }
+
+    #[test]
+    fn test_remove_stage_partitions_different_jobs() {
+        let manager = InMemoryShuffleManager::new();
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        // Store partitions for stage 1 in two different jobs
+        for job in ["job1", "job2"] {
+            for partition in 0..3 {
+                let key = InMemoryShuffleManager::partition_key(job, 1, partition);
+                let data =
+                    ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+                manager.store_partition(key, data);
+            }
+        }
+
+        assert_eq!(manager.partition_count(), 6);
+
+        // Remove stage 1 from job1 only
+        let removed = manager.remove_stage_partitions("job1", 1);
+        assert_eq!(removed, 3);
+        assert_eq!(manager.partition_count(), 3);
+
+        // Verify job2 stage 1 partitions still exist
+        let key = InMemoryShuffleManager::partition_key("job2", 1, 0);
+        assert!(manager.contains_partition(&key));
+    }
+
+    #[test]
+    fn test_remove_partition_returns_data() {
+        let manager = InMemoryShuffleManager::new();
+        let batch = create_test_batch();
+        let schema = batch.schema();
+        let data = ShufflePartitionData::new(schema.clone(), vec![batch]);
+
+        let key = InMemoryShuffleManager::partition_key("job1", 1, 0);
+        manager.store_partition(key.clone(), data);
+
+        assert!(manager.contains_partition(&key));
+
+        // Remove should return the data
+        let removed = manager.remove_partition(&key);
+        assert!(removed.is_some());
+        let removed_data = removed.unwrap();
+        assert_eq!(removed_data.num_rows, 3);
+        assert_eq!(removed_data.num_batches, 1);
+
+        // Partition should no longer exist
+        assert!(!manager.contains_partition(&key));
+
+        // Second remove should return None
+        let removed_again = manager.remove_partition(&key);
+        assert!(removed_again.is_none());
+    }
+
+    #[test]
+    fn test_total_memory_usage() {
+        let manager = InMemoryShuffleManager::new();
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        // Store multiple partitions
+        for i in 0..3 {
+            let key = InMemoryShuffleManager::partition_key("job1", 1, i);
+            let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+            manager.store_partition(key, data);
+        }
+
+        // Memory usage should be > 0
+        let usage = manager.total_memory_usage();
+        assert!(usage > 0);
+
+        // Remove partitions and verify usage decreases
+        manager.remove_job_partitions("job1");
+        assert_eq!(manager.total_memory_usage(), 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let manager = InMemoryShuffleManager::new();
+        let batch = create_test_batch();
+        let schema = batch.schema();
+
+        for i in 0..5 {
+            let key = InMemoryShuffleManager::partition_key("job1", 1, i);
+            let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
+            manager.store_partition(key, data);
+        }
+
+        assert_eq!(manager.partition_count(), 5);
+        manager.clear();
+        assert_eq!(manager.partition_count(), 0);
     }
 }

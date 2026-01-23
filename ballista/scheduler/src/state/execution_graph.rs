@@ -29,6 +29,7 @@ use log::{debug, error, info, warn};
 
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{FailedJob, ShuffleWritePartition, job_status};
@@ -1128,6 +1129,20 @@ impl ExecutionGraph {
                 // Set the task info to Running for new task
                 stage.task_infos[partition_id] = Some(task_info);
 
+                // Check if this is the final stage (no output links means this is the output stage)
+                let is_final_stage = stage.output_links.is_empty();
+
+                // Create session config with the is_final_stage flag set
+                let task_session_config = if is_final_stage {
+                    Arc::new(
+                        (*self.session_config)
+                            .clone()
+                            .with_ballista_is_final_stage(true),
+                    )
+                } else {
+                    self.session_config.clone()
+                };
+
                 Ok(TaskDescription {
                     session_id,
                     partition,
@@ -1135,7 +1150,7 @@ impl ExecutionGraph {
                     task_id,
                     task_attempt,
                     plan: stage.plan.clone(),
-                    session_config: self.session_config.clone(),
+                    session_config: task_session_config,
                     schedulable_time_millis: stage.stage_running_time,
                 })
             } else {
@@ -2902,6 +2917,62 @@ mod test {
     // async fn test_shuffle_files_should_cleaned_after_fetch_failure() -> Result<()> {
     //     todo!()
     // }
+
+    /// Test that is_final_stage flag is correctly set on tasks from the final output stage
+    #[tokio::test]
+    async fn test_is_final_stage_flag() -> Result<()> {
+        use ballista_core::extension::SessionConfigExt;
+
+        // Create a simple two-stage aggregation plan
+        // Stage 1: partial aggregation (has output_links to stage 2)
+        // Stage 2: final aggregation (no output_links - this is the final stage)
+        let mut agg_graph = test_aggregation_plan(4).await;
+
+        let executor = mock_executor("executor-id1".to_string());
+
+        // Collect all tasks and their is_final_stage flags
+        let mut stages_and_flags: Vec<(usize, bool)> = Vec::new();
+
+        while let Some(task) = agg_graph.pop_next_task(&executor.id)? {
+            let stage_id = task.partition.stage_id;
+            let is_final = task.session_config.ballista_is_final_stage();
+            stages_and_flags.push((stage_id, is_final));
+
+            // Complete the task to move to next stage
+            let task_status = mock_completed_task(task, &executor.id);
+            agg_graph.update_task_status(&executor, vec![task_status], 1, 1)?;
+        }
+
+        // Verify we got tasks from multiple stages
+        assert!(!stages_and_flags.is_empty(), "Should have at least one task");
+
+        // Get unique stage IDs
+        let unique_stages: HashSet<usize> =
+            stages_and_flags.iter().map(|(s, _)| *s).collect();
+
+        // Find the final stage (highest stage number for aggregation plan)
+        let final_stage_id = *unique_stages.iter().max().unwrap();
+
+        // Verify: tasks from non-final stages should have is_final_stage=false
+        // tasks from final stage should have is_final_stage=true
+        for (stage_id, is_final) in &stages_and_flags {
+            if *stage_id == final_stage_id {
+                assert!(
+                    *is_final,
+                    "Final stage {} should have is_final_stage=true",
+                    stage_id
+                );
+            } else {
+                assert!(
+                    !*is_final,
+                    "Non-final stage {} should have is_final_stage=false",
+                    stage_id
+                );
+            }
+        }
+
+        Ok(())
+    }
 
     fn drain_tasks(graph: &mut ExecutionGraph) -> Result<()> {
         let executor = mock_executor("executor-id1".to_string());

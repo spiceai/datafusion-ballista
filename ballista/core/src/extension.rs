@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::config::{
-    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME, BALLISTA_SHUFFLE_FORMAT,
-    BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
-    BALLISTA_SHUFFLE_READER_MAX_REQUESTS, BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT,
-    BALLISTA_STANDALONE_PARALLELISM, BallistaConfig, ShuffleFormat,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_IS_FINAL_STAGE, BALLISTA_JOB_NAME,
+    BALLISTA_SHUFFLE_FORMAT, BALLISTA_SHUFFLE_MEMORY_MODE,
+    BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
+    BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
+    BallistaConfig, ShuffleFormat,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -160,6 +161,13 @@ pub trait SessionConfigExt {
 
     /// Sets whether to use in-memory shuffle mode.
     fn with_ballista_shuffle_memory_mode(self, memory_mode: bool) -> Self;
+
+    /// Returns whether this is the final output stage.
+    /// Final stages always write to disk regardless of memory_mode setting.
+    fn ballista_is_final_stage(&self) -> bool;
+
+    /// Sets whether this is the final output stage.
+    fn with_ballista_is_final_stage(self, is_final: bool) -> Self;
 
     /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
@@ -484,6 +492,23 @@ impl SessionConfigExt for SessionConfig {
         } else {
             self.with_option_extension(BallistaConfig::default())
                 .set_bool(BALLISTA_SHUFFLE_MEMORY_MODE, memory_mode)
+        }
+    }
+
+    fn ballista_is_final_stage(&self) -> bool {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.is_final_stage())
+            .unwrap_or_else(|| BallistaConfig::default().is_final_stage())
+    }
+
+    fn with_ballista_is_final_stage(self, is_final: bool) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_bool(BALLISTA_IS_FINAL_STAGE, is_final)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_bool(BALLISTA_IS_FINAL_STAGE, is_final)
         }
     }
 
@@ -944,5 +969,79 @@ mod test {
                 .iter()
                 .any(|p| p.key == "datafusion.catalog.information_schema")
         )
+    }
+
+    #[test]
+    fn test_is_final_stage_config() {
+        // Default should be false
+        let config = SessionConfig::new_with_ballista();
+        assert!(!config.ballista_is_final_stage());
+
+        // Set to true
+        let config = config.with_ballista_is_final_stage(true);
+        assert!(config.ballista_is_final_stage());
+
+        // Set back to false
+        let config = config.with_ballista_is_final_stage(false);
+        assert!(!config.ballista_is_final_stage());
+    }
+
+    #[test]
+    fn test_shuffle_memory_mode_config() {
+        // Default should be false (disk-based)
+        let config = SessionConfig::new_with_ballista();
+        assert!(!config.ballista_shuffle_memory_mode());
+
+        // Enable memory mode
+        let config = config.with_ballista_shuffle_memory_mode(true);
+        assert!(config.ballista_shuffle_memory_mode());
+
+        // Disable memory mode
+        let config = config.with_ballista_shuffle_memory_mode(false);
+        assert!(!config.ballista_shuffle_memory_mode());
+    }
+
+    #[test]
+    fn test_shuffle_format_config() {
+        use crate::config::ShuffleFormat;
+
+        // Default should be ArrowIpc
+        let config = SessionConfig::new_with_ballista();
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::ArrowIpc);
+
+        // Set to Vortex
+        let config = config.with_ballista_shuffle_format(ShuffleFormat::Vortex);
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::Vortex);
+
+        // Set back to ArrowIpc
+        let config = config.with_ballista_shuffle_format(ShuffleFormat::ArrowIpc);
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::ArrowIpc);
+    }
+
+    #[test]
+    fn test_is_final_stage_serialization() {
+        use crate::config::BALLISTA_IS_FINAL_STAGE;
+
+        // Test that is_final_stage is included in key-value pairs
+        let config = SessionConfig::new_with_ballista().with_ballista_is_final_stage(true);
+        let pairs = config.to_key_value_pairs();
+
+        let is_final_pair = pairs.iter().find(|p| p.key == BALLISTA_IS_FINAL_STAGE);
+        assert!(is_final_pair.is_some());
+        assert_eq!(is_final_pair.unwrap().value, Some("true".to_string()));
+    }
+
+    #[test]
+    fn test_config_without_ballista_extension() {
+        // Test that methods work even without explicit ballista extension
+        let config = SessionConfig::new();
+
+        // Should return defaults
+        assert!(!config.ballista_is_final_stage());
+        assert!(!config.ballista_shuffle_memory_mode());
+
+        // Should be able to set values (which adds the extension)
+        let config = config.with_ballista_is_final_stage(true);
+        assert!(config.ballista_is_final_stage());
     }
 }

@@ -309,8 +309,13 @@ impl ShuffleWriterExec {
         let job_id = self.job_id.clone();
         let stage_id = self.stage_id;
 
-        // Check if memory mode is enabled
+        // Check if memory mode is enabled and this is not the final stage
+        // Final stages always write to disk to ensure proper cleanup via existing mechanisms
         let memory_mode = context.session_config().ballista_shuffle_memory_mode();
+        let is_final_stage = context.session_config().ballista_is_final_stage();
+
+        // Use memory mode only for intermediate stages, not for the final output stage
+        let use_memory = memory_mode && !is_final_stage;
 
         // Get shuffle format from session config
         let shuffle_format = context.session_config().ballista_shuffle_format();
@@ -320,7 +325,7 @@ impl ShuffleWriterExec {
             let now = Instant::now();
             let mut stream = plan.execute(input_partition, context)?;
 
-            if memory_mode {
+            if use_memory {
                 // Use in-memory shuffle storage with configurable format
                 Self::execute_shuffle_write_memory(
                     &job_id,
@@ -335,6 +340,9 @@ impl ShuffleWriterExec {
                 .await
             } else {
                 // Use disk-based shuffle storage with configurable format
+                // This is used for:
+                // 1. When memory_mode is disabled
+                // 2. For final stages (even if memory_mode is enabled)
                 Self::execute_shuffle_write_disk(
                     path,
                     input_partition,

@@ -746,6 +746,10 @@ async fn fetch_partition_object_store(
 }
 
 /// Fetch partition data from in-memory shuffle storage.
+///
+/// After successfully fetching the data, the partition is removed from memory
+/// to allow for immediate memory reclamation. This is safe because each shuffle
+/// partition is typically read only once by the consuming stage.
 async fn fetch_partition_memory(
     location: &PartitionLocation,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
@@ -759,17 +763,23 @@ async fn fetch_partition_memory(
     })?;
 
     let shuffle_manager = global_shuffle_manager();
-    let data = shuffle_manager.get_partition(key).map_err(|e| {
-        BallistaError::FetchFailed(
-            metadata.id.clone(),
-            partition_id.stage_id,
-            partition_id.partition_id,
-            e.to_string(),
-        )
-    })?;
+
+    // Remove and retrieve the partition data in one atomic operation
+    // This ensures the memory is reclaimed as soon as the data is read
+    let data = shuffle_manager.remove_partition(key).ok_or_else(|| {
+        // If remove fails, try a regular get (for retry scenarios)
+        shuffle_manager.get_partition(key).map_err(|e| {
+            BallistaError::FetchFailed(
+                metadata.id.clone(),
+                partition_id.stage_id,
+                partition_id.partition_id,
+                e.to_string(),
+            )
+        })
+    }).or_else(|result| result)?;
 
     debug!(
-        "Fetched partition {} from memory: {} batches, {} rows",
+        "Fetched and removed partition {} from memory: {} batches, {} rows",
         key, data.num_batches, data.num_rows
     );
 
