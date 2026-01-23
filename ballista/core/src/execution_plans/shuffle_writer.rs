@@ -350,6 +350,7 @@ impl ShuffleWriterExec {
     }
 
     /// Executes shuffle write to disk (original behavior).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_shuffle_write_disk(
         mut path: PathBuf,
         input_partition: usize,
@@ -471,7 +472,7 @@ impl ShuffleWriterExec {
                 let mut part_locs = vec![];
 
                 for (i, w) in writers.into_iter().enumerate() {
-                    if let Some(mut w) = w {
+                    if let Some(w) = w {
                         let num_bytes = fs::metadata(&w.path)?.len();
                         w.writer.finish()?;
                         debug!(

@@ -49,6 +49,7 @@ pub struct PrometheusMetricsCollector {
 }
 
 impl PrometheusMetricsCollector {
+    /// Creates a new PrometheusMetricsCollector with the given registry.
     pub fn new(registry: &Registry) -> Result<Self> {
         let execution_time = register_histogram_with_registry!(
             "job_exec_time_seconds",
@@ -126,6 +127,7 @@ impl PrometheusMetricsCollector {
         })
     }
 
+    /// Returns the current global PrometheusMetricsCollector instance.
     pub fn current() -> Result<Arc<dyn SchedulerMetricsCollector>> {
         COLLECTOR
             .get_or_try_init(|| {
@@ -133,7 +135,7 @@ impl PrometheusMetricsCollector {
 
                 Ok(Arc::new(collector) as Arc<dyn SchedulerMetricsCollector>)
             })
-            .map(|arc| arc.clone())
+            .cloned()
     }
 }
 
@@ -205,6 +207,22 @@ impl SchedulerMetricsCollector for PrometheusMetricsCollector {
     ) {
     }
     fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+
+    // Shuffle affinity - not tracked by default Prometheus collector
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
 
     // Executor management - not tracked by default Prometheus collector
     fn set_active_executor_count(&self, _count: usize) {}
