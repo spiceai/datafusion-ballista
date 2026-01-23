@@ -50,7 +50,8 @@ pub const BALLISTA_SHUFFLE_STORAGE_TYPE: &str = "ballista.shuffle.storage_type";
 pub const BALLISTA_SHUFFLE_STORAGE_URL: &str = "ballista.shuffle.storage_url";
 /// Configuration key for shuffle storage mode (disk or memory).
 pub const BALLISTA_SHUFFLE_MEMORY_MODE: &str = "ballista.shuffle.memory_mode";
-/// Configuration key indicating if this is the final output stage.
+/// Internal configuration key indicating if this is the final output stage.
+/// This is set by the scheduler based on stage topology, NOT user-configurable.
 /// When true, shuffle data is always written to disk regardless of memory_mode setting.
 pub const BALLISTA_IS_FINAL_STAGE: &str = "ballista.shuffle.is_final_stage";
 /// Shuffle format configuration: "arrow_ipc" or "vortex"
@@ -109,10 +110,9 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "When enabled, shuffle data is kept in memory on executors instead of being written to disk. This can improve performance for workloads with sufficient memory.".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
-        ConfigEntry::new(BALLISTA_IS_FINAL_STAGE.to_string(),
-                         "When true, indicates this is the final output stage. Final stages always write to disk regardless of memory_mode setting to ensure proper cleanup.".to_string(),
-                         DataType::Boolean,
-                         Some((false).to_string())),
+        // Note: BALLISTA_IS_FINAL_STAGE is intentionally NOT in CONFIG_ENTRIES.
+        // It's an internal flag set by the scheduler based on stage topology,
+        // not a user-configurable setting.
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS.to_string(),
                          "Connection timeout for gRPC client in seconds".to_string(),
                          DataType::UInt64,
@@ -352,9 +352,21 @@ impl BallistaConfig {
     }
 
     /// Returns whether this is the final output stage.
+    /// This is an internal flag set by the scheduler, not user-configurable.
     /// Final stages always write to disk regardless of memory_mode setting.
     pub fn is_final_stage(&self) -> bool {
-        self.get_bool_setting(BALLISTA_IS_FINAL_STAGE)
+        self.settings
+            .get(BALLISTA_IS_FINAL_STAGE)
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false)
+    }
+
+    /// Sets the internal is_final_stage flag.
+    /// This should only be called by the scheduler when creating task configurations.
+    pub fn with_is_final_stage(mut self, is_final: bool) -> Self {
+        self.settings
+            .insert(BALLISTA_IS_FINAL_STAGE.to_string(), is_final.to_string());
+        self
     }
 
     /// Returns the configured shuffle format (ArrowIpc or Vortex)
