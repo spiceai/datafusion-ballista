@@ -42,7 +42,6 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 
 use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
 use ballista_core::error::BallistaError;
-use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::executor_status::Status;
 use ballista_core::serde::protobuf::{
@@ -53,8 +52,8 @@ use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
 use ballista_core::utils::{
-    GrpcServerConfig, create_grpc_client_connection, create_grpc_client_endpoint,
-    create_grpc_server, default_config_producer, get_time_before,
+    GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
+    default_config_producer, get_time_before,
 };
 use ballista_core::{BALLISTA_VERSION, ConfigProducer, RuntimeProducer};
 use tonic::transport::{Endpoint, Error as TonicTransportError};
@@ -289,8 +288,6 @@ pub async fn start_executor_process(
     ));
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
-    let session_config = (executor.config_producer)();
-    let ballista_config = session_config.ballista_config();
     let connection = if connect_timeout == 0 {
         let mut endpoint = create_grpc_client_endpoint(scheduler_url).map_err(|_| {
             BallistaError::GrpcConnectionError(

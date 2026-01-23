@@ -16,7 +16,17 @@
 // under the License.
 //
 
+//! Remote catalog serialization and stub providers for Ballista clients.
+//!
+//! This module provides functionality to serialize catalog metadata (schemas, tables, functions)
+//! from the scheduler to ship to Ballista clients, as well as stub providers that allow clients
+//! to perform logical planning without access to actual table data.
+
+/// Extension trait for serializing catalog schemas and table names.
 pub mod catalog_serialize_ext;
+/// Extension trait for serializing user-defined functions.
 pub mod remote_function_serialize_ext;
+/// Stub scalar UDF implementation for remote function planning.
 pub mod remote_scalar_udf;
+/// Stub table provider for remote table planning.
 pub mod remote_table_provider;

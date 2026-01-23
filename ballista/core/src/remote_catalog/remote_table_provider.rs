@@ -18,7 +18,7 @@
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{exec_err, Result};
+use datafusion::common::{Result, exec_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -36,6 +36,7 @@ pub struct RemoteTableProvider {
 }
 
 impl RemoteTableProvider {
+    /// Create a new RemoteTableProvider with the given catalog, schema, and table names.
     pub fn new(
         catalog_name: &str,
         schema_name: &str,
@@ -50,14 +51,17 @@ impl RemoteTableProvider {
         }
     }
 
+    /// Get the catalog name.
     pub fn catalog_name(&self) -> &str {
         &self.catalog_name
     }
 
+    /// Get the schema name.
     pub fn schema_name(&self) -> &str {
         &self.schema_name
     }
 
+    /// Get the table name.
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
@@ -84,7 +88,11 @@ impl TableProvider for RemoteTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        exec_err!("{}.{}.{} is a stub table implementation to be resolved on the Ballista scheduler. It should not be scanned on the client. This is a bug.",
-        self.catalog_name, self.schema_name, self.table_name)
+        exec_err!(
+            "{}.{}.{} is a stub table implementation to be resolved on the Ballista scheduler. It should not be scanned on the client. This is a bug.",
+            self.catalog_name,
+            self.schema_name,
+            self.table_name
+        )
     }
 }

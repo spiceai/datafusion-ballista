@@ -55,10 +55,10 @@ pub mod registry;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
 
-/// General utility functions for Ballista operations.
-
+/// Remote catalog serialization and stub providers for Ballista clients.
 pub mod remote_catalog;
 
+/// General utility functions for Ballista operations.
 pub mod utils;
 
 ///

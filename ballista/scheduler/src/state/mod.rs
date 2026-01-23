@@ -23,7 +23,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
@@ -37,6 +37,7 @@ use crate::state::task_manager::{TaskLauncher, TaskManager};
 
 use crate::cluster::{BallistaCluster, BoundTask, ExecutorSlot};
 use crate::config::SchedulerConfig;
+use crate::metrics::SchedulerMetricsCollector;
 use crate::state::execution_graph::TaskDescription;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
@@ -117,6 +118,8 @@ pub struct SchedulerState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     pub codec: BallistaCodec<T, U>,
     /// Scheduler configuration.
     pub config: Arc<SchedulerConfig>,
+    /// Metrics collector for recording scheduler metrics.
+    pub metrics_collector: Arc<dyn SchedulerMetricsCollector>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T, U> {
@@ -126,6 +129,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         codec: BallistaCodec<T, U>,
         scheduler_name: String,
         config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
     ) -> Self {
         Self {
             executor_manager: ExecutorManager::new(
@@ -140,6 +144,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             session_manager: SessionManager::new(cluster.job_state()),
             codec,
             config,
+            metrics_collector,
         }
     }
 
@@ -148,9 +153,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
     pub fn new_with_default_scheduler_name(
         cluster: BallistaCluster,
         codec: BallistaCodec<T, U>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
     ) -> Self {
         let config = Arc::new(SchedulerConfig::default());
-        SchedulerState::new(cluster, codec, "localhost:50050".to_owned(), config)
+        SchedulerState::new(
+            cluster,
+            codec,
+            "localhost:50050".to_owned(),
+            config,
+            metrics_collector,
+        )
     }
 
     #[allow(dead_code)]
@@ -159,6 +171,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         codec: BallistaCodec<T, U>,
         scheduler_name: String,
         config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         dispatcher: Arc<dyn TaskLauncher>,
     ) -> Self {
         Self {
@@ -175,6 +188,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             session_manager: SessionManager::new(cluster.job_state()),
             codec,
             config,
+            metrics_collector,
         }
     }
 
@@ -187,15 +201,33 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         sender: EventSender<QueryStageSchedulerEvent>,
     ) -> Result<()> {
-        let schedulable_tasks = self
+        let binding_result = self
             .executor_manager
             .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
             .await?;
-        if schedulable_tasks.is_empty() {
+        if binding_result.bound_tasks.is_empty() {
             debug!("No schedulable tasks found to be launched");
             return Ok(());
         }
 
+        // Record shuffle affinity metrics
+        for affinity in &binding_result.shuffle_affinity {
+            if affinity.has_local_data {
+                self.metrics_collector.record_task_shuffle_affinity_hit(
+                    &affinity.job_id,
+                    affinity.stage_id,
+                    &affinity.executor_id,
+                );
+            } else {
+                self.metrics_collector.record_task_shuffle_affinity_miss(
+                    &affinity.job_id,
+                    affinity.stage_id,
+                    &affinity.executor_id,
+                );
+            }
+        }
+
+        let schedulable_tasks = binding_result.bound_tasks;
         let state = self.clone();
         tokio::spawn(async move {
             let mut if_revive = false;
@@ -270,6 +302,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         &self,
         bound_tasks: Vec<BoundTask>,
     ) -> Result<Vec<ExecutorSlot>> {
+        // Get current time once for all latency calculations
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        // Record task scheduling metrics for each task
+        for (executor_id, task) in &bound_tasks {
+            // Calculate scheduling latency: time from when task became schedulable to now
+            let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
+            self.metrics_collector.record_task_scheduled(
+                &task.partition.job_id,
+                task.partition.stage_id,
+                executor_id,
+                latency_ms as u64,
+            );
+        }
+
         // Put tasks to the same executor together
         // And put tasks belonging to the same stage together for creating MultiTaskDefinition
         let mut executor_stage_assignments: HashMap<
@@ -366,9 +416,53 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .get_executor_metadata(executor_id)
             .await?;
 
-        self.task_manager
+        let result = self
+            .task_manager
             .update_task_statuses(&executor, tasks_status)
-            .await
+            .await?;
+
+        // Record stage lifecycle metrics
+        for (job_id, stage_id, task_count, _started_at_ms) in
+            &result.metrics_info.stages_started
+        {
+            self.metrics_collector
+                .record_stage_started(job_id, *stage_id, *task_count);
+        }
+        for (job_id, stage_id, duration_ms) in &result.metrics_info.stages_completed {
+            self.metrics_collector.record_stage_completed(
+                job_id,
+                *stage_id,
+                *duration_ms,
+            );
+        }
+        for (job_id, stage_id, error_type) in &result.metrics_info.stages_failed {
+            self.metrics_collector
+                .record_stage_failed(job_id, *stage_id, error_type);
+        }
+        for (job_id, stage_id) in &result.metrics_info.stages_retried {
+            self.metrics_collector.record_stage_retry(job_id, *stage_id);
+        }
+
+        // Record task lifecycle metrics
+        for (job_id, stage_id, executor_id) in &result.metrics_info.tasks_completed {
+            self.metrics_collector
+                .record_task_completed(job_id, *stage_id, executor_id);
+        }
+        for (job_id, stage_id, executor_id, error_type) in
+            &result.metrics_info.tasks_failed
+        {
+            self.metrics_collector.record_task_failed(
+                job_id,
+                *stage_id,
+                executor_id,
+                error_type,
+            );
+        }
+        for (job_id, stage_id) in &result.metrics_info.tasks_retried {
+            self.metrics_collector.record_task_retry(job_id, *stage_id);
+        }
+
+        Ok(result.events)
     }
 
     pub(crate) async fn submit_job(
@@ -490,6 +584,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .await?;
 
         let elapsed = start.elapsed();
+
+        // Record planning duration metric
+        self.metrics_collector
+            .record_planning_duration(job_id, elapsed.as_millis() as u64);
 
         info!("Planned job {job_id} in {elapsed:?}");
 

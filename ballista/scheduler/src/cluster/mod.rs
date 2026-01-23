@@ -155,6 +155,53 @@ pub type ExecutorHeartbeatStream = Pin<Box<dyn Stream<Item = ExecutorHeartbeat> 
 /// Tuple of (executor_id, task_description).
 pub type BoundTask = (String, TaskDescription);
 
+/// Shuffle affinity information for a bound task.
+///
+/// Tracks whether a task was scheduled on an executor that has local shuffle data
+/// from the task's input stages.
+#[derive(Debug, Clone)]
+pub struct ShuffleAffinityInfo {
+    /// Job ID for this task.
+    pub job_id: String,
+    /// Stage ID for this task.
+    pub stage_id: usize,
+    /// Executor ID where the task was scheduled.
+    pub executor_id: String,
+    /// True if the executor has local shuffle data for at least one input partition.
+    pub has_local_data: bool,
+}
+
+/// Result of task binding including shuffle affinity metrics.
+#[derive(Debug, Default)]
+pub struct BindingResult {
+    /// Tasks bound to executors.
+    pub bound_tasks: Vec<BoundTask>,
+    /// Shuffle affinity information for tasks that have shuffle inputs.
+    /// Only populated for tasks whose stages read from shuffle (not leaf stages).
+    pub shuffle_affinity: Vec<ShuffleAffinityInfo>,
+}
+
+impl BindingResult {
+    /// Creates a new empty binding result.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a binding result from bound tasks without affinity info.
+    pub fn from_tasks(bound_tasks: Vec<BoundTask>) -> Self {
+        Self {
+            bound_tasks,
+            shuffle_affinity: Vec::new(),
+        }
+    }
+
+    /// Extends this result with another binding result.
+    pub fn extend(&mut self, other: BindingResult) {
+        self.bound_tasks.extend(other.bound_tasks);
+        self.shuffle_affinity.extend(other.shuffle_affinity);
+    }
+}
+
 /// An executor slot representing available task capacity.
 ///
 /// Tuple of (executor_id, slot_count).
@@ -175,12 +222,13 @@ pub trait ClusterState: Send + Sync + 'static {
     /// Binds ready-to-run tasks from active jobs to available executor slots.
     ///
     /// If `executors` is provided, only bind slots from the specified executor IDs.
+    /// Returns both the bound tasks and shuffle affinity information for metrics.
     async fn bind_schedulable_tasks(
         &self,
         distribution: TaskDistributionPolicy,
         active_jobs: Arc<HashMap<String, JobInfoCache>>,
         executors: Option<HashSet<String>>,
-    ) -> Result<Vec<BoundTask>>;
+    ) -> Result<BindingResult>;
 
     /// Unbinds executor slots when tasks finish or fail.
     ///
@@ -349,17 +397,43 @@ pub trait JobState: Send + Sync {
     fn produce_config(&self) -> SessionConfig;
 }
 
+use crate::state::execution_stage::RunningStage;
+
+/// Collects the set of executor IDs that have local shuffle data for this stage.
+///
+/// Returns `None` if the stage has no shuffle inputs (leaf stage),
+/// otherwise returns `Some(set)` where the set contains executor IDs with local data.
+fn get_executors_with_local_shuffle_data(
+    running_stage: &RunningStage,
+) -> Option<HashSet<String>> {
+    if running_stage.inputs.is_empty() {
+        // Leaf stage with no shuffle inputs
+        return None;
+    }
+
+    let mut executors_with_local_data = HashSet::new();
+    for stage_output in running_stage.inputs.values() {
+        for partition_locations in stage_output.partition_locations.values() {
+            for location in partition_locations {
+                executors_with_local_data.insert(location.executor_meta.id.clone());
+            }
+        }
+    }
+
+    Some(executors_with_local_data)
+}
+
 pub(crate) async fn bind_task_bias(
     mut slots: Vec<&mut AvailableTaskSlots>,
     running_jobs: Arc<HashMap<String, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
-) -> Vec<BoundTask> {
-    let mut schedulable_tasks: Vec<BoundTask> = vec![];
+) -> BindingResult {
+    let mut result = BindingResult::new();
 
     let total_slots = slots.iter().fold(0, |acc, s| acc + s.slots);
     if total_slots == 0 {
         debug!("Not enough available executor slots for task running!!!");
-        return schedulable_tasks;
+        return result;
     }
 
     // Sort the slots by descending order
@@ -386,6 +460,12 @@ pub(crate) async fn bind_task_bias(
                 black_list.push(running_stage.stage_id);
                 continue;
             }
+
+            // Get executors with local shuffle data before we borrow task_infos mutably
+            let executors_with_local_data =
+                get_executors_with_local_shuffle_data(running_stage);
+            let stage_id = running_stage.stage_id;
+
             // We are sure that it will at least bind one task by going through the following logic.
             // It will not go into a dead loop.
             let runnable_tasks = running_stage
@@ -400,7 +480,7 @@ pub(crate) async fn bind_task_bias(
                 while slot.slots == 0 {
                     idx_slot += 1;
                     if idx_slot >= slots.len() {
-                        return schedulable_tasks;
+                        return result;
                     }
                     slot = &mut slots[idx_slot];
                 }
@@ -409,9 +489,19 @@ pub(crate) async fn bind_task_bias(
                 *task_id_gen += 1;
                 *task_info = Some(create_task_info(executor_id.clone(), task_id));
 
+                // Record shuffle affinity for this task if it has shuffle inputs
+                if let Some(ref local_executors) = executors_with_local_data {
+                    result.shuffle_affinity.push(ShuffleAffinityInfo {
+                        job_id: job_id.clone(),
+                        stage_id,
+                        executor_id: executor_id.clone(),
+                        has_local_data: local_executors.contains(&executor_id),
+                    });
+                }
+
                 let partition = PartitionId {
                     job_id: job_id.clone(),
-                    stage_id: running_stage.stage_id,
+                    stage_id,
                     partition_id,
                 };
                 let task_desc = TaskDescription {
@@ -422,28 +512,29 @@ pub(crate) async fn bind_task_bias(
                     task_attempt: running_stage.task_failure_numbers[partition_id],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
+                    schedulable_time_millis: running_stage.stage_running_time,
                 };
-                schedulable_tasks.push((executor_id, task_desc));
+                result.bound_tasks.push((executor_id, task_desc));
 
                 slot.slots -= 1;
             }
         }
     }
 
-    schedulable_tasks
+    result
 }
 
 pub(crate) async fn bind_task_round_robin(
     mut slots: Vec<&mut AvailableTaskSlots>,
     running_jobs: Arc<HashMap<String, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
-) -> Vec<BoundTask> {
-    let mut schedulable_tasks: Vec<BoundTask> = vec![];
+) -> BindingResult {
+    let mut result = BindingResult::new();
 
     let mut total_slots = slots.iter().fold(0, |acc, s| acc + s.slots);
     if total_slots == 0 {
         debug!("Not enough available executor slots for task running!!!");
-        return schedulable_tasks;
+        return result;
     }
     debug!("Total slot number is {total_slots}");
 
@@ -470,6 +561,12 @@ pub(crate) async fn bind_task_round_robin(
                 black_list.push(running_stage.stage_id);
                 continue;
             }
+
+            // Get executors with local shuffle data before we borrow task_infos mutably
+            let executors_with_local_data =
+                get_executors_with_local_shuffle_data(running_stage);
+            let stage_id = running_stage.stage_id;
+
             // We are sure that it will at least bind one task by going through the following logic.
             // It will not go into a dead loop.
             let runnable_tasks = running_stage
@@ -495,9 +592,19 @@ pub(crate) async fn bind_task_round_robin(
                 *task_id_gen += 1;
                 *task_info = Some(create_task_info(executor_id.clone(), task_id));
 
+                // Record shuffle affinity for this task if it has shuffle inputs
+                if let Some(ref local_executors) = executors_with_local_data {
+                    result.shuffle_affinity.push(ShuffleAffinityInfo {
+                        job_id: job_id.clone(),
+                        stage_id,
+                        executor_id: executor_id.clone(),
+                        has_local_data: local_executors.contains(&executor_id),
+                    });
+                }
+
                 let partition = PartitionId {
                     job_id: job_id.clone(),
-                    stage_id: running_stage.stage_id,
+                    stage_id,
                     partition_id,
                 };
                 let task_desc = TaskDescription {
@@ -508,20 +615,21 @@ pub(crate) async fn bind_task_round_robin(
                     task_attempt: running_stage.task_failure_numbers[partition_id],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
+                    schedulable_time_millis: running_stage.stage_running_time,
                 };
-                schedulable_tasks.push((executor_id, task_desc));
+                result.bound_tasks.push((executor_id, task_desc));
 
                 idx_slot += 1;
                 slot.slots -= 1;
                 total_slots -= 1;
                 if total_slots == 0 {
-                    return schedulable_tasks;
+                    return result;
                 }
             }
         }
     }
 
-    schedulable_tasks
+    result
 }
 
 /// Maps execution plan to list of files it scans
@@ -568,7 +676,7 @@ pub(crate) async fn bind_task_consistent_hash(
     tolerance: usize,
     running_jobs: Arc<HashMap<String, JobInfoCache>>,
     get_scan_files: GetScanFilesFunc,
-) -> Result<(Vec<BoundTask>, Option<ConsistentHash<TopologyNode>>)> {
+) -> Result<(BindingResult, Option<ConsistentHash<TopologyNode>>)> {
     let mut total_slots = 0usize;
     for (_, node) in topology_nodes.iter() {
         total_slots += node.available_slots as usize;
@@ -577,7 +685,7 @@ pub(crate) async fn bind_task_consistent_hash(
         debug!(
             "Not enough available executor slots for binding tasks with consistent hashing policy!!!"
         );
-        return Ok((vec![], None));
+        return Ok((BindingResult::new(), None));
     }
     debug!("Total slot number for consistent hash binding is {total_slots}");
 
@@ -588,7 +696,7 @@ pub(crate) async fn bind_task_consistent_hash(
     let mut ch_topology: ConsistentHash<TopologyNode> =
         ConsistentHash::new(node_replicas);
 
-    let mut schedulable_tasks: Vec<BoundTask> = vec![];
+    let mut result = BindingResult::new();
     for (job_id, job_info) in running_jobs.iter() {
         if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
             debug!("Job {job_id} is not in running status and will be skipped");
@@ -638,6 +746,10 @@ pub(crate) async fn bind_task_consistent_hash(
                         *task_id_gen += 1;
                         *task_info = Some(create_task_info(executor_id.clone(), task_id));
 
+                        // Note: Consistent hash is used for scan (leaf) stages, not shuffle stages,
+                        // so we don't track shuffle affinity here. The stage has scan files,
+                        // meaning it's a leaf stage without shuffle inputs.
+
                         let partition = PartitionId {
                             job_id: job_id.clone(),
                             stage_id: running_stage.stage_id,
@@ -652,13 +764,14 @@ pub(crate) async fn bind_task_consistent_hash(
                                 [partition_id],
                             plan: running_stage.plan.clone(),
                             session_config: running_stage.session_config.clone(),
+                            schedulable_time_millis: running_stage.stage_running_time,
                         };
-                        schedulable_tasks.push((executor_id, task_desc));
+                        result.bound_tasks.push((executor_id, task_desc));
 
                         node.available_slots -= 1;
                         total_slots -= 1;
                         if total_slots == 0 {
-                            return Ok((schedulable_tasks, Some(ch_topology)));
+                            return Ok((result, Some(ch_topology)));
                         }
                     }
                 }
@@ -671,7 +784,7 @@ pub(crate) async fn bind_task_consistent_hash(
         }
     }
 
-    Ok((schedulable_tasks, Some(ch_topology)))
+    Ok((result, Some(ch_topology)))
 }
 
 // If if there's no plan which needs to scan files, skip it.
@@ -778,11 +891,11 @@ mod test {
         let mut available_slots = mock_available_slots();
         let available_slots_ref: Vec<&mut AvailableTaskSlots> =
             available_slots.iter_mut().collect();
-        let bound_tasks =
+        let binding_result =
             bind_task_bias(available_slots_ref, Arc::new(active_jobs), |_| false).await;
-        assert_eq!(9, bound_tasks.len());
+        assert_eq!(9, binding_result.bound_tasks.len());
 
-        let result = get_result(bound_tasks);
+        let result = get_result(binding_result.bound_tasks);
 
         let mut expected = Vec::new();
         {
@@ -828,12 +941,12 @@ mod test {
         let mut available_slots = mock_available_slots();
         let available_slots_ref: Vec<&mut AvailableTaskSlots> =
             available_slots.iter_mut().collect();
-        let bound_tasks =
+        let binding_result =
             bind_task_round_robin(available_slots_ref, Arc::new(active_jobs), |_| false)
                 .await;
-        assert_eq!(9, bound_tasks.len());
+        assert_eq!(9, binding_result.bound_tasks.len());
 
-        let result = get_result(bound_tasks);
+        let result = get_result(binding_result.bound_tasks);
 
         let mut expected = Vec::new();
         {
@@ -888,7 +1001,7 @@ mod test {
 
         // Check none scan files case
         {
-            let (bound_tasks, _) = bind_task_consistent_hash(
+            let (binding_result, _) = bind_task_consistent_hash(
                 topology_nodes.clone(),
                 num_replicas,
                 tolerance,
@@ -896,12 +1009,12 @@ mod test {
                 |_, _| Ok(vec![]),
             )
             .await?;
-            assert_eq!(0, bound_tasks.len());
+            assert_eq!(0, binding_result.bound_tasks.len());
         }
 
         // Check job_b with scan files
         {
-            let (bound_tasks, _) = bind_task_consistent_hash(
+            let (binding_result, _) = bind_task_consistent_hash(
                 topology_nodes,
                 num_replicas,
                 tolerance,
@@ -909,9 +1022,9 @@ mod test {
                 |job_id, _| mock_get_scan_files("job_b", job_id, 8),
             )
             .await?;
-            assert_eq!(6, bound_tasks.len());
+            assert_eq!(6, binding_result.bound_tasks.len());
 
-            let result = get_result(bound_tasks);
+            let result = get_result(binding_result.bound_tasks);
 
             let mut expected = HashMap::new();
             {
@@ -941,7 +1054,7 @@ mod test {
         let tolerance = 1;
 
         {
-            let (bound_tasks, _) = bind_task_consistent_hash(
+            let (binding_result, _) = bind_task_consistent_hash(
                 topology_nodes,
                 num_replicas,
                 tolerance,
@@ -949,9 +1062,9 @@ mod test {
                 |job_id, _| mock_get_scan_files("job_b", job_id, 8),
             )
             .await?;
-            assert_eq!(7, bound_tasks.len());
+            assert_eq!(7, binding_result.bound_tasks.len());
 
-            let result = get_result(bound_tasks);
+            let result = get_result(binding_result.bound_tasks);
 
             let mut expected = HashMap::new();
             {
