@@ -46,7 +46,7 @@ use {
 
 use std::ops::Deref;
 
-use crate::cluster::{bind_task_bias, bind_task_round_robin};
+use crate::cluster::{BindingResult, bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::SchedulerServer;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
@@ -118,7 +118,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             }];
             let available_slots = available_slots.iter_mut().collect();
             let running_jobs = self.state.task_manager.get_running_job_cache();
-            let schedulable_tasks = match self.state.config.task_distribution {
+            let binding_result = match self.state.config.task_distribution {
                 TaskDistributionPolicy::Bias => {
                     bind_task_bias(available_slots, running_jobs, |_| false).await
                 }
@@ -131,15 +131,54 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     ));
                 }
 
-                TaskDistributionPolicy::Custom(ref policy) => policy
-                    .bind_tasks(available_slots, running_jobs)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?,
+                TaskDistributionPolicy::Custom(ref policy) => BindingResult::from_tasks(
+                    policy
+                        .bind_tasks(available_slots, running_jobs)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                ),
             };
 
+            // Record shuffle affinity metrics
+            for affinity in &binding_result.shuffle_affinity {
+                if affinity.has_local_data {
+                    self.state
+                        .metrics_collector
+                        .record_task_shuffle_affinity_hit(
+                            &affinity.job_id,
+                            affinity.stage_id,
+                            &affinity.executor_id,
+                        );
+                } else {
+                    self.state
+                        .metrics_collector
+                        .record_task_shuffle_affinity_miss(
+                            &affinity.job_id,
+                            affinity.stage_id,
+                            &affinity.executor_id,
+                        );
+                }
+            }
+
             let mut tasks = vec![];
-            for (_, task) in schedulable_tasks {
+            let now_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+
+            for (_, task) in binding_result.bound_tasks {
                 let job_id = task.partition.job_id.clone();
+                let stage_id = task.partition.stage_id;
+
+                // Record task scheduling metric with actual latency
+                let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
+                self.state.metrics_collector.record_task_scheduled(
+                    &job_id,
+                    stage_id,
+                    &executor_id,
+                    latency_ms as u64,
+                );
+
                 match self.state.task_manager.prepare_task_definition(task) {
                     Ok(task_definition) => tasks.push(task_definition),
                     Err(e) => {
@@ -490,6 +529,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         );
 
         let executor_manager = self.state.executor_manager.clone();
+        let metrics_collector = self.state.metrics_collector.clone();
         let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
             let msg = format!("Get query stage event loop error due to {e:?}");
             error!("{msg}");
@@ -499,6 +539,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         Self::remove_executor(
             executor_manager,
             event_sender,
+            metrics_collector,
             &executor_id,
             Some(reason),
             self.config.executor_termination_grace_period,
@@ -665,6 +706,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 
@@ -697,6 +739,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 

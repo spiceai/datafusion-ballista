@@ -323,6 +323,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 );
             }
         }
+
+        // Update queue size metrics after processing each event
+        let pending_jobs = self.state.task_manager.pending_job_number();
+        self.metrics_collector
+            .set_pending_jobs_queue_size(pending_jobs as u64);
+
+        let pending_tasks = self.state.task_manager.total_pending_tasks().await;
+        self.metrics_collector
+            .set_pending_tasks_queue_size(pending_tasks as u64);
+
         Ok(())
     }
 

@@ -36,6 +36,7 @@ pub struct RemoteTableProvider {
 }
 
 impl RemoteTableProvider {
+    /// Create a new RemoteTableProvider with the given catalog, schema, and table names.
     pub fn new(
         catalog_name: &str,
         schema_name: &str,
@@ -50,14 +51,17 @@ impl RemoteTableProvider {
         }
     }
 
+    /// Get the catalog name.
     pub fn catalog_name(&self) -> &str {
         &self.catalog_name
     }
 
+    /// Get the schema name.
     pub fn schema_name(&self) -> &str {
         &self.schema_name
     }
 
+    /// Get the table name.
     pub fn table_name(&self) -> &str {
         &self.table_name
     }

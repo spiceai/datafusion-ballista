@@ -56,6 +56,7 @@ impl PartialEq for RemoteScalarUDF {
 impl Eq for RemoteScalarUDF {}
 
 impl RemoteScalarUDF {
+    /// Create a new RemoteScalarUDF from a ScalarUdfInfo protobuf message.
     pub fn new(meta: ScalarUdfInfo) -> Result<Self> {
         let mut arities = vec![];
 

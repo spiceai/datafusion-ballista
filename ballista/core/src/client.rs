@@ -47,8 +47,6 @@ use datafusion::error::Result;
 use crate::extension::BallistaConfigGrpcEndpoint;
 use crate::serde::protobuf;
 
-use crate::utils::{GrpcClientConfig, create_grpc_client_connection};
-
 use crate::utils::create_grpc_client_endpoint;
 
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};

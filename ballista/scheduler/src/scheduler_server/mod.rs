@@ -99,6 +99,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             codec,
             scheduler_name.clone(),
             config.clone(),
+            metrics_collector.clone(),
         ));
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
             state.clone(),
@@ -137,6 +138,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             codec,
             scheduler_name.clone(),
             config.clone(),
+            metrics_collector.clone(),
             task_launcher,
         ));
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
@@ -312,6 +314,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     Self::remove_executor(
                         state.executor_manager.clone(),
                         sender_clone,
+                        state.metrics_collector.clone(),
                         &executor_id,
                         Some(stop_reason.clone()),
                         0,
@@ -338,6 +341,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     pub(crate) fn remove_executor(
         executor_manager: ExecutorManager,
         event_sender: EventSender<QueryStageSchedulerEvent>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         executor_id: &str,
         reason: Option<String>,
         wait_secs: u64,
@@ -356,6 +360,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                 error!("error removing executor {executor_id}: {e:?}");
             }
 
+            // Record executor deregistration metric
+            metrics_collector.record_executor_deregistered(&executor_id);
+
+            // Update active executor count
+            let count = executor_manager.get_alive_executors().len();
+            metrics_collector.set_active_executor_count(count);
+
             if let Err(e) = event_sender
                 .post_event(QueryStageSchedulerEvent::ExecutorLost(executor_id, reason))
                 .await
@@ -366,8 +377,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     }
 
     async fn do_register_executor(&self, metadata: ExecutorMetadata) -> Result<()> {
+        let executor_id = metadata.id.clone();
         let executor_data = ExecutorData {
-            executor_id: metadata.id.clone(),
+            executor_id: executor_id.clone(),
             total_task_slots: metadata.specification.task_slots,
             available_task_slots: metadata.specification.task_slots,
         };
@@ -377,6 +389,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             .executor_manager
             .register_executor(metadata, executor_data)
             .await?;
+
+        // Record executor registration metric
+        self.state
+            .metrics_collector
+            .record_executor_registered(&executor_id);
+
+        // Update active executor count
+        let count = self.state.executor_manager.get_alive_executors().len();
+        self.state
+            .metrics_collector
+            .set_active_executor_count(count);
 
         // If we are using push-based scheduling then reserve this executors slots and send
         // them for scheduling tasks.

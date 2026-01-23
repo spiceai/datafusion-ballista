@@ -163,6 +163,21 @@ impl PartitionStats {
         }
     }
 
+    /// Returns the number of rows in the partition, if known.
+    pub fn num_rows(&self) -> Option<u64> {
+        self.num_rows
+    }
+
+    /// Returns the number of batches in the partition, if known.
+    pub fn num_batches(&self) -> Option<u64> {
+        self.num_batches
+    }
+
+    /// Returns the number of bytes in the partition, if known.
+    pub fn num_bytes(&self) -> Option<u64> {
+        self.num_bytes
+    }
+
     /// Returns the Arrow struct field representation of these statistics.
     pub fn arrow_struct_repr(self) -> Field {
         Field::new(

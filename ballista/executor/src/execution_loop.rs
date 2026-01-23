@@ -66,6 +66,10 @@ use tonic::codegen::{Body, Bytes, StdError};
 /// Number of consecutive failures before reducing log level from WARN to DEBUG.
 const QUIET_AFTER_FAILURES: u32 = 5;
 
+/// Main polling loop for executor task execution.
+///
+/// This function polls the scheduler for new tasks to execute and runs them,
+/// ensuring no more than the configured number of tasks run simultaneously.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,

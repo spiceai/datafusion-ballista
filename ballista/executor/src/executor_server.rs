@@ -38,7 +38,6 @@ pub type EndpointOverrideFn =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
 
 use ballista_core::error::BallistaError;
-use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     CancelTasksParams, CancelTasksResult, ExecutorMetric, ExecutorStatus,
@@ -55,9 +54,7 @@ use ballista_core::serde::scheduler::TaskDefinition;
 use ballista_core::serde::scheduler::from_proto::{
     get_task_definition, get_task_definition_vec,
 };
-use ballista_core::utils::{
-    create_grpc_client_connection, create_grpc_client_endpoint, create_grpc_server,
-};
+use ballista_core::utils::{create_grpc_client_endpoint, create_grpc_server};
 
 use dashmap::DashMap;
 use datafusion::execution::TaskContext;

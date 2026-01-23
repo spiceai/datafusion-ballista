@@ -755,6 +755,57 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
     }
 
     fn set_pending_tasks_queue_size(&self, _value: u64) {}
+    fn set_pending_jobs_queue_size(&self, _value: u64) {}
+
+    // Stage lifecycle
+    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, _task_count: usize) {}
+    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, _duration_ms: u64) {
+    }
+    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, _error_type: &str) {}
+    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {}
+
+    // Task scheduling
+    fn record_task_scheduled(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        _latency_ms: u64,
+    ) {
+    }
+    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+    }
+    fn record_task_failed(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        _error_type: &str,
+    ) {
+    }
+    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+
+    // Executor management
+    fn set_active_executor_count(&self, _count: usize) {}
+    fn record_executor_registered(&self, _executor_id: &str) {}
+    fn record_executor_deregistered(&self, _executor_id: &str) {}
+
+    // Planning
+    fn record_planning_duration(&self, _job_id: &str, _duration_ms: u64) {}
 
     fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
         Ok(None)

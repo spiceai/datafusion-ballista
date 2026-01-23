@@ -65,7 +65,10 @@ pub async fn create_scheduler<
         .unwrap_or_else(|| Arc::new(BallistaPhysicalExtensionCodec::default()));
 
     let codec = BallistaCodec::new(codec_logical, codec_physical);
-    let metrics_collector = default_metrics_collector()?;
+    let metrics_collector = config
+        .override_metrics_collector
+        .clone()
+        .map_or_else(|| default_metrics_collector(), Ok)?;
 
     let mut scheduler_server = SchedulerServer::new(
         config.scheduler_name(),

@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::planner::DefaultDistributedPlanner;
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
 use crate::state::execution_graph::{
     ExecutionGraph, ExecutionStage, RunningTaskInfo, TaskDescription,
+    TaskStatusUpdateResult,
 };
 use crate::state::executor_manager::ExecutorManager;
 
@@ -262,6 +262,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         self.active_job_cache.len()
     }
 
+    /// Get the total number of pending tasks across all active jobs.
+    ///
+    /// A pending task is a task that is available to schedule on an executor
+    /// but cannot be scheduled because no resources are available.
+    pub async fn total_pending_tasks(&self) -> usize {
+        let mut total = 0;
+        for entry in self.active_job_cache.iter() {
+            let graph = entry.value().execution_graph.read().await;
+            total += graph.available_tasks();
+        }
+        total
+    }
+
     /// Generate an ExecutionGraph for the job and save it to the persistent state.
     /// By default, this job will be curated by the scheduler which receives it.
     /// Then we will also save it to the active execution graph
@@ -362,14 +375,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
     }
 
-    /// Update given task statuses in the respective job and return a tuple containing:
-    /// 1. A list of QueryStageSchedulerEvent to publish.
-    /// 2. A list of reservations that can now be offered.
+    /// Update given task statuses in the respective job and return a `TaskStatusUpdateResult`
+    /// containing:
+    /// 1. A list of `QueryStageSchedulerEvent` to publish.
+    /// 2. Metrics information about stage/task lifecycle changes.
     pub(crate) async fn update_task_statuses(
         &self,
         executor: &ExecutorMetadata,
         task_status: Vec<TaskStatus>,
-    ) -> Result<Vec<QueryStageSchedulerEvent>> {
+    ) -> Result<TaskStatusUpdateResult> {
         let mut job_updates: HashMap<String, Vec<TaskStatus>> = HashMap::new();
         for status in task_status {
             trace!("Task Update\n{status:?}");
@@ -378,13 +392,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             job_task_statuses.push(status);
         }
 
-        let mut events: Vec<QueryStageSchedulerEvent> = vec![];
+        let mut combined_result = TaskStatusUpdateResult::default();
         for (job_id, statuses) in job_updates {
             let num_tasks = statuses.len();
             debug!("Updating {num_tasks} tasks in job {job_id}");
 
-            // let graph = self.get_active_execution_graph(&job_id).await;
-            let job_events = if let Some(cached) =
+            let job_result = if let Some(cached) =
                 self.get_active_execution_graph(&job_id)
             {
                 let mut graph = cached.write().await;
@@ -399,15 +412,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 error!(
                     "Fail to find job {job_id} in the active cache and it may not be curated by this scheduler"
                 );
-                vec![]
+                TaskStatusUpdateResult::default()
             };
 
-            for event in job_events {
-                events.push(event);
-            }
+            // Combine events and metrics from all jobs
+            combined_result.events.extend(job_result.events);
+            combined_result
+                .metrics_info
+                .stages_started
+                .extend(job_result.metrics_info.stages_started);
+            combined_result
+                .metrics_info
+                .stages_completed
+                .extend(job_result.metrics_info.stages_completed);
+            combined_result
+                .metrics_info
+                .stages_failed
+                .extend(job_result.metrics_info.stages_failed);
+            combined_result
+                .metrics_info
+                .stages_retried
+                .extend(job_result.metrics_info.stages_retried);
+            combined_result
+                .metrics_info
+                .tasks_completed
+                .extend(job_result.metrics_info.tasks_completed);
+            combined_result
+                .metrics_info
+                .tasks_failed
+                .extend(job_result.metrics_info.tasks_failed);
+            combined_result
+                .metrics_info
+                .tasks_retried
+                .extend(job_result.metrics_info.tasks_retried);
         }
 
-        Ok(events)
+        Ok(combined_result)
     }
 
     /// Mark a job to success. This will create a key under the CompletedJobs keyspace
