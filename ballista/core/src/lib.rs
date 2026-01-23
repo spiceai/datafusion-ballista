@@ -58,10 +58,10 @@ pub mod serde;
 #[cfg(feature = "build-binary")]
 pub mod shuffle_storage;
 
-/// General utility functions for Ballista operations.
-
+/// Remote catalog serialization and stub providers for Ballista clients.
 pub mod remote_catalog;
 
+/// General utility functions for Ballista operations.
 pub mod utils;
 
 ///
