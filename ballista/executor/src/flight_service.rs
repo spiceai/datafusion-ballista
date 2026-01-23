@@ -28,6 +28,7 @@ use tokio_util::io::ReaderStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::global_shuffle_manager;
 use ballista_core::serde::decode_protobuf;
 use ballista_core::serde::scheduler::Action as BallistaAction;
 use datafusion::arrow::ipc::CompressionType;
@@ -98,6 +99,55 @@ impl FlightService for BallistaFlightService {
 
         match &action {
             BallistaAction::FetchPartition { path, .. } => {
+                // Check if this is an in-memory partition
+                if let Some(key) = path.strip_prefix("memory://") {
+                    // Fetch from in-memory shuffle manager
+                    let shuffle_manager = global_shuffle_manager();
+                    let data = shuffle_manager.get_partition(key).map_err(|e| {
+                        Status::not_found(format!(
+                            "In-memory partition not found: {key}: {e}"
+                        ))
+                    })?;
+
+                    debug!(
+                        "FetchPartition serving in-memory partition: {} ({} batches, {} rows, format: {:?})",
+                        key, data.num_batches, data.num_rows, data.format
+                    );
+
+                    let (tx, rx) = channel(2);
+                    let schema = data.schema.clone();
+
+                    // Convert to batches (handles both Arrow and Vortex formats)
+                    let batches = data.to_batches().map_err(|e| {
+                        Status::internal(format!(
+                            "Failed to convert in-memory partition to batches: {e}"
+                        ))
+                    })?;
+
+                    // Stream the batches from memory
+                    task::spawn(async move {
+                        for batch in batches {
+                            if tx.send(Ok(batch)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                        .map_err(|e| from_arrow_err(&e))?;
+                    let flight_data_stream = FlightDataEncoderBuilder::new()
+                        .with_schema(schema)
+                        .with_options(write_options)
+                        .build(ReceiverStream::new(rx))
+                        .map_err(|err| Status::from_error(Box::new(err)));
+
+                    return Ok(Response::new(
+                        Box::pin(flight_data_stream) as Self::DoGetStream
+                    ));
+                }
+
+                // Handle disk-based partition
                 // Detect shuffle format based on file extension
                 let is_vortex = Path::new(path)
                     .extension()
@@ -106,12 +156,6 @@ impl FlightService for BallistaFlightService {
 
                 let format = if is_vortex { "vortex" } else { "arrow-ipc" };
                 debug!("FetchPartition reading {path} (format: {format})");
-
-                // Detect shuffle format based on file extension
-                let is_vortex = Path::new(path)
-                    .extension()
-                    .map(|ext| ext == "vortex")
-                    .unwrap_or(false);
 
                 let (schema, rx) = if is_vortex {
                     #[cfg(feature = "vortex")]
@@ -222,6 +266,64 @@ impl FlightService for BallistaFlightService {
                 match &action {
                     BallistaAction::FetchPartition { path, .. } => {
                         debug!("FetchPartition reading {path}");
+
+                        // Check if this is an in-memory partition
+                        // For in-memory partitions, we need to serialize to IPC format first
+                        if let Some(key) = path.strip_prefix("memory://") {
+                            let shuffle_manager = global_shuffle_manager();
+                            let data =
+                                shuffle_manager.get_partition(key).map_err(|e| {
+                                    Status::not_found(format!(
+                                        "In-memory partition not found: {key}: {e}"
+                                    ))
+                                })?;
+
+                            debug!(
+                                "FetchPartition serving in-memory partition via block transfer: {} ({} batches, format: {:?})",
+                                key, data.num_batches, data.format
+                            );
+
+                            // Convert to batches (handles both Arrow and Vortex formats)
+                            let batches = data.to_batches().map_err(|e| {
+                                Status::internal(format!(
+                                    "Failed to convert in-memory partition to batches: {e}"
+                                ))
+                            })?;
+
+                            // Serialize batches to IPC format in memory
+                            let mut buffer = Vec::new();
+                            {
+                                use datafusion::arrow::ipc::writer::StreamWriter;
+                                let mut writer = StreamWriter::try_new_with_options(
+                                    &mut buffer,
+                                    &data.schema,
+                                    IpcWriteOptions::default()
+                                        .try_with_compression(Some(
+                                            CompressionType::LZ4_FRAME,
+                                        ))
+                                        .map_err(|e| from_arrow_err(&e))?,
+                                )
+                                .map_err(|e| from_arrow_err(&e))?;
+
+                                for batch in &batches {
+                                    writer
+                                        .write(batch)
+                                        .map_err(|e| from_arrow_err(&e))?;
+                                }
+                                writer.finish().map_err(|e| from_arrow_err(&e))?;
+                            }
+
+                            let bytes = bytes::Bytes::from(buffer);
+                            let result_stream = futures::stream::once(async move {
+                                Ok(arrow_flight::Result { body: bytes })
+                            });
+
+                            return Ok(Response::new(
+                                Box::pin(result_stream) as Self::DoActionStream
+                            ));
+                        }
+
+                        // Handle disk-based partition
                         let file = tokio::fs::File::open(&path).await.map_err(|e| {
                             Status::internal(format!("Failed to open file: {e}"))
                         })?;

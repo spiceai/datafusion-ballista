@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::client::BallistaClient;
+use crate::execution_plans::shuffle_manager::global_shuffle_manager;
 use crate::extension::{
     BallistaConfigGrpcEndpoint, SessionConfigExt, ShuffleReadMetricsCallback,
 };
@@ -379,6 +380,7 @@ impl Stream for AbortableReceiverStream {
 /// Local partitions are read directly from local Arrow IPC files,
 /// while remote partitions are fetched using the Arrow Flight client.
 /// If `force_remote_read` is true, all partitions are treated as remote.
+#[allow(dead_code)]
 fn local_remote_read_split(
     partition_locations: Vec<PartitionLocation>,
     force_remote_read: bool,
@@ -390,6 +392,34 @@ fn local_remote_read_split(
     } else {
         (vec![], partition_locations)
     }
+}
+
+/// Splits partition locations into memory, local disk, and remote categories.
+/// Returns (memory_locations, local_locations, remote_locations)
+fn split_partition_locations(
+    partition_locations: Vec<PartitionLocation>,
+    force_remote_read: bool,
+) -> (
+    Vec<PartitionLocation>,
+    Vec<PartitionLocation>,
+    Vec<PartitionLocation>,
+) {
+    let mut memory_locations = Vec::new();
+    let mut local_locations = Vec::new();
+    let mut remote_locations = Vec::new();
+
+    for loc in partition_locations {
+        if check_is_memory_location(&loc) {
+            // Memory locations are always read locally
+            memory_locations.push(loc);
+        } else if !force_remote_read && check_is_local_location(&loc) {
+            local_locations.push(loc);
+        } else {
+            remote_locations.push(loc);
+        }
+    }
+
+    (memory_locations, local_locations, remote_locations)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,14 +437,28 @@ fn send_fetch_partitions(
     let semaphore = Arc::new(Semaphore::new(max_request_num));
     let mut spawned_tasks: Vec<SpawnedTask<()>> = vec![];
 
-    let (local_locations, remote_locations): (Vec<_>, Vec<_>) =
-        local_remote_read_split(partition_locations, force_remote_read);
+    let (memory_locations, local_locations, remote_locations) =
+        split_partition_locations(partition_locations, force_remote_read);
 
     debug!(
-        "local shuffle file counts:{}, remote shuffle file count:{}.",
+        "memory shuffle partition count: {}, local shuffle file counts: {}, remote shuffle file count: {}.",
+        memory_locations.len(),
         local_locations.len(),
         remote_locations.len()
     );
+
+    // Read memory partitions first (fastest path)
+    let response_sender_m = response_sender.clone();
+    spawned_tasks.push(SpawnedTask::spawn(async move {
+        for p in memory_locations {
+            let r = PartitionReaderEnum::Memory
+                .fetch_partition(&p, max_message_size, flight_transport, None, false)
+                .await;
+            if let Err(e) = response_sender_m.send(r).await {
+                error!("Fail to send response event to the channel due to {e}");
+            }
+        }
+    }));
 
     // keep local shuffle files reading in serial order for memory control.
     let response_sender_c = response_sender.clone();
@@ -510,6 +554,11 @@ fn check_is_local_location(location: &PartitionLocation) -> bool {
     std::path::Path::new(location.path.as_str()).exists()
 }
 
+/// Check if the partition location is stored in memory
+fn check_is_memory_location(location: &PartitionLocation) -> bool {
+    location.path.starts_with("memory://")
+}
+
 /// Partition reader Trait, different partition reader can have
 #[async_trait]
 trait PartitionReader: Send + Sync + Clone {
@@ -527,6 +576,7 @@ trait PartitionReader: Send + Sync + Clone {
 #[derive(Clone)]
 enum PartitionReaderEnum {
     Local,
+    Memory,
     FlightRemote,
     #[allow(dead_code)]
     ObjectStoreRemote,
@@ -555,6 +605,7 @@ impl PartitionReader for PartitionReaderEnum {
                 .await
             }
             PartitionReaderEnum::Local => fetch_partition_local(location).await,
+            PartitionReaderEnum::Memory => fetch_partition_memory(location).await,
             PartitionReaderEnum::ObjectStoreRemote => {
                 fetch_partition_object_store(location).await
             }
@@ -692,6 +743,94 @@ async fn fetch_partition_object_store(
     Err(BallistaError::NotImplemented(
         "Should not use ObjectStorePartitionReader".to_string(),
     ))
+}
+
+/// Fetch partition data from in-memory shuffle storage.
+///
+/// After successfully fetching the data, the partition is removed from memory
+/// to allow for immediate memory reclamation. This is safe because each shuffle
+/// partition is typically read only once by the consuming stage.
+async fn fetch_partition_memory(
+    location: &PartitionLocation,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    // Extract the key from the "memory://{key}" path format
+    let key = path.strip_prefix("memory://").ok_or_else(|| {
+        BallistaError::General(format!("Invalid in-memory partition path format: {path}"))
+    })?;
+
+    let shuffle_manager = global_shuffle_manager();
+
+    // Remove and retrieve the partition data in one atomic operation
+    // This ensures the memory is reclaimed as soon as the data is read
+    let data = shuffle_manager
+        .remove_partition(key)
+        .ok_or_else(|| {
+            // If remove fails, try a regular get (for retry scenarios)
+            shuffle_manager.get_partition(key).map_err(|e| {
+                BallistaError::FetchFailed(
+                    metadata.id.clone(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    e.to_string(),
+                )
+            })
+        })
+        .or_else(|result| result)?;
+
+    debug!(
+        "Fetched and removed partition {} from memory: {} batches, {} rows",
+        key, data.num_batches, data.num_rows
+    );
+
+    let batches = data.to_batches().map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to convert in-memory partition to batches: {e}"),
+        )
+    })?;
+
+    Ok(Box::pin(InMemoryShuffleStream::new(data.schema, batches)))
+}
+
+/// Stream that reads from in-memory shuffle data
+struct InMemoryShuffleStream {
+    schema: SchemaRef,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl InMemoryShuffleStream {
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into_iter(),
+        }
+    }
+}
+
+impl Stream for InMemoryShuffleStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.batches.next() {
+            Some(batch) => Poll::Ready(Some(Ok(batch))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+impl RecordBatchStream for InMemoryShuffleStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 #[cfg(test)]
