@@ -468,7 +468,6 @@ impl datafusion::config::ConfigExtension for BallistaConfig {
 /// Ballista supports both push-based and pull-based task scheduling.
 /// It is recommended that you try both to determine which is the best for your use case.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
-#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum TaskSchedulingPolicy {
     /// Pull-based scheduling works in a similar way to Apache Spark
     #[default]
@@ -485,18 +484,23 @@ impl Display for TaskSchedulingPolicy {
     }
 }
 
-#[cfg(feature = "build-binary")]
 impl std::str::FromStr for TaskSchedulingPolicy {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        clap::ValueEnum::from_str(s, true)
+        match s.to_lowercase().as_str() {
+            "pull-staged" | "pullstaged" => Ok(TaskSchedulingPolicy::PullStaged),
+            "push-staged" | "pushstaged" => Ok(TaskSchedulingPolicy::PushStaged),
+            _ => Err(format!(
+                "Invalid scheduling policy '{}'. Valid options: 'pull-staged', 'push-staged'",
+                s
+            )),
+        }
     }
 }
 
 /// Configures the log file rotation policy.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
-#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum LogRotationPolicy {
     /// Rotate log files every minute.
     Minutely,
@@ -520,12 +524,20 @@ impl Display for LogRotationPolicy {
     }
 }
 
-#[cfg(feature = "build-binary")]
 impl std::str::FromStr for LogRotationPolicy {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        clap::ValueEnum::from_str(s, true)
+        match s.to_lowercase().as_str() {
+            "minutely" => Ok(LogRotationPolicy::Minutely),
+            "hourly" => Ok(LogRotationPolicy::Hourly),
+            "daily" => Ok(LogRotationPolicy::Daily),
+            "never" => Ok(LogRotationPolicy::Never),
+            _ => Err(format!(
+                "Invalid rotation policy '{}'. Valid options: 'minutely', 'hourly', 'daily', 'never'",
+                s
+            )),
+        }
     }
 }
 

@@ -28,13 +28,9 @@ use std::result;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-#[cfg(feature = "build-binary")]
 use object_store::ObjectStore;
-#[cfg(feature = "build-binary")]
 use object_store::aws::AmazonS3Builder;
-#[cfg(feature = "build-binary")]
 use object_store::azure::MicrosoftAzureBuilder;
-#[cfg(feature = "build-binary")]
 use url::Url;
 
 use crate::client::BallistaClient;
@@ -841,7 +837,6 @@ fn check_is_object_store_location(location: &PartitionLocation) -> bool {
     path.starts_with("s3://") || path.starts_with("abfs://") || path.starts_with("az://")
 }
 
-#[cfg(feature = "build-binary")]
 async fn fetch_partition_object_store(
     location: &PartitionLocation,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
@@ -877,16 +872,6 @@ async fn fetch_partition_object_store(
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
-#[cfg(not(feature = "build-binary"))]
-async fn fetch_partition_object_store(
-    _location: &PartitionLocation,
-) -> result::Result<SendableRecordBatchStream, BallistaError> {
-    Err(BallistaError::NotImplemented(
-        "Object store support requires 'build-binary' feature".to_string(),
-    ))
-}
-
-#[cfg(feature = "build-binary")]
 async fn fetch_partition_object_store_inner(
     path: &str,
 ) -> result::Result<Vec<RecordBatch>, BallistaError> {

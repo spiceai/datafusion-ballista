@@ -33,7 +33,7 @@ path = "src/bin/main.rs"
 required-features = ["build-binary"]
 
 [features]
-build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing", "ballista-core/build-binary"]
+build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing"]
 default = ["build-binary", "substrait"]
 # job info can cache stage plans, in some cases where 
 # task plans can be re-computed, cache behavior may need to be disabled.
