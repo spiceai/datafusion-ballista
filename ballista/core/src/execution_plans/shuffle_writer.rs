@@ -36,6 +36,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::ShuffleFormat;
+use crate::execution_plans::shuffle_manager::{
+    InMemoryShuffleManager, ShufflePartitionData, global_shuffle_manager,
+};
 use crate::extension::SessionConfigExt;
 use crate::utils;
 
@@ -198,6 +201,16 @@ pub struct WriteTracker {
     pub path: PathBuf,
 }
 
+/// Tracker for in-memory shuffle writes.
+/// Collects record batches in memory instead of writing to disk.
+pub struct InMemoryWriteTracker {
+    pub num_batches: usize,
+    pub num_rows: usize,
+    pub num_bytes: usize,
+    pub batches: Vec<RecordBatch>,
+    pub key: String,
+}
+
 #[derive(Debug, Clone)]
 struct ShuffleWriteMetrics {
     /// Time spend writing batches to shuffle files
@@ -293,6 +306,16 @@ impl ShuffleWriterExec {
         let write_metrics = ShuffleWriteMetrics::new(input_partition, &self.metrics);
         let output_partitioning = self.shuffle_output_partitioning.clone();
         let plan = self.plan.clone();
+        let job_id = self.job_id.clone();
+        let stage_id = self.stage_id;
+
+        // Check if memory mode is enabled and this is not the final stage
+        // Final stages always write to disk to ensure proper cleanup via existing mechanisms
+        let memory_mode = context.session_config().ballista_shuffle_memory_mode();
+        let is_final_stage = context.session_config().ballista_is_final_stage();
+
+        // Use memory mode only for intermediate stages, not for the final output stage
+        let use_memory = memory_mode && !is_final_stage;
 
         // Get shuffle format from session config
         let shuffle_format = context.session_config().ballista_shuffle_format();
@@ -302,139 +325,381 @@ impl ShuffleWriterExec {
             let now = Instant::now();
             let mut stream = plan.execute(input_partition, context)?;
 
-            match output_partitioning {
-                None => {
-                    let timer = write_metrics.write_time.timer();
-                    path.push(format!("{input_partition}"));
-                    std::fs::create_dir_all(&path)?;
-                    path.push(format!("data.{file_ext}"));
-                    let path = path.to_str().unwrap();
-                    debug!("Writing results to {path} (format: {shuffle_format})");
-
-                    // stream results to disk using configured format
-                    let stats = utils::write_stream_to_disk_with_format(
-                        &mut stream,
-                        path,
-                        &write_metrics.write_time,
-                        shuffle_format,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-
-                    write_metrics
-                        .input_rows
-                        .add(stats.num_rows.unwrap_or(0) as usize);
-                    write_metrics
-                        .output_rows
-                        .add(stats.num_rows.unwrap_or(0) as usize);
-                    timer.done();
-
-                    info!(
-                        "Executed partition {} in {} seconds. Statistics: {}",
-                        input_partition,
-                        now.elapsed().as_secs(),
-                        stats
-                    );
-
-                    Ok(vec![ShuffleWritePartition {
-                        partition_id: input_partition as u64,
-                        path: path.to_owned(),
-                        num_batches: stats.num_batches.unwrap_or(0),
-                        num_rows: stats.num_rows.unwrap_or(0),
-                        num_bytes: stats.num_bytes.unwrap_or(0),
-                    }])
-                }
-
-                Some(Partitioning::Hash(exprs, num_output_partitions)) => {
-                    // we won't necessary produce output for every possible partition, so we
-                    // create writers on demand
-                    let mut writers: Vec<Option<WriteTracker>> = vec![];
-                    for _ in 0..num_output_partitions {
-                        writers.push(None);
-                    }
-
-                    let mut partitioner = BatchPartitioner::try_new(
-                        Partitioning::Hash(exprs, num_output_partitions),
-                        write_metrics.repart_time.clone(),
-                    )?;
-
-                    let schema = stream.schema();
-
-                    while let Some(result) = stream.next().await {
-                        let input_batch = result?;
-
-                        write_metrics.input_rows.add(input_batch.num_rows());
-
-                        partitioner.partition(
-                            input_batch,
-                            |output_partition, output_batch| {
-                                // partition func in datafusion make sure not write empty output_batch.
-                                let timer = write_metrics.write_time.timer();
-                                match &mut writers[output_partition] {
-                                    Some(w) => {
-                                        w.num_batches += 1;
-                                        w.num_rows += output_batch.num_rows();
-                                        w.writer.write(&output_batch)?;
-                                    }
-                                    None => {
-                                        let mut file_path = path.clone();
-                                        file_path.push(format!("{output_partition}"));
-                                        std::fs::create_dir_all(&file_path)?;
-
-                                        file_path.push(format!(
-                                            "data-{input_partition}.{file_ext}"
-                                        ));
-                                        debug!("Writing results to {file_path:?} (format: {shuffle_format})");
-
-                                        let mut writer = ShuffleFileWriter::try_new(
-                                            file_path.clone(),
-                                            schema.clone(),
-                                            shuffle_format,
-                                        )?;
-
-                                        writer.write(&output_batch)?;
-                                        writers[output_partition] = Some(WriteTracker {
-                                            num_batches: 1,
-                                            num_rows: output_batch.num_rows(),
-                                            writer,
-                                            path: file_path,
-                                        });
-                                    }
-                                }
-                                write_metrics.output_rows.add(output_batch.num_rows());
-                                timer.done();
-                                Ok(())
-                            },
-                        )?;
-                    }
-
-                    let mut part_locs = vec![];
-
-                    for (i, w) in writers.into_iter().enumerate() {
-                        if let Some(w) = w {
-                            let num_bytes = fs::metadata(&w.path)?.len();
-                            w.writer.finish()?;
-                            debug!(
-                                "Finished writing shuffle partition {} at {:?}. Batches: {}. Rows: {}. Bytes: {}.",
-                                i, w.path, w.num_batches, w.num_rows, num_bytes
-                            );
-
-                            part_locs.push(ShuffleWritePartition {
-                                partition_id: i as u64,
-                                path: w.path.to_string_lossy().to_string(),
-                                num_batches: w.num_batches as u64,
-                                num_rows: w.num_rows as u64,
-                                num_bytes,
-                            });
-                        }
-                    }
-                    Ok(part_locs)
-                }
-
-                _ => Err(DataFusionError::Execution(
-                    "Invalid shuffle partitioning scheme".to_owned(),
-                )),
+            if use_memory {
+                // Use in-memory shuffle storage with configurable format
+                Self::execute_shuffle_write_memory(
+                    &job_id,
+                    stage_id,
+                    input_partition,
+                    &mut stream,
+                    output_partitioning,
+                    write_metrics,
+                    now,
+                    shuffle_format,
+                )
+                .await
+            } else {
+                // Use disk-based shuffle storage with configurable format
+                // This is used for:
+                // 1. When memory_mode is disabled
+                // 2. For final stages (even if memory_mode is enabled)
+                Self::execute_shuffle_write_disk(
+                    path,
+                    input_partition,
+                    &mut stream,
+                    output_partitioning,
+                    write_metrics,
+                    now,
+                    shuffle_format,
+                    file_ext,
+                )
+                .await
             }
+        }
+    }
+
+    /// Executes shuffle write to disk (original behavior).
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_shuffle_write_disk(
+        mut path: PathBuf,
+        input_partition: usize,
+        stream: &mut std::pin::Pin<
+            Box<dyn datafusion::physical_plan::RecordBatchStream + Send>,
+        >,
+        output_partitioning: Option<Partitioning>,
+        write_metrics: ShuffleWriteMetrics,
+        now: Instant,
+        shuffle_format: ShuffleFormat,
+        file_ext: &str,
+    ) -> Result<Vec<ShuffleWritePartition>> {
+        match output_partitioning {
+            None => {
+                let timer = write_metrics.write_time.timer();
+                path.push(format!("{input_partition}"));
+                std::fs::create_dir_all(&path)?;
+                path.push(format!("data.{file_ext}"));
+                let path = path.to_str().unwrap();
+                debug!("Writing results to {path} (format: {shuffle_format})");
+
+                // stream results to disk using configured format
+                let stats = utils::write_stream_to_disk_with_format(
+                    stream,
+                    path,
+                    &write_metrics.write_time,
+                    shuffle_format,
+                )
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+
+                write_metrics
+                    .input_rows
+                    .add(stats.num_rows.unwrap_or(0) as usize);
+                write_metrics
+                    .output_rows
+                    .add(stats.num_rows.unwrap_or(0) as usize);
+                timer.done();
+
+                info!(
+                    "Executed partition {} in {} seconds. Statistics: {}",
+                    input_partition,
+                    now.elapsed().as_secs(),
+                    stats
+                );
+
+                Ok(vec![ShuffleWritePartition {
+                    partition_id: input_partition as u64,
+                    path: path.to_owned(),
+                    num_batches: stats.num_batches.unwrap_or(0),
+                    num_rows: stats.num_rows.unwrap_or(0),
+                    num_bytes: stats.num_bytes.unwrap_or(0),
+                }])
+            }
+
+            Some(Partitioning::Hash(exprs, num_output_partitions)) => {
+                // we won't necessary produce output for every possible partition, so we
+                // create writers on demand
+                let mut writers: Vec<Option<WriteTracker>> = vec![];
+                for _ in 0..num_output_partitions {
+                    writers.push(None);
+                }
+
+                let mut partitioner = BatchPartitioner::try_new(
+                    Partitioning::Hash(exprs, num_output_partitions),
+                    write_metrics.repart_time.clone(),
+                )?;
+
+                let schema = stream.schema();
+
+                while let Some(result) = stream.next().await {
+                    let input_batch = result?;
+
+                    write_metrics.input_rows.add(input_batch.num_rows());
+
+                    partitioner.partition(
+                        input_batch,
+                        |output_partition, output_batch| {
+                            // partition func in datafusion make sure not write empty output_batch.
+                            let timer = write_metrics.write_time.timer();
+                            match &mut writers[output_partition] {
+                                Some(w) => {
+                                    w.num_batches += 1;
+                                    w.num_rows += output_batch.num_rows();
+                                    w.writer.write(&output_batch)?;
+                                }
+                                None => {
+                                    let mut file_path = path.clone();
+                                    file_path.push(format!("{output_partition}"));
+                                    std::fs::create_dir_all(&file_path)?;
+
+                                    file_path.push(format!(
+                                        "data-{input_partition}.{file_ext}"
+                                    ));
+                                    debug!("Writing results to {file_path:?} (format: {shuffle_format})");
+
+                                    let mut writer = ShuffleFileWriter::try_new(
+                                        file_path.clone(),
+                                        schema.clone(),
+                                        shuffle_format,
+                                    )?;
+
+                                    writer.write(&output_batch)?;
+                                    writers[output_partition] = Some(WriteTracker {
+                                        num_batches: 1,
+                                        num_rows: output_batch.num_rows(),
+                                        writer,
+                                        path: file_path,
+                                    });
+                                }
+                            }
+                            write_metrics.output_rows.add(output_batch.num_rows());
+                            timer.done();
+                            Ok(())
+                        },
+                    )?;
+                }
+
+                let mut part_locs = vec![];
+
+                for (i, w) in writers.into_iter().enumerate() {
+                    if let Some(w) = w {
+                        let num_bytes = fs::metadata(&w.path)?.len();
+                        w.writer.finish()?;
+                        debug!(
+                            "Finished writing shuffle partition {} at {:?}. Batches: {}. Rows: {}. Bytes: {}.",
+                            i, w.path, w.num_batches, w.num_rows, num_bytes
+                        );
+
+                        part_locs.push(ShuffleWritePartition {
+                            partition_id: i as u64,
+                            path: w.path.to_string_lossy().to_string(),
+                            num_batches: w.num_batches as u64,
+                            num_rows: w.num_rows as u64,
+                            num_bytes,
+                        });
+                    }
+                }
+                Ok(part_locs)
+            }
+
+            _ => Err(DataFusionError::Execution(
+                "Invalid shuffle partitioning scheme".to_owned(),
+            )),
+        }
+    }
+
+    /// Executes shuffle write to in-memory storage.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_shuffle_write_memory(
+        job_id: &str,
+        stage_id: usize,
+        input_partition: usize,
+        stream: &mut std::pin::Pin<
+            Box<dyn datafusion::physical_plan::RecordBatchStream + Send>,
+        >,
+        output_partitioning: Option<Partitioning>,
+        write_metrics: ShuffleWriteMetrics,
+        now: Instant,
+        shuffle_format: ShuffleFormat,
+    ) -> Result<Vec<ShuffleWritePartition>> {
+        let shuffle_manager = global_shuffle_manager();
+        let schema = stream.schema();
+
+        match output_partitioning {
+            None => {
+                let timer = write_metrics.write_time.timer();
+
+                // Collect all batches into memory
+                let mut batches = Vec::new();
+                let mut num_rows = 0usize;
+                let mut num_bytes = 0usize;
+
+                while let Some(result) = stream.next().await {
+                    let batch = result?;
+                    num_rows += batch.num_rows();
+                    num_bytes += batch.get_array_memory_size();
+                    write_metrics.input_rows.add(batch.num_rows());
+                    write_metrics.output_rows.add(batch.num_rows());
+                    batches.push(batch);
+                }
+
+                let num_batches = batches.len();
+                let key = InMemoryShuffleManager::partition_key(
+                    job_id,
+                    stage_id,
+                    input_partition,
+                );
+
+                // Store in the global shuffle manager using the configured format
+                let data =
+                    Self::create_partition_data(schema.clone(), batches, shuffle_format)?;
+                shuffle_manager.store_partition(key.clone(), data);
+
+                timer.done();
+
+                info!(
+                    "Executed partition {} to memory ({shuffle_format}) in {} seconds. Batches: {}, Rows: {}, Bytes: {}",
+                    input_partition,
+                    now.elapsed().as_secs(),
+                    num_batches,
+                    num_rows,
+                    num_bytes
+                );
+
+                // Use special "memory://" prefix to indicate in-memory storage
+                Ok(vec![ShuffleWritePartition {
+                    partition_id: input_partition as u64,
+                    path: format!("memory://{key}"),
+                    num_batches: num_batches as u64,
+                    num_rows: num_rows as u64,
+                    num_bytes: num_bytes as u64,
+                }])
+            }
+
+            Some(Partitioning::Hash(exprs, num_output_partitions)) => {
+                // We collect batches per output partition in memory
+                let mut mem_writers: Vec<Option<InMemoryWriteTracker>> = vec![];
+                for _ in 0..num_output_partitions {
+                    mem_writers.push(None);
+                }
+
+                let mut partitioner = BatchPartitioner::try_new(
+                    Partitioning::Hash(exprs, num_output_partitions),
+                    write_metrics.repart_time.clone(),
+                )?;
+
+                while let Some(result) = stream.next().await {
+                    let input_batch = result?;
+                    write_metrics.input_rows.add(input_batch.num_rows());
+
+                    partitioner.partition(
+                        input_batch,
+                        |output_partition, output_batch| {
+                            let timer = write_metrics.write_time.timer();
+                            let batch_bytes = output_batch.get_array_memory_size();
+                            let batch_rows = output_batch.num_rows();
+
+                            match &mut mem_writers[output_partition] {
+                                Some(w) => {
+                                    w.num_batches += 1;
+                                    w.num_rows += batch_rows;
+                                    w.num_bytes += batch_bytes;
+                                    w.batches.push(output_batch);
+                                }
+                                None => {
+                                    let key = InMemoryShuffleManager::hash_partition_key(
+                                        job_id,
+                                        stage_id,
+                                        output_partition,
+                                        input_partition,
+                                    );
+                                    mem_writers[output_partition] =
+                                        Some(InMemoryWriteTracker {
+                                            num_batches: 1,
+                                            num_rows: batch_rows,
+                                            num_bytes: batch_bytes,
+                                            batches: vec![output_batch],
+                                            key,
+                                        });
+                                }
+                            }
+                            write_metrics.output_rows.add(batch_rows);
+                            timer.done();
+                            Ok(())
+                        },
+                    )?;
+                }
+
+                let mut part_locs = vec![];
+
+                for (i, w) in mem_writers.into_iter().enumerate() {
+                    if let Some(w) = w {
+                        debug!(
+                            "Finished writing shuffle partition {} to memory ({shuffle_format}). Batches: {}. Rows: {}. Bytes: {}.",
+                            i, w.num_batches, w.num_rows, w.num_bytes
+                        );
+
+                        // Store in the global shuffle manager using the configured format
+                        let data = Self::create_partition_data(
+                            schema.clone(),
+                            w.batches,
+                            shuffle_format,
+                        )?;
+                        shuffle_manager.store_partition(w.key.clone(), data);
+
+                        part_locs.push(ShuffleWritePartition {
+                            partition_id: i as u64,
+                            path: format!("memory://{}", w.key),
+                            num_batches: w.num_batches as u64,
+                            num_rows: w.num_rows as u64,
+                            num_bytes: w.num_bytes as u64,
+                        });
+                    }
+                }
+                Ok(part_locs)
+            }
+
+            _ => Err(DataFusionError::Execution(
+                "Invalid shuffle partitioning scheme".to_owned(),
+            )),
+        }
+    }
+
+    /// Creates partition data in the specified format (Arrow or Vortex).
+    fn create_partition_data(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        format: ShuffleFormat,
+    ) -> Result<ShufflePartitionData> {
+        match format {
+            ShuffleFormat::ArrowIpc => Ok(ShufflePartitionData::new(schema, batches)),
+            #[cfg(feature = "vortex")]
+            ShuffleFormat::Vortex => {
+                use vortex_array::ArrayRef;
+                use vortex_array::arrow::FromArrowArray;
+
+                let mut arrays = Vec::with_capacity(batches.len());
+                let mut total_rows = 0u64;
+                let mut total_bytes = 0u64;
+
+                for batch in batches {
+                    total_rows += batch.num_rows() as u64;
+                    // Convert Arrow RecordBatch to Vortex Array
+                    let vortex_array = ArrayRef::from_arrow(&batch, false);
+                    total_bytes += vortex_array.nbytes();
+                    arrays.push(vortex_array);
+                }
+
+                Ok(ShufflePartitionData::new_vortex(
+                    schema,
+                    arrays,
+                    total_rows,
+                    total_bytes,
+                ))
+            }
+            #[cfg(not(feature = "vortex"))]
+            ShuffleFormat::Vortex => Err(DataFusionError::NotImplemented(
+                "Vortex format requires the 'vortex' feature to be enabled".to_string(),
+            )),
         }
     }
 }

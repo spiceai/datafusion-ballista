@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/// Prometheus metrics collector implementation.
 #[cfg(feature = "prometheus")]
 pub mod prometheus;
 

@@ -48,6 +48,11 @@ pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
 pub const BALLISTA_SHUFFLE_STORAGE_TYPE: &str = "ballista.shuffle.storage_type";
 /// Configuration key for shuffle storage base URL/path.
 pub const BALLISTA_SHUFFLE_STORAGE_URL: &str = "ballista.shuffle.storage_url";
+/// Configuration key for shuffle storage mode (disk or memory).
+pub const BALLISTA_SHUFFLE_MEMORY_MODE: &str = "ballista.shuffle.memory_mode";
+/// Configuration key indicating if this is the final output stage.
+/// When true, shuffle data is always written to disk regardless of memory_mode setting.
+pub const BALLISTA_IS_FINAL_STAGE: &str = "ballista.shuffle.is_final_stage";
 /// Shuffle format configuration: "arrow_ipc" or "vortex"
 pub const BALLISTA_SHUFFLE_FORMAT: &str = "ballista.shuffle.format";
 
@@ -100,6 +105,14 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Base URL/path for shuffle storage. For local: file path; For S3: s3://bucket/prefix; For Azure: abfs://container@account.dfs.core.windows.net/prefix".to_string(),
                          DataType::Utf8,
                          None),
+        ConfigEntry::new(BALLISTA_SHUFFLE_MEMORY_MODE.to_string(),
+                         "When enabled, shuffle data is kept in memory on executors instead of being written to disk. This can improve performance for workloads with sufficient memory.".to_string(),
+                         DataType::Boolean,
+                         Some((false).to_string())),
+        ConfigEntry::new(BALLISTA_IS_FINAL_STAGE.to_string(),
+                         "When true, indicates this is the final output stage. Final stages always write to disk regardless of memory_mode setting to ensure proper cleanup.".to_string(),
+                         DataType::Boolean,
+                         Some((false).to_string())),
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS.to_string(),
                          "Connection timeout for gRPC client in seconds".to_string(),
                          DataType::UInt64,
@@ -329,6 +342,21 @@ impl BallistaConfig {
         self.settings.get(BALLISTA_SHUFFLE_STORAGE_URL).cloned()
     }
 
+    /// Returns whether in-memory shuffle mode is enabled.
+    ///
+    /// When enabled, shuffle data is kept in memory on executors instead of
+    /// being written to disk. This can improve performance for workloads
+    /// with sufficient memory.
+    pub fn shuffle_memory_mode(&self) -> bool {
+        self.get_bool_setting(BALLISTA_SHUFFLE_MEMORY_MODE)
+    }
+
+    /// Returns whether this is the final output stage.
+    /// Final stages always write to disk regardless of memory_mode setting.
+    pub fn is_final_stage(&self) -> bool {
+        self.get_bool_setting(BALLISTA_IS_FINAL_STAGE)
+    }
+
     /// Returns the configured shuffle format (ArrowIpc or Vortex)
     ///
     /// Note: Vortex format requires the 'vortex' feature to be enabled.
@@ -498,5 +526,47 @@ mod tests {
         let config = BallistaConfig::default();
         assert_eq!(16777216, config.default_grpc_client_max_message_size());
         Ok(())
+    }
+
+    #[test]
+    fn test_is_final_stage_default() {
+        let config = BallistaConfig::default();
+        // Default should be false
+        assert!(!config.is_final_stage());
+    }
+
+    #[test]
+    fn test_shuffle_memory_mode_default() {
+        let config = BallistaConfig::default();
+        // Default should be false (disk-based shuffles)
+        assert!(!config.shuffle_memory_mode());
+    }
+
+    #[test]
+    fn test_shuffle_format_default() {
+        let config = BallistaConfig::default();
+        // Default should be ArrowIpc
+        assert_eq!(config.shuffle_format(), ShuffleFormat::ArrowIpc);
+    }
+
+    #[test]
+    fn test_shuffle_format_parsing() {
+        assert_eq!(
+            "arrow_ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "arrow-ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "ipc".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::ArrowIpc
+        );
+        assert_eq!(
+            "vortex".parse::<ShuffleFormat>().unwrap(),
+            ShuffleFormat::Vortex
+        );
+        assert!("invalid".parse::<ShuffleFormat>().is_err());
     }
 }

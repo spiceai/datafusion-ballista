@@ -38,6 +38,7 @@ pub type EndpointOverrideFn =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
 
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::global_shuffle_manager;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     CancelTasksParams, CancelTasksResult, ExecutorMetric, ExecutorStatus,
@@ -774,6 +775,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
     ) -> Result<Response<RemoveJobDataResult>, Status> {
         let job_id = request.into_inner().job_id;
 
+        // Clean up in-memory shuffle partitions for this job
+        let shuffle_manager = global_shuffle_manager();
+        shuffle_manager.remove_job_partitions(&job_id);
+
+        // Clean up disk-based shuffle data
         remove_job_dir(&self.executor.work_dir, &job_id)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
