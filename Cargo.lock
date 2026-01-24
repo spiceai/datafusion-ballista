@@ -950,6 +950,7 @@ dependencies = [
  "datafusion-proto",
  "env_logger",
  "log",
+ "object_store",
  "rstest",
  "tempfile",
  "tokio",
