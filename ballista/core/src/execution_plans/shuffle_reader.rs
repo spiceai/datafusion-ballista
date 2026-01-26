@@ -29,10 +29,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 
-
-use url::Url;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use url::Url;
 
 use crate::client::BallistaClient;
 use crate::execution_plans::shuffle_manager::global_shuffle_manager;
@@ -210,6 +212,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             customize_endpoint,
             use_tls,
             metrics_callback,
+            context.runtime_env(),
         );
 
         let result = RecordBatchStreamAdapter::new(
@@ -400,8 +403,8 @@ fn local_remote_read_split(
     }
 }
 
-/// Splits partition locations into memory, local disk, and remote categories.
-/// Returns (memory_locations, local_locations, remote_locations)
+/// Splits partition locations into memory, local disk, object store, and remote categories.
+/// Returns (memory_locations, local_locations, object_store_locations, remote_locations)
 fn split_partition_locations(
     partition_locations: Vec<PartitionLocation>,
     force_remote_read: bool,
@@ -409,15 +412,20 @@ fn split_partition_locations(
     Vec<PartitionLocation>,
     Vec<PartitionLocation>,
     Vec<PartitionLocation>,
+    Vec<PartitionLocation>,
 ) {
     let mut memory_locations = Vec::new();
     let mut local_locations = Vec::new();
+    let mut object_store_locations = Vec::new();
     let mut remote_locations = Vec::new();
 
     for loc in partition_locations {
         if check_is_memory_location(&loc) {
             // Memory locations are always read locally
             memory_locations.push(loc);
+        } else if check_is_object_store_location(&loc) {
+            // Object store locations are handled via the runtime_env's registered object stores
+            object_store_locations.push(loc);
         } else if !force_remote_read && check_is_local_location(&loc) {
             local_locations.push(loc);
         } else {
@@ -425,7 +433,12 @@ fn split_partition_locations(
         }
     }
 
-    (memory_locations, local_locations, remote_locations)
+    (
+        memory_locations,
+        local_locations,
+        object_store_locations,
+        remote_locations,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,18 +451,20 @@ fn send_fetch_partitions(
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
     metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
     let semaphore = Arc::new(Semaphore::new(max_request_num));
     let mut spawned_tasks: Vec<SpawnedTask<()>> = vec![];
 
-    let (memory_locations, local_locations, remote_locations) =
+    let (memory_locations, local_locations, object_store_locations, remote_locations) =
         split_partition_locations(partition_locations, force_remote_read);
 
     debug!(
-        "memory shuffle partition count: {}, local shuffle file counts: {}, remote shuffle file count: {}.",
+        "memory shuffle partition count: {}, local shuffle file counts: {}, object store shuffle file count: {}, remote shuffle file count: {}.",
         memory_locations.len(),
         local_locations.len(),
+        object_store_locations.len(),
         remote_locations.len()
     );
 
@@ -502,6 +517,23 @@ fn send_fetch_partitions(
             }
 
             if let Err(e) = response_sender_c.send(r).await {
+                error!("Fail to send response event to the channel due to {e}");
+            }
+        }
+    }));
+
+    // Read object store partitions using the RuntimeEnv's registered object stores
+    let response_sender_os = response_sender.clone();
+    let runtime_env_clone = Arc::clone(&runtime_env);
+    spawned_tasks.push(SpawnedTask::spawn(async move {
+        for p in object_store_locations {
+            let r = fetch_partition_object_store_with_runtime(
+                &p,
+                Arc::clone(&runtime_env_clone),
+            )
+            .await;
+
+            if let Err(e) = response_sender_os.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
         }
@@ -831,11 +863,113 @@ impl RecordBatchStream for InMemoryShuffleStream {
     }
 }
 
+/// Fetch partition from object store using the RuntimeEnv's registered object stores.
+/// This uses the credentials and configuration from the runtime environment.
+async fn fetch_partition_object_store_with_runtime(
+    location: &PartitionLocation,
+    runtime_env: Arc<RuntimeEnv>,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use object_store::path::Path as ObjectPath;
+
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    debug!(
+        "Fetching shuffle partition from object store using runtime_env: {}",
+        path
+    );
+
+    let url = Url::parse(path).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{}': {:?}",
+            path, e
+        ))
+    })?;
+
+    // Get the object store from the RuntimeEnv's registry
+    // This uses the credentials configured in the runtime (e.g., SpiceObjectStoreRegistry)
+    let object_store_url = ObjectStoreUrl::parse(&url).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{}': {:?}",
+            path, e
+        ))
+    })?;
+
+    let store = runtime_env.object_store(&object_store_url).map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to get object store for URL '{}': {:?}", path, e),
+        )
+    })?;
+
+    // Extract the object path from the URL
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    debug!("Reading object from path: {:?}", object_path);
+
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to read object from {}: {:?}", path, e),
+        )
+    })?;
+
+    let bytes = get_result.bytes().await.map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to read bytes from {}: {:?}", path, e),
+        )
+    })?;
+
+    let cursor = Cursor::new(bytes.to_vec());
+    let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to create Arrow stream reader for {}: {:?}", path, e),
+        )
+    })?;
+
+    let mut batches = Vec::new();
+    for batch_result in stream_reader {
+        batches.push(batch_result.map_err(|e| {
+            BallistaError::FetchFailed(
+                metadata.id.clone(),
+                partition_id.stage_id,
+                partition_id.partition_id,
+                format!("Failed to read batch from {}: {:?}", path, e),
+            )
+        })?);
+    }
+
+    if batches.is_empty() {
+        return Err(BallistaError::General(format!(
+            "No batches found in shuffle partition at {}",
+            path
+        )));
+    }
+
+    let schema = batches[0].schema();
+    let stream = futures::stream::iter(batches.into_iter().map(Ok));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
 /// Check if the location is an object store path (S3 or Azure).
-#[allow(dead_code)]
 fn check_is_object_store_location(location: &PartitionLocation) -> bool {
     let path = location.path.as_str();
-    path.starts_with("s3://") || path.starts_with("abfs://") || path.starts_with("az://")
+    path.starts_with("s3://")
+        || path.starts_with("abfs://")
+        || path.starts_with("az://")
+        || path.starts_with("gs://")
 }
 
 async fn fetch_partition_object_store(
@@ -1357,6 +1491,7 @@ mod tests {
             None,
             false,
             None, // No metrics callback in tests
+            Arc::new(RuntimeEnv::default()),
         );
 
         let stream = RecordBatchStreamAdapter::new(

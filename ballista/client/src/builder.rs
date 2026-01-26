@@ -49,8 +49,8 @@
 use crate::extension::SessionContextExt;
 use ballista_core::extension::SessionConfigExt;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::ObjectStore;
 use std::sync::Arc;
