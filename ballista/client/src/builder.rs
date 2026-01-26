@@ -228,7 +228,7 @@ impl BallistaBuilder {
         self
     }
 
-    /// Builds a [`SessionState`] with the configured object stores.
+    /// Builds a [`datafusion::execution::SessionState`] with the configured object stores.
     fn build_state(&self) -> Result<datafusion::execution::SessionState> {
         let runtime_env = RuntimeEnvBuilder::new().build()?;
 
