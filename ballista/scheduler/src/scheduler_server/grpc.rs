@@ -118,6 +118,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             }];
             let available_slots = available_slots.iter_mut().collect();
             let running_jobs = self.state.task_manager.get_running_job_cache();
+
             let binding_result = match self.state.config.task_distribution {
                 TaskDistributionPolicy::Bias => {
                     bind_task_bias(available_slots, running_jobs, |_| false).await

@@ -169,6 +169,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.init().await?;
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
+        self.start_pending_tasks_metrics_loop();
 
         Ok(())
     }
@@ -337,6 +338,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             }
         });
         Ok(())
+    }
+
+    /// Spawns a background task that periodically updates the pending tasks metric.
+    ///
+    /// This metric requires iterating over all active jobs and acquiring read locks,
+    /// which can cause lock contention if done in the main event loop. Running it
+    /// periodically in a background task provides observability without impacting
+    /// scheduler performance.
+    fn start_pending_tasks_metrics_loop(&self) {
+        let state = self.state.clone();
+        tokio::task::spawn(async move {
+            // Update every 5 seconds - frequent enough for observability,
+            // infrequent enough to avoid lock contention
+            const UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+            loop {
+                let pending_tasks = state.task_manager.total_pending_tasks().await;
+                state
+                    .metrics_collector
+                    .set_pending_tasks_queue_size(pending_tasks as u64);
+
+                tokio::time::sleep(UPDATE_INTERVAL).await;
+            }
+        });
     }
 
     pub(crate) fn remove_executor(
