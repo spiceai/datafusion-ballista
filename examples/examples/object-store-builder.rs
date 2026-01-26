@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     // Use BallistaBuilder to create a context with the pre-created object store
     let ctx = BallistaBuilder::new()
         .with_job_name("Object Store Builder Example")
-        .with_object_store(&format!("s3://{S3_BUCKET}"), Arc::new(s3_store))
+        .add_object_store(&format!("s3://{S3_BUCKET}"), Arc::new(s3_store))
         .standalone()
         .await?;
 

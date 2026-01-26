@@ -39,7 +39,7 @@
 //!     .build()?;
 //!
 //! let ctx = BallistaBuilder::new()
-//!     .with_object_store("s3://my-bucket", Arc::new(s3_store))
+//!     .add_object_store("s3://my-bucket", Arc::new(s3_store))
 //!     .standalone()
 //!     .await?;
 //! # Ok(())
@@ -79,7 +79,7 @@ use url::Url;
 ///     .build()?;
 ///
 /// let ctx = BallistaBuilder::new()
-///     .with_object_store("s3://my-bucket", Arc::new(s3_store))
+///     .add_object_store("s3://my-bucket", Arc::new(s3_store))
 ///     .remote("df://localhost:50050")
 ///     .await?;
 /// # Ok(())
@@ -159,32 +159,28 @@ impl BallistaBuilder {
     ///     .build()?;
     ///
     /// let ctx = BallistaBuilder::new()
-    ///     .with_object_store("s3://my-bucket", Arc::new(s3_store))
+    ///     .add_object_store("s3://my-bucket", Arc::new(s3_store))
     ///     .standalone()
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_object_store(mut self, url: &str, store: Arc<dyn ObjectStore>) -> Self {
+    pub fn add_object_store(mut self, url: &str, store: Arc<dyn ObjectStore>) -> Self {
         // Parse the URL, or store it for later error handling during build
         if let Ok(parsed_url) = Url::parse(url) {
             self.object_stores.push((parsed_url, store));
         } else {
             // We'll handle invalid URLs during build
-            log::warn!("Invalid object store URL: {}", url);
+            log::warn!("Invalid object store URL: {url}");
         }
         self
     }
 
     /// Registers a pre-created object store for a given URL.
     ///
-    /// This is the same as [`with_object_store`](Self::with_object_store) but takes
+    /// This is the same as [`add_object_store`](Self::add_object_store) but takes
     /// a pre-parsed [`Url`] instead of a string.
-    pub fn with_object_store_url(
-        mut self,
-        url: Url,
-        store: Arc<dyn ObjectStore>,
-    ) -> Self {
+    pub fn add_object_store_url(mut self, url: Url, store: Arc<dyn ObjectStore>) -> Self {
         self.object_stores.push((url, store));
         self
     }

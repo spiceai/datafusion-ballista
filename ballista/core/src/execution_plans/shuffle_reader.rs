@@ -876,15 +876,11 @@ async fn fetch_partition_object_store_with_runtime(
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
 
-    debug!(
-        "Fetching shuffle partition from object store using runtime_env: {}",
-        path
-    );
+    debug!("Fetching shuffle partition from object store using runtime_env: {path}");
 
     let url = Url::parse(path).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to parse object store URL '{}': {:?}",
-            path, e
+            "Failed to parse object store URL '{path}': {e:?}"
         ))
     })?;
 
@@ -892,8 +888,7 @@ async fn fetch_partition_object_store_with_runtime(
     // This uses the credentials configured in the runtime (e.g., SpiceObjectStoreRegistry)
     let object_store_url = ObjectStoreUrl::parse(&url).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to parse object store URL '{}': {:?}",
-            path, e
+            "Failed to parse object store URL '{path}': {e:?}"
         ))
     })?;
 
@@ -902,21 +897,21 @@ async fn fetch_partition_object_store_with_runtime(
             metadata.id.clone(),
             partition_id.stage_id,
             partition_id.partition_id,
-            format!("Failed to get object store for URL '{}': {:?}", path, e),
+            format!("Failed to get object store for URL '{path}': {e:?}"),
         )
     })?;
 
     // Extract the object path from the URL
     let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
 
-    debug!("Reading object from path: {:?}", object_path);
+    debug!("Reading object from path: {object_path:?}");
 
     let get_result = store.get(&object_path).await.map_err(|e| {
         BallistaError::FetchFailed(
             metadata.id.clone(),
             partition_id.stage_id,
             partition_id.partition_id,
-            format!("Failed to read object from {}: {:?}", path, e),
+            format!("Failed to read object from {path}: {e:?}"),
         )
     })?;
 
@@ -925,7 +920,7 @@ async fn fetch_partition_object_store_with_runtime(
             metadata.id.clone(),
             partition_id.stage_id,
             partition_id.partition_id,
-            format!("Failed to read bytes from {}: {:?}", path, e),
+            format!("Failed to read bytes from {path}: {e:?}"),
         )
     })?;
 
@@ -935,7 +930,7 @@ async fn fetch_partition_object_store_with_runtime(
             metadata.id.clone(),
             partition_id.stage_id,
             partition_id.partition_id,
-            format!("Failed to create Arrow stream reader for {}: {:?}", path, e),
+            format!("Failed to create Arrow stream reader for {path}: {e:?}"),
         )
     })?;
 
@@ -946,15 +941,14 @@ async fn fetch_partition_object_store_with_runtime(
                 metadata.id.clone(),
                 partition_id.stage_id,
                 partition_id.partition_id,
-                format!("Failed to read batch from {}: {:?}", path, e),
+                format!("Failed to read batch from {path}: {e:?}"),
             )
         })?);
     }
 
     if batches.is_empty() {
         return Err(BallistaError::General(format!(
-            "No batches found in shuffle partition at {}",
-            path
+            "No batches found in shuffle partition at {path}"
         )));
     }
 
@@ -981,7 +975,7 @@ async fn fetch_partition_object_store(
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
 
-    debug!("Fetching shuffle partition from object store: {}", path);
+    debug!("Fetching shuffle partition from object store: {path}");
 
     let batches = fetch_partition_object_store_inner(path)
         .await
@@ -997,8 +991,7 @@ async fn fetch_partition_object_store(
 
     if batches.is_empty() {
         return Err(BallistaError::General(format!(
-            "No batches found in shuffle partition at {}",
-            path
+            "No batches found in shuffle partition at {path}"
         )));
     }
 
@@ -1014,8 +1007,7 @@ async fn fetch_partition_object_store_inner(
 
     let url = Url::parse(path).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to parse object store URL '{}': {:?}",
-            path, e
+            "Failed to parse object store URL '{path}': {e:?}"
         ))
     })?;
 
@@ -1023,44 +1015,42 @@ async fn fetch_partition_object_store_inner(
     let store: Arc<dyn ObjectStore> = match scheme {
         "s3" => {
             let bucket = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No bucket in S3 URL: {}", path))
+                BallistaError::General(format!("No bucket in S3 URL: {path}"))
             })?;
             let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
             Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create S3 client: {:?}", e))
+                BallistaError::General(format!("Failed to create S3 client: {e:?}"))
             })?)
         }
         "abfs" | "az" => {
             // Parse Azure URL: abfs://container@account.dfs.core.windows.net/path
             let host = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No host in Azure URL: {}", path))
+                BallistaError::General(format!("No host in Azure URL: {path}"))
             })?;
 
             // Extract container from username portion
             let container = url.username();
             if container.is_empty() {
                 return Err(BallistaError::General(format!(
-                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {}",
-                    path
+                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {path}"
                 )));
             }
 
             // Extract account from host (account.dfs.core.windows.net)
             let account = host.split('.').next().ok_or_else(|| {
-                BallistaError::General(format!("No account in Azure URL: {}", path))
+                BallistaError::General(format!("No account in Azure URL: {path}"))
             })?;
 
             let builder = MicrosoftAzureBuilder::from_env()
                 .with_account(account)
                 .with_container_name(container);
             Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create Azure client: {:?}", e))
+                BallistaError::General(format!("Failed to create Azure client: {e:?}"))
             })?)
         }
         _ => {
             return Err(BallistaError::General(format!(
-                "Unsupported object store scheme: {}. Supported: s3, abfs, az",
-                scheme
+                "Unsupported object store scheme: {scheme}. Supported: s3, abfs, az"
             )));
         }
     };
@@ -1068,28 +1058,27 @@ async fn fetch_partition_object_store_inner(
     // Extract the object path from the URL
     let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
 
-    debug!("Reading object from path: {:?}", object_path);
+    debug!("Reading object from path: {object_path:?}");
 
     let get_result = store.get(&object_path).await.map_err(|e| {
-        BallistaError::General(format!("Failed to read object from {}: {:?}", path, e))
+        BallistaError::General(format!("Failed to read object from {path}: {e:?}"))
     })?;
 
     let bytes = get_result.bytes().await.map_err(|e| {
-        BallistaError::General(format!("Failed to read bytes from {}: {:?}", path, e))
+        BallistaError::General(format!("Failed to read bytes from {path}: {e:?}"))
     })?;
 
     let cursor = Cursor::new(bytes.to_vec());
     let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to create Arrow stream reader for {}: {:?}",
-            path, e
+            "Failed to create Arrow stream reader for {path}: {e:?}"
         ))
     })?;
 
     let mut batches = Vec::new();
     for batch_result in stream_reader {
         batches.push(batch_result.map_err(|e| {
-            BallistaError::General(format!("Failed to read batch from {}: {:?}", path, e))
+            BallistaError::General(format!("Failed to read batch from {path}: {e:?}"))
         })?);
     }
 
