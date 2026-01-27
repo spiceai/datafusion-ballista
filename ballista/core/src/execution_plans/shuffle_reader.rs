@@ -31,6 +31,9 @@ use std::task::{Context, Poll};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
+
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use url::Url;
 
 use crate::client::BallistaClient;
@@ -209,6 +212,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             customize_endpoint,
             use_tls,
             metrics_callback,
+            context.runtime_env(),
         );
 
         let result = RecordBatchStreamAdapter::new(
@@ -399,32 +403,41 @@ fn local_remote_read_split(
     }
 }
 
-/// Splits partition locations into memory, local disk, and remote categories.
-/// Returns (memory_locations, local_locations, remote_locations)
+/// Partition locations split into categories for different fetch strategies.
+#[derive(Debug, Default)]
+struct SplitPartitionLocations {
+    /// Partitions stored in memory (fastest path)
+    memory: Vec<PartitionLocation>,
+    /// Partitions stored on local disk
+    local: Vec<PartitionLocation>,
+    /// Partitions stored in object stores (S3, Azure, GCS)
+    object_store: Vec<PartitionLocation>,
+    /// Partitions requiring remote fetch via Flight
+    remote: Vec<PartitionLocation>,
+}
+
+/// Splits partition locations into memory, local disk, object store, and remote categories.
 fn split_partition_locations(
     partition_locations: Vec<PartitionLocation>,
     force_remote_read: bool,
-) -> (
-    Vec<PartitionLocation>,
-    Vec<PartitionLocation>,
-    Vec<PartitionLocation>,
-) {
-    let mut memory_locations = Vec::new();
-    let mut local_locations = Vec::new();
-    let mut remote_locations = Vec::new();
+) -> SplitPartitionLocations {
+    let mut result = SplitPartitionLocations::default();
 
     for loc in partition_locations {
         if check_is_memory_location(&loc) {
             // Memory locations are always read locally
-            memory_locations.push(loc);
+            result.memory.push(loc);
+        } else if check_is_object_store_location(&loc) {
+            // Object store locations are handled via the runtime_env's registered object stores
+            result.object_store.push(loc);
         } else if !force_remote_read && check_is_local_location(&loc) {
-            local_locations.push(loc);
+            result.local.push(loc);
         } else {
-            remote_locations.push(loc);
+            result.remote.push(loc);
         }
     }
 
-    (memory_locations, local_locations, remote_locations)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -437,23 +450,25 @@ fn send_fetch_partitions(
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
     metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
     let semaphore = Arc::new(Semaphore::new(max_request_num));
     let mut spawned_tasks: Vec<SpawnedTask<()>> = vec![];
 
-    let (memory_locations, local_locations, remote_locations) =
-        split_partition_locations(partition_locations, force_remote_read);
+    let locations = split_partition_locations(partition_locations, force_remote_read);
 
     debug!(
-        "memory shuffle partition count: {}, local shuffle file counts: {}, remote shuffle file count: {}.",
-        memory_locations.len(),
-        local_locations.len(),
-        remote_locations.len()
+        "memory shuffle partition count: {}, local shuffle file counts: {}, object store shuffle file count: {}, remote shuffle file count: {}.",
+        locations.memory.len(),
+        locations.local.len(),
+        locations.object_store.len(),
+        locations.remote.len()
     );
 
     // Read memory partitions first (fastest path)
     let response_sender_m = response_sender.clone();
+    let memory_locations = locations.memory;
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in memory_locations {
             let r = PartitionReaderEnum::Memory
@@ -469,6 +484,7 @@ fn send_fetch_partitions(
     let response_sender_c = response_sender.clone();
     let customize_endpoint_c = customize_endpoint.clone();
     let metrics_callback_c = metrics_callback.clone();
+    let local_locations = locations.local;
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in local_locations {
             let start_time = std::time::Instant::now();
@@ -506,7 +522,25 @@ fn send_fetch_partitions(
         }
     }));
 
-    for p in remote_locations.into_iter() {
+    // Read object store partitions using the RuntimeEnv's registered object stores
+    let response_sender_os = response_sender.clone();
+    let runtime_env_clone = Arc::clone(&runtime_env);
+    let object_store_locations = locations.object_store;
+    spawned_tasks.push(SpawnedTask::spawn(async move {
+        for p in object_store_locations {
+            let r = fetch_partition_object_store_with_runtime(
+                &p,
+                Arc::clone(&runtime_env_clone),
+            )
+            .await;
+
+            if let Err(e) = response_sender_os.send(r).await {
+                error!("Fail to send response event to the channel due to {e}");
+            }
+        }
+    }));
+
+    for p in locations.remote.into_iter() {
         let semaphore = semaphore.clone();
         let response_sender = response_sender.clone();
         let customize_endpoint_c = customize_endpoint.clone();
@@ -830,11 +864,255 @@ impl RecordBatchStream for InMemoryShuffleStream {
     }
 }
 
+/// Fetch partition from object store using the RuntimeEnv's registered object stores.
+/// This uses the credentials and configuration from the runtime environment.
+///
+/// This implementation streams data from the object store and decodes record batches
+/// incrementally using Arrow's `StreamDecoder`, avoiding buffering the entire partition
+/// in memory.
+async fn fetch_partition_object_store_with_runtime(
+    location: &PartitionLocation,
+    runtime_env: Arc<RuntimeEnv>,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    use object_store::path::Path as ObjectPath;
+
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    debug!("Fetching shuffle partition from object store using runtime_env: {path}");
+
+    let url = Url::parse(path).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{path}': {e:?}"
+        ))
+    })?;
+
+    // Get the object store from the RuntimeEnv's registry
+    // This uses the credentials configured in the runtime (e.g., SpiceObjectStoreRegistry)
+    let object_store_url = ObjectStoreUrl::parse(&url).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{path}': {e:?}"
+        ))
+    })?;
+
+    let store = runtime_env.object_store(&object_store_url).map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to get object store for URL '{path}': {e:?}"),
+        )
+    })?;
+
+    // Extract the object path from the URL
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    debug!("Reading object from path: {object_path:?}");
+
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to read object from {path}: {e:?}"),
+        )
+    })?;
+
+    // Convert to a streaming byte stream instead of loading all bytes into memory
+    let byte_stream = get_result.into_stream();
+
+    // Create the streaming decoder
+    let stream = ObjectStoreShuffleStream::try_new(byte_stream, path.clone()).await?;
+
+    Ok(Box::pin(stream))
+}
+
+/// Maximum length of message with schema definition for object store streaming.
+const OBJECT_STORE_MAX_SCHEMA_BUFFER_SIZE: usize = 8_388_608;
+
+/// A streaming reader for Arrow IPC data from object stores.
+///
+/// This stream incrementally decodes record batches as data chunks arrive from
+/// the object store, avoiding the need to buffer the entire partition in memory.
+/// It uses Arrow's `StreamDecoder` to decode IPC messages from the byte stream.
+struct ObjectStoreShuffleStream {
+    /// The Arrow IPC stream decoder
+    decoder: datafusion::arrow::ipc::reader::StreamDecoder,
+    /// Buffer holding partially received IPC messages
+    state_buffer: datafusion::arrow::buffer::Buffer,
+    /// The underlying byte stream from the object store
+    byte_stream: Pin<Box<dyn Stream<Item = object_store::Result<bytes::Bytes>> + Send>>,
+    /// The schema of the data being streamed
+    schema: SchemaRef,
+    /// Path for error messages
+    path: String,
+}
+
+impl ObjectStoreShuffleStream {
+    /// Creates a new `ObjectStoreShuffleStream` from an object store byte stream.
+    ///
+    /// This reads the schema from the stream header and initializes the decoder.
+    async fn try_new(
+        byte_stream: impl Stream<Item = object_store::Result<bytes::Bytes>> + Send + 'static,
+        path: String,
+    ) -> result::Result<Self, BallistaError> {
+        use datafusion::arrow::buffer::Buffer;
+        use datafusion::arrow::ipc::convert::try_schema_from_ipc_buffer;
+        use datafusion::arrow::ipc::reader::StreamDecoder;
+
+        let mut byte_stream: Pin<
+            Box<dyn Stream<Item = object_store::Result<bytes::Bytes>> + Send>,
+        > = Box::pin(byte_stream);
+        let mut state_buffer = Buffer::default();
+
+        // Read chunks until we have enough data to parse the schema
+        loop {
+            if state_buffer.len() > OBJECT_STORE_MAX_SCHEMA_BUFFER_SIZE {
+                return Err(BallistaError::General(format!(
+                    "Schema buffer length exceeded maximum buffer size for {path}, \
+                    expected {} actual: {}",
+                    OBJECT_STORE_MAX_SCHEMA_BUFFER_SIZE,
+                    state_buffer.len()
+                )));
+            }
+
+            match byte_stream.next().await {
+                Some(Ok(blob)) => {
+                    state_buffer = Self::combine_buffers(&state_buffer, &blob);
+
+                    match try_schema_from_ipc_buffer(state_buffer.as_slice()) {
+                        Ok(schema) => {
+                            return Ok(Self {
+                                decoder: StreamDecoder::new(),
+                                state_buffer,
+                                byte_stream,
+                                schema: Arc::new(schema),
+                                path,
+                            });
+                        }
+                        Err(datafusion::arrow::error::ArrowError::ParseError(_)) => {
+                            // Parse errors are ignored as we may not have received the
+                            // whole message yet, so the schema cannot be extracted
+                        }
+                        Err(e) => {
+                            return Err(BallistaError::General(format!(
+                                "Failed to parse schema from {path}: {e:?}"
+                            )));
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(BallistaError::General(format!(
+                        "Error reading from object store {path}: {e:?}"
+                    )));
+                }
+                None => {
+                    return Err(BallistaError::General(format!(
+                        "Premature end of stream while reading schema from {path}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn combine_buffers(
+        first: &datafusion::arrow::buffer::Buffer,
+        second: &bytes::Bytes,
+    ) -> datafusion::arrow::buffer::Buffer {
+        use datafusion::arrow::buffer::MutableBuffer;
+        let mut combined = MutableBuffer::new(first.len() + second.len());
+        combined.extend_from_slice(first.as_slice());
+        combined.extend_from_slice(second);
+        combined.into()
+    }
+
+    fn decode(
+        &mut self,
+    ) -> result::Result<Option<RecordBatch>, datafusion::arrow::error::ArrowError> {
+        self.decoder.decode(&mut self.state_buffer)
+    }
+
+    fn extend_bytes(&mut self, blob: bytes::Bytes) {
+        self.state_buffer = Self::combine_buffers(&self.state_buffer, &blob);
+    }
+}
+
+impl Stream for ObjectStoreShuffleStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // First, try to decode a batch from the current buffer
+        match self.decode() {
+            Ok(Some(batch)) => return Poll::Ready(Some(Ok(batch))),
+            Ok(None) => {
+                // No complete batch in buffer, need more data
+            }
+            Err(e) => {
+                return Poll::Ready(Some(Err(DataFusionError::ArrowError(
+                    Box::new(e),
+                    None,
+                ))));
+            }
+        }
+
+        // Poll the underlying byte stream for more data
+        match self.byte_stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(blob))) => {
+                self.extend_bytes(blob);
+
+                // Try to decode again with the new data
+                match self.decode() {
+                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+                    Ok(None) => {
+                        // Still not enough data, wake ourselves to poll again
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Err(e) => Poll::Ready(Some(Err(DataFusionError::ArrowError(
+                        Box::new(e),
+                        None,
+                    )))),
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(DataFusionError::External(
+                    format!("Error reading from object store {}: {e:?}", self.path)
+                        .into(),
+                ))))
+            }
+            Poll::Ready(None) => {
+                // End of stream - try one more decode in case there's remaining data
+                match self.decode() {
+                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+                    Ok(None) => Poll::Ready(None),
+                    Err(e) => Poll::Ready(Some(Err(DataFusionError::ArrowError(
+                        Box::new(e),
+                        None,
+                    )))),
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for ObjectStoreShuffleStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
 /// Check if the location is an object store path (S3 or Azure).
-#[allow(dead_code)]
 fn check_is_object_store_location(location: &PartitionLocation) -> bool {
     let path = location.path.as_str();
-    path.starts_with("s3://") || path.starts_with("abfs://") || path.starts_with("az://")
+    path.starts_with("s3://")
+        || path.starts_with("abfs://")
+        || path.starts_with("az://")
+        || path.starts_with("gs://")
 }
 
 async fn fetch_partition_object_store(
@@ -846,7 +1124,7 @@ async fn fetch_partition_object_store(
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
 
-    debug!("Fetching shuffle partition from object store: {}", path);
+    debug!("Fetching shuffle partition from object store: {path}");
 
     let batches = fetch_partition_object_store_inner(path)
         .await
@@ -862,8 +1140,7 @@ async fn fetch_partition_object_store(
 
     if batches.is_empty() {
         return Err(BallistaError::General(format!(
-            "No batches found in shuffle partition at {}",
-            path
+            "No batches found in shuffle partition at {path}"
         )));
     }
 
@@ -879,8 +1156,7 @@ async fn fetch_partition_object_store_inner(
 
     let url = Url::parse(path).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to parse object store URL '{}': {:?}",
-            path, e
+            "Failed to parse object store URL '{path}': {e:?}"
         ))
     })?;
 
@@ -888,44 +1164,42 @@ async fn fetch_partition_object_store_inner(
     let store: Arc<dyn ObjectStore> = match scheme {
         "s3" => {
             let bucket = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No bucket in S3 URL: {}", path))
+                BallistaError::General(format!("No bucket in S3 URL: {path}"))
             })?;
             let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
             Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create S3 client: {:?}", e))
+                BallistaError::General(format!("Failed to create S3 client: {e:?}"))
             })?)
         }
         "abfs" | "az" => {
             // Parse Azure URL: abfs://container@account.dfs.core.windows.net/path
             let host = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No host in Azure URL: {}", path))
+                BallistaError::General(format!("No host in Azure URL: {path}"))
             })?;
 
             // Extract container from username portion
             let container = url.username();
             if container.is_empty() {
                 return Err(BallistaError::General(format!(
-                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {}",
-                    path
+                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {path}"
                 )));
             }
 
             // Extract account from host (account.dfs.core.windows.net)
             let account = host.split('.').next().ok_or_else(|| {
-                BallistaError::General(format!("No account in Azure URL: {}", path))
+                BallistaError::General(format!("No account in Azure URL: {path}"))
             })?;
 
             let builder = MicrosoftAzureBuilder::from_env()
                 .with_account(account)
                 .with_container_name(container);
             Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create Azure client: {:?}", e))
+                BallistaError::General(format!("Failed to create Azure client: {e:?}"))
             })?)
         }
         _ => {
             return Err(BallistaError::General(format!(
-                "Unsupported object store scheme: {}. Supported: s3, abfs, az",
-                scheme
+                "Unsupported object store scheme: {scheme}. Supported: s3, abfs, az"
             )));
         }
     };
@@ -933,28 +1207,27 @@ async fn fetch_partition_object_store_inner(
     // Extract the object path from the URL
     let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
 
-    debug!("Reading object from path: {:?}", object_path);
+    debug!("Reading object from path: {object_path:?}");
 
     let get_result = store.get(&object_path).await.map_err(|e| {
-        BallistaError::General(format!("Failed to read object from {}: {:?}", path, e))
+        BallistaError::General(format!("Failed to read object from {path}: {e:?}"))
     })?;
 
     let bytes = get_result.bytes().await.map_err(|e| {
-        BallistaError::General(format!("Failed to read bytes from {}: {:?}", path, e))
+        BallistaError::General(format!("Failed to read bytes from {path}: {e:?}"))
     })?;
 
     let cursor = Cursor::new(bytes.to_vec());
     let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
         BallistaError::General(format!(
-            "Failed to create Arrow stream reader for {}: {:?}",
-            path, e
+            "Failed to create Arrow stream reader for {path}: {e:?}"
         ))
     })?;
 
     let mut batches = Vec::new();
     for batch_result in stream_reader {
         batches.push(batch_result.map_err(|e| {
-            BallistaError::General(format!("Failed to read batch from {}: {:?}", path, e))
+            BallistaError::General(format!("Failed to read batch from {path}: {e:?}"))
         })?);
     }
 
@@ -1356,6 +1629,7 @@ mod tests {
             None,
             false,
             None, // No metrics callback in tests
+            Arc::new(RuntimeEnv::default()),
         );
 
         let stream = RecordBatchStreamAdapter::new(
@@ -1427,5 +1701,205 @@ mod tests {
             Field::new("number", DataType::UInt32, true),
             Field::new("str", DataType::Utf8, true),
         ]))
+    }
+
+    /// Test that ObjectStoreShuffleStream correctly decodes Arrow IPC data
+    /// delivered in chunks, simulating streaming from an object store.
+    #[tokio::test]
+    async fn test_object_store_shuffle_stream() {
+        use bytes::Bytes;
+        use datafusion::arrow::ipc::writer::StreamWriter;
+
+        // Create test batches
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+            ],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(StringArray::from(vec![Some("d"), None, Some("f")])),
+            ],
+        )
+        .unwrap();
+
+        // Write batches to IPC format in memory
+        let mut ipc_data = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_data, &schema).unwrap();
+            writer.write(&batch1).unwrap();
+            writer.write(&batch2).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Split IPC data into small chunks to simulate streaming
+        let chunk_size = 64; // Small chunks to test incremental decoding
+        let chunks: Vec<Bytes> = ipc_data
+            .chunks(chunk_size)
+            .map(Bytes::copy_from_slice)
+            .collect();
+
+        // Create a stream that yields chunks with small delays to simulate network
+        let byte_stream =
+            futures::stream::iter(chunks.into_iter().map(Ok::<_, object_store::Error>));
+
+        // Create the ObjectStoreShuffleStream
+        let mut stream =
+            ObjectStoreShuffleStream::try_new(byte_stream, "test://path".to_string())
+                .await
+                .expect("Failed to create ObjectStoreShuffleStream");
+
+        // Verify the schema was correctly parsed
+        assert_eq!(stream.schema().fields().len(), 2);
+        assert_eq!(stream.schema().field(0).name(), "a");
+        assert_eq!(stream.schema().field(1).name(), "b");
+
+        // Collect all batches from the stream
+        let mut collected_batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            collected_batches.push(result.expect("Failed to read batch"));
+        }
+
+        // Verify we got both batches
+        assert_eq!(collected_batches.len(), 2);
+
+        // Verify batch1 contents
+        assert_eq!(collected_batches[0].num_rows(), 3);
+        let col_a = collected_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_a.values(), &[1, 2, 3]);
+
+        // Verify batch2 contents
+        assert_eq!(collected_batches[1].num_rows(), 3);
+        let col_a = collected_batches[1]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_a.values(), &[4, 5, 6]);
+    }
+
+    /// Test ObjectStoreShuffleStream with single-byte chunks (extreme fragmentation)
+    #[tokio::test]
+    async fn test_object_store_shuffle_stream_single_byte_chunks() {
+        use bytes::Bytes;
+        use datafusion::arrow::ipc::writer::StreamWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![42, 43, 44]))],
+        )
+        .unwrap();
+
+        // Write to IPC format
+        let mut ipc_data = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_data, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Split into single-byte chunks (extreme case)
+        let chunks: Vec<Bytes> = ipc_data.iter().map(|&b| Bytes::from(vec![b])).collect();
+
+        let byte_stream =
+            futures::stream::iter(chunks.into_iter().map(Ok::<_, object_store::Error>));
+
+        let mut stream =
+            ObjectStoreShuffleStream::try_new(byte_stream, "test://single".to_string())
+                .await
+                .expect("Failed to create stream with single-byte chunks");
+
+        let mut count = 0;
+        while let Some(result) = stream.next().await {
+            result.expect("Failed to read batch");
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    /// Test ObjectStoreShuffleStream handles errors from the byte stream
+    #[tokio::test]
+    async fn test_object_store_shuffle_stream_error_handling() {
+        use bytes::Bytes;
+        use datafusion::arrow::ipc::writer::StreamWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Write to IPC format
+        let mut ipc_data = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_data, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Create chunks but inject an error partway through
+        let chunk_size = 64;
+        let chunks: Vec<_> = ipc_data.chunks(chunk_size).collect();
+        let mid = chunks.len() / 2;
+
+        let items: Vec<object_store::Result<Bytes>> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == mid {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "simulated error".into(),
+                    })
+                } else {
+                    Ok(Bytes::copy_from_slice(c))
+                }
+            })
+            .collect();
+
+        let byte_stream = futures::stream::iter(items);
+
+        // The stream creation might fail if the error occurs before schema is parsed,
+        // or reading might fail later
+        let stream_result =
+            ObjectStoreShuffleStream::try_new(byte_stream, "test://error".to_string())
+                .await;
+
+        // Either creation fails or reading fails - both are acceptable
+        match stream_result {
+            Err(_) => {
+                // Error during schema parsing is fine
+            }
+            Ok(mut stream) => {
+                // Error should occur while reading batches
+                let mut found_error = false;
+                while let Some(result) = stream.next().await {
+                    if result.is_err() {
+                        found_error = true;
+                        break;
+                    }
+                }
+                assert!(found_error, "Expected an error while reading batches");
+            }
+        }
     }
 }

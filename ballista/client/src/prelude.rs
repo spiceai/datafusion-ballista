@@ -22,5 +22,6 @@
 //     error::{BallistaError, Result},
 // };
 
+pub use crate::builder::BallistaBuilder;
 pub use crate::extension::{SessionConfigExt, SessionContextExt};
 //pub use futures::StreamExt;
