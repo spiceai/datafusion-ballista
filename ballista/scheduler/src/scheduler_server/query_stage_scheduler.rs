@@ -122,6 +122,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 }
 
                 let state = self.state.clone();
+
+                // Clone the job state sender to move into the async task
                 let job_state_sender = self.job_state_sender.clone();
                 tokio::spawn(async move {
                     let event = if let Err(e) = state
