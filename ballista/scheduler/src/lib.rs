@@ -46,3 +46,4 @@ pub mod state;
 pub mod test_utils;
 
 pub use scheduler_server::SessionBuilder;
+pub use scheduler_server::job_state_event::{JobState, JobStateEvent};
