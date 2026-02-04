@@ -425,8 +425,19 @@ fn split_partition_locations(
 
     for loc in partition_locations {
         if check_is_memory_location(&loc) {
-            // Memory locations are always read locally
-            result.memory.push(loc);
+            // Memory locations should only be read locally if they exist in this executor's
+            // shuffle manager. If the partition doesn't exist locally, it means the partition
+            // was written by another executor and we need to fetch it remotely via Flight.
+            if check_is_local_memory_location(&loc) {
+                result.memory.push(loc);
+            } else {
+                // Partition is in memory on another executor, fetch remotely
+                debug!(
+                    "Memory partition {} not found locally, will fetch remotely from executor {}",
+                    loc.path, loc.executor_meta.id
+                );
+                result.remote.push(loc);
+            }
         } else if check_is_object_store_location(&loc) {
             // Object store locations are handled via the runtime_env's registered object stores
             result.object_store.push(loc);
@@ -596,6 +607,16 @@ fn check_is_local_location(location: &PartitionLocation) -> bool {
 /// Check if the partition location is stored in memory
 fn check_is_memory_location(location: &PartitionLocation) -> bool {
     location.path.starts_with("memory://")
+}
+
+/// Check if a memory:// partition actually exists in the local shuffle manager.
+/// This is used to determine whether to read the partition locally or fetch it remotely.
+fn check_is_local_memory_location(location: &PartitionLocation) -> bool {
+    if let Some(key) = location.path.strip_prefix("memory://") {
+        global_shuffle_manager().contains_partition(key)
+    } else {
+        false
+    }
 }
 
 /// Partition reader Trait, different partition reader can have
