@@ -646,8 +646,7 @@ impl ShuffleWriterExec {
 
                 let mut part_locs = Vec::new();
 
-                for (output_partition, entry) in
-                    partition_batches.into_iter().enumerate()
+                for (output_partition, entry) in partition_batches.into_iter().enumerate()
                 {
                     if let Some((batches, _num_batches, _num_rows)) = entry {
                         let (path, stats) = storage

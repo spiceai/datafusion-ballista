@@ -871,14 +871,9 @@ mod tests {
         assert_eq!(config.storage_type, ShuffleStorageType::Azure);
         assert_eq!(
             config.base_url,
-            Some(
-                "abfs://mycontainer@myaccount.dfs.core.windows.net/shuffle".to_string()
-            )
+            Some("abfs://mycontainer@myaccount.dfs.core.windows.net/shuffle".to_string())
         );
-        assert_eq!(
-            config.azure_config.account,
-            Some("myaccount".to_string())
-        );
+        assert_eq!(config.azure_config.account, Some("myaccount".to_string()));
         assert_eq!(
             config.azure_config.container,
             Some("mycontainer".to_string())
@@ -893,18 +888,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.storage_type, ShuffleStorageType::Azure);
-        assert_eq!(
-            config.azure_config.account,
-            Some("myaccount".to_string())
-        );
+        assert_eq!(config.azure_config.account, Some("myaccount".to_string()));
     }
 
     #[test]
     fn test_from_type_and_url_s3_invalid_url() {
-        let result = ShuffleStorageConfig::from_type_and_url(
-            ShuffleStorageType::S3,
-            "not-a-url",
-        );
+        let result =
+            ShuffleStorageConfig::from_type_and_url(ShuffleStorageType::S3, "not-a-url");
         assert!(result.is_err());
     }
 }
