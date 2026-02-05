@@ -40,6 +40,7 @@ use crate::execution_plans::shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, global_shuffle_manager,
 };
 use crate::extension::SessionConfigExt;
+use crate::shuffle_storage::ShuffleStorageType;
 use crate::utils;
 
 use crate::serde::protobuf::ShuffleWritePartition;
@@ -317,6 +318,18 @@ impl ShuffleWriterExec {
         // Use memory mode only for intermediate stages, not for the final output stage
         let use_memory = memory_mode && !is_final_stage;
 
+        // Check for object store shuffle configuration
+        let storage_type_str = context.session_config().ballista_shuffle_storage_type();
+        let storage_type: ShuffleStorageType = storage_type_str
+            .parse()
+            .unwrap_or(ShuffleStorageType::Local);
+        let storage_url = context.session_config().ballista_shuffle_storage_url();
+        let use_object_store = !use_memory
+            && matches!(
+                storage_type,
+                ShuffleStorageType::S3 | ShuffleStorageType::Azure
+            );
+
         // Get shuffle format from session config
         let shuffle_format = context.session_config().ballista_shuffle_format();
         let file_ext = utils::shuffle_file_extension(shuffle_format);
@@ -336,6 +349,20 @@ impl ShuffleWriterExec {
                     write_metrics,
                     now,
                     shuffle_format,
+                )
+                .await
+            } else if use_object_store {
+                // Use object store (S3 or Azure) for shuffle data
+                Self::execute_shuffle_write_object_store(
+                    &job_id,
+                    stage_id,
+                    input_partition,
+                    &mut stream,
+                    output_partitioning,
+                    write_metrics,
+                    now,
+                    storage_type,
+                    storage_url,
                 )
                 .await
             } else {
@@ -495,6 +522,158 @@ impl ShuffleWriterExec {
                             num_batches: w.num_batches as u64,
                             num_rows: w.num_rows as u64,
                             num_bytes,
+                        });
+                    }
+                }
+                Ok(part_locs)
+            }
+
+            _ => Err(DataFusionError::Execution(
+                "Invalid shuffle partitioning scheme".to_owned(),
+            )),
+        }
+    }
+
+    /// Executes shuffle write to an object store (S3 or Azure).
+    ///
+    /// Uses Arrow IPC format with LZ4 compression for serialization. Data is serialized
+    /// to an in-memory buffer and then uploaded to the object store in a single PUT request.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_shuffle_write_object_store(
+        job_id: &str,
+        stage_id: usize,
+        input_partition: usize,
+        stream: &mut std::pin::Pin<
+            Box<dyn datafusion::physical_plan::RecordBatchStream + Send>,
+        >,
+        output_partitioning: Option<Partitioning>,
+        write_metrics: ShuffleWriteMetrics,
+        now: Instant,
+        storage_type: ShuffleStorageType,
+        storage_url: Option<String>,
+    ) -> Result<Vec<ShuffleWritePartition>> {
+        use crate::shuffle_storage::{ShuffleStorageConfig, ShuffleStorageFactory};
+
+        let base_url = storage_url.ok_or_else(|| {
+            DataFusionError::Configuration(format!(
+                "Shuffle storage URL must be set when using {storage_type} storage type. Set the 'ballista.shuffle.storage_url' configuration."
+            ))
+        })?;
+
+        let config = ShuffleStorageConfig::from_type_and_url(storage_type, &base_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let storage = ShuffleStorageFactory::create(&config)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let schema = stream.schema();
+
+        match output_partitioning {
+            None => {
+                // No repartitioning — collect all batches and write them as a single partition
+                let mut batches = Vec::new();
+                while let Some(result) = stream.next().await {
+                    let batch = result?;
+                    write_metrics.input_rows.add(batch.num_rows());
+                    write_metrics.output_rows.add(batch.num_rows());
+                    batches.push(batch);
+                }
+
+                let (path, stats) = storage
+                    .write_shuffle_data(
+                        job_id,
+                        stage_id,
+                        input_partition,
+                        input_partition,
+                        batches,
+                        schema,
+                        &write_metrics.write_time,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                info!(
+                    "Executed partition {} to object store in {} seconds. Statistics: {}",
+                    input_partition,
+                    now.elapsed().as_secs(),
+                    stats
+                );
+
+                Ok(vec![ShuffleWritePartition {
+                    partition_id: input_partition as u64,
+                    path,
+                    num_batches: stats.num_batches.unwrap_or(0),
+                    num_rows: stats.num_rows.unwrap_or(0),
+                    num_bytes: stats.num_bytes.unwrap_or(0),
+                }])
+            }
+
+            Some(Partitioning::Hash(exprs, num_output_partitions)) => {
+                // Hash-repartition: collect batches per output partition, then upload each
+                let mut partition_batches: Vec<Option<(Vec<RecordBatch>, usize, usize)>> =
+                    (0..num_output_partitions).map(|_| None).collect();
+
+                let mut partitioner = BatchPartitioner::try_new(
+                    Partitioning::Hash(exprs, num_output_partitions),
+                    write_metrics.repart_time.clone(),
+                )?;
+
+                while let Some(result) = stream.next().await {
+                    let input_batch = result?;
+                    write_metrics.input_rows.add(input_batch.num_rows());
+
+                    partitioner.partition(
+                        input_batch,
+                        |output_partition, output_batch| {
+                            let timer = write_metrics.write_time.timer();
+                            let batch_rows = output_batch.num_rows();
+                            match &mut partition_batches[output_partition] {
+                                Some((batches, num_batches, num_rows)) => {
+                                    *num_batches += 1;
+                                    *num_rows += batch_rows;
+                                    batches.push(output_batch);
+                                }
+                                None => {
+                                    partition_batches[output_partition] =
+                                        Some((vec![output_batch], 1, batch_rows));
+                                }
+                            }
+                            write_metrics.output_rows.add(batch_rows);
+                            timer.done();
+                            Ok(())
+                        },
+                    )?;
+                }
+
+                let mut part_locs = Vec::new();
+
+                for (output_partition, entry) in
+                    partition_batches.into_iter().enumerate()
+                {
+                    if let Some((batches, _num_batches, _num_rows)) = entry {
+                        let (path, stats) = storage
+                            .write_shuffle_data(
+                                job_id,
+                                stage_id,
+                                output_partition,
+                                input_partition,
+                                batches,
+                                schema.clone(),
+                                &write_metrics.write_time,
+                            )
+                            .await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                        debug!(
+                            "Finished writing shuffle partition {} to object store. Stats: {}.",
+                            output_partition, stats
+                        );
+
+                        part_locs.push(ShuffleWritePartition {
+                            partition_id: output_partition as u64,
+                            path,
+                            num_batches: stats.num_batches.unwrap_or(0),
+                            num_rows: stats.num_rows.unwrap_or(0),
+                            num_bytes: stats.num_bytes.unwrap_or(0),
                         });
                     }
                 }
