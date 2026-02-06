@@ -34,7 +34,7 @@ use log::{debug, error};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutPayload, WriteMultipart};
 use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -175,6 +175,64 @@ impl ShuffleStorageConfig {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    /// Creates a storage configuration from a storage type and URL.
+    ///
+    /// Parses the URL to extract backend-specific fields (bucket, account, container, prefix).
+    /// Credentials are resolved from environment variables by the underlying object store builders.
+    pub fn from_type_and_url(
+        storage_type: ShuffleStorageType,
+        url: &str,
+    ) -> Result<Self> {
+        match storage_type {
+            ShuffleStorageType::Local => Ok(Self::new_local(url)),
+            ShuffleStorageType::S3 => {
+                let parsed = Url::parse(url).map_err(|e| {
+                    BallistaError::General(format!(
+                        "Failed to parse S3 shuffle URL '{url}': {e}"
+                    ))
+                })?;
+                let bucket = parsed.host_str().ok_or_else(|| {
+                    BallistaError::General(format!(
+                        "No bucket found in S3 shuffle URL '{url}'"
+                    ))
+                })?;
+                let path = parsed.path().trim_start_matches('/');
+                let prefix = if path.is_empty() { None } else { Some(path) };
+                Ok(Self::new_s3(bucket, prefix, None))
+            }
+            ShuffleStorageType::Azure => {
+                let parsed = Url::parse(url).map_err(|e| {
+                    BallistaError::General(format!(
+                        "Failed to parse Azure shuffle URL '{url}': {e}"
+                    ))
+                })?;
+                // Azure URL format: abfs://container@account.dfs.core.windows.net/prefix
+                let host = parsed.host_str().ok_or_else(|| {
+                    BallistaError::General(format!(
+                        "No host found in Azure shuffle URL '{url}'"
+                    ))
+                })?;
+                let account = host
+                    .strip_suffix(".dfs.core.windows.net")
+                    .or_else(|| host.strip_suffix(".blob.core.windows.net"))
+                    .ok_or_else(|| {
+                        BallistaError::General(format!(
+                            "Cannot extract Azure account name from host '{host}' in URL '{url}'"
+                        ))
+                    })?;
+                let container = parsed.username();
+                if container.is_empty() {
+                    return Err(BallistaError::General(format!(
+                        "No container found in Azure shuffle URL '{url}'. Expected format: abfs://container@account.dfs.core.windows.net/prefix"
+                    )));
+                }
+                let path = parsed.path().trim_start_matches('/');
+                let prefix = if path.is_empty() { None } else { Some(path) };
+                Ok(Self::new_azure(account, container, prefix))
+            }
         }
     }
 }
@@ -445,17 +503,68 @@ impl ObjectStoreShuffleStorage {
         }
     }
 
+    /// Returns a reference to the underlying object store.
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// Constructs the full URL for a shuffle partition.
+    pub fn make_full_url(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition_id: usize,
+        input_partition: usize,
+        file_ext: &str,
+    ) -> (String, ObjectPath) {
+        let relative_path =
+            self.make_path(job_id, stage_id, partition_id, input_partition, file_ext);
+        let full_url = format!("{}/{}", self.base_url, relative_path);
+        let object_path = ObjectPath::from(relative_path);
+        (full_url, object_path)
+    }
+
+    /// Starts a streaming multipart upload for a shuffle partition.
+    ///
+    /// Returns a `WriteMultipart` writer and the full URL where data will be written.
+    /// The caller should serialize batches and write them to the returned writer,
+    /// then call `finish()` to complete the upload.
+    pub async fn start_multipart_write(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition_id: usize,
+        input_partition: usize,
+        file_ext: &str,
+    ) -> Result<(WriteMultipart, String)> {
+        let (full_url, object_path) =
+            self.make_full_url(job_id, stage_id, partition_id, input_partition, file_ext);
+
+        debug!("Starting multipart upload to object store: {}", full_url);
+
+        let upload = self.store.put_multipart(&object_path).await.map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to start multipart upload to {}: {:?}",
+                full_url, e
+            ))
+        })?;
+
+        let write = WriteMultipart::new(upload);
+        Ok((write, full_url))
+    }
+
     fn make_path(
         &self,
         job_id: &str,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
+        file_ext: &str,
     ) -> String {
         let filename = if input_partition == partition_id {
-            "data.arrow".to_string()
+            format!("data.{file_ext}")
         } else {
-            format!("data-{}.arrow", input_partition)
+            format!("data-{input_partition}.{file_ext}")
         };
         format!("{}/{}/{}/{}", job_id, stage_id, partition_id, filename)
     }
@@ -474,7 +583,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         write_metric: &metrics::Time,
     ) -> Result<(String, PartitionStats)> {
         let relative_path =
-            self.make_path(job_id, stage_id, partition_id, input_partition);
+            self.make_path(job_id, stage_id, partition_id, input_partition, "arrow");
         let full_url = format!("{}/{}", self.base_url, relative_path);
 
         debug!("Writing shuffle data to object store: {}", full_url);
@@ -763,5 +872,80 @@ mod tests {
             config.base_url,
             Some("abfs://mycontainer@myaccount.dfs.core.windows.net/shuffle".to_string())
         );
+    }
+
+    #[test]
+    fn test_from_type_and_url_local() {
+        let config = ShuffleStorageConfig::from_type_and_url(
+            ShuffleStorageType::Local,
+            "/tmp/ballista",
+        )
+        .unwrap();
+        assert_eq!(config.storage_type, ShuffleStorageType::Local);
+        assert_eq!(config.base_url, Some("/tmp/ballista".to_string()));
+    }
+
+    #[test]
+    fn test_from_type_and_url_s3() {
+        let config = ShuffleStorageConfig::from_type_and_url(
+            ShuffleStorageType::S3,
+            "s3://my-bucket/shuffle/prefix",
+        )
+        .unwrap();
+        assert_eq!(config.storage_type, ShuffleStorageType::S3);
+        assert_eq!(
+            config.base_url,
+            Some("s3://my-bucket/shuffle/prefix".to_string())
+        );
+        assert_eq!(config.s3_config.bucket, Some("my-bucket".to_string()));
+    }
+
+    #[test]
+    fn test_from_type_and_url_s3_no_prefix() {
+        let config = ShuffleStorageConfig::from_type_and_url(
+            ShuffleStorageType::S3,
+            "s3://my-bucket",
+        )
+        .unwrap();
+        assert_eq!(config.storage_type, ShuffleStorageType::S3);
+        assert_eq!(config.base_url, Some("s3://my-bucket".to_string()));
+        assert_eq!(config.s3_config.bucket, Some("my-bucket".to_string()));
+    }
+
+    #[test]
+    fn test_from_type_and_url_azure() {
+        let config = ShuffleStorageConfig::from_type_and_url(
+            ShuffleStorageType::Azure,
+            "abfs://mycontainer@myaccount.dfs.core.windows.net/shuffle",
+        )
+        .unwrap();
+        assert_eq!(config.storage_type, ShuffleStorageType::Azure);
+        assert_eq!(
+            config.base_url,
+            Some("abfs://mycontainer@myaccount.dfs.core.windows.net/shuffle".to_string())
+        );
+        assert_eq!(config.azure_config.account, Some("myaccount".to_string()));
+        assert_eq!(
+            config.azure_config.container,
+            Some("mycontainer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_from_type_and_url_azure_no_prefix() {
+        let config = ShuffleStorageConfig::from_type_and_url(
+            ShuffleStorageType::Azure,
+            "abfs://mycontainer@myaccount.dfs.core.windows.net",
+        )
+        .unwrap();
+        assert_eq!(config.storage_type, ShuffleStorageType::Azure);
+        assert_eq!(config.azure_config.account, Some("myaccount".to_string()));
+    }
+
+    #[test]
+    fn test_from_type_and_url_s3_invalid_url() {
+        let result =
+            ShuffleStorageConfig::from_type_and_url(ShuffleStorageType::S3, "not-a-url");
+        assert!(result.is_err());
     }
 }
