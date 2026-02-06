@@ -693,7 +693,6 @@ impl ShuffleWriterExec {
                             &schema,
                             &storage,
                             &write_metrics,
-                            now,
                             file_ext,
                         )
                         .await
@@ -711,7 +710,6 @@ impl ShuffleWriterExec {
                             &schema,
                             &storage,
                             &write_metrics,
-                            now,
                             file_ext,
                         )
                         .await
@@ -746,7 +744,6 @@ impl ShuffleWriterExec {
         schema: &SchemaRef,
         storage: &crate::shuffle_storage::ObjectStoreShuffleStorage,
         write_metrics: &ShuffleWriteMetrics,
-        _now: Instant,
         file_ext: &str,
     ) -> Result<Vec<ShuffleWritePartition>> {
         struct ObjectStoreWriteTracker {
@@ -882,7 +879,6 @@ impl ShuffleWriterExec {
         schema: &SchemaRef,
         storage: &crate::shuffle_storage::ObjectStoreShuffleStorage,
         write_metrics: &ShuffleWriteMetrics,
-        _now: Instant,
         file_ext: &str,
     ) -> Result<Vec<ShuffleWritePartition>> {
         use vortex_array::arrow::FromArrowArray;
