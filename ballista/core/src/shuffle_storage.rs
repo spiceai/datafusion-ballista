@@ -34,7 +34,7 @@ use log::{debug, error};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutPayload, WriteMultipart};
 use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -503,17 +503,68 @@ impl ObjectStoreShuffleStorage {
         }
     }
 
+    /// Returns a reference to the underlying object store.
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// Constructs the full URL for a shuffle partition.
+    pub fn make_full_url(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition_id: usize,
+        input_partition: usize,
+        file_ext: &str,
+    ) -> (String, ObjectPath) {
+        let relative_path =
+            self.make_path(job_id, stage_id, partition_id, input_partition, file_ext);
+        let full_url = format!("{}/{}", self.base_url, relative_path);
+        let object_path = ObjectPath::from(relative_path);
+        (full_url, object_path)
+    }
+
+    /// Starts a streaming multipart upload for a shuffle partition.
+    ///
+    /// Returns a `WriteMultipart` writer and the full URL where data will be written.
+    /// The caller should serialize batches and write them to the returned writer,
+    /// then call `finish()` to complete the upload.
+    pub async fn start_multipart_write(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition_id: usize,
+        input_partition: usize,
+        file_ext: &str,
+    ) -> Result<(WriteMultipart, String)> {
+        let (full_url, object_path) =
+            self.make_full_url(job_id, stage_id, partition_id, input_partition, file_ext);
+
+        debug!("Starting multipart upload to object store: {}", full_url);
+
+        let upload = self.store.put_multipart(&object_path).await.map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to start multipart upload to {}: {:?}",
+                full_url, e
+            ))
+        })?;
+
+        let write = WriteMultipart::new(upload);
+        Ok((write, full_url))
+    }
+
     fn make_path(
         &self,
         job_id: &str,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
+        file_ext: &str,
     ) -> String {
         let filename = if input_partition == partition_id {
-            "data.arrow".to_string()
+            format!("data.{file_ext}")
         } else {
-            format!("data-{}.arrow", input_partition)
+            format!("data-{input_partition}.{file_ext}")
         };
         format!("{}/{}/{}/{}", job_id, stage_id, partition_id, filename)
     }
@@ -532,7 +583,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         write_metric: &metrics::Time,
     ) -> Result<(String, PartitionStats)> {
         let relative_path =
-            self.make_path(job_id, stage_id, partition_id, input_partition);
+            self.make_path(job_id, stage_id, partition_id, input_partition, "arrow");
         let full_url = format!("{}/{}", self.base_url, relative_path);
 
         debug!("Writing shuffle data to object store: {}", full_url);
