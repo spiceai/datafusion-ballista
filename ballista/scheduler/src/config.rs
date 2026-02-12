@@ -49,6 +49,14 @@ pub type EndpointOverrideFn =
 /// rather than waiting for their next poll interval.
 pub type OnWorkAvailableFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Callback invoked when running tasks should be cancelled on an executor.
+///
+/// Arguments are:
+/// - executor_id
+/// - running tasks to cancel on that executor
+pub type OnCancelTasksFn =
+    Arc<dyn Fn(&str, Vec<crate::state::execution_graph::RunningTaskInfo>) + Send + Sync>;
+
 /// Command-line configuration for the scheduler binary.
 #[cfg(feature = "build-binary")]
 #[derive(clap::Parser, Debug)]
@@ -261,6 +269,8 @@ pub struct SchedulerConfig {
     /// Callback invoked when new work becomes available for executors.
     /// The string argument is a reason/description for debugging purposes.
     pub on_work_available: Option<OnWorkAvailableFn>,
+    /// Callback invoked when running tasks should be cancelled on an executor.
+    pub on_cancel_tasks: Option<OnCancelTasksFn>,
 }
 
 impl Default for SchedulerConfig {
@@ -290,6 +300,7 @@ impl Default for SchedulerConfig {
             override_create_grpc_client_endpoint: None,
             override_metrics_collector: None,
             on_work_available: None,
+            on_cancel_tasks: None,
         }
     }
 }
@@ -542,6 +553,7 @@ impl TryFrom<Config> for SchedulerConfig {
             override_create_grpc_client_endpoint: None,
             override_metrics_collector: None,
             on_work_available: None,
+            on_cancel_tasks: None,
         };
 
         Ok(config)
