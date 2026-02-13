@@ -19,7 +19,7 @@
 name = "ballista-executor"
 description = "Ballista Distributed Compute - Executor"
 license = "Apache-2.0"
-version = "51.0.0"
+version = "52.0.0"
 homepage = "https://datafusion.apache.org/ballista/"
 repository = "https://github.com/apache/datafusion-ballista"
 readme = "README.md"
@@ -44,7 +44,7 @@ async-trait = { workspace = true }
 
 backoff = { workspace = true }
 
-ballista-core = { path = "../core", version = "51.0.0" }
+ballista-core = { path = "../core", version = "52.0.0" }
 bytes = "1"
 
 clap = { workspace = true, optional = true }

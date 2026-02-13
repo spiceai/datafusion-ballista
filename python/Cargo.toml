@@ -35,8 +35,8 @@ ballista = { path = "../ballista/client" }
 ballista-core = { path = "../ballista/core" }
 ballista-executor = { path = "../ballista/executor" }
 ballista-scheduler = { path = "../ballista/scheduler" }
-datafusion = "51.0.0"
-datafusion-proto = "51.0.0"
+datafusion = "52.0.0"
+datafusion-proto = "52.0.0"
 datafusion-python = "50.1.0"
 
 pyo3 = { version = "0.25", features = ["extension-module", "abi3", "abi3-py39"] }
