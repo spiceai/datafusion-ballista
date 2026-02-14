@@ -456,6 +456,8 @@ impl ShuffleWriterExec {
                 let mut partitioner = BatchPartitioner::try_new(
                     Partitioning::Hash(exprs, num_output_partitions),
                     write_metrics.repart_time.clone(),
+                    input_partition,
+                    1,
                 )?;
 
                 let schema = stream.schema();
@@ -760,6 +762,8 @@ impl ShuffleWriterExec {
         let mut partitioner = BatchPartitioner::try_new(
             Partitioning::Hash(exprs, num_output_partitions),
             write_metrics.repart_time.clone(),
+            input_partition,
+            1,
         )?;
 
         // Collect serialized IPC bytes per partition in the synchronous
@@ -895,6 +899,8 @@ impl ShuffleWriterExec {
         let mut partitioner = BatchPartitioner::try_new(
             Partitioning::Hash(exprs, num_output_partitions),
             write_metrics.repart_time.clone(),
+            input_partition,
+            1,
         )?;
 
         while let Some(result) = stream.next().await {
@@ -1056,6 +1062,8 @@ impl ShuffleWriterExec {
                 let mut partitioner = BatchPartitioner::try_new(
                     Partitioning::Hash(exprs, num_output_partitions),
                     write_metrics.repart_time.clone(),
+                    input_partition,
+                    1,
                 )?;
 
                 while let Some(result) = stream.next().await {
