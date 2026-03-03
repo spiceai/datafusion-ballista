@@ -29,8 +29,7 @@ use ballista_core::serde::protobuf::{
     ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobStatusParams,
     GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
     HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
-    PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
     RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
     execute_query_failure_result, execute_query_result,
 };

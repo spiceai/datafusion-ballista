@@ -18,8 +18,7 @@
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
 use crate::extension::{
-    BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor,
-    ResultFetchMetricsCallback, SessionConfigExt,
+    BallistaConfigGrpcEndpoint, ResultFetchMetricsCallback, SessionConfigExt,
 };
 use crate::serde::protobuf::get_job_status_result::FlightProxy;
 use crate::serde::protobuf::{
@@ -694,6 +693,7 @@ fn get_client_host_port(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_partition(
     location: PartitionLocation,
     max_message_size: usize,

@@ -30,7 +30,6 @@ use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
 use std::future::Future;
-use std::io::BufWriter;
 use std::iter::Iterator;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -631,7 +630,10 @@ impl ShuffleWriterExec {
                         ShuffleFormat::Vortex => {
                             use vortex_array::arrow::FromArrowArray;
                             let vortex_array =
-                                vortex_array::ArrayRef::from_arrow(&batch, false);
+                                vortex_array::ArrayRef::from_arrow(&batch, false)
+                                    .map_err(|e| {
+                                        DataFusionError::External(Box::new(e))
+                                    })?;
                             vortex_buffer.push(vortex_array);
                         }
                         // Non-vortex build: already returned error above
@@ -883,7 +885,7 @@ impl ShuffleWriterExec {
         >,
         exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
         num_output_partitions: usize,
-        schema: &SchemaRef,
+        _schema: &SchemaRef,
         storage: &crate::shuffle_storage::ObjectStoreShuffleStorage,
         write_metrics: &ShuffleWriteMetrics,
         file_ext: &str,
@@ -915,7 +917,8 @@ impl ShuffleWriterExec {
                 let batch_rows = output_batch.num_rows() as u64;
 
                 let vortex_array =
-                    vortex_array::ArrayRef::from_arrow(&output_batch, false);
+                    vortex_array::ArrayRef::from_arrow(&output_batch, false)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 match &mut buffers[output_partition] {
                     Some(buf) => {
@@ -1166,7 +1169,8 @@ impl ShuffleWriterExec {
                 for batch in batches {
                     total_rows += batch.num_rows() as u64;
                     // Convert Arrow RecordBatch to Vortex Array
-                    let vortex_array = ArrayRef::from_arrow(&batch, false);
+                    let vortex_array = ArrayRef::from_arrow(&batch, false)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     total_bytes += vortex_array.nbytes();
                     arrays.push(vortex_array);
                 }
@@ -1407,6 +1411,7 @@ fn serialize_vortex_arrays_to_bytes(
     let array_iter = ArrayIteratorAdapter::new(dtype, iter);
     let ipc_data = array_iter
         .into_ipc()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
         .collect_to_buffer()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

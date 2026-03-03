@@ -1291,7 +1291,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     task_id,
                     task_attempt,
                     plan: stage.plan.clone(),
-                    session_config: self.session_config.clone()
+                    session_config: self.session_config.clone(),
+                    schedulable_time_millis: 0,
                 })
             } else {
                 Err(BallistaError::General(format!("Stage {stage_id} is not a running stage")))

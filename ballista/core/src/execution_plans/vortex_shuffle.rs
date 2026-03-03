@@ -37,10 +37,10 @@ use futures::Stream;
 use log::debug;
 
 use vortex_array::ArrayRef;
+use vortex_array::LEGACY_SESSION;
 use vortex_array::arrow::FromArrowArray;
 use vortex_array::arrow::IntoArrowArray;
 use vortex_array::iter::ArrayIteratorAdapter;
-use vortex_array::session::ArraySession;
 use vortex_error::VortexResult;
 use vortex_ipc::iterator::{ArrayIteratorIPC, SyncIPCReader};
 
@@ -80,7 +80,8 @@ impl VortexWriteTracker {
     /// Write a record batch to the buffer
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         // Convert Arrow RecordBatch to Vortex Array
-        let vortex_array = ArrayRef::from_arrow(batch, false);
+        let vortex_array = ArrayRef::from_arrow(batch, false)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         self.buffer.push(vortex_array);
         self.num_batches += 1;
@@ -105,6 +106,7 @@ impl VortexWriteTracker {
             // Convert to IPC bytes
             let ipc_data = array_iter
                 .into_ipc()
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 .collect_to_buffer()
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
@@ -149,13 +151,12 @@ impl LocalVortexShuffleStream {
             BallistaError::General(format!("Failed to read Vortex file at {path}: {e:?}"))
         })?;
 
-        // Create default registry with all canonical encodings
-        let session = ArraySession::default();
-        let registry = session.registry().clone();
+        // Create default session with all canonical encodings
+        let session = &*LEGACY_SESSION;
 
         // Read IPC data
         let cursor = Cursor::new(data);
-        let reader = SyncIPCReader::try_new(cursor, registry).map_err(|e| {
+        let reader = SyncIPCReader::try_new(cursor, session).map_err(|e| {
             BallistaError::General(format!(
                 "Failed to create Vortex IPC reader at {path}: {e:?}"
             ))
@@ -246,7 +247,9 @@ pub async fn write_stream_to_disk_vortex(
         num_bytes += batch_size_bytes;
 
         // Convert Arrow RecordBatch to Vortex Array
-        let vortex_array = ArrayRef::from_arrow(&batch, false);
+        let vortex_array = ArrayRef::from_arrow(&batch, false).map_err(|e| {
+            BallistaError::General(format!("Failed to convert to Vortex: {e}"))
+        })?;
         arrays.push(vortex_array);
     }
 
@@ -263,9 +266,15 @@ pub async fn write_stream_to_disk_vortex(
         let array_iter = ArrayIteratorAdapter::new(dtype, iter);
 
         // Convert to IPC bytes
-        let ipc_data = array_iter.into_ipc().collect_to_buffer().map_err(|e| {
-            BallistaError::General(format!("Failed to write Vortex IPC: {e}"))
-        })?;
+        let ipc_data = array_iter
+            .into_ipc()
+            .map_err(|e| {
+                BallistaError::General(format!("Failed to create Vortex IPC: {e}"))
+            })?
+            .collect_to_buffer()
+            .map_err(|e| {
+                BallistaError::General(format!("Failed to write Vortex IPC: {e}"))
+            })?;
 
         writer.write_all(ipc_data.as_ref()).map_err(|e| {
             BallistaError::General(format!("Failed to write to file: {e}"))

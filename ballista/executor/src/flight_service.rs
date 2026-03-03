@@ -482,8 +482,8 @@ fn read_vortex_partition(
     use std::io::Cursor;
     use std::sync::Arc;
     use vortex_array::ArrayRef;
+    use vortex_array::LEGACY_SESSION;
     use vortex_array::iter::ArrayIterator;
-    use vortex_array::session::ArraySession;
     use vortex_ipc::iterator::SyncIPCReader;
 
     let file = File::open(path)
@@ -502,13 +502,12 @@ fn read_vortex_partition(
         )))
     })?;
 
-    // Create default registry with all canonical encodings
-    let session = ArraySession::default();
-    let registry = session.registry().clone();
+    // Create default session with all canonical encodings
+    let session = &*LEGACY_SESSION;
 
     // Read IPC data
     let cursor = Cursor::new(data);
-    let reader = SyncIPCReader::try_new(cursor, registry).map_err(|e| {
+    let reader = SyncIPCReader::try_new(cursor, session).map_err(|e| {
         from_ballista_err(&BallistaError::General(format!(
             "Failed to create Vortex IPC reader at {path}: {e:?}"
         )))

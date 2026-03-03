@@ -446,9 +446,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let num_tasks = statuses.len();
             debug!("Updating {num_tasks} tasks in job {job_id}");
 
-            let events = if let Some(cached) =
-                self.get_active_execution_graph(&job_id)
-            {
+            let events = if let Some(cached) = self.get_active_execution_graph(&job_id) {
                 let mut graph = cached.write().await;
                 graph.update_task_status(
                     executor,

@@ -28,7 +28,10 @@ use datafusion::prelude::SessionConfig;
 use log::{debug, error, info, warn};
 
 use ballista_core::error::{BallistaError, Result};
-use ballista_core::execution_plans::{ShuffleWriter, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec};
+use ballista_core::execution_plans::{
+    ShuffleWriter, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
+};
+#[cfg(test)]
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
@@ -268,6 +271,7 @@ pub trait ExecutionGraph: Debug {
     fn cloned(&self) -> ExecutionGraphBox;
 }
 
+/// Type alias for a boxed [ExecutionGraph] trait object.
 pub type ExecutionGraphBox = Box<dyn ExecutionGraph + Send + Sync>;
 
 /// [ExecutionGraph] implementation which generates
@@ -1290,7 +1294,12 @@ impl ExecutionGraph for StaticExecutionGraph {
         max_task_failures: usize,
         max_stage_failures: usize,
     ) -> Result<Vec<QueryStageSchedulerEvent>> {
-        let result = self.update_task_status_with_metrics(executor, task_statuses, max_task_failures, max_stage_failures)?;
+        let result = self.update_task_status_with_metrics(
+            executor,
+            task_statuses,
+            max_task_failures,
+            max_stage_failures,
+        )?;
         Ok(result.events)
     }
 
@@ -1964,6 +1973,7 @@ mod test {
         TaskKilled, failed_task, job_status,
     };
 
+    use super::StaticExecutionGraph;
     use crate::state::execution_graph::ExecutionGraph;
     use crate::test_utils::{
         mock_completed_task, mock_executor, mock_failed_task,
@@ -2382,7 +2392,7 @@ mod test {
         // This long delayed failed task should not failure the stage/job and should not trigger any query stage events
         let query_stage_events =
             agg_graph.update_task_status(&executor1, vec![task_status], 4, 4)?;
-        assert!(query_stage_events.events.is_empty());
+        assert!(query_stage_events.is_empty());
 
         drain_tasks(&mut agg_graph)?;
         assert!(agg_graph.is_successful(), "Failed to complete agg plan");
@@ -2436,9 +2446,9 @@ mod test {
             4,
         )?;
 
-        assert_eq!(stage_events.events.len(), 1);
+        assert_eq!(stage_events.len(), 1);
         assert!(matches!(
-            stage_events.events[0],
+            stage_events[0],
             QueryStageSchedulerEvent::CancelTasks(_)
         ));
 
@@ -2555,7 +2565,7 @@ mod test {
 
                 if attempt < 3 {
                     // No JobRunningFailed stage events
-                    assert_eq!(stage_events.events.len(), 0);
+                    assert_eq!(stage_events.len(), 0);
                     // Stage 1 is running
                     let running_stage = agg_graph.running_stages();
                     assert_eq!(running_stage.len(), 1);
@@ -2563,9 +2573,9 @@ mod test {
                     assert_eq!(agg_graph.available_tasks(), 2);
                 } else {
                     // Job is failed after exceeds the max_stage_failures
-                    assert_eq!(stage_events.events.len(), 1);
+                    assert_eq!(stage_events.len(), 1);
                     assert!(matches!(
-                        stage_events.events[0],
+                        stage_events[0],
                         QueryStageSchedulerEvent::JobRunningFailed { .. }
                     ));
                     // Stage 2 is still running
@@ -3039,9 +3049,9 @@ mod test {
             4,
         )?;
 
-        assert_eq!(stage_events.events.len(), 1);
+        assert_eq!(stage_events.len(), 1);
         assert!(matches!(
-            stage_events.events[0],
+            stage_events[0],
             QueryStageSchedulerEvent::JobRunningFailed { .. }
         ));
 
@@ -3119,7 +3129,7 @@ mod test {
         Ok(())
     }
 
-    fn drain_tasks(graph: &mut ExecutionGraph) -> Result<()> {
+    fn drain_tasks(graph: &mut StaticExecutionGraph) -> Result<()> {
         let executor = mock_executor("executor-id1".to_string());
         while let Some(task) = graph.pop_next_task(&executor.id)? {
             let task_status = mock_completed_task(task, &executor.id);

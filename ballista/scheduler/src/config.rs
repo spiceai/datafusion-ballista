@@ -28,8 +28,8 @@
 use crate::SessionBuilder;
 use crate::cluster::DistributionPolicy;
 use crate::metrics::SchedulerMetricsCollector;
-use ballista_core::{ConfigProducer, config::TaskSchedulingPolicy};
 use ballista_core::extension::EndpointOverrideFn;
+use ballista_core::{ConfigProducer, config::TaskSchedulingPolicy};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use std::fmt::Display;

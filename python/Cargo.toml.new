@@ -17,46 +17,36 @@
 
 [package]
 authors = ["Apache DataFusion <dev@datafusion.apache.org>"]
-description = "Ballista Benchmarks"
-edition = "2024"
+description = "Apache Arrow Ballista Python Client"
+edition = "2021"
 homepage = "https://datafusion.apache.org/ballista/"
+include = ["/src", "/ballista", "/LICENSE.txt", "pyproject.toml", "Cargo.toml", "Cargo.lock"]
 license = "Apache-2.0"
-name = "ballista-benchmarks"
+name = "pyballista"
 publish = false
+readme = "README.md"
 repository = "https://github.com/apache/datafusion-ballista"
-version = "52.0.0"
-
-[features]
-default = ["mimalloc"]
-ci = []
-
-[lints.rust.unexpected_cfgs]
-check-cfg = ["cfg(feature, values(\"snmalloc\"))"]
-level = "warn"
+rust-version = "1.82.0"
+version = "51.0.0"
 
 [dependencies]
-ballista = { path = "../ballista/client", version = "52.0.0" }
-ballista-core = { path = "../ballista/core", version = "52.0.0" }
-datafusion = { workspace = true }
-datafusion-proto = { workspace = true }
-env_logger = { workspace = true }
-futures = { workspace = true }
-mimalloc = { workspace = true, optional = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = "1.0.78"
-structopt = { version = "0.3", default-features = false }
-tempfile = { workspace = true }
-tokio = { version = "^1.44", features = [
-    "macros",
-    "rt",
-    "rt-multi-thread",
-    "parking_lot",
-] }
+async-trait = "0.1.89"
+ballista = { path = "../ballista/client" }
+ballista-core = { path = "../ballista/core" }
+ballista-executor = { path = "../ballista/executor" }
+ballista-scheduler = { path = "../ballista/scheduler" }
+datafusion = { version = "52.0.0", features = ["pyarrow", "avro"] }
+datafusion-proto = "52.0.0"
+datafusion-python = { version = "51" }
+log = { version = "0.4" }
+pyo3 = { version = "0.26", features = ["extension-module", "abi3", "abi3-py310"] }
+pyo3-log = "0.13"
+tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tonic = { version = "0.14" }
 
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+[lib]
+crate-type = ["cdylib"]
+name = "ballista"
 
-[[bench]]
-harness = false
-name = "sort_shuffle"
+[build-dependencies]
+pyo3-build-config = "0.26"

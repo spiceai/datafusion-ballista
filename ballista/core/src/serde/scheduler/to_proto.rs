@@ -212,9 +212,6 @@ impl TryInto<protobuf::OperatorMetric> for &MetricValue {
             }),
             // at the moment there there is no way to serialize custom metrics
             // thus at the moment we can't support it
-            MetricValue::OutputBatches(count) => Ok(protobuf::OperatorMetric {
-                metric: Some(operator_metric::Metric::OutputRows(count.value() as u64)),
-            }),
             MetricValue::Custom { .. } => Err(BallistaError::General(String::from(
                 "Custom metrics values are not supported",
             ))),

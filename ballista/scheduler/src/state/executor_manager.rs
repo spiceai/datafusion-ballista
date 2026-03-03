@@ -471,8 +471,10 @@ impl ExecutorManager {
                 "http://{}:{}",
                 executor_metadata.host, executor_metadata.grpc_port
             );
-            let mut endpoint =
-                create_grpc_client_endpoint(executor_url, Some(&GrpcClientConfig::default()))?;
+            let mut endpoint = create_grpc_client_endpoint(
+                executor_url,
+                Some(&GrpcClientConfig::default()),
+            )?;
 
             if let Some(ref override_fn) =
                 self.config.override_create_grpc_client_endpoint
