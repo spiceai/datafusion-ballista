@@ -16,18 +16,18 @@
 # under the License.
 
 [package]
-name = "pyballista"
-version = "51.0.0"
-homepage = "https://datafusion.apache.org/ballista/"
-repository = "https://github.com/apache/datafusion-ballista"
 authors = ["Apache DataFusion <dev@datafusion.apache.org>"]
 description = "Apache Arrow Ballista Python Client"
-readme = "README.md"
-license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.82.0"
+homepage = "https://datafusion.apache.org/ballista/"
 include = ["/src", "/ballista", "/LICENSE.txt", "pyproject.toml", "Cargo.toml", "Cargo.lock"]
+license = "Apache-2.0"
+name = "pyballista"
 publish = false
+readme = "README.md"
+repository = "https://github.com/apache/datafusion-ballista"
+rust-version = "1.82.0"
+version = "51.0.0"
 
 [dependencies]
 async-trait = "0.1.89"
