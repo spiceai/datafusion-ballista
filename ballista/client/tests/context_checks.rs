@@ -24,10 +24,12 @@ mod supported {
         standalone_context_with_state,
     };
     use ballista_core::config::BallistaConfig;
+
     use datafusion::physical_plan::collect;
     use datafusion::prelude::*;
     use datafusion::{assert_batches_eq, prelude::SessionContext};
     use rstest::*;
+    use std::path::PathBuf;
 
     #[rstest::fixture]
     fn test_data() -> String {
@@ -38,7 +40,7 @@ mod supported {
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
     #[tokio::test]
-    async fn should_execute_sql_show(
+    async fn should_execute_sql_collect(
         #[future(awt)]
         #[case]
         ctx: SessionContext,
@@ -336,6 +338,7 @@ mod supported {
         ctx: SessionContext,
         test_data: String,
     ) -> datafusion::error::Result<()> {
+        // registering table to show in show tables
         ctx.register_parquet(
             "test",
             &format!("{test_data}/alltypes_plain.parquet"),
@@ -401,7 +404,7 @@ mod supported {
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
     #[tokio::test]
-    async fn should_execute_dataframe(
+    async fn should_collect_from_dataframe(
         #[future(awt)]
         #[case]
         ctx: SessionContext,
@@ -477,48 +480,6 @@ mod supported {
         ];
 
         assert_batches_eq!(expected, &result);
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::standalone(standalone_context())]
-    #[case::remote(remote_context())]
-    #[tokio::test]
-    async fn should_execute_sql_app_name_show(
-        #[future(awt)]
-        #[case]
-        ctx: SessionContext,
-        test_data: String,
-    ) -> datafusion::error::Result<()> {
-        ctx.sql("SET ballista.job.name = 'Super Cool Ballista App'")
-            .await?
-            .show()
-            .await?;
-
-        ctx.register_parquet(
-            "test",
-            &format!("{test_data}/alltypes_plain.parquet"),
-            Default::default(),
-        )
-        .await?;
-
-        let result = ctx
-            .sql("select string_col, timestamp_col from test where id > 4")
-            .await?
-            .collect()
-            .await?;
-        let expected = [
-            "+------------+---------------------+",
-            "| string_col | timestamp_col       |",
-            "+------------+---------------------+",
-            "| 31         | 2009-03-01T00:01:00 |",
-            "| 30         | 2009-04-01T00:00:00 |",
-            "| 31         | 2009-04-01T00:01:00 |",
-            "+------------+---------------------+",
-        ];
-
-        assert_batches_eq!(expected, &result);
-
         Ok(())
     }
 
@@ -714,17 +675,22 @@ mod supported {
         ];
 
         let write_dir = tempfile::tempdir().expect("temporary directory to be created");
-        let write_dir_path = write_dir
-            .path()
-            .to_str()
-            .expect("path to be converted to str");
+        let write_dir_path = PathBuf::from(
+            write_dir
+                .path()
+                .to_str()
+                .expect("path to be converted to str"),
+        );
+
+        let parquet_file = write_dir_path.join("p_written_table.parquet");
+        let parquet_file = parquet_file.to_str().expect("cannot create csv file");
 
         ctx.sql("select * from test")
             .await?
-            .write_parquet(write_dir_path, Default::default(), Default::default())
+            .write_parquet(parquet_file, Default::default(), Default::default())
             .await?;
 
-        ctx.register_parquet("p_written_table", write_dir_path, Default::default())
+        ctx.register_parquet("p_written_table", parquet_file, Default::default())
             .await?;
 
         let result = ctx
@@ -735,12 +701,15 @@ mod supported {
 
         assert_batches_eq!(expected, &result);
 
+        let csv_file = write_dir_path.join("c_written_table.csv");
+        let csv_file = csv_file.to_str().expect("cannot create csv file");
+
         ctx.sql("select * from test")
             .await?
-            .write_csv(write_dir_path, Default::default(), Default::default())
+            .write_csv(csv_file, Default::default(), Default::default())
             .await?;
 
-        ctx.register_csv("c_written_table", write_dir_path, Default::default())
+        ctx.register_csv("c_written_table", csv_file, Default::default())
             .await?;
 
         let result = ctx
@@ -751,12 +720,15 @@ mod supported {
 
         assert_batches_eq!(expected, &result);
 
+        let json_file = write_dir_path.join("j_written_table.json");
+        let json_file = json_file.to_str().expect("cannot create csv file");
+
         ctx.sql("select * from test")
             .await?
-            .write_json(write_dir_path, Default::default(), Default::default())
+            .write_json(json_file, Default::default(), Default::default())
             .await?;
 
-        ctx.register_json("j_written_table", write_dir_path, Default::default())
+        ctx.register_json("j_written_table", json_file, Default::default())
             .await?;
 
         let result = ctx
@@ -1048,13 +1020,12 @@ mod supported {
             "|                  |           EmptyRelation: rows=1                                                                                                                                                  |",
             "| physical_plan    | ProjectionExec: expr=[count(Int64(1))@1 as count(*), id@0 as id]                                                                                                                 |",
             "|                  |   AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                                 |",
-            "|                  |     CoalesceBatchesExec: target_batch_size=8192                                                                                                                                  |",
-            "|                  |       RepartitionExec: partitioning=Hash([id@0], 16), input_partitions=1                                                                                                         |",
-            "|                  |         AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                                    |",
-            "|                  |           ProjectionExec: expr=[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)),depth=1)@0 as id]                                                  |",
-            "|                  |             UnnestExec                                                                                                                                                           |",
-            "|                  |               ProjectionExec: expr=[[1, 2, 3, 4, 5] as __unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)))]                                           |",
-            "|                  |                 PlaceholderRowExec                                                                                                                                               |",
+            "|                  |     RepartitionExec: partitioning=Hash([id@0], 16), input_partitions=1                                                                                                           |",
+            "|                  |       AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                                      |",
+            "|                  |         ProjectionExec: expr=[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)),depth=1)@0 as id]                                                    |",
+            "|                  |           UnnestExec                                                                                                                                                             |",
+            "|                  |             ProjectionExec: expr=[[1, 2, 3, 4, 5] as __unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)))]                                             |",
+            "|                  |               PlaceholderRowExec                                                                                                                                                 |",
             "|                  |                                                                                                                                                                                  |",
             "| distributed_plan | =========ResolvedStage[stage_id=1.0, partitions=1]=========                                                                                                                      |",
             "|                  | ShuffleWriterExec: partitioning: Hash([id@0], 16)                                                                                                                                |",
@@ -1069,12 +1040,69 @@ mod supported {
             "|                  | ShuffleWriterExec: partitioning: None                                                                                                                                            |",
             "|                  |   ProjectionExec: expr=[count(Int64(1))@1 as count(*), id@0 as id]                                                                                                               |",
             "|                  |     AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                               |",
-            "|                  |       CoalesceBatchesExec: target_batch_size=8192                                                                                                                                |",
-            "|                  |         UnresolvedShuffleExec: partitioning: Hash([id@0], 16)                                                                                                                    |",
+            "|                  |       UnresolvedShuffleExec: partitioning: Hash([id@0], 16)                                                                                                                      |",
             "|                  |                                                                                                                                                                                  |",
             "|                  |                                                                                                                                                                                  |",
             "+------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
         ];
         assert_batches_eq!(expected, &result);
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+    async fn should_force_client_pull(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+        test_data: String,
+    ) -> datafusion::error::Result<()> {
+        ctx.register_parquet(
+            "test",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        ctx.sql("SET ballista.client.pull = true")
+            .await?
+            .show()
+            .await?;
+
+        let result = ctx
+            .sql("select name, value from information_schema.df_settings where name like 'ballista.client.pull' order by name limit 1")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+----------------------+-------+",
+            "| name                 | value |",
+            "+----------------------+-------+",
+            "| ballista.client.pull | true  |",
+            "+----------------------+-------+",
+        ];
+
+        assert_batches_eq!(expected, &result);
+
+        let expected = [
+            "+------------+----------+",
+            "| string_col | count(*) |",
+            "+------------+----------+",
+            "| 30         | 1        |",
+            "| 31         | 2        |",
+            "+------------+----------+",
+        ];
+
+        let result = ctx
+            .sql("select string_col, count(*) from test where id > 4 group by string_col order by string_col")
+            .await?
+            .collect()
+            .await?;
+
+        assert_batches_eq!(expected, &result);
+
+        Ok(())
     }
 }

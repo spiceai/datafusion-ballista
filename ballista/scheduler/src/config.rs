@@ -28,16 +28,12 @@
 use crate::SessionBuilder;
 use crate::cluster::DistributionPolicy;
 use crate::metrics::SchedulerMetricsCollector;
+use ballista_core::extension::EndpointOverrideFn;
 use ballista_core::{ConfigProducer, config::TaskSchedulingPolicy};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use std::fmt::Display;
 use std::sync::Arc;
-use tonic::transport::{Endpoint, Error as TonicTransportError};
-
-/// Type alias for the endpoint override function used in gRPC client configuration
-pub type EndpointOverrideFn =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
 
 /// Callback invoked when new work becomes available for executors.
 ///
@@ -65,7 +61,9 @@ pub struct Config {
     /// Route for proxying flight results via scheduler (IP:PORT format).
     #[arg(
         long,
-        help = "Route for proxying flight results via scheduler. Should be of the form 'IP:PORT"
+        num_args = 0..=1,
+        default_missing_value = "",
+        help = "Route for proxying flight results via scheduler. Use 'HOST:PORT' to let clients fetch results from the specified address. If empty a flight proxy will be started on the scheduler host and port."
     )]
     pub advertise_flight_sql_endpoint: Option<String>,
     /// Namespace for the ballista cluster.
@@ -89,7 +87,7 @@ pub struct Config {
     #[arg(
         short = 's',
         long,
-        default_value_t = ballista_core::config::TaskSchedulingPolicy::PullStaged,
+        default_value_t = ballista_core::config::TaskSchedulingPolicy::PushStaged,
         help = "The scheduling policy for the scheduler, possible values: pull-staged, push-staged. Default: pull-staged"
     )]
     pub scheduler_policy: ballista_core::config::TaskSchedulingPolicy,
@@ -271,6 +269,8 @@ pub struct SchedulerConfig {
     pub on_work_available: Option<OnWorkAvailableFn>,
     /// Callback invoked when running tasks should be cancelled on an executor.
     pub on_cancel_tasks: Option<OnCancelTasksFn>,
+    /// Whether to use TLS when connecting to executors (for flight proxy)
+    pub use_tls: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -301,6 +301,7 @@ impl Default for SchedulerConfig {
             override_metrics_collector: None,
             on_work_available: None,
             on_cancel_tasks: None,
+            use_tls: false,
         }
     }
 }
@@ -421,12 +422,11 @@ impl SchedulerConfig {
         self
     }
 
-    /// Sets an override function for creating gRPC client endpoints.
+    /// Set a custom override function for creating gRPC client endpoints.
+    /// This allows configuring TLS, timeouts, and other transport settings.
     pub fn with_override_create_grpc_client_endpoint(
         mut self,
-        override_fn: Arc<
-            dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync,
-        >,
+        override_fn: EndpointOverrideFn,
     ) -> Self {
         self.override_create_grpc_client_endpoint = Some(override_fn);
         self
@@ -438,6 +438,12 @@ impl SchedulerConfig {
         metrics_collector: Arc<dyn SchedulerMetricsCollector>,
     ) -> Self {
         self.override_metrics_collector = Some(metrics_collector);
+        self
+    }
+
+    /// Sets whether TLS should be used when connecting to executors (for flight proxy).
+    pub fn with_use_tls(mut self, use_tls: bool) -> Self {
+        self.use_tls = use_tls;
         self
     }
 }
@@ -554,6 +560,7 @@ impl TryFrom<Config> for SchedulerConfig {
             override_metrics_collector: None,
             on_work_available: None,
             on_cancel_tasks: None,
+            use_tls: false,
         };
 
         Ok(config)

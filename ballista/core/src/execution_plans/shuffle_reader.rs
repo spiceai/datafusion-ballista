@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::stats::Precision;
+use datafusion::physical_plan::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -38,6 +39,9 @@ use url::Url;
 
 use crate::client::BallistaClient;
 use crate::execution_plans::shuffle_manager::global_shuffle_manager;
+use crate::execution_plans::sort_shuffle::{
+    get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
+};
 use crate::extension::{
     BallistaConfigGrpcEndpoint, SessionConfigExt, ShuffleReadMetricsCallback,
 };
@@ -49,12 +53,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::runtime::SpawnedTask;
 
 use datafusion::error::{DataFusionError, Result};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet,
+};
 use datafusion::physical_plan::{
     ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, ready};
 
 use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
@@ -173,6 +179,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         let max_message_size = config.ballista_grpc_client_max_message_size();
         let force_remote_read = config.ballista_shuffle_reader_force_remote_read();
         let prefer_flight = config.ballista_shuffle_reader_remote_prefer_flight();
+        let batch_size = config.batch_size();
         let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
         let use_tls = config.ballista_use_tls();
         let metrics_callback = config.ballista_shuffle_read_metrics_callback();
@@ -215,11 +222,18 @@ impl ExecutionPlan for ShuffleReaderExec {
             context.runtime_env(),
         );
 
-        let result = RecordBatchStreamAdapter::new(
-            Arc::new(self.schema.as_ref().clone()),
+        let input_stream = Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
             response_receiver.try_flatten(),
-        );
-        Ok(Box::pin(result))
+        ));
+
+        Ok(Box::pin(CoalescedShuffleReaderStream::new(
+            input_stream,
+            batch_size,
+            None,
+            &self.metrics,
+            partition,
+        )))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -260,8 +274,8 @@ impl ExecutionPlan for ShuffleReaderExec {
         }
     }
 }
-
-fn stats_for_partition(
+/// Calculates stats for partition
+pub fn stats_for_partition(
     partition: usize,
     num_fields: usize,
     partition_locations: &[Vec<PartitionLocation>],
@@ -296,7 +310,8 @@ fn stats_for_partition(
     })
 }
 
-fn stats_for_partitions(
+/// Calculates stats for partitions
+pub fn stats_for_partitions(
     num_fields: usize,
     partition_stats: impl Iterator<Item = PartitionStats>,
 ) -> Statistics {
@@ -723,6 +738,7 @@ async fn fetch_partition_local(
     let path = &location.path;
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
+    let data_path = std::path::Path::new(path);
 
     // Detect format from file extension
     let is_vortex = path.ends_with(".vortex");
@@ -730,9 +746,6 @@ async fn fetch_partition_local(
     if is_vortex {
         #[cfg(feature = "vortex")]
         {
-            // For Vortex files, we need the schema. Get it from partition stats or infer.
-            // For now, we'll create a stream that reads the vortex file.
-            // Note: Vortex IPC format is self-describing, so we can read the schema from the file.
             let stream = fetch_partition_local_vortex(path).map_err(|e| {
                 BallistaError::FetchFailed(
                     metadata.id.clone(),
@@ -741,27 +754,49 @@ async fn fetch_partition_local(
                     e.to_string(),
                 )
             })?;
-            Ok(stream)
+            return Ok(stream);
         }
         #[cfg(not(feature = "vortex"))]
         {
-            Err(BallistaError::General(
+            return Err(BallistaError::General(
                 "Vortex format files found but 'vortex' feature is not enabled"
                     .to_string(),
-            ))
+            ));
         }
-    } else {
-        // Arrow IPC format
-        let reader = fetch_partition_local_arrow(path).map_err(|e| {
+    }
+
+    // Check if this is a sort-based shuffle output (has index file)
+    if is_sort_shuffle_output(data_path) {
+        debug!(
+            "Reading sort-based shuffle for partition {} from {:?}",
+            partition_id.partition_id, data_path
+        );
+        let index_path = get_index_path(data_path);
+        return stream_sort_shuffle_partition(
+            data_path,
+            &index_path,
+            partition_id.partition_id,
+        )
+        .map_err(|e| {
             BallistaError::FetchFailed(
                 metadata.id.clone(),
                 partition_id.stage_id,
                 partition_id.partition_id,
                 e.to_string(),
             )
-        })?;
-        Ok(Box::pin(LocalShuffleStream::new(reader)))
+        });
     }
+
+    // Standard hash-based shuffle - read the file directly
+    let reader = fetch_partition_local_arrow(path).map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            e.to_string(),
+        )
+    })?;
+    Ok(Box::pin(LocalShuffleStream::new(reader)))
 }
 
 /// Fetch partition from local Arrow IPC file
@@ -772,11 +807,16 @@ fn fetch_partition_local_arrow(
         BallistaError::General(format!("Failed to open partition file at {path}: {e:?}"))
     })?;
     let file = BufReader::new(file);
-    let reader = StreamReader::try_new(file, None).map_err(|e| {
-        BallistaError::General(format!(
-            "Failed to create Arrow IPC reader at {path}: {e:?}"
-        ))
-    })?;
+    // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
+    let reader = unsafe {
+        StreamReader::try_new(file, None)
+            .map_err(|e| {
+                BallistaError::General(format!(
+                    "Failed to create Arrow IPC reader at {path}: {e:?}"
+                ))
+            })?
+            .with_skip_validation(cfg!(feature = "arrow-ipc-optimizations"))
+    };
     Ok(reader)
 }
 
@@ -1255,6 +1295,96 @@ async fn fetch_partition_object_store_inner(
     Ok(batches)
 }
 
+struct CoalescedShuffleReaderStream {
+    schema: SchemaRef,
+    input: SendableRecordBatchStream,
+    coalescer: LimitedBatchCoalescer,
+    completed: bool,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl CoalescedShuffleReaderStream {
+    pub fn new(
+        input: SendableRecordBatchStream,
+        batch_size: usize,
+        limit: Option<usize>,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Self {
+        let schema = input.schema();
+        Self {
+            schema: schema.clone(),
+            input,
+            coalescer: LimitedBatchCoalescer::new(schema, batch_size, limit),
+            completed: false,
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+        }
+    }
+}
+
+impl Stream for CoalescedShuffleReaderStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+        let _timer = elapsed_compute.timer();
+
+        loop {
+            // If there is already a completed batch ready, return it directly
+            if let Some(batch) = self.coalescer.next_completed_batch() {
+                self.baseline_metrics.record_output(batch.num_rows());
+                return Poll::Ready(Some(Ok(batch)));
+            }
+
+            // If the upstream is completed, then it is completed for this stream too
+            if self.completed {
+                return Poll::Ready(None);
+            }
+
+            // Pull from upstream
+            match ready!(self.input.poll_next_unpin(cx)) {
+                // If upstream is completed, then flush remaning buffered batches
+                None => {
+                    self.completed = true;
+                    if let Err(e) = self.coalescer.finish() {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+                // If upstream is not completed, then push to coalescer
+                Some(Ok(batch)) => {
+                    if batch.num_rows() > 0 {
+                        // Try to push to coalescer
+                        match self.coalescer.push_batch(batch) {
+                            // If push is successful, then continue
+                            Ok(PushBatchStatus::Continue) => {
+                                continue;
+                            }
+                            // If limit is reached, then finish coalescer and set completed to true
+                            Ok(PushBatchStatus::LimitReached) => {
+                                self.completed = true;
+                                if let Err(e) = self.coalescer.finish() {
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                            }
+                            Err(e) => return Poll::Ready(Some(Err(e))),
+                        }
+                    }
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for CoalescedShuffleReaderStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1717,6 +1847,22 @@ mod tests {
         .unwrap()
     }
 
+    fn create_custom_test_batch(rows: usize) -> RecordBatch {
+        let schema = create_test_schema();
+
+        // 1. Create number column (0, 1, 2, ..., rows-1)
+        let number_vec: Vec<u32> = (0..rows as u32).collect();
+        let number_array = UInt32Array::from(number_vec);
+
+        // 2. Create string column ("s0", "s1", ..., "s{rows-1}")
+        // Just to fill data, the content is not important
+        let string_vec: Vec<String> = (0..rows).map(|i| format!("s{}", i)).collect();
+        let string_array = StringArray::from(string_vec);
+
+        RecordBatch::try_new(schema, vec![Arc::new(number_array), Arc::new(string_array)])
+            .unwrap()
+    }
+
     fn create_test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("number", DataType::UInt32, true),
@@ -1922,5 +2068,158 @@ mod tests {
                 assert!(found_error, "Expected an error while reading batches");
             }
         }
+    }
+
+    use datafusion::physical_plan::memory::MemoryStream;
+
+    #[tokio::test]
+    async fn test_coalesce_stream_logic() -> Result<()> {
+        // 1. Create test data - 10 small batches, each with 3 rows
+        let schema = create_test_schema();
+        let small_batch = create_test_batch();
+        let batches = vec![small_batch.clone(); 10];
+
+        // 2. Create mock upstream stream (Input Stream)
+        let input_stream = MemoryStream::try_new(batches, schema.clone(), None)?;
+        let input_stream = Box::pin(input_stream) as SendableRecordBatchStream;
+
+        // 3. Configure Coalescer: target batch size to 10 rows
+        let target_batch_size = 10;
+
+        // 4. Manually build the CoalescedShuffleReaderStream
+        let coalesced_stream = CoalescedShuffleReaderStream::new(
+            input_stream,
+            target_batch_size,
+            None,
+            &ExecutionPlanMetricsSet::new(),
+            0,
+        );
+
+        // 5. Execute stream and collect results
+        let output_batches = common::collect(Box::pin(coalesced_stream)).await?;
+
+        // 6. Assertions
+        // Assert A: Data total not lost (30 rows)
+        let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 30);
+
+        // Assert B: Batch count reduced (10 -> 3)
+        assert_eq!(output_batches.len(), 3);
+
+        // Assert C: Each batch size is correct (all should be 10)
+        assert_eq!(output_batches[0].num_rows(), 10);
+        assert_eq!(output_batches[1].num_rows(), 10);
+        assert_eq!(output_batches[2].num_rows(), 10);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_stream_remainder_flush() -> Result<()> {
+        let schema = create_test_schema();
+        // Create 10 small batch, each with 3 rows. Total 30 rows.
+        let small_batch = create_test_batch();
+        let batches = vec![small_batch.clone(); 10];
+
+        let input_stream = MemoryStream::try_new(batches, schema.clone(), None)?;
+        let input_stream = Box::pin(input_stream) as SendableRecordBatchStream;
+
+        // Target set to 100 rows.
+        // Because 30 < 100, it can never be filled. Must depend on the `finish()` mechanism to flush out these 30 rows at the end of the stream.
+        let target_batch_size = 100;
+
+        let coalesced_stream = CoalescedShuffleReaderStream::new(
+            input_stream,
+            target_batch_size,
+            None,
+            &ExecutionPlanMetricsSet::new(),
+            0,
+        );
+
+        let output_batches = common::collect(Box::pin(coalesced_stream)).await?;
+
+        // Assertions
+        assert_eq!(output_batches.len(), 1); // Should only have 1 batch
+        assert_eq!(output_batches[0].num_rows(), 30); // Should contain all 30 rows
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_stream_large_batch() -> Result<()> {
+        let schema = create_test_schema();
+
+        // 1. Create a large batch (20 rows)
+        let big_batch = create_custom_test_batch(20);
+        let batches = vec![big_batch.clone(); 10]; // Total 200 rows
+
+        let input_stream = MemoryStream::try_new(batches, schema.clone(), None)?;
+        let input_stream = Box::pin(input_stream) as SendableRecordBatchStream;
+
+        // 2. Target set to small size, 10 rows
+        let target_batch_size = 10;
+
+        let coalesced_stream = CoalescedShuffleReaderStream::new(
+            input_stream,
+            target_batch_size,
+            None,
+            &ExecutionPlanMetricsSet::new(),
+            0,
+        );
+
+        let output_batches = common::collect(Box::pin(coalesced_stream)).await?;
+
+        // 3. Validation: It should not split the large batch, but directly output it
+        // Coalescer will not split the batch if size > (max_batch_size / 2)
+        assert_eq!(output_batches.len(), 10);
+        assert_eq!(output_batches[0].num_rows(), 20);
+
+        Ok(())
+    }
+
+    use futures::stream;
+
+    #[tokio::test]
+    async fn test_coalesce_stream_error_propagation() -> Result<()> {
+        let schema = create_test_schema();
+        let small_batch = create_test_batch(); // 3行
+
+        // 1. Construct a stream with error
+        let batches = vec![
+            Ok(small_batch),
+            Err(DataFusionError::Execution(
+                "Network connection failed".to_string(),
+            )),
+        ];
+
+        // 2. Construct a stream with error
+        let stream = stream::iter(batches);
+        let input_stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream));
+
+        // 3. Configure Coalescer
+        let target_batch_size = 10;
+
+        let coalesced_stream = CoalescedShuffleReaderStream::new(
+            input_stream,
+            target_batch_size,
+            None,
+            &ExecutionPlanMetricsSet::new(),
+            0,
+        );
+
+        // 4. Execute stream
+        let result = common::collect(Box::pin(coalesced_stream)).await;
+
+        // 5. Validation
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Network connection failed")
+        );
+
+        Ok(())
     }
 }

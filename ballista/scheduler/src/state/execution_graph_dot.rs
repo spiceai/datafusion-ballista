@@ -19,7 +19,7 @@
 
 use crate::state::execution_graph::ExecutionGraph;
 use ballista_core::execution_plans::{
-    ShuffleReaderExec, ShuffleWriterExec, UnresolvedShuffleExec,
+    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
 };
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -45,19 +45,19 @@ use std::sync::Arc;
 
 /// Utility for producing dot diagrams from execution graphs
 pub struct ExecutionGraphDot<'a> {
-    graph: &'a ExecutionGraph,
+    graph: &'a dyn ExecutionGraph,
 }
 
 impl<'a> ExecutionGraphDot<'a> {
     /// Create a DOT graph from the provided ExecutionGraph
-    pub fn generate(graph: &'a ExecutionGraph) -> Result<String, fmt::Error> {
+    pub fn generate(graph: &'a dyn ExecutionGraph) -> Result<String, fmt::Error> {
         let mut dot = Self { graph };
         dot._generate()
     }
 
     /// Create a DOT graph for one query stage from the provided ExecutionGraph
     pub fn generate_for_query_stage(
-        graph: &ExecutionGraph,
+        graph: &dyn ExecutionGraph,
         stage_id: usize,
     ) -> Result<String, fmt::Error> {
         if let Some(stage) = graph.stages().get(&stage_id) {
@@ -320,6 +320,11 @@ filter_expr={}",
             "ShuffleWriter [{} partitions]",
             exec.input_partition_count()
         )
+    } else if let Some(exec) = plan.as_any().downcast_ref::<SortShuffleWriterExec>() {
+        format!(
+            "SortShuffleWriter [{} partitions]",
+            exec.input_partition_count()
+        )
     } else if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
         let config = if let Some(config) =
             exec.data_source().as_any().downcast_ref::<FileScanConfig>()
@@ -405,7 +410,7 @@ fn get_file_scan(scan: &FileScanConfig) -> String {
 #[cfg(test)]
 mod tests {
     use crate::planner::DefaultDistributedPlanner;
-    use crate::state::execution_graph::ExecutionGraph;
+    use crate::state::execution_graph::StaticExecutionGraph;
     use crate::state::execution_graph_dot::ExecutionGraphDot;
     use ballista_core::error::{BallistaError, Result};
     use ballista_core::extension::SessionConfigExt;
@@ -436,19 +441,13 @@ mod tests {
 	subgraph cluster2 {
 		label = "Stage 3 [Unresolved]";
 		stage_3_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_3_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0 [shape=box, label="HashJoin
+		stage_3_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_3_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0_0 -> stage_3_0_0_0_0
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_0_1_0 -> stage_3_0_0_0_1
-		stage_3_0_0_0_1 -> stage_3_0_0_0
+		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_3_0_0_0 -> stage_3_0_0
+		stage_3_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
+		stage_3_0_0_1 -> stage_3_0_0
 		stage_3_0_0 -> stage_3_0
 	}
 	subgraph cluster3 {
@@ -460,25 +459,19 @@ filter_expr="]
 	subgraph cluster4 {
 		label = "Stage 5 [Unresolved]";
 		stage_5_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_5_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0 [shape=box, label="HashJoin
+		stage_5_0_0 [shape=box, label="HashJoin
 join_expr=b@3 = b@1
 filter_expr="]
-		stage_5_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_5_0_0_0_0_0 -> stage_5_0_0_0_0
-		stage_5_0_0_0_0 -> stage_5_0_0_0
-		stage_5_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=4]"]
-		stage_5_0_0_0_1_0 -> stage_5_0_0_0_1
-		stage_5_0_0_0_1 -> stage_5_0_0_0
+		stage_5_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
 		stage_5_0_0_0 -> stage_5_0_0
+		stage_5_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=4]"]
+		stage_5_0_0_1 -> stage_5_0_0
 		stage_5_0_0 -> stage_5_0
 	}
-	stage_1_0 -> stage_3_0_0_0_0_0
-	stage_2_0 -> stage_3_0_0_0_1_0
-	stage_3_0 -> stage_5_0_0_0_0_0
-	stage_4_0 -> stage_5_0_0_0_1_0
+	stage_1_0 -> stage_3_0_0_0
+	stage_2_0 -> stage_3_0_0_1
+	stage_3_0 -> stage_5_0_0_0
+	stage_4_0 -> stage_5_0_0_1
 }
 "#;
         assert_eq!(expected, &dot);
@@ -493,19 +486,13 @@ filter_expr="]
 
         let expected = r#"digraph G {
 		stage_3_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_3_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0 [shape=box, label="HashJoin
+		stage_3_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_3_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0_0 -> stage_3_0_0_0_0
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_3_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_0_1_0 -> stage_3_0_0_0_1
-		stage_3_0_0_0_1 -> stage_3_0_0_0
+		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_3_0_0_0 -> stage_3_0_0
+		stage_3_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
+		stage_3_0_0_1 -> stage_3_0_0
 		stage_3_0_0 -> stage_3_0
 }
 "#;
@@ -541,34 +528,24 @@ filter_expr="]
 	subgraph cluster3 {
 		label = "Stage 4 [Unresolved]";
 		stage_4_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_4_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0 [shape=box, label="HashJoin
 join_expr=a@1 = a@0
 filter_expr="]
-		stage_4_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_4_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0
-		stage_4_0_0_0_0_0_0 -> stage_4_0_0_0_0_0
-		stage_4_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_4_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_1
-		stage_4_0_0_0_0_0_1 -> stage_4_0_0_0_0_0
-		stage_4_0_0_0_0_0 -> stage_4_0_0_0_0
+		stage_4_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_4_0_0_0_0 -> stage_4_0_0_0
-		stage_4_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_4_0_0_0_1_0 -> stage_4_0_0_0_1
+		stage_4_0_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
 		stage_4_0_0_0_1 -> stage_4_0_0_0
 		stage_4_0_0_0 -> stage_4_0_0
+		stage_4_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_4_0_0_1 -> stage_4_0_0
 		stage_4_0_0 -> stage_4_0
 	}
-	stage_1_0 -> stage_4_0_0_0_0_0_0_0
-	stage_2_0 -> stage_4_0_0_0_0_0_1_0
-	stage_3_0 -> stage_4_0_0_0_1_0
+	stage_1_0 -> stage_4_0_0_0_0
+	stage_2_0 -> stage_4_0_0_0_1
+	stage_3_0 -> stage_4_0_0_1
 }
 "#;
         assert_eq!(expected, &dot);
@@ -583,29 +560,19 @@ filter_expr="]
 
         let expected = r#"digraph G {
 		stage_4_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_4_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0 [shape=box, label="HashJoin
 join_expr=a@1 = a@0
 filter_expr="]
-		stage_4_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_4_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0
-		stage_4_0_0_0_0_0_0 -> stage_4_0_0_0_0_0
-		stage_4_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_4_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_1
-		stage_4_0_0_0_0_0_1 -> stage_4_0_0_0_0_0
-		stage_4_0_0_0_0_0 -> stage_4_0_0_0_0
+		stage_4_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_4_0_0_0_0 -> stage_4_0_0_0
-		stage_4_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_4_0_0_0_1_0 -> stage_4_0_0_0_1
+		stage_4_0_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
 		stage_4_0_0_0_1 -> stage_4_0_0_0
 		stage_4_0_0_0 -> stage_4_0_0
+		stage_4_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_4_0_0_1 -> stage_4_0_0
 		stage_4_0_0 -> stage_4_0
 }
 "#;
@@ -613,7 +580,7 @@ filter_expr="]
         Ok(())
     }
 
-    async fn test_graph() -> Result<ExecutionGraph> {
+    async fn test_graph() -> Result<StaticExecutionGraph> {
         let mut config = SessionConfig::new()
             .with_target_partitions(48)
             .with_batch_size(4096);
@@ -636,7 +603,7 @@ filter_expr="]
         let plan = df.into_optimized_plan()?;
         let plan = ctx.state().create_physical_plan(&plan).await?;
         let mut planner = DefaultDistributedPlanner::new();
-        ExecutionGraph::new(
+        StaticExecutionGraph::new(
             "scheduler_id",
             "job_id",
             "job_name",
@@ -650,7 +617,7 @@ filter_expr="]
 
     // With the improvement of https://github.com/apache/arrow-datafusion/pull/4122,
     // Redundant RepartitionExec can be removed so that the stage number will be reduced
-    async fn test_graph_optimized() -> Result<ExecutionGraph> {
+    async fn test_graph_optimized() -> Result<StaticExecutionGraph> {
         let mut config = SessionConfig::new()
             .with_target_partitions(48)
             .with_batch_size(4096);
@@ -672,7 +639,7 @@ filter_expr="]
         let plan = df.into_optimized_plan()?;
         let plan = ctx.state().create_physical_plan(&plan).await?;
         let mut planner = DefaultDistributedPlanner::new();
-        ExecutionGraph::new(
+        StaticExecutionGraph::new(
             "scheduler_id",
             "job_id",
             "job_name",

@@ -59,6 +59,7 @@ mod unsupported {
             .await
             .unwrap();
     }
+
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
@@ -70,6 +71,12 @@ mod unsupported {
         ctx: SessionContext,
         test_data: String,
     ) {
+        ctx.sql("SET ballista.cache.noop = false")
+            .await
+            .unwrap()
+            .show()
+            .await
+            .unwrap();
         let df = ctx
             .read_parquet(
                 &format!("{test_data}/alltypes_plain.parquet"),
@@ -95,5 +102,81 @@ mod unsupported {
         ];
 
         assert_batches_eq!(expected, &result);
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+    async fn should_support_on_cache_collect(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+    ) -> datafusion::error::Result<()> {
+        // opt out case, should fail
+        ctx.sql("SET ballista.cache.noop = false")
+            .await?
+            .show()
+            .await?;
+        let cached_df = ctx.sql("SELECT 1").await?.cache().await?;
+
+        // Collect fails because extension node is not handled for now by default query planner
+        let result = cached_df.collect().await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No installed planner was able to convert the custom node to an execution plan: BallistaCacheNode"),
+            "Expected planner error, got: {err_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+
+    async fn should_execute_sql_collect_from_arrow_file(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+        test_data: String,
+    ) -> datafusion::error::Result<()> {
+        ctx.register_arrow(
+            "test",
+            &format!("{test_data}/alltypes_plain.arrow"),
+            Default::default(),
+        )
+        .await?;
+
+        let result = ctx
+            .sql("select string_col, timestamp_col from test where id > 4")
+            .await?
+            .collect()
+            .await;
+
+        // at the moment its not supported
+        assert!(result.is_err());
+
+        // let result = ctx
+        //     .sql("select string_col, timestamp_col from test where id > 4")
+        //     .await?
+        //     .collect()
+        //     .await?;
+        // let expected = [
+        //     "+------------+---------------------+",
+        //     "| string_col | timestamp_col       |",
+        //     "+------------+---------------------+",
+        //     "| 31         | 2009-03-01T00:01:00 |",
+        //     "| 30         | 2009-04-01T00:00:00 |",
+        //     "| 31         | 2009-04-01T00:01:00 |",
+        //     "+------------+---------------------+",
+        // ];
+
+        // assert_batches_eq!(expected, &result);
+
+        Ok(())
     }
 }

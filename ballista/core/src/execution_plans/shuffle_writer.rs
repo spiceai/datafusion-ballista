@@ -70,6 +70,8 @@ use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use log::{debug, info};
 
+use super::shuffle_writer_trait::ShuffleWriter;
+
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
 /// partition is re-partitioned and streamed to disk in Arrow IPC format. Future stages of the query
@@ -628,7 +630,10 @@ impl ShuffleWriterExec {
                         ShuffleFormat::Vortex => {
                             use vortex_array::arrow::FromArrowArray;
                             let vortex_array =
-                                vortex_array::ArrayRef::from_arrow(&batch, false);
+                                vortex_array::ArrayRef::from_arrow(&batch, false)
+                                    .map_err(|e| {
+                                        DataFusionError::External(Box::new(e))
+                                    })?;
                             vortex_buffer.push(vortex_array);
                         }
                         // Non-vortex build: already returned error above
@@ -880,7 +885,7 @@ impl ShuffleWriterExec {
         >,
         exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
         num_output_partitions: usize,
-        schema: &SchemaRef,
+        _schema: &SchemaRef,
         storage: &crate::shuffle_storage::ObjectStoreShuffleStorage,
         write_metrics: &ShuffleWriteMetrics,
         file_ext: &str,
@@ -912,7 +917,8 @@ impl ShuffleWriterExec {
                 let batch_rows = output_batch.num_rows() as u64;
 
                 let vortex_array =
-                    vortex_array::ArrayRef::from_arrow(&output_batch, false);
+                    vortex_array::ArrayRef::from_arrow(&output_batch, false)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 match &mut buffers[output_partition] {
                     Some(buf) => {
@@ -1163,7 +1169,8 @@ impl ShuffleWriterExec {
                 for batch in batches {
                     total_rows += batch.num_rows() as u64;
                     // Convert Arrow RecordBatch to Vortex Array
-                    let vortex_array = ArrayRef::from_arrow(&batch, false);
+                    let vortex_array = ArrayRef::from_arrow(&batch, false)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     total_bytes += vortex_array.nbytes();
                     arrays.push(vortex_array);
                 }
@@ -1333,6 +1340,31 @@ impl ExecutionPlan for ShuffleWriterExec {
     }
 }
 
+impl ShuffleWriter for ShuffleWriterExec {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn stage_id(&self) -> usize {
+        self.stage_id
+    }
+
+    fn shuffle_output_partitioning(&self) -> Option<&Partitioning> {
+        self.shuffle_output_partitioning.as_ref()
+    }
+
+    fn input_partition_count(&self) -> usize {
+        self.plan
+            .properties()
+            .output_partitioning()
+            .partition_count()
+    }
+
+    fn clone_box(&self) -> Arc<dyn ShuffleWriter> {
+        Arc::new(self.clone())
+    }
+}
+
 fn result_schema() -> SchemaRef {
     let stats = PartitionStats::default();
     Arc::new(Schema::new(vec![
@@ -1379,6 +1411,7 @@ fn serialize_vortex_arrays_to_bytes(
     let array_iter = ArrayIteratorAdapter::new(dtype, iter);
     let ipc_data = array_iter
         .into_ipc()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
         .collect_to_buffer()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -1387,6 +1420,7 @@ fn serialize_vortex_arrays_to_bytes(
 
 #[cfg(test)]
 #[cfg(not(feature = "force_hash_collisions"))]
+#[allow(dead_code, unused_imports)] // clippy false positive with local imports
 mod tests {
     use super::*;
     use datafusion::arrow::array::{StringArray, StructArray, UInt32Array, UInt64Array};

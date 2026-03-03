@@ -21,6 +21,7 @@ fn main() -> Result<(), String> {
 
     #[cfg(feature = "keda-scaler")]
     tonic_prost_build::configure()
+        .server_attribute(".", "#[allow(missing_docs)]")
         .compile_protos(&["proto/keda.proto"], &["proto"])
         .map_err(|e| format!("protobuf compilation failed: {e}"))?;
 

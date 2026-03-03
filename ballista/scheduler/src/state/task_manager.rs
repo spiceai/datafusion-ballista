@@ -18,14 +18,15 @@
 use crate::planner::DefaultDistributedPlanner;
 
 use crate::state::execution_graph::{
-    ExecutionGraph, ExecutionStage, RunningTaskInfo, TaskDescription,
+    ExecutionGraphBox, RunningTaskInfo, StaticExecutionGraph, TaskDescription,
     TaskStatusUpdateResult,
 };
 use crate::state::executor_manager::ExecutorManager;
 
+use ballista_core::JobStatusSubscriber;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
-use ballista_core::extension::SessionConfigHelperExt;
+use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use datafusion::prelude::SessionConfig;
 use rand::distr::Alphanumeric;
 
@@ -37,6 +38,7 @@ use ballista_core::serde::protobuf::{
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use dashmap::DashMap;
 
+use crate::state::aqe::AdaptiveExecutionGraph;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::{AsExecutionPlan, PhysicalExtensionCodec};
@@ -143,7 +145,7 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 #[derive(Clone)]
 pub struct JobInfoCache {
     /// The execution graph for this job, protected by a read-write lock.
-    pub execution_graph: Arc<RwLock<ExecutionGraph>>,
+    pub execution_graph: Arc<RwLock<ExecutionGraphBox>>,
     /// Cached job status for quick access.
     pub status: Option<job_status::Status>,
     #[cfg(not(feature = "disable-stage-plan-cache"))]
@@ -153,8 +155,9 @@ pub struct JobInfoCache {
 
 impl JobInfoCache {
     /// Creates a new `JobInfoCache` from an execution graph.
-    pub fn new(graph: ExecutionGraph) -> Self {
+    pub fn new(graph: ExecutionGraphBox) -> Self {
         let status = graph.status().status.clone();
+
         Self {
             execution_graph: Arc::new(RwLock::new(graph)),
             status,
@@ -301,6 +304,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// Generate an ExecutionGraph for the job and save it to the persistent state.
     /// By default, this job will be curated by the scheduler which receives it.
     /// Then we will also save it to the active execution graph
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_job(
         &self,
         job_id: &str,
@@ -309,21 +313,43 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         plan: Arc<dyn ExecutionPlan>,
         queued_at: u64,
         session_config: Arc<SessionConfig>,
+        subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
         let mut planner = DefaultDistributedPlanner::new();
-        let mut graph = ExecutionGraph::new(
-            &self.scheduler_id,
-            job_id,
-            job_name,
-            session_id,
-            plan,
-            queued_at,
-            session_config,
-            &mut planner,
-        )?;
-        info!("Submitting execution graph: {graph:?}");
 
-        self.state.submit_job(job_id.to_string(), &graph).await?;
+        let mut graph = if session_config.ballista_adaptive_query_planner_enabled() {
+            debug!("Using adaptive query planner (AQE) for job planning");
+            warn!(
+                "Adaptive Query Planning is EXPERIMENTAL, should be used for testing purposes only!"
+            );
+            Box::new(AdaptiveExecutionGraph::try_new(
+                &self.scheduler_id,
+                job_id,
+                job_name,
+                session_id,
+                plan,
+                queued_at,
+                session_config,
+            )?) as ExecutionGraphBox
+        } else {
+            debug!("Using static query planner for job planning");
+            Box::new(StaticExecutionGraph::new(
+                &self.scheduler_id,
+                job_id,
+                job_name,
+                session_id,
+                plan,
+                queued_at,
+                session_config,
+                &mut planner,
+            )?) as ExecutionGraphBox
+        };
+
+        info!("Submitting execution graph:\n\n{graph:?}");
+
+        self.state
+            .submit_job(job_id.to_string(), &graph, subscriber)
+            .await?;
         graph.revive();
         self.active_job_cache
             .insert(job_id.to_owned(), JobInfoCache::new(graph));
@@ -386,15 +412,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub(crate) async fn get_job_execution_graph(
         &self,
         job_id: &str,
-    ) -> Result<Option<Arc<ExecutionGraph>>> {
+    ) -> Result<Option<ExecutionGraphBox>> {
         if let Some(cached) = self.get_active_execution_graph(job_id) {
             let guard = cached.read().await;
 
-            Ok(Some(Arc::new(guard.deref().clone())))
+            Ok(Some(guard.deref().cloned()))
         } else {
             let graph = self.state.get_execution_graph(job_id).await?;
 
-            Ok(graph.map(Arc::new))
+            Ok(graph)
         }
     }
 
@@ -420,9 +446,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let num_tasks = statuses.len();
             debug!("Updating {num_tasks} tasks in job {job_id}");
 
-            let job_result = if let Some(cached) =
-                self.get_active_execution_graph(&job_id)
-            {
+            let events = if let Some(cached) = self.get_active_execution_graph(&job_id) {
                 let mut graph = cached.write().await;
                 graph.update_task_status(
                     executor,
@@ -435,39 +459,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 error!(
                     "Fail to find job {job_id} in the active cache and it may not be curated by this scheduler"
                 );
-                TaskStatusUpdateResult::default()
+                vec![]
             };
 
-            // Combine events and metrics from all jobs
-            combined_result.events.extend(job_result.events);
-            combined_result
-                .metrics_info
-                .stages_started
-                .extend(job_result.metrics_info.stages_started);
-            combined_result
-                .metrics_info
-                .stages_completed
-                .extend(job_result.metrics_info.stages_completed);
-            combined_result
-                .metrics_info
-                .stages_failed
-                .extend(job_result.metrics_info.stages_failed);
-            combined_result
-                .metrics_info
-                .stages_retried
-                .extend(job_result.metrics_info.stages_retried);
-            combined_result
-                .metrics_info
-                .tasks_completed
-                .extend(job_result.metrics_info.tasks_completed);
-            combined_result
-                .metrics_info
-                .tasks_failed
-                .extend(job_result.metrics_info.tasks_failed);
-            combined_result
-                .metrics_info
-                .tasks_retried
-                .extend(job_result.metrics_info.tasks_retried);
+            // Combine events from all jobs
+            combined_result.events.extend(events);
+            // Note: metrics are not available through the trait interface.
+            // Use update_task_status_with_metrics on StaticExecutionGraph for metrics tracking.
         }
 
         Ok(combined_result)
@@ -479,7 +477,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         debug!("Moving job {job_id} from Active to Success");
 
         if let Some(graph) = self.remove_active_execution_graph(job_id) {
-            let graph = graph.read().await.clone();
+            let graph = graph.read().await;
             if graph.is_successful() {
                 self.state.save_job(job_id, &graph).await?;
             } else {
@@ -579,15 +577,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub async fn executor_lost(&self, executor_id: &str) -> Result<Vec<RunningTaskInfo>> {
         // Collect all the running task need to cancel when there are running stages rolled back.
         let mut running_tasks_to_cancel: Vec<RunningTaskInfo> = vec![];
-        // Collect graphs we update so we can update them in storage
-        let updated_graphs: DashMap<String, ExecutionGraph> = DashMap::new();
+
         {
             for pairs in self.active_job_cache.iter() {
-                let (job_id, job_info) = pairs.pair();
+                let (_job_id, job_info) = pairs.pair();
                 let mut graph = job_info.execution_graph.write().await;
                 let reset = graph.reset_stages_on_lost_executor(executor_id)?;
                 if !reset.0.is_empty() {
-                    updated_graphs.insert(job_id.to_owned(), graph.clone());
                     running_tasks_to_cancel.extend(reset.1);
                 }
             }
@@ -747,7 +743,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub(crate) fn get_active_execution_graph(
         &self,
         job_id: &str,
-    ) -> Option<Arc<RwLock<ExecutionGraph>>> {
+    ) -> Option<Arc<RwLock<ExecutionGraphBox>>> {
         self.active_job_cache
             .get(job_id)
             .as_deref()
@@ -758,7 +754,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub(crate) fn remove_active_execution_graph(
         &self,
         job_id: &str,
-    ) -> Option<Arc<RwLock<ExecutionGraph>>> {
+    ) -> Option<Arc<RwLock<ExecutionGraphBox>>> {
         self.active_job_cache
             .remove(job_id)
             .map(|value| value.1.execution_graph)
@@ -811,14 +807,9 @@ pub struct JobOverview {
     pub completed_stages: usize,
 }
 
-impl From<&ExecutionGraph> for JobOverview {
-    fn from(value: &ExecutionGraph) -> Self {
-        let mut completed_stages = 0;
-        for stage in value.stages().values() {
-            if let ExecutionStage::Successful(_) = stage {
-                completed_stages += 1;
-            }
-        }
+impl From<&ExecutionGraphBox> for JobOverview {
+    fn from(value: &ExecutionGraphBox) -> Self {
+        let completed_stages = value.completed_stages();
 
         Self {
             job_id: value.job_id().to_string(),

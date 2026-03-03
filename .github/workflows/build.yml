@@ -27,9 +27,13 @@ concurrency:
 on:
   pull_request:
     branches: ["main"]
+    paths:
+      - 'python/**'
   push:
     tags: ["*-rc*"]
     branches: ["branch-*"]
+    paths:
+      - 'python/**'
 
 jobs:
   test-release:
@@ -43,9 +47,9 @@ jobs:
           - "3.12"
           - "3.13"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -57,7 +61,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -70,13 +74,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -97,13 +101,13 @@ jobs:
   generate-license:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6.0.2
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Generate license file
         run: uv run --no-project python ./dev/create_license.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-wheel-license
           path: LICENSE.txt
@@ -118,9 +122,9 @@ jobs:
         python-version: ["3.10"]
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -128,7 +132,7 @@ jobs:
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-wheel-license
           path: .
@@ -139,7 +143,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -161,7 +165,7 @@ jobs:
         run: find python/target/wheels/
 
       - name: Archive wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.os  }}
           path: python/target/wheels/*
@@ -175,9 +179,9 @@ jobs:
       matrix:
         python-version: ["3.10"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -185,7 +189,7 @@ jobs:
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-wheel-license
           path: .
@@ -196,7 +200,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -210,7 +214,7 @@ jobs:
         run: find python/target/wheels/
 
       - name: Archive wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-macos-aarch64
           path: python/target/wheels/*
@@ -220,13 +224,13 @@ jobs:
     name: Manylinux x86_64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-wheel-license
           path: .
@@ -239,7 +243,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -250,7 +254,7 @@ jobs:
           uv run --no-project maturin build --release --strip
 
       - name: Archive wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-manylinux-x86_64
           path: python/target/wheels/*
@@ -260,13 +264,13 @@ jobs:
     name: Manylinux arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-wheel-license
           path: .
@@ -279,7 +283,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@9cfd02964306b527feff5fee75acfd028cce4260 # v6.8.0
         with:
           enable-cache: true
 
@@ -290,7 +294,7 @@ jobs:
           uv run --no-project maturin build --release --strip
 
       - name: Archive wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-manylinux-aarch64
           path: python/target/wheels/*
@@ -300,13 +304,13 @@ jobs:
     name: Source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-wheel-license
           path: .
@@ -319,7 +323,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@9cfd02964306b527feff5fee75acfd028cce4260 # v6.8.0
         with:
           enable-cache: true
 
@@ -349,7 +353,7 @@ jobs:
       - build-sdist
     steps:
       - name: Merge Build Artifacts
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
           name: dist
           pattern: dist-*
@@ -360,7 +364,7 @@ jobs:
   #   needs: [build-manylinux, build-python-mac-win]
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/download-artifact@v4
+  #     - uses: actions/download-artifact@v8
   #     - name: Publish to PyPI
   #       uses: pypa/gh-action-pypi-publish@master
   #       with:

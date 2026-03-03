@@ -80,7 +80,7 @@ impl BallistaClient {
         let addr = format!("{scheme}://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
 
-        let mut endpoint = create_grpc_client_endpoint(addr.clone())
+        let mut endpoint = create_grpc_client_endpoint(addr.clone(), None)
             .map_err(|e| {
                 BallistaError::GrpcConnectionError(format!(
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"

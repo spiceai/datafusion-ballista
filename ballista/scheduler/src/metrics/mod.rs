@@ -17,6 +17,7 @@
 
 /// Prometheus metrics collector implementation.
 #[cfg(feature = "prometheus")]
+/// Module implementing prometheus metrics.
 pub mod prometheus;
 
 #[cfg(feature = "prometheus")]

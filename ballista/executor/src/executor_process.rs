@@ -40,8 +40,18 @@ use uuid::Uuid;
 
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 
+use crate::execution_engine::ExecutionEngine;
+use crate::executor::{Executor, TasksDrainedFuture};
+use crate::executor_server::TERMINATING;
+use crate::flight_service::BallistaFlightService;
+use crate::metrics::LoggingMetricsCollector;
+use crate::shutdown::Shutdown;
+use crate::shutdown::ShutdownNotifier;
+use crate::{ArrowFlightServerProvider, terminate};
+use crate::{execution_loop, executor_server};
 use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
 use ballista_core::error::BallistaError;
+use ballista_core::extension::{EndpointOverrideFn, SessionConfigExt};
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::executor_status::Status;
 use ballista_core::serde::protobuf::{
@@ -52,24 +62,10 @@ use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
 use ballista_core::utils::{
-    GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
+    GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
     default_config_producer, get_time_before,
 };
 use ballista_core::{BALLISTA_VERSION, ConfigProducer, RuntimeProducer};
-use tonic::transport::{Endpoint, Error as TonicTransportError};
-
-/// Type alias for the endpoint override function used in gRPC client configuration
-pub type EndpointOverrideFn =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
-use crate::execution_engine::ExecutionEngine;
-use crate::executor::{Executor, TasksDrainedFuture};
-use crate::executor_server::TERMINATING;
-use crate::flight_service::BallistaFlightService;
-use crate::metrics::LoggingMetricsCollector;
-use crate::shutdown::Shutdown;
-use crate::shutdown::ShutdownNotifier;
-use crate::{ArrowFlightServerProvider, terminate};
-use crate::{execution_loop, executor_server};
 
 /// Configuration for the executor process.
 ///
@@ -223,13 +219,14 @@ pub async fn start_executor_process(
     } else {
         opt.concurrent_tasks
     };
-
+    let task_scheduling_policy = opt.task_scheduling_policy;
     // assign this executor an unique ID
     let executor_id = Uuid::new_v4().to_string();
     info!("Executor starting ... (Datafusion Ballista {BALLISTA_VERSION})");
     info!("Executor id: {executor_id}");
     info!("Executor working directory: {work_dir}");
     info!("Executor number of concurrent tasks: {concurrent_tasks}");
+    info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -288,12 +285,16 @@ pub async fn start_executor_process(
     ));
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
+    let session_config = (executor.config_producer)();
+    let ballista_config = session_config.ballista_config();
+    let grpc_config = GrpcClientConfig::from(&ballista_config);
     let connection = if connect_timeout == 0 {
-        let mut endpoint = create_grpc_client_endpoint(scheduler_url).map_err(|_| {
-            BallistaError::GrpcConnectionError(
-                "Could not create endpoint to scheduler".to_string(),
-            )
-        })?;
+        let mut endpoint = create_grpc_client_endpoint(scheduler_url, Some(&grpc_config))
+            .map_err(|_| {
+                BallistaError::GrpcConnectionError(
+                    "Could not create endpoint to scheduler".to_string(),
+                )
+            })?;
 
         if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
             endpoint = override_fn(endpoint).map_err(|_| {
@@ -317,7 +318,7 @@ pub async fn start_executor_process(
         while x.is_none()
             && Instant::now().elapsed().as_secs() - start_time < connect_timeout
         {
-            match create_grpc_client_endpoint(scheduler_url.clone()) {
+            match create_grpc_client_endpoint(scheduler_url.clone(), Some(&grpc_config)) {
                 Ok(mut endpoint) => {
                     if let Some(ref override_fn) =
                         opt.override_create_grpc_client_endpoint

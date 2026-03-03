@@ -28,6 +28,20 @@ import "datafusion.proto";
 import "datafusion_common.proto";
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ballista Logical Plan
+///////////////////////////////////////////////////////////////////////////////////////////////////
+message BallistaLogicalPlanNode {
+  oneof LogicalPlanType {
+    LogicalPlanCacheNode cache_node = 1;
+  }
+}
+
+message LogicalPlanCacheNode {
+  string cache_id = 1;
+  string session_id = 2;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 // Ballista Physical Plan
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 message BallistaPhysicalPlanNode {
@@ -35,6 +49,7 @@ message BallistaPhysicalPlanNode {
     ShuffleWriterExecNode shuffle_writer = 1;
     ShuffleReaderExecNode shuffle_reader = 2;
     UnresolvedShuffleExecNode unresolved_shuffle = 3;
+    SortShuffleWriterExecNode sort_shuffle_writer = 4;
   }
 }
 
@@ -45,6 +60,19 @@ message ShuffleWriterExecNode {
   uint32 stage_id = 2;
   datafusion.PhysicalPlanNode input = 3;
   datafusion.PhysicalHashRepartition output_partitioning = 4;
+}
+
+// Sort-based shuffle writer that produces consolidated files with index
+message SortShuffleWriterExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  datafusion.PhysicalPlanNode input = 3;
+  datafusion.PhysicalHashRepartition output_partitioning = 4;
+  // Configuration for sort shuffle
+  uint64 buffer_size = 5;
+  uint64 memory_limit = 6;
+  double spill_threshold = 7;
+  uint64 batch_size = 8;
 }
 
 message UnresolvedShuffleExecNode {
@@ -292,6 +320,7 @@ message OperatorMetric {
     uint64 output_bytes = 12;
     NamedPruningMetrics pruning_metrics = 13;
     NamedRatio ratio = 14;
+    uint64 output_batches = 15;
   }
 }
 
@@ -645,6 +674,10 @@ message JobStatus {
 
 message GetJobStatusResult {
   JobStatus status = 1;
+  oneof flight_proxy {
+      bool local = 2;
+      string external = 3;
+  }
 }
 
 message FilePartitionMetadata {
@@ -794,6 +827,8 @@ service SchedulerGrpc {
   rpc CreateUpdateSession (CreateUpdateSessionParams) returns (CreateUpdateSessionResult) {}
 
   rpc RemoveSession (RemoveSessionParams) returns (RemoveSessionResult) {}
+
+  rpc ExecuteQueryPush (ExecuteQueryParams) returns (stream GetJobStatusResult) {}
 
   rpc ExecuteQuery (ExecuteQueryParams) returns (ExecuteQueryResult) {}
 
