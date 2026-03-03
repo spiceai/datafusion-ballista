@@ -21,10 +21,6 @@ members = ["ballista-cli", "ballista/client", "ballista/core", "ballista/executo
 resolver = "3"
 
 [workspace.package]
-# edition to be changed to 2024 when we update 
-# Minimum Supported Rust Version (MSRV) to 1.85.0
-# which is datafusion 49
-# 
 edition = "2024"
 # we should try to follow datafusion version 
 rust-version = "1.88.0"
@@ -39,7 +35,9 @@ datafusion = "52.0.0"
 datafusion-cli = "52.0.0"
 datafusion-proto = "52.0.0"
 datafusion-proto-common = "52.0.0"
+datafusion-spark = "52"
 datafusion-substrait = "52.0.0"
+insta = "1.46"
 object_store = { version = "0.12", features = ["aws", "azure"] }
 bytes = "1.5"
 prost = "0.14"
@@ -54,17 +52,17 @@ tonic-prost-build = { version = "0.14" }
 tracing = "0.1"
 tracing-appender = "0.2.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ctor = { version = "0.5" }
+ctor = { version = "0.6" }
 mimalloc = { version = "0.1" }
 
 tokio = { version = "1" }
-uuid = { version = "1.13", features = ["v4", "v7"] }
+uuid = { version = "1.21", features = ["v4", "v7"] }
 rand = { version = "0.9" }
 env_logger = { version = "0.11" }
 futures = { version = "0.3" }
 log = { version = "0.4" }
 parking_lot = { version = "0.12" }
-tempfile = { version = "3.16" }
+tempfile = { version = "3.26" }
 dashmap = { version = "6.1" }
 async-trait = { version = "0.1" }
 serde = { version = "1.0" }
@@ -75,7 +73,6 @@ url = { version = "2.5" }
 # Vortex columnar format dependencies from spiceai fork
 vortex-array = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
 vortex-buffer = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
-vortex-dtype = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
 vortex-error = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
 vortex-ipc = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
 

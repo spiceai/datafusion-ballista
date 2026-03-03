@@ -31,11 +31,12 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
 use futures::StreamExt;
 use log::error;
+use std::io::BufWriter;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
-use tonic::transport::{Channel, Error, Server};
+use tonic::transport::{Channel, Endpoint, Error, Server};
 
 /// Configuration for gRPC client connections.
 ///
@@ -130,11 +131,21 @@ impl Default for GrpcServerConfig {
 pub fn default_session_builder(
     config: SessionConfig,
 ) -> datafusion::common::Result<SessionState> {
-    Ok(SessionStateBuilder::new()
+    use crate::extension::{
+        ballista_aggregate_functions, ballista_scalar_functions,
+        ballista_window_functions,
+    };
+
+    let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
         .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build()?))
-        .build())
+        .with_scalar_functions(ballista_scalar_functions())
+        .with_aggregate_functions(ballista_aggregate_functions())
+        .with_window_functions(ballista_window_functions())
+        .build();
+
+    Ok(state)
 }
 
 /// Creates a default session configuration with Ballista extensions.
@@ -148,10 +159,10 @@ pub async fn write_stream_to_disk(
     path: &str,
     disk_write_metric: &metrics::Time,
 ) -> Result<PartitionStats> {
-    let file = File::create(path).map_err(|e| {
+    let file = BufWriter::new(File::create(path).map_err(|e| {
         error!("Failed to create partition file at {path}: {e:?}");
         BallistaError::IoError(e)
-    })?;
+    })?);
 
     let mut num_rows = 0;
     let mut num_batches = 0;
@@ -254,26 +265,32 @@ where
     endpoint.connect().await
 }
 
-/// Creates a gRPC client endpoint (returns Endpoint without connecting).
-/// Used for TLS/API key customization before establishing connection.
+/// Creates a gRPC client endpoint (without connecting) for customization.
+/// This is typically used when TLS or other custom configuration is needed.
+/// If `config` is provided, standard timeout and keepalive settings are applied.
 pub fn create_grpc_client_endpoint<D>(
     dst: D,
-) -> std::result::Result<tonic::transport::Endpoint, Error>
+    config: Option<&GrpcClientConfig>,
+) -> std::result::Result<Endpoint, Error>
 where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
 {
-    let endpoint = tonic::transport::Endpoint::new(dst)?
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(20))
-        // Disable Nagle's Algorithm since we don't want packets to wait
-        .tcp_nodelay(true)
-        .tcp_keepalive(Option::Some(Duration::from_secs(3600)))
-        .http2_keep_alive_interval(Duration::from_secs(300))
-        .keep_alive_timeout(Duration::from_secs(20))
-        .keep_alive_while_idle(true);
-
-    Ok(endpoint)
+    let endpoint = tonic::transport::Endpoint::new(dst)?;
+    if let Some(config) = config {
+        Ok(endpoint
+            .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
+            .timeout(Duration::from_secs(config.timeout_seconds))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_seconds)))
+            .http2_keep_alive_interval(Duration::from_secs(
+                config.http2_keepalive_interval_seconds,
+            ))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .keep_alive_while_idle(true))
+    } else {
+        Ok(endpoint)
+    }
 }
 
 /// Creates a gRPC server builder with the specified configuration.
@@ -314,4 +331,51 @@ pub fn get_time_before(interval_seconds: u64) -> u64 {
         .checked_sub(Duration::from_secs(interval_seconds))
         .unwrap_or_else(|| Duration::from_secs(0))
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_grpc_client_config_from_ballista_config() {
+        let ballista_config = BallistaConfig::default();
+        let grpc_config = GrpcClientConfig::from(&ballista_config);
+
+        // Verify the conversion picks up the right values
+        assert_eq!(
+            grpc_config.connect_timeout_seconds,
+            ballista_config.default_grpc_client_connect_timeout_seconds() as u64
+        );
+        assert_eq!(
+            grpc_config.timeout_seconds,
+            ballista_config.default_grpc_client_timeout_seconds() as u64
+        );
+        assert_eq!(
+            grpc_config.tcp_keepalive_seconds,
+            ballista_config.default_grpc_client_tcp_keepalive_seconds() as u64
+        );
+        assert_eq!(
+            grpc_config.http2_keepalive_interval_seconds,
+            ballista_config.default_grpc_client_http2_keepalive_interval_seconds() as u64
+        );
+    }
+
+    #[test]
+    fn test_create_grpc_client_endpoint_with_config() {
+        let config = GrpcClientConfig {
+            connect_timeout_seconds: 10,
+            timeout_seconds: 30,
+            tcp_keepalive_seconds: 1800,
+            http2_keepalive_interval_seconds: 150,
+        };
+        let result = create_grpc_client_endpoint("http://localhost:50051", Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_grpc_client_endpoint_invalid_url() {
+        let result = create_grpc_client_endpoint("not a valid url", None);
+        assert!(result.is_err());
+    }
 }

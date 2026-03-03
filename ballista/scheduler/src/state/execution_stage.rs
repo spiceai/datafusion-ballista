@@ -32,7 +32,7 @@ use datafusion::prelude::SessionConfig;
 use log::{debug, warn};
 
 use ballista_core::error::{BallistaError, Result};
-use ballista_core::execution_plans::ShuffleWriterExec;
+use ballista_core::execution_plans::{ShuffleWriterExec, SortShuffleWriterExec};
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
     FailedTask, OperatorMetricsSet, ResultLost, SuccessfulTask, TaskStatus,
@@ -979,13 +979,19 @@ impl Debug for FailedStage {
 }
 
 /// Get the total number of partitions for a stage with plan.
-/// Only for [`ShuffleWriterExec`], the input partition count and the output partition count
+/// Only for shuffle writers, the input partition count and the output partition count
 /// will be different. Here, we should use the input partition count.
 fn get_stage_partitions(plan: Arc<dyn ExecutionPlan>) -> usize {
-    plan.as_any()
-        .downcast_ref::<ShuffleWriterExec>()
-        .map(|shuffle_writer| shuffle_writer.input_partition_count())
-        .unwrap_or_else(|| plan.properties().output_partitioning().partition_count())
+    // Try ShuffleWriterExec first
+    if let Some(shuffle_writer) = plan.as_any().downcast_ref::<ShuffleWriterExec>() {
+        return shuffle_writer.input_partition_count();
+    }
+    // Try SortShuffleWriterExec
+    if let Some(shuffle_writer) = plan.as_any().downcast_ref::<SortShuffleWriterExec>() {
+        return shuffle_writer.input_partition_count();
+    }
+    // Fallback to output partitioning
+    plan.properties().output_partitioning().partition_count()
 }
 
 /// This data structure collects the partition locations for an `ExecutionStage`.
@@ -1027,5 +1033,19 @@ impl StageOutput {
     /// Returns true if all partitions for this stage output are complete.
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+    /// returns vector of partition locations
+    /// which is compatible with ShuffleReader vector format
+    pub fn partition_locations(
+        mut self,
+        output_partitions: usize,
+    ) -> Vec<Vec<PartitionLocation>> {
+        let mut partition_locations = Vec::new();
+        for i in 0..output_partitions {
+            let p = self.partition_locations.remove(&i).unwrap_or_default();
+            partition_locations.push(p);
+        }
+
+        partition_locations
     }
 }

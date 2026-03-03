@@ -22,6 +22,8 @@ mod distributed_query;
 mod shuffle_manager;
 mod shuffle_reader;
 mod shuffle_writer;
+mod shuffle_writer_trait;
+pub mod sort_shuffle;
 mod unresolved_shuffle;
 
 #[cfg(feature = "vortex")]
@@ -33,7 +35,10 @@ pub use shuffle_manager::{
     global_shuffle_manager,
 };
 pub use shuffle_reader::ShuffleReaderExec;
+pub use shuffle_reader::{stats_for_partition, stats_for_partitions};
 pub use shuffle_writer::ShuffleWriterExec;
+pub use shuffle_writer_trait::ShuffleWriter;
+pub use sort_shuffle::SortShuffleWriterExec;
 pub use unresolved_shuffle::UnresolvedShuffleExec;
 
 #[cfg(feature = "vortex")]

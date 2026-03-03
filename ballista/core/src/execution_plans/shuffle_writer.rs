@@ -30,6 +30,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
 use std::future::Future;
+use std::io::BufWriter;
 use std::iter::Iterator;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +70,8 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use log::{debug, info};
+
+use super::shuffle_writer_trait::ShuffleWriter;
 
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
@@ -1333,6 +1336,31 @@ impl ExecutionPlan for ShuffleWriterExec {
     }
 }
 
+impl ShuffleWriter for ShuffleWriterExec {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn stage_id(&self) -> usize {
+        self.stage_id
+    }
+
+    fn shuffle_output_partitioning(&self) -> Option<&Partitioning> {
+        self.shuffle_output_partitioning.as_ref()
+    }
+
+    fn input_partition_count(&self) -> usize {
+        self.plan
+            .properties()
+            .output_partitioning()
+            .partition_count()
+    }
+
+    fn clone_box(&self) -> Arc<dyn ShuffleWriter> {
+        Arc::new(self.clone())
+    }
+}
+
 fn result_schema() -> SchemaRef {
     let stats = PartitionStats::default();
     Arc::new(Schema::new(vec![
@@ -1387,6 +1415,7 @@ fn serialize_vortex_arrays_to_bytes(
 
 #[cfg(test)]
 #[cfg(not(feature = "force_hash_collisions"))]
+#[allow(dead_code, unused_imports)] // clippy false positive with local imports
 mod tests {
     use super::*;
     use datafusion::arrow::array::{StringArray, StructArray, UInt32Array, UInt64Array};

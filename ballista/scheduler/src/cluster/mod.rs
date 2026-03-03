@@ -37,13 +37,15 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, PartitionId};
 use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_core::{ConfigProducer, consistent_hash};
+use ballista_core::{ConfigProducer, JobStatusSubscriber, consistent_hash};
 
 use crate::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 
 use crate::config::{SchedulerConfig, TaskDistributionPolicy};
 use crate::scheduler_server::SessionBuilder;
-use crate::state::execution_graph::{ExecutionGraph, TaskDescription, create_task_info};
+use crate::state::execution_graph::{
+    ExecutionGraphBox, TaskDescription, create_task_info,
+};
 use crate::state::task_manager::JobInfoCache;
 
 /// Event broadcasting and subscription for cluster state changes.
@@ -347,7 +349,12 @@ pub trait JobState: Send + Sync {
     /// Submits a new job to the job state.
     ///
     /// The submitter is assumed to own the job.
-    async fn submit_job(&self, job_id: String, graph: &ExecutionGraph) -> Result<()>;
+    async fn submit_job(
+        &self,
+        job_id: String,
+        graph: &ExecutionGraphBox,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<()>;
 
     /// Returns the set of all active job IDs.
     async fn get_jobs(&self) -> Result<HashSet<String>>;
@@ -359,12 +366,15 @@ pub trait JobState: Send + Sync {
     ///
     /// The job may not belong to the caller, and the graph may be updated
     /// by another scheduler after this call returns.
-    async fn get_execution_graph(&self, job_id: &str) -> Result<Option<ExecutionGraph>>;
+    async fn get_execution_graph(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ExecutionGraphBox>>;
 
     /// Persists the current state of an owned job.
     ///
     /// Returns an error if the job is not owned by the caller.
-    async fn save_job(&self, job_id: &str, graph: &ExecutionGraph) -> Result<()>;
+    async fn save_job(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()>;
 
     /// Marks an unscheduled job as failed.
     ///
@@ -378,7 +388,7 @@ pub trait JobState: Send + Sync {
     ///
     /// Returns the execution graph if the job is still running and successfully acquired,
     /// otherwise returns None.
-    async fn try_acquire_job(&self, job_id: &str) -> Result<Option<ExecutionGraph>>;
+    async fn try_acquire_job(&self, job_id: &str) -> Result<Option<ExecutionGraphBox>>;
 
     /// Returns a stream of job state events.
     async fn job_state_events(&self) -> Result<JobStateEventStream>;
@@ -879,7 +889,7 @@ mod test {
         BoundTask, TopologyNode, bind_task_bias, bind_task_consistent_hash,
         bind_task_round_robin,
     };
-    use crate::state::execution_graph::ExecutionGraph;
+    use crate::state::execution_graph::{ExecutionGraph, StaticExecutionGraph};
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
         mock_completed_task, revive_graph_and_complete_next_stage,
@@ -1110,8 +1120,14 @@ mod test {
         let graph_b = mock_graph("job_b", num_partition, 7).await?;
 
         let mut active_jobs = HashMap::new();
-        active_jobs.insert(graph_a.job_id().to_string(), JobInfoCache::new(graph_a));
-        active_jobs.insert(graph_b.job_id().to_string(), JobInfoCache::new(graph_b));
+        active_jobs.insert(
+            graph_a.job_id().to_string(),
+            JobInfoCache::new(Box::new(graph_a)),
+        );
+        active_jobs.insert(
+            graph_b.job_id().to_string(),
+            JobInfoCache::new(Box::new(graph_b)),
+        );
 
         Ok(active_jobs)
     }
@@ -1120,7 +1136,7 @@ mod test {
         job_id: &str,
         num_target_partitions: usize,
         num_pending_task: usize,
-    ) -> Result<ExecutionGraph> {
+    ) -> Result<StaticExecutionGraph> {
         let mut graph =
             test_aggregation_plan_with_job_id(num_target_partitions, job_id).await;
         let executor = ExecutorMetadata {

@@ -35,23 +35,29 @@ exclude = ["*.proto"]
 rustc-args = ["--cfg", "docsrs"]
 
 [features]
+arrow-ipc-optimizations = []
+build-binary = ["aws-config", "aws-credential-types", "clap"]
+default = ["arrow-ipc-optimizations"]
 docsrs = []
 # Used for testing ONLY: causes all values to hash to the same value (test for collisions)
 force_hash_collisions = ["datafusion/force_hash_collisions"]
+spark-compat = ["dep:datafusion-spark"]
 # Enable Vortex columnar format support for shuffles
-vortex = ["vortex-array", "vortex-buffer", "vortex-dtype", "vortex-error", "vortex-ipc"]
+vortex = ["vortex-array", "vortex-buffer", "vortex-error", "vortex-ipc"]
 
 [dependencies]
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
-aws-config = { version = "1.6.0" }
-aws-credential-types = { version = "1.2.0" }
+aws-config = { version = "1.8.13", optional = true }
+aws-credential-types = { version = "1.2.0", optional = true }
 bytes = { workspace = true }
 chrono = { version = "0.4", default-features = false }
+clap = { workspace = true, optional = true }
 dashmap = "6"
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 datafusion-proto-common = { workspace = true }
+datafusion-spark = { workspace = true, optional = true }
 futures = { workspace = true }
 itertools = "0.14"
 log = { workspace = true }
@@ -72,7 +78,6 @@ uuid = { workspace = true }
 # Vortex columnar format dependencies (optional)
 vortex-array = { workspace = true, optional = true }
 vortex-buffer = { workspace = true, optional = true }
-vortex-dtype = { workspace = true, optional = true }
 vortex-error = { workspace = true, optional = true }
 vortex-ipc = { workspace = true, optional = true }
 

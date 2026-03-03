@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use ballista_core::JobStatusSubscriber;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::datasource::source_as_provider;
@@ -52,6 +53,7 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use log::{debug, error, info, warn};
 use prost::Message;
 
+mod aqe;
 mod distributed_explain;
 /// Execution graph representation and management.
 pub mod execution_graph;
@@ -472,6 +474,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         session_ctx: Arc<SessionContext>,
         plan: &LogicalPlan,
         queued_at: u64,
+        subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
         let start = Instant::now();
         let session_config = Arc::new(session_ctx.copied_config());
@@ -580,6 +583,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 plan.data,
                 queued_at,
                 session_config,
+                subscriber,
             )
             .await?;
 
