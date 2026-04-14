@@ -174,7 +174,9 @@ where
             Ok(Err(_)) => {
                 // Semaphore closed - should not happen in normal operation
                 warn!("Task slot semaphore closed unexpectedly");
-                break Ok(());
+                return Err(BallistaError::General(
+                    "Task slot semaphore closed unexpectedly".to_string(),
+                ));
             }
             Err(_) => {
                 // Timeout: all task slots are busy. Continue to call poll_work
