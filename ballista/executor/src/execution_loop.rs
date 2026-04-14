@@ -55,6 +55,12 @@ use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
+// Maximum time to wait for a free task slot before sending poll_work anyway.
+// In pull-based scheduling, poll_work also serves as the heartbeat to the
+// scheduler. If we block indefinitely waiting for a free slot, the scheduler
+// will declare this executor dead after executor_timeout_seconds.
+const SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Main execution loop that polls the scheduler for available tasks.
 ///
 /// This function runs indefinitely, periodically asking the scheduler for
@@ -139,12 +145,6 @@ where
 
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor.concurrent_tasks);
-
-    // Maximum time to wait for a free task slot before sending poll_work anyway.
-    // In pull-based scheduling, poll_work also serves as the heartbeat to the
-    // scheduler. If we block indefinitely waiting for a free slot, the scheduler
-    // will declare this executor dead after executor_timeout_seconds.
-    const SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
     // Track consecutive scheduler connection failures for backoff and log suppression
     let mut consecutive_failures: u32 = 0;
