@@ -28,16 +28,19 @@ use crate::serde::protobuf::{
 };
 use crate::serde::protobuf::{ExecutorMetadata, SuccessfulJob};
 use crate::utils::{GrpcClientConfig, create_grpc_client_endpoint};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{FetchType, LogicalPlan, SortExpr};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::create_physical_sort_exprs;
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion::physical_plan::sorts::sort::sort_batch;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -137,6 +140,28 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         )
+    }
+
+    /// If the logical plan has a Sort with a fetch (LIMIT) at the top,
+    /// return the sort expressions and fetch count. The distributed planner
+    /// strips the final SortPreservingMergeExec for TopK queries so the
+    /// client must apply the final sort-merge locally.
+    fn extract_sort_fetch(plan: &LogicalPlan) -> Option<(Vec<SortExpr>, usize)> {
+        // For ORDER BY ... LIMIT N, DataFusion folds the limit into Sort.fetch
+        if let LogicalPlan::Sort(sort) = plan {
+            if let Some(fetch) = sort.fetch {
+                return Some((sort.expr.clone(), fetch));
+            }
+        }
+        // Limit can also appear as a separate node wrapping Sort
+        if let LogicalPlan::Limit(limit) = plan {
+            if let Ok(FetchType::Literal(Some(fetch))) = limit.get_fetch_type() {
+                if let LogicalPlan::Sort(sort) = limit.input.as_ref() {
+                    return Some((sort.expr.clone(), fetch));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -249,6 +274,35 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 
         let session_config = context.session_config().clone();
 
+        // Check if the logical plan has a Sort+Limit (TopK) at the top.
+        // The distributed planner strips the final SortPreservingMergeExec
+        // for TopK queries, so the client must apply the sort-merge locally.
+        let sort_fetch = Self::extract_sort_fetch(&self.plan);
+        let physical_sort_exprs = if let Some((ref sort_exprs, _)) = sort_fetch {
+            let input_schema = match &self.plan {
+                LogicalPlan::Sort(sort) => sort.input.schema(),
+                LogicalPlan::Limit(limit) => limit.input.schema(),
+                _ => self.plan.schema(),
+            };
+            let exec_props = datafusion::execution::context::ExecutionProps::default();
+            match create_physical_sort_exprs(
+                sort_exprs,
+                input_schema.as_ref(),
+                &exec_props,
+            ) {
+                Ok(exprs) => Some(exprs),
+                Err(e) => {
+                    info!(
+                        "Could not create physical sort exprs for client-side merge: {e}. \
+                         Falling back to unsorted results."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         if session_config.ballista_config().client_pull() {
             let stream = futures::stream::once(
                 execute_query_pull(
@@ -276,7 +330,16 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
             });
 
             let schema = self.schema();
-            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            if let (Some(phys_exprs), Some((_, fetch))) =
+                (physical_sort_exprs, sort_fetch)
+            {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    apply_client_side_sort(stream, schema, phys_exprs, fetch),
+                )))
+            } else {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            }
         } else {
             let stream = futures::stream::once(
                 execute_query_push(
@@ -303,7 +366,16 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
             });
 
             let schema = self.schema();
-            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            if let (Some(phys_exprs), Some((_, fetch))) =
+                (physical_sort_exprs, sort_fetch)
+            {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema.clone(),
+                    apply_client_side_sort(stream, schema, phys_exprs, fetch),
+                )))
+            } else {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            }
         }
     }
 
@@ -769,6 +841,41 @@ async fn fetch_partition(
     }
 
     Ok(stream)
+}
+
+/// Collect all batches from a stream, sort them, and return the top `fetch` rows.
+/// This is used client-side when the distributed planner stripped the final
+/// `SortPreservingMergeExec(fetch=K)` to allow multi-executor parallelism.
+fn apply_client_side_sort<S>(
+    stream: S,
+    schema: SchemaRef,
+    sort_exprs: Vec<datafusion::physical_expr::PhysicalSortExpr>,
+    fetch: usize,
+) -> impl Stream<Item = Result<RecordBatch>>
+where
+    S: Stream<Item = Result<RecordBatch>> + Send + 'static,
+{
+    futures::stream::once(async move {
+        // Collect all batches
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        let merged = concat_batches(&schema, &batches)?;
+
+        if merged.num_rows() == 0 {
+            return Ok(merged);
+        }
+
+        let ordering = datafusion::physical_expr::LexOrdering::new(sort_exprs)
+            .ok_or_else(|| DataFusionError::Internal("Empty sort expressions".into()))?;
+
+        let sorted = sort_batch(&merged, &ordering, Some(fetch))?;
+
+        Ok(sorted)
+    })
 }
 
 #[cfg(test)]

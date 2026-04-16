@@ -105,6 +105,34 @@ impl DistributedPlanner for DefaultDistributedPlanner {
         info!("planning query stages for job {job_id}");
         let (new_plan, mut stages) =
             self.plan_query_stages_internal(job_id, execution_plan, config)?;
+
+        // Optimization: when the remaining plan is SortPreservingMergeExec with
+        // a fetch (TopK), skip it in the distributed plan.  Without this, the
+        // merge becomes a single-task final stage that runs on one executor,
+        // negating the parallelism of the preceding sort stage.
+        //
+        // By stripping the merge, the preceding sort stage (with N partitions,
+        // each producing ≤K sorted rows) becomes the effective final stage.
+        // The final ShuffleWriter wraps the UnresolvedShuffleExec directly,
+        // giving it N tasks distributed across all executors.  The client
+        // performs the lightweight final merge of the pre-sorted partitions.
+        let new_plan = if let Some(spm) =
+            new_plan.as_any().downcast_ref::<SortPreservingMergeExec>()
+        {
+            if spm.fetch().is_some() {
+                info!(
+                    "Stripping SortPreservingMergeExec(fetch={:?}) from distributed plan; \
+                         client will perform final merge",
+                    spm.fetch()
+                );
+                spm.input().clone()
+            } else {
+                new_plan
+            }
+        } else {
+            new_plan
+        };
+
         stages.push(create_shuffle_writer_with_config(
             job_id,
             self.next_stage_id(),
@@ -799,6 +827,117 @@ order by
             }
             _ => panic!("invalid sort {sort:?}"),
         };
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distributed_topk_strips_merge() -> Result<(), BallistaError> {
+        let ctx = datafusion_test_context("testdata").await?;
+        let session_state = ctx.state();
+
+        // TopK query: ORDER BY ... LIMIT should strip SortPreservingMergeExec
+        // so that the sort stage tasks get distributed across multiple executors.
+        let df = ctx
+            .sql(
+                "select l_returnflag, l_extendedprice
+                 from lineitem
+                 order by l_extendedprice desc
+                 limit 10",
+            )
+            .await?;
+
+        let plan = df.into_optimized_plan()?;
+        let plan = session_state.optimize(&plan)?;
+        let plan = session_state.create_physical_plan(&plan).await?;
+
+        let mut planner = DefaultDistributedPlanner::new();
+        let job_uuid = Uuid::new_v4();
+        let stages = planner.plan_query_stages(
+            &job_uuid.to_string(),
+            plan,
+            ctx.state().config().options(),
+        )?;
+        for (i, stage) in stages.iter().enumerate() {
+            println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
+        }
+
+        // The TopK optimization strips SortPreservingMergeExec(fetch=10).
+        // Stage 0: SortExec(TopK, fetch=10) with DataSourceExec (2 partitions)
+        // Stage 1: UnresolvedShuffleExec reading from Stage 0 (2 partitions)
+        // Without the optimization there would be a 3rd stage with
+        // SortPreservingMergeExec (1 partition, single executor bottleneck).
+        assert_eq!(
+            2,
+            stages.len(),
+            "TopK query should have 2 stages (no SortPreservingMergeExec stage)"
+        );
+
+        // Stage 0: SortExec(fetch=10) with multiple partitions
+        let stage0 = &stages[0];
+        let shuffle_writer = downcast_exec!(stage0, ShuffleWriterExec);
+        let sort = downcast_exec!(shuffle_writer.children()[0], SortExec);
+        assert_eq!(sort.fetch(), Some(10), "SortExec should retain fetch=10");
+
+        // Final stage should NOT contain SortPreservingMergeExec - it should
+        // just be an UnresolvedShuffleExec with 2 partitions, ensuring tasks
+        // are distributed across multiple executors.
+        let final_stage = &stages[1];
+        let shuffle_writer = downcast_exec!(final_stage, ShuffleWriterExec);
+        let child = shuffle_writer.children()[0].clone();
+        let unresolved_shuffle = downcast_exec!(child, UnresolvedShuffleExec);
+        assert_eq!(
+            unresolved_shuffle.output_partition_count, 2,
+            "Final stage should have 2 partitions for multi-executor distribution"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distributed_sort_without_limit_keeps_merge() -> Result<(), BallistaError> {
+        let ctx = datafusion_test_context("testdata").await?;
+        let session_state = ctx.state();
+
+        // ORDER BY without LIMIT should NOT strip the SortPreservingMergeExec
+        let df = ctx
+            .sql(
+                "select l_returnflag, l_extendedprice
+                 from lineitem
+                 order by l_extendedprice desc",
+            )
+            .await?;
+
+        let plan = df.into_optimized_plan()?;
+        let plan = session_state.optimize(&plan)?;
+        let plan = session_state.create_physical_plan(&plan).await?;
+
+        let mut planner = DefaultDistributedPlanner::new();
+        let job_uuid = Uuid::new_v4();
+        let stages = planner.plan_query_stages(
+            &job_uuid.to_string(),
+            plan,
+            ctx.state().config().options(),
+        )?;
+        for (i, stage) in stages.iter().enumerate() {
+            println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
+        }
+
+        // Sort without LIMIT should still have the merge stage
+        assert_eq!(
+            2,
+            stages.len(),
+            "Sort without LIMIT should keep SortPreservingMergeExec (2 stages)"
+        );
+
+        // The final stage should have SortPreservingMergeExec (no fetch)
+        let final_stage = stages.last().unwrap();
+        let shuffle_writer = downcast_exec!(final_stage, ShuffleWriterExec);
+        let merge = downcast_exec!(shuffle_writer.children()[0], SortPreservingMergeExec);
+        assert!(
+            merge.fetch().is_none(),
+            "SortPreservingMergeExec without LIMIT should have no fetch"
+        );
 
         Ok(())
     }
