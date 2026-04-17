@@ -791,6 +791,10 @@ impl SessionConfigHelperExt for SessionConfig {
             // this setting it will also be enforced by the scheduler
             // thus user will not be able to override it.
             .with_round_robin_repartition(false)
+            // Enable in-memory shuffle to avoid disk I/O and serialization
+            // overhead for intermediate stages. Final stages still write
+            // to disk regardless of this setting.
+            .with_ballista_shuffle_memory_mode(true)
             // There is issue with Utv8View(s) where Arrow IPC will generate
             // frames which would be too big to send using Arrow Flight.
             //
@@ -1221,9 +1225,9 @@ mod test {
 
     #[test]
     fn test_shuffle_memory_mode_config() {
-        // Default should be false (disk-based)
+        // Default with ballista should be true (enabled in restricted config)
         let config = SessionConfig::new_with_ballista();
-        assert!(!config.ballista_shuffle_memory_mode());
+        assert!(config.ballista_shuffle_memory_mode());
 
         // Enable memory mode
         let config = config.with_ballista_shuffle_memory_mode(true);
