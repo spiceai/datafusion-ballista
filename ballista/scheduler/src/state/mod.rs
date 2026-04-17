@@ -542,8 +542,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         // sufficient scan parallelism across all executors.
         // The client's default target_partitions may be much lower than the
         // total cluster capacity, resulting in too few tasks per scan stage.
+        let alive_executors = self.executor_manager.get_alive_executors();
         let total_task_slots = self.executor_manager.get_total_task_slots().await;
         let current_target = session_config.target_partitions();
+        info!(
+            "Cluster capacity for job {}: alive_executors={}, total_task_slots={}, \
+             current target_partitions={}",
+            job_id,
+            alive_executors.len(),
+            total_task_slots,
+            current_target
+        );
         let plan = if total_task_slots > current_target {
             info!(
                 "Adjusting target_partitions from {} to {} based on cluster capacity \
