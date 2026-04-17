@@ -31,10 +31,13 @@ use ballista_core::{
     },
     serde::scheduler::PartitionLocation,
 };
+use datafusion::common::JoinType;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
@@ -103,6 +106,12 @@ impl DistributedPlanner for DefaultDistributedPlanner {
         config: &ConfigOptions,
     ) -> Result<Vec<Arc<dyn ShuffleWriter>>> {
         info!("planning query stages for job {job_id}");
+        // Safety: revert CollectLeft to Partitioned for non-INNER joins.
+        // CollectLeft broadcasts the build side to all partitions, but in
+        // distributed mode each executor independently emits "unmatched"
+        // build rows for outer/semi/anti joins, producing duplicates.
+        // See https://github.com/apache/datafusion-ballista/issues/1055
+        let execution_plan = revert_non_inner_collect_left(execution_plan)?;
         let (new_plan, mut stages) =
             self.plan_query_stages_internal(job_id, execution_plan, config)?;
         stages.push(create_shuffle_writer_with_config(
@@ -226,6 +235,71 @@ fn create_unresolved_shuffle(
         shuffle_writer.schema(),
         shuffle_writer.properties().output_partitioning().clone(),
     ))
+}
+
+/// Revert CollectLeft hash joins to Partitioned for non-INNER join types.
+///
+/// In distributed execution, CollectLeft broadcasts the build side to every
+/// partition/task. For INNER joins this is correct — each task independently
+/// produces matching rows. For LEFT/RIGHT/FULL OUTER and SEMI/ANTI joins,
+/// each task would independently emit "unmatched" build rows, producing
+/// duplicate or incorrect results across executors.
+///
+/// This replaces non-INNER CollectLeft joins with Partitioned joins and
+/// inserts the necessary RepartitionExec(Hash) nodes on both sides so the
+/// distributed planner creates proper shuffle stages.
+fn revert_non_inner_collect_left(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
+            if *hash_join.partition_mode() == PartitionMode::CollectLeft
+                && hash_join.join_type() != &JoinType::Inner
+            {
+                info!(
+                    "Reverting CollectLeft to Partitioned for {:?} join (bug #1055 workaround)",
+                    hash_join.join_type()
+                );
+                let left = hash_join.left().clone();
+                let right = hash_join.right().clone();
+                let on = hash_join.on();
+                let partition_count = right
+                    .properties()
+                    .output_partitioning()
+                    .partition_count();
+
+                // Build hash expressions for both sides from join keys
+                let left_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
+                    on.iter().map(|(l, _)| l.clone()).collect();
+                let right_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
+                    on.iter().map(|(_, r)| r.clone()).collect();
+
+                let left_repart = Arc::new(RepartitionExec::try_new(
+                    left,
+                    Partitioning::Hash(left_exprs, partition_count),
+                )?) as Arc<dyn ExecutionPlan>;
+                let right_repart = Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::Hash(right_exprs, partition_count),
+                )?) as Arc<dyn ExecutionPlan>;
+
+                let new_join = Arc::new(HashJoinExec::try_new(
+                    left_repart,
+                    right_repart,
+                    on.to_vec(),
+                    hash_join.filter().cloned(),
+                    hash_join.join_type(),
+                    hash_join.projection.clone(),
+                    PartitionMode::Partitioned,
+                    hash_join.null_equality(),
+                )?);
+                return Ok(Transformed::yes(new_join as Arc<dyn ExecutionPlan>));
+            }
+        }
+        Ok(Transformed::no(node))
+    })
+    .map(|t| t.data)
+    .map_err(|e| BallistaError::DataFusionError(Box::new(e)))
 }
 
 /// Returns all unresolved shuffle nodes in the execution plan.
@@ -869,8 +943,8 @@ order by
     /// target_partitions based on cluster capacity), scan stages may have too few
     /// tasks to fully utilize the cluster.
     #[tokio::test]
-    async fn test_scan_parallelism_scales_with_target_partitions(
-    ) -> Result<(), BallistaError> {
+    async fn test_scan_parallelism_scales_with_target_partitions()
+    -> Result<(), BallistaError> {
         use datafusion::execution::SessionStateBuilder;
         use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
         use std::io::Write;
@@ -890,8 +964,7 @@ order by
 
         // First: plan with LOW target_partitions (2)
         let low_target = 2;
-        let mut config_low =
-            SessionConfig::new().with_target_partitions(low_target);
+        let mut config_low = SessionConfig::new().with_target_partitions(low_target);
         // Set repartition_file_min_size to 0 so small test files get repartitioned
         config_low.options_mut().optimizer.repartition_file_min_size = 0;
         let ctx_low = SessionContext::new_with_config(config_low);
@@ -906,10 +979,7 @@ order by
             .sql("SELECT id, value FROM test_table ORDER BY value DESC LIMIT 10")
             .await?;
         let logical_plan = df_low.into_optimized_plan()?;
-        let plan_low = ctx_low
-            .state()
-            .create_physical_plan(&logical_plan)
-            .await?;
+        let plan_low = ctx_low.state().create_physical_plan(&logical_plan).await?;
 
         let mut planner_low = DefaultDistributedPlanner::new();
         let stages_low = planner_low.plan_query_stages(
@@ -920,22 +990,23 @@ order by
 
         // The first (scan) stage should have low partition count
         let scan_stage_low = &stages_low[0];
-        let scan_partitions_low = downcast_exec!(scan_stage_low, ShuffleWriterExec)
-            .input_partition_count();
+        let scan_partitions_low =
+            downcast_exec!(scan_stage_low, ShuffleWriterExec).input_partition_count();
 
         // Now: simulate the fix — use SessionStateBuilder to adjust target_partitions
         // on an existing session. This is exactly what submit_job does when it detects
         // the cluster has more capacity than the client's target_partitions.
         let high_target = 16;
-        let mut adjusted_config = ctx_low.copied_config().with_target_partitions(high_target);
-        adjusted_config.options_mut().optimizer.repartition_file_min_size = 0;
-        let adjusted_state =
-            SessionStateBuilder::new_from_existing(ctx_low.state())
-                .with_config(adjusted_config)
-                .build();
-        let plan_high = adjusted_state
-            .create_physical_plan(&logical_plan)
-            .await?;
+        let mut adjusted_config =
+            ctx_low.copied_config().with_target_partitions(high_target);
+        adjusted_config
+            .options_mut()
+            .optimizer
+            .repartition_file_min_size = 0;
+        let adjusted_state = SessionStateBuilder::new_from_existing(ctx_low.state())
+            .with_config(adjusted_config)
+            .build();
+        let plan_high = adjusted_state.create_physical_plan(&logical_plan).await?;
 
         println!(
             "Physical plan (high):\n{}",
@@ -950,8 +1021,8 @@ order by
         )?;
 
         let scan_stage_high = &stages_high[0];
-        let scan_partitions_high = downcast_exec!(scan_stage_high, ShuffleWriterExec)
-            .input_partition_count();
+        let scan_partitions_high =
+            downcast_exec!(scan_stage_high, ShuffleWriterExec).input_partition_count();
 
         println!(
             "Scan partitions: low target_partitions={low_target} -> {scan_partitions_low}, \
