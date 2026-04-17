@@ -18,12 +18,14 @@
 //! Client API for sending requests to executors.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use std::{
     convert::{TryFrom, TryInto},
     task::{Context, Poll},
 };
+
+use dashmap::DashMap;
 
 use crate::error::{BallistaError, Result as BResult};
 use crate::serde::scheduler::{Action, PartitionId};
@@ -65,7 +67,33 @@ pub struct BallistaClient {
 const IO_RETRIES_TIMES: u8 = 3;
 const IO_RETRY_WAIT_TIME_MS: u64 = 3000;
 
+/// Global connection pool for reusing gRPC connections to executors during
+/// shuffle reads. Keyed by "host:port". Tonic's Channel supports HTTP/2
+/// multiplexing, so a single connection handles many concurrent requests.
+static CLIENT_POOL: LazyLock<DashMap<String, BallistaClient>> =
+    LazyLock::new(DashMap::new);
+
 impl BallistaClient {
+    /// Get a cached client or create a new one for the given host and port.
+    /// Reuses the underlying HTTP/2 connection via tonic Channel cloning.
+    pub async fn try_new_pooled(
+        host: &str,
+        port: u16,
+        max_message_size: usize,
+        use_tls: bool,
+        customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    ) -> BResult<Self> {
+        let key = format!("{host}:{port}");
+        if let Some(client) = CLIENT_POOL.get(&key) {
+            return Ok(client.clone());
+        }
+        let client =
+            Self::try_new(host, port, max_message_size, use_tls, customize_endpoint)
+                .await?;
+        CLIENT_POOL.insert(key, client.clone());
+        Ok(client)
+    }
+
     /// Create a new BallistaClient to connect to the executor listening on the specified
     /// host and port
     pub async fn try_new(

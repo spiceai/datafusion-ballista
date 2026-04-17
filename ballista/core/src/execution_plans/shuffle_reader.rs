@@ -697,11 +697,9 @@ async fn fetch_partition_remote(
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
-    // TODO for shuffle client connections, we should avoid creating new connections again and again.
-    // And we should also avoid to keep alive too many connections for long time.
     let host = metadata.host.as_str();
     let port = metadata.port;
-    let mut ballista_client = BallistaClient::try_new(
+    let mut ballista_client = BallistaClient::try_new_pooled(
         host,
         port,
         max_message_size,
