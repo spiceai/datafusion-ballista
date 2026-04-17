@@ -860,4 +860,120 @@ order by
             (proto).try_into_physical_plan(ctx, codec.physical_extension_codec())?;
         Ok(result_exec_plan)
     }
+
+    /// Regression test for scan parallelism across distributed executors.
+    ///
+    /// Verifies that increasing target_partitions results in more scan stage
+    /// partitions, which is how the scheduler ensures cluster-wide scan parallelism
+    /// when submitting jobs. Without the fix in submit_job (which adjusts
+    /// target_partitions based on cluster capacity), scan stages may have too few
+    /// tasks to fully utilize the cluster.
+    #[tokio::test]
+    async fn test_scan_parallelism_scales_with_target_partitions(
+    ) -> Result<(), BallistaError> {
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
+        use std::io::Write;
+
+        // Create a temporary directory with 16 small CSV files to simulate
+        // a table with many partitions (like a large dataset on object storage).
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let schema = "id,value\n";
+        for i in 0..16 {
+            let path = tmp_dir.path().join(format!("part{i:02}.csv"));
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(f, "{schema}").unwrap();
+            for j in 0..10 {
+                writeln!(f, "{},{}", i * 10 + j, (i * 10 + j) * 100).unwrap();
+            }
+        }
+
+        // First: plan with LOW target_partitions (2)
+        let low_target = 2;
+        let mut config_low =
+            SessionConfig::new().with_target_partitions(low_target);
+        // Set repartition_file_min_size to 0 so small test files get repartitioned
+        config_low.options_mut().optimizer.repartition_file_min_size = 0;
+        let ctx_low = SessionContext::new_with_config(config_low);
+        ctx_low
+            .register_csv(
+                "test_table",
+                tmp_dir.path().to_str().unwrap(),
+                CsvReadOptions::new(),
+            )
+            .await?;
+        let df_low = ctx_low
+            .sql("SELECT id, value FROM test_table ORDER BY value DESC LIMIT 10")
+            .await?;
+        let logical_plan = df_low.into_optimized_plan()?;
+        let plan_low = ctx_low
+            .state()
+            .create_physical_plan(&logical_plan)
+            .await?;
+
+        let mut planner_low = DefaultDistributedPlanner::new();
+        let stages_low = planner_low.plan_query_stages(
+            "job-low",
+            plan_low,
+            ctx_low.state().config().options(),
+        )?;
+
+        // The first (scan) stage should have low partition count
+        let scan_stage_low = &stages_low[0];
+        let scan_partitions_low = downcast_exec!(scan_stage_low, ShuffleWriterExec)
+            .input_partition_count();
+
+        // Now: simulate the fix — use SessionStateBuilder to adjust target_partitions
+        // on an existing session. This is exactly what submit_job does when it detects
+        // the cluster has more capacity than the client's target_partitions.
+        let high_target = 16;
+        let mut adjusted_config = ctx_low.copied_config().with_target_partitions(high_target);
+        adjusted_config.options_mut().optimizer.repartition_file_min_size = 0;
+        let adjusted_state =
+            SessionStateBuilder::new_from_existing(ctx_low.state())
+                .with_config(adjusted_config)
+                .build();
+        let plan_high = adjusted_state
+            .create_physical_plan(&logical_plan)
+            .await?;
+
+        println!(
+            "Physical plan (high):\n{}",
+            displayable(plan_high.as_ref()).indent(false)
+        );
+
+        let mut planner_high = DefaultDistributedPlanner::new();
+        let stages_high = planner_high.plan_query_stages(
+            "job-high",
+            plan_high,
+            adjusted_state.config().options(),
+        )?;
+
+        let scan_stage_high = &stages_high[0];
+        let scan_partitions_high = downcast_exec!(scan_stage_high, ShuffleWriterExec)
+            .input_partition_count();
+
+        println!(
+            "Scan partitions: low target_partitions={low_target} -> {scan_partitions_low}, \
+             high target_partitions={high_target} -> {scan_partitions_high}"
+        );
+
+        // The adjusted plan's scan stage must have strictly more partitions
+        // than the low-parallelism plan.
+        assert!(
+            scan_partitions_high > scan_partitions_low,
+            "Cluster-aware planning should produce more scan partitions: \
+             got {scan_partitions_high} (target={high_target}) vs \
+             {scan_partitions_low} (target={low_target})"
+        );
+
+        // The scan stage should have at least as many partitions as target_partitions
+        // (limited by the number of files — 16 files here matches our high target).
+        assert!(
+            scan_partitions_high >= high_target,
+            "Scan stage should have at least {high_target} partitions, got {scan_partitions_high}"
+        );
+
+        Ok(())
+    }
 }

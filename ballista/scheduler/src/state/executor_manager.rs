@@ -398,6 +398,22 @@ impl ExecutorManager {
             })
     }
 
+    /// Returns the total number of task slots across all alive executors.
+    ///
+    /// Used for cluster-aware query planning to determine optimal parallelism.
+    pub(crate) async fn get_total_task_slots(&self) -> usize {
+        let alive_executors = self.get_alive_executors();
+        let mut total = 0;
+        for executor_id in &alive_executors {
+            if let Ok(metadata) =
+                self.cluster_state.get_executor_metadata(executor_id).await
+            {
+                total += metadata.specification.task_slots as usize;
+            }
+        }
+        total
+    }
+
     /// Retrieve the set of all executor IDs where the executor has been observed in the last
     /// `last_seen_ts_threshold` seconds.
     pub(crate) fn get_alive_executors(&self) -> HashSet<String> {

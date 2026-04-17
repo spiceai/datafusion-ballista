@@ -44,6 +44,7 @@ use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -537,7 +538,29 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             None
         };
 
-        let plan = session_ctx.state().create_physical_plan(plan).await?;
+        // Adjust target_partitions based on cluster capacity to ensure
+        // sufficient scan parallelism across all executors.
+        // The client's default target_partitions may be much lower than the
+        // total cluster capacity, resulting in too few tasks per scan stage.
+        let total_task_slots = self.executor_manager.get_total_task_slots().await;
+        let current_target = session_config.target_partitions();
+        let plan = if total_task_slots > current_target {
+            info!(
+                "Adjusting target_partitions from {} to {} based on cluster capacity \
+                 for job {}",
+                current_target, total_task_slots, job_id
+            );
+            let adjusted_config = session_ctx
+                .copied_config()
+                .with_target_partitions(total_task_slots);
+            let adjusted_state =
+                SessionStateBuilder::new_from_existing(session_ctx.state())
+                    .with_config(adjusted_config)
+                    .build();
+            adjusted_state.create_physical_plan(plan).await?
+        } else {
+            session_ctx.state().create_physical_plan(plan).await?
+        };
         debug!(
             "Physical plan: {}",
             DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
