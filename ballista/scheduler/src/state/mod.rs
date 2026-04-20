@@ -542,16 +542,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         // sufficient scan parallelism across all executors.
         // The client's default target_partitions may be much lower than the
         // total cluster capacity, resulting in too few tasks per scan stage.
+        // We use the maximum of (current_target, total_task_slots) to ensure
+        // at least one task per executor slot, and never reduce parallelism
+        // below what the client requested.
         let alive_executors = self.executor_manager.get_alive_executors();
         let total_task_slots = self.executor_manager.get_total_task_slots().await;
         let current_target = session_config.target_partitions();
+        let effective_target = current_target.max(total_task_slots);
         info!(
             "Cluster capacity for job {}: alive_executors={}, total_task_slots={}, \
-             current target_partitions={}",
+             current target_partitions={}, effective target_partitions={}",
             job_id,
             alive_executors.len(),
             total_task_slots,
-            current_target
+            current_target,
+            effective_target
         );
         // Enable broadcast (CollectLeft) joins for distributed execution.
         // Shuffling is much more expensive than broadcasting in a distributed
@@ -564,26 +569,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         const BROADCAST_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
         const BROADCAST_THRESHOLD_ROWS: u64 = 10_000_000; // 10M rows
 
-        let adjusted_config = if total_task_slots > current_target {
-            info!(
-                "Adjusting target_partitions from {} to {} based on cluster capacity \
-                 for job {}",
-                current_target, total_task_slots, job_id
+        let adjusted_config = session_ctx
+            .copied_config()
+            .with_target_partitions(effective_target)
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                BROADCAST_THRESHOLD_BYTES,
+            )
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                BROADCAST_THRESHOLD_ROWS,
             );
-            session_ctx
-                .copied_config()
-                .with_target_partitions(total_task_slots)
-        } else {
-            session_ctx.copied_config()
-        }
-        .set_u64(
-            "datafusion.optimizer.hash_join_single_partition_threshold",
-            BROADCAST_THRESHOLD_BYTES,
-        )
-        .set_u64(
-            "datafusion.optimizer.hash_join_single_partition_threshold_rows",
-            BROADCAST_THRESHOLD_ROWS,
-        );
 
         // Use the adjusted config for both physical planning and stage resolution
         let session_config = Arc::new(adjusted_config.clone());
