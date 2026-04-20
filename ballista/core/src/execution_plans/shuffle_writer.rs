@@ -406,7 +406,6 @@ impl ShuffleWriterExec {
     ) -> Result<Vec<ShuffleWritePartition>> {
         match output_partitioning {
             None => {
-                let timer = write_metrics.write_time.timer();
                 path.push(format!("{input_partition}"));
                 std::fs::create_dir_all(&path)?;
                 path.push(format!("data.{file_ext}"));
@@ -429,7 +428,6 @@ impl ShuffleWriterExec {
                 write_metrics
                     .output_rows
                     .add(stats.num_rows.unwrap_or(0) as usize);
-                timer.done();
 
                 info!(
                     "Executed partition {} in {} seconds. Statistics: {}",
