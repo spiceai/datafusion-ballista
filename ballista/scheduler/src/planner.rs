@@ -252,8 +252,8 @@ fn revert_non_inner_collect_left(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     plan.transform_up(|node| {
-        if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
-            if *hash_join.partition_mode() == PartitionMode::CollectLeft
+        if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>()
+            && *hash_join.partition_mode() == PartitionMode::CollectLeft
                 && hash_join.join_type() != &JoinType::Inner
             {
                 info!(
@@ -295,7 +295,6 @@ fn revert_non_inner_collect_left(
                 )?);
                 return Ok(Transformed::yes(new_join as Arc<dyn ExecutionPlan>));
             }
-        }
         Ok(Transformed::no(node))
     })
     .map(|t| t.data)
@@ -459,18 +458,24 @@ fn create_shuffle_writer_with_config(
 
 #[cfg(test)]
 mod test {
-    use crate::planner::{DefaultDistributedPlanner, DistributedPlanner};
+    use crate::planner::{
+        DefaultDistributedPlanner, DistributedPlanner, revert_non_inner_collect_left,
+    };
     use crate::test_utils::datafusion_test_context;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
     use ballista_core::serde::BallistaCodec;
     use datafusion::arrow::compute::SortOptions;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+    use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::filter::FilterExec;
-    use datafusion::physical_plan::joins::HashJoinExec;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use datafusion::physical_plan::windows::BoundedWindowAggExec;
@@ -933,5 +938,104 @@ order by
         let result_exec_plan: Arc<dyn ExecutionPlan> =
             (proto).try_into_physical_plan(ctx, codec.physical_extension_codec())?;
         Ok(result_exec_plan)
+    }
+
+    fn memory_exec(
+        schema: Arc<Schema>,
+        partition_count: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(schema).with_partitions(partition_count))
+    }
+
+    #[test]
+    fn revert_non_inner_collect_left_rewrites_left_join() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let left = memory_exec(schema.clone(), 1);
+        let right = memory_exec(schema, 4);
+
+        let join_on = vec![(
+            Arc::new(Column::new("a", 0)) as _,
+            Arc::new(Column::new("a", 0)) as _,
+        )];
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                join_on,
+                None,
+                &JoinType::Left,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .unwrap(),
+        );
+
+        let rewritten = revert_non_inner_collect_left(plan).unwrap();
+
+        let rewritten_join = rewritten
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("expected HashJoinExec after rewrite");
+        assert_eq!(*rewritten_join.partition_mode(), PartitionMode::Partitioned);
+        assert_eq!(*rewritten_join.join_type(), JoinType::Left);
+
+        // Both children should be RepartitionExec(Hash)
+        let left_repart = rewritten_join
+            .left()
+            .as_any()
+            .downcast_ref::<RepartitionExec>()
+            .expect("expected left child to be RepartitionExec");
+        let right_repart = rewritten_join
+            .right()
+            .as_any()
+            .downcast_ref::<RepartitionExec>()
+            .expect("expected right child to be RepartitionExec");
+
+        assert!(matches!(
+            left_repart.partitioning(),
+            Partitioning::Hash(_, 4)
+        ));
+        assert!(matches!(
+            right_repart.partitioning(),
+            Partitioning::Hash(_, 4)
+        ));
+    }
+
+    #[test]
+    fn revert_non_inner_collect_left_preserves_inner_join() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let left = memory_exec(schema.clone(), 1);
+        let right = memory_exec(schema, 4);
+
+        let join_on = vec![(
+            Arc::new(Column::new("a", 0)) as _,
+            Arc::new(Column::new("a", 0)) as _,
+        )];
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                join_on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .unwrap(),
+        );
+
+        let rewritten = revert_non_inner_collect_left(plan).unwrap();
+
+        let rewritten_join = rewritten
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("expected HashJoinExec");
+        // CollectLeft should be preserved for INNER joins
+        assert_eq!(*rewritten_join.partition_mode(), PartitionMode::CollectLeft);
+        assert_eq!(*rewritten_join.join_type(), JoinType::Inner);
     }
 }

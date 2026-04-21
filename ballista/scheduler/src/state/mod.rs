@@ -527,16 +527,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             Ok(TreeNodeRecursion::Continue)
         })?;
 
-        let explain_distributed_plan = if let Some(inner_lp) = explain_inner_logical_plan
-        {
-            Some(
-                generate_distributed_explain_plan(job_id, session_ctx.clone(), inner_lp)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
         // Enable broadcast (CollectLeft) joins for distributed execution.
         // Shuffling is much more expensive than broadcasting in a distributed
         // system, so we set a higher threshold than the DataFusion default.
@@ -550,6 +540,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
 
         let adjusted_config = session_ctx
             .copied_config()
+            .with_create_default_catalog_and_schema(false)
             .set_u64(
                 "datafusion.optimizer.hash_join_single_partition_threshold",
                 BROADCAST_THRESHOLD_BYTES,
@@ -559,11 +550,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 BROADCAST_THRESHOLD_ROWS,
             );
 
-        // Use the adjusted config for both physical planning and stage resolution
+        // Use the adjusted config for both physical planning, stage resolution,
+        // and EXPLAIN generation so they all reflect the same configuration.
         let session_config = Arc::new(adjusted_config.clone());
         let adjusted_state = SessionStateBuilder::new_from_existing(session_ctx.state())
             .with_config(adjusted_config)
             .build();
+
+        let explain_distributed_plan = if let Some(inner_lp) = explain_inner_logical_plan
+        {
+            Some(
+                generate_distributed_explain_plan(job_id, &adjusted_state, inner_lp)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         let plan = adjusted_state.create_physical_plan(plan).await?;
         debug!(
             "Physical plan: {}",

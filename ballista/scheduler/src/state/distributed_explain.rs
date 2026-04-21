@@ -23,6 +23,7 @@ use ballista_core::error::Result;
 use datafusion::arrow::array::{ListArray, ListBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{ScalarValue, UnnestOptions};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, PlanType, StringifiedPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -32,7 +33,6 @@ use datafusion::physical_plan::expressions::lit;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::unnest::{ListUnnest, UnnestExec};
-use datafusion::prelude::SessionContext;
 
 use crate::state::execution_graph::ExecutionStage;
 use crate::{
@@ -42,12 +42,12 @@ use crate::{
 
 pub(crate) async fn generate_distributed_explain_plan(
     job_id: &str,
-    session_ctx: Arc<SessionContext>,
+    session_state: &SessionState,
     plan: Arc<LogicalPlan>,
 ) -> Result<String> {
-    let session_config = Arc::new(session_ctx.copied_config());
+    let session_config = Arc::new(session_state.config().clone());
 
-    let plan = session_ctx.state().create_physical_plan(&plan).await?;
+    let plan = session_state.create_physical_plan(&plan).await?;
 
     let mut planner = DefaultDistributedPlanner::new();
     let shuffle_stages =
