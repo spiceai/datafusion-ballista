@@ -168,8 +168,15 @@ impl DefaultDistributedPlanner {
             // skip the stage break and keep the merge in the same stage as its children.
             // This avoids the overhead of shuffle write/read for a small number of rows,
             // which dominates execution time for TopK queries in distributed mode.
-            // The merge will run as a single task on one executor with all partitions
-            // executing as parallel threads within that executor.
+            //
+            // Note on parallelism: because SortPreservingMergeExec has an output
+            // partitioning of 1, the entire stage becomes a single task assigned to
+            // one executor (ShuffleWriterExec::input_partition_count() == 1).
+            // This does sacrifice cluster-level parallelism (no cross-executor
+            // distribution). However, within that executor the child partitions
+            // still execute as parallel async streams, so intra-executor parallelism
+            // is preserved. For small fetch values this trade-off is worthwhile as
+            // the shuffle coordination overhead far exceeds the merge cost.
             const TOPK_FETCH_THRESHOLD: usize = 1000;
             if sort_preserving_merge
                 .fetch()
