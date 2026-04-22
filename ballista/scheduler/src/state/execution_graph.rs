@@ -1319,7 +1319,9 @@ impl ExecutionGraph for StaticExecutionGraph {
 
     /// Return all currently running tasks along with the executor ID on which they are assigned
     fn running_tasks(&self) -> Vec<RunningTaskInfo> {
-        self.stages.values().flat_map(|stage| {
+        self.stages
+            .values()
+            .flat_map(|stage| {
                 if let ExecutionStage::Running(stage) = stage {
                     stage
                         .running_tasks()
