@@ -438,7 +438,9 @@ impl ExecutorManager {
             get_time_before(self.config.executor_termination_grace_period);
 
         self.cluster_state
-            .executor_heartbeats().values().filter_map(|heartbeat| {
+            .executor_heartbeats()
+            .values()
+            .filter_map(|heartbeat| {
                 let terminating = matches!(
                     heartbeat
                         .status
