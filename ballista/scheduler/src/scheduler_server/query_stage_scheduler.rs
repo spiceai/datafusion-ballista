@@ -298,11 +298,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                                     running_tasks,
                                 ))
                                 .await
-                            {
-                                error!(
-                                    "Fail to post CancelTasks for job {job_id} due to {e:?}"
-                                );
-                            }
+                        {
+                            error!(
+                                "Fail to post CancelTasks for job {job_id} due to {e:?}"
+                            );
+                        }
                     }
                     Err(e) => {
                         error!("Fail to invoke abort_job for job {job_id} due to {e:?}");
