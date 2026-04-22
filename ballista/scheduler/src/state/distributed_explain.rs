@@ -84,7 +84,8 @@ pub(crate) fn extract_logical_and_physical_plans(
                 .rev()
                 .find(|p| matches!(p.plan_type, PlanType::FinalAnalyzedLogicalPlan))
                 .or_else(|| {
-                    // Fallback to FinalLogicalPlan for non-indent formats
+                    // Fall back to the pre-analysis FinalLogicalPlan when the
+                    // analyzed plan is not present.
                     plans
                         .iter()
                         .find(|p| matches!(p.plan_type, PlanType::FinalLogicalPlan))

@@ -151,7 +151,6 @@ impl<T: 'static + AsLogicalPlan> QueryPlanner for BallistaQueryPlanner<T> {
                         distributed_query_exec,
                         self.scheduler_url.clone(),
                         Arc::clone(analyze.schema.inner()),
-                        analyze.verbose,
                     )))
                 }
                 _ => {

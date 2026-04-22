@@ -48,7 +48,6 @@ pub struct DistributedExplainAnalyzeExec<T: 'static + AsLogicalPlan> {
     child: Arc<dyn ExecutionPlan>,
     scheduler_url: String,
     schema: SchemaRef,
-    verbose: bool,
     properties: PlanProperties,
     phantom: PhantomData<T>,
 }
@@ -59,14 +58,12 @@ impl<T: 'static + AsLogicalPlan> DistributedExplainAnalyzeExec<T> {
         child: Arc<DistributedQueryExec<T>>,
         scheduler_url: String,
         schema: SchemaRef,
-        verbose: bool,
     ) -> Self {
         let properties = Self::compute_properties(Arc::clone(&schema));
         Self {
             child,
             scheduler_url,
             schema,
-            verbose,
             properties,
             phantom: PhantomData,
         }
@@ -141,7 +138,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedExplainAnalyzeExec
                 child,
                 scheduler_url: self.scheduler_url.clone(),
                 schema: Arc::clone(&self.schema),
-                verbose: self.verbose,
                 properties: Self::compute_properties(Arc::clone(&self.schema)),
                 phantom: PhantomData,
             }));
@@ -162,7 +158,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedExplainAnalyzeExec
         let child = Arc::clone(&self.child);
         let scheduler_url = self.scheduler_url.clone();
         let schema = Arc::clone(&self.schema);
-        let verbose = self.verbose;
         let stream_schema = Arc::clone(&self.schema);
         let session_config = ctx.session_config().clone();
 
@@ -189,7 +184,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedExplainAnalyzeExec
                 })?;
             let job_metrics =
                 fetch_job_metrics(&scheduler_url, &job_id, session_config).await?;
-            format_metrics_as_record_batch(&job_metrics, &job_id, schema, verbose)
+            format_metrics_as_record_batch(&job_metrics, schema)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -246,9 +241,7 @@ async fn fetch_job_metrics(
 
 fn format_metrics_as_record_batch(
     job_metrics: &GetJobMetricsResult,
-    _job_id: &str,
     schema: SchemaRef,
-    _verbose: bool,
 ) -> Result<RecordBatch> {
     let plan = job_metrics
         .stages
@@ -354,8 +347,7 @@ mod tests {
             ],
         };
 
-        let batch =
-            format_metrics_as_record_batch(&response, "job-1", schema, true).unwrap();
+        let batch = format_metrics_as_record_batch(&response, schema).unwrap();
 
         let plan_type = batch
             .column(0)
