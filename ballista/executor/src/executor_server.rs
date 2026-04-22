@@ -378,6 +378,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 stage_id,
                 plan,
                 &self.executor.work_dir,
+                task.session_config.options(),
             )
             .unwrap();
 

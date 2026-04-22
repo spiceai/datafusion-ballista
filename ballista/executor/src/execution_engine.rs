@@ -27,10 +27,13 @@ use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::fmt::{Debug, Display};
@@ -53,6 +56,7 @@ pub trait ExecutionEngine: Sync + Send {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn QueryStageExecutor>>;
 }
 
@@ -135,7 +139,14 @@ impl ExecutionEngine for DefaultExecutionEngine {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
+        // Re-run FilterPushdown(Post) to re-establish dynamic filter links
+        // (e.g., TopK → DataSourceExec) that are lost during protobuf
+        // serialization/deserialization between scheduler and executor.
+        let filter_pushdown = FilterPushdown::new_post_optimization();
+        let plan = filter_pushdown.optimize(plan, config)?;
+
         // Fix ParquetSource metadata_size_hint lost during serialization
         let plan = fix_parquet_metadata_size_hint(plan)?;
 
