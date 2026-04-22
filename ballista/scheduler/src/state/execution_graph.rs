@@ -397,6 +397,19 @@ impl StaticExecutionGraph {
         let mut job_err_msg = "".to_owned();
         let mut stage_metrics = StageMetricsInfo::default();
 
+        info!(
+            "Job {job_id} processing_stages_update: resolved_stages={:?}, successful_stages={:?}, \
+             failed_stages={:?}, rollback_running_stages={:?}, resubmit_successful_stages={:?}",
+            updated_stages.resolved_stages,
+            updated_stages.successful_stages,
+            updated_stages.failed_stages.keys().collect::<Vec<_>>(),
+            updated_stages
+                .rollback_running_stages
+                .keys()
+                .collect::<Vec<_>>(),
+            updated_stages.resubmit_successful_stages,
+        );
+
         for stage_id in updated_stages.resolved_stages {
             self.resolve_stage(stage_id)?;
             has_resolved = true;
@@ -494,7 +507,29 @@ impl StaticExecutionGraph {
                 completed_at: timestamp_millis(),
             });
         } else if has_resolved {
+            info!("Job {job_id} has newly resolved stages, emitting JobUpdated");
             events.push(QueryStageSchedulerEvent::JobUpdated(job_id))
+        } else {
+            // Log stage summary when no terminal event is emitted — helps diagnose hangs
+            let stage_summary: Vec<String> = self.stages.iter().map(|(id, stage)| {
+                match stage {
+                    ExecutionStage::UnResolved(s) => {
+                        let complete_inputs: Vec<usize> = s.inputs.iter()
+                            .filter(|(_, inp)| inp.is_complete()).map(|(id, _)| *id).collect();
+                        let incomplete_inputs: Vec<usize> = s.inputs.iter()
+                            .filter(|(_, inp)| !inp.is_complete()).map(|(id, _)| *id).collect();
+                        format!("stage {id}: UnResolved(complete_inputs={complete_inputs:?}, incomplete_inputs={incomplete_inputs:?}, resolvable={})", s.resolvable())
+                    }
+                    ExecutionStage::Resolved(_) => format!("stage {id}: Resolved"),
+                    ExecutionStage::Running(s) => format!("stage {id}: Running(available_tasks={}, is_successful={})", s.available_tasks(), s.is_successful()),
+                    ExecutionStage::Successful(_) => format!("stage {id}: Successful"),
+                    ExecutionStage::Failed(_) => format!("stage {id}: Failed"),
+                }
+            }).collect();
+            info!(
+                "Job {job_id} no terminal event emitted (not failed, not successful, no newly resolved). Stage states: [{}]",
+                stage_summary.join(", ")
+            );
         }
         Ok((events, stage_metrics))
     }
@@ -509,6 +544,11 @@ impl StaticExecutionGraph {
     ) -> Result<Vec<usize>> {
         let mut resolved_stages = vec![];
         let job_id = &self.job_id;
+        info!(
+            "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
+             num_locations={}, output_links={output_links:?}",
+            locations.len()
+        );
         if output_links.is_empty() {
             // If `output_links` is empty, then this is a final stage
             self.output_locations.extend(locations);
@@ -528,7 +568,20 @@ impl StaticExecutionGraph {
                         }
 
                         // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
-                        if linked_unresolved_stage.resolvable() {
+                        let resolvable = linked_unresolved_stage.resolvable();
+                        info!(
+                            "Job {job_id} stage {link} (child of {stage_id}): input complete={is_completed}, resolvable={resolvable}, \
+                             inputs_status=[{}]",
+                            linked_unresolved_stage
+                                .inputs
+                                .iter()
+                                .map(|(id, inp)| {
+                                    format!("{id}:complete={}", inp.is_complete())
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        if resolvable {
                             resolved_stages.push(linked_unresolved_stage.stage_id);
                         }
                     } else {

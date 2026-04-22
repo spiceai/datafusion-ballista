@@ -376,6 +376,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     .await
                 {
                     Ok(stage_events) => {
+                        info!(
+                            "TaskUpdating from executor {executor_id}: {num_status} tasks processed, \
+                             {} stage events emitted: {:?}",
+                            stage_events.len(),
+                            stage_events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
+                        );
+
                         if self.state.config.is_push_staged_scheduling() {
                             event_sender
                                 .post_event(QueryStageSchedulerEvent::ReviveOffers)
