@@ -56,6 +56,7 @@ pub trait ExecutionEngine: Sync + Send {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn QueryStageExecutor>>;
 }
 
@@ -138,13 +139,13 @@ impl ExecutionEngine for DefaultExecutionEngine {
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
         // Re-run FilterPushdown(Post) to re-establish dynamic filter links
         // (e.g., TopK → DataSourceExec) that are lost during protobuf
         // serialization/deserialization between scheduler and executor.
         let filter_pushdown = FilterPushdown::new_post_optimization();
-        let config = ConfigOptions::default();
-        let plan = filter_pushdown.optimize(plan, &config)?;
+        let plan = filter_pushdown.optimize(plan, config)?;
 
         // Fix ParquetSource metadata_size_hint lost during serialization
         let plan = fix_parquet_metadata_size_hint(plan)?;
