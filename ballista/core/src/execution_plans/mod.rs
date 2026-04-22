@@ -18,6 +18,7 @@
 //! This module contains execution plans that are needed to distribute DataFusion's execution plans into
 //! several Ballista executors.
 
+mod distributed_explain_analyze;
 mod distributed_query;
 mod shuffle_manager;
 mod shuffle_reader;
@@ -27,6 +28,7 @@ mod unresolved_shuffle;
 #[cfg(feature = "vortex")]
 pub mod vortex_shuffle;
 
+pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
 pub use distributed_query::DistributedQueryExec;
 pub use shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, ShufflePartitionKey,

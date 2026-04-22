@@ -16,15 +16,16 @@
 // under the License.
 
 use crate::config::BallistaConfig;
-use crate::execution_plans::DistributedQueryExec;
+use crate::execution_plans::{DistributedExplainAnalyzeExec, DistributedQueryExec};
 use crate::serde::BallistaLogicalExtensionCodec;
+use crate::serde::logical_plan_ext::BallistaExplainNode;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{QueryPlanner, SessionState};
-use datafusion::logical_expr::{LogicalPlan, TableScan};
+use datafusion::logical_expr::{Extension, LogicalPlan, TableScan};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
@@ -128,19 +129,70 @@ impl<T: 'static + AsLogicalPlan> QueryPlanner for BallistaQueryPlanner<T> {
                     log::debug!("create_physical_plan - handling empty exec");
                     Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))))
                 }
+                LogicalPlan::Analyze(analyze) => {
+                    log::debug!(
+                        "create_physical_plan - handling explain analyze statement"
+                    );
+                    // Strip the `Analyze` wrapper and run the inner plan as a
+                    // regular distributed job. After the child query stream
+                    // drains, `DistributedExplainAnalyzeExec` fetches per-stage
+                    // metrics via `GetJobMetrics` and renders them locally.
+                    let inner_plan = analyze.input.as_ref().clone();
+                    let distributed_query_exec =
+                        Arc::new(DistributedQueryExec::<T>::with_extension(
+                            self.scheduler_url.clone(),
+                            self.config.clone(),
+                            inner_plan,
+                            self.extension_codec.clone(),
+                            session_state.session_id().to_string(),
+                        ));
+
+                    Ok(Arc::new(DistributedExplainAnalyzeExec::new(
+                        distributed_query_exec,
+                        self.scheduler_url.clone(),
+                        Arc::clone(analyze.schema.inner()),
+                        analyze.verbose,
+                    )))
+                }
                 _ => {
                     log::debug!("create_physical_plan - handling general statement");
+
+                    // For EXPLAIN, wrap the plan in a Ballista logical
+                    // extension so fields (like `explain_format`) survive
+                    // the client -> scheduler serialization round-trip. The
+                    // scheduler unwraps these before physical planning.
+                    let plan_to_send = wrap_explain_for_distribution(logical_plan);
 
                     Ok(Arc::new(DistributedQueryExec::<T>::with_extension(
                         self.scheduler_url.clone(),
                         self.config.clone(),
-                        logical_plan.clone(),
+                        plan_to_send,
                         self.extension_codec.clone(),
                         session_state.session_id().to_string(),
                     )))
                 }
             }
         }
+    }
+}
+
+/// Wrap `LogicalPlan::Explain` in a Ballista logical extension node so that
+/// fields such as `explain_format` survive serialization to the scheduler
+/// via `datafusion-proto`. Other plans are returned unchanged.
+fn wrap_explain_for_distribution(plan: &LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Explain(explain) => {
+            let node = BallistaExplainNode {
+                verbose: explain.verbose,
+                explain_format: explain.explain_format.clone(),
+                plan: explain.plan.clone(),
+                schema: explain.schema.clone(),
+            };
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(node),
+            })
+        }
+        _ => plan.clone(),
     }
 }
 

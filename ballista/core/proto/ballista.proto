@@ -38,6 +38,28 @@ message BallistaPhysicalPlanNode {
   }
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ballista Logical Plan extensions
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Ballista wrapper around datafusion Explain logical plan node.
+// Used to preserve `explain_format` across the client -> scheduler boundary
+// because the datafusion-proto `ExplainNode` does not encode that field.
+message BallistaExplainNode {
+  bool verbose = 1;
+  // One of: "indent", "tree", "pgjson", "graphviz"
+  string explain_format = 2;
+}
+
+// Discriminating wrapper encoded as the payload of a Ballista logical
+// extension node. Allows a single codec entry point to route to the
+// appropriate Ballista logical extension type.
+message BallistaLogicalExtensionNode {
+  oneof node {
+    BallistaExplainNode explain = 1;
+  }
+}
+
 message ShuffleWriterExecNode {
   //TODO it seems redundant to provide job and stage id here since we also have them
   // in the TaskDefinition that wraps this plan
@@ -606,6 +628,27 @@ message GetJobStatusParams {
   string job_id = 1;
 }
 
+message GetJobMetricsParams {
+  string job_id = 1;
+}
+
+message JobStageMetrics {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated OperatorWithMetrics operators = 3;
+}
+
+message OperatorWithMetrics {
+  uint32 depth = 1;
+  string operator_type = 2;
+  string operator_desc = 3;
+  repeated OperatorMetric metrics = 4;
+}
+
+message GetJobMetricsResult {
+  repeated JobStageMetrics stages = 1;
+}
+
 message SuccessfulJob {
   repeated PartitionLocation partition_location = 1;
   uint64 queued_at = 2;
@@ -798,6 +841,8 @@ service SchedulerGrpc {
   rpc ExecuteQuery (ExecuteQueryParams) returns (ExecuteQueryResult) {}
 
   rpc GetJobStatus (GetJobStatusParams) returns (GetJobStatusResult) {}
+
+  rpc GetJobMetrics (GetJobMetricsParams) returns (GetJobMetricsResult) {}
 
   // Used by Executor to tell Scheduler it is stopped.
   rpc ExecutorStopped (ExecutorStoppedParams) returns (ExecutorStoppedResult) {}

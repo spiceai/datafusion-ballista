@@ -223,9 +223,19 @@ message AnalyzeNode {
   bool verbose = 2;
 }
 
+// Format options for EXPLAIN output
+enum ExplainFormat {
+  EXPLAIN_FORMAT_UNSPECIFIED = 0;
+  EXPLAIN_FORMAT_INDENT = 1;
+  EXPLAIN_FORMAT_TREE = 2;
+  EXPLAIN_FORMAT_POSTGRES_JSON = 3;
+  EXPLAIN_FORMAT_GRAPHVIZ = 4;
+}
+
 message ExplainNode {
   LogicalPlanNode input = 1;
   bool verbose = 2;
+  ExplainFormat format = 3;
 }
 
 message AggregateNode {

@@ -48,8 +48,9 @@ use datafusion::physical_plan::{
 use datafusion_proto::logical_plan::{
     AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, error, info};
+use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -84,6 +85,10 @@ pub struct DistributedQueryExec<T: 'static + AsLogicalPlan> {
     /// - job_execution_time_ms: Time spent executing on the cluster (ended_at - started_at)
     /// - job_scheduling_in_ms: Time job waited in scheduler queue (started_at - queued_at)
     metrics: ExecutionPlanMetricsSet,
+    /// The scheduler job id after the query has been accepted. Populated
+    /// once by the execute path and read by the parent
+    /// `DistributedExplainAnalyzeExec` to fetch stage metrics.
+    job_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
@@ -105,6 +110,7 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,7 +133,13 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the scheduler job id after the query has been accepted.
+    pub fn job_id(&self) -> Option<String> {
+        self.job_id.lock().clone()
     }
 
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
@@ -197,6 +209,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.plan.schema().as_arrow().clone().into(),
             ),
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::clone(&self.job_id),
         }))
     }
 
@@ -265,6 +278,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.session_id.clone(),
                 query,
                 Arc::new(self.metrics.clone()),
+                Arc::clone(&self.job_id),
                 partition,
                 self.config.clone(),
                 interceptor,
@@ -308,13 +322,14 @@ async fn execute_query(
     session_id: String,
     query: ExecuteQueryParams,
     metrics: Arc<ExecutionPlanMetricsSet>,
+    job_id_handle: Arc<Mutex<Option<String>>>,
     partition: usize,
     config: BallistaConfig,
     grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
     result_fetch_callback: Option<Arc<dyn ResultFetchMetricsCallback>>,
-) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
+) -> Result<impl futures::Stream<Item = Result<RecordBatch>> + Send> {
     // Capture query submission time for total_query_time_ms
     let query_start_time = std::time::Instant::now();
 
@@ -364,6 +379,7 @@ async fn execute_query(
     );
 
     let job_id = query_result.job_id;
+    *job_id_handle.lock() = Some(job_id.clone());
     let mut prev_status: Option<job_status::Status> = None;
 
     loop {
@@ -409,7 +425,6 @@ async fn execute_query(
                 started_at,
                 ended_at,
                 partition_location,
-                ..
             })) => {
                 // Calculate job execution time (server-side execution)
                 let job_execution_ms = ended_at.saturating_sub(started_at);

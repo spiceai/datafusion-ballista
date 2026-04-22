@@ -56,6 +56,8 @@ pub use generated::ballista as protobuf;
 
 /// Generated protobuf code from Ballista protocol definitions.
 pub mod generated;
+/// Ballista-specific logical plan extension nodes.
+pub mod logical_plan_ext;
 /// Scheduler-specific serialization types and conversions.
 pub mod scheduler;
 
@@ -187,6 +189,59 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
         inputs: &[datafusion::logical_expr::LogicalPlan],
         ctx: &TaskContext,
     ) -> Result<datafusion::logical_expr::Extension> {
+        // Try to decode as a Ballista extension wrapper first.
+        if let Ok(wrapper) = protobuf::BallistaLogicalExtensionNode::decode(buf) {
+            use crate::serde::logical_plan_ext::BallistaExplainNode;
+            use datafusion::logical_expr::Extension;
+            use protobuf::ballista_logical_extension_node::Node as ExtNode;
+
+            match wrapper.node {
+                Some(ExtNode::Explain(explain)) => {
+                    if inputs.len() != 1 {
+                        return Err(DataFusionError::Internal(format!(
+                            "BallistaExplainNode expects 1 input, got {}",
+                            inputs.len()
+                        )));
+                    }
+                    let explain_format =
+                        BallistaExplainNode::format_from_str(&explain.explain_format)
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "Unknown ExplainFormat: {}",
+                                    explain.explain_format
+                                ))
+                            })?;
+                    // Build the output schema for explain: (plan_type, plan).
+                    let schema = Arc::new(datafusion::common::DFSchema::try_from(
+                        datafusion::arrow::datatypes::Schema::new(vec![
+                            datafusion::arrow::datatypes::Field::new(
+                                "plan_type",
+                                datafusion::arrow::datatypes::DataType::Utf8,
+                                false,
+                            ),
+                            datafusion::arrow::datatypes::Field::new(
+                                "plan",
+                                datafusion::arrow::datatypes::DataType::Utf8,
+                                false,
+                            ),
+                        ]),
+                    )?);
+                    let node = BallistaExplainNode {
+                        verbose: explain.verbose,
+                        explain_format,
+                        plan: Arc::new(inputs[0].clone()),
+                        schema,
+                    };
+                    return Ok(Extension {
+                        node: Arc::new(node),
+                    });
+                }
+                None => {
+                    // Fall through to default codec.
+                }
+            }
+        }
+
         self.default_codec.try_decode(buf, inputs, ctx)
     }
 
@@ -195,6 +250,26 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
         node: &datafusion::logical_expr::Extension,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
+        use crate::serde::logical_plan_ext::as_ballista_explain;
+        use protobuf::ballista_logical_extension_node::Node as ExtNode;
+
+        if let Some(explain) = as_ballista_explain(node.node.as_ref()) {
+            let wrapper = protobuf::BallistaLogicalExtensionNode {
+                node: Some(ExtNode::Explain(protobuf::BallistaExplainNode {
+                    verbose: explain.verbose,
+                    explain_format:
+                        crate::serde::logical_plan_ext::BallistaExplainNode::format_as_str(
+                            &explain.explain_format,
+                        )
+                        .to_string(),
+                })),
+            };
+            wrapper
+                .encode(buf)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            return Ok(());
+        }
+
         self.default_codec.try_encode(node, buf)
     }
 
@@ -617,5 +692,92 @@ mod test {
         assert_eq!(decoded_exec.stage_id, 1);
         assert_eq!(decoded_exec.schema().as_ref(), schema.as_ref());
         assert_eq!(&decoded_exec.properties().partitioning, &partitioning);
+    }
+
+    /// Build a simple logical plan wrapped in a `BallistaExplainNode` to
+    /// exercise the logical-extension codec round-trip.
+    fn wrap_in_explain(
+        format: datafusion::common::format::ExplainFormat,
+        verbose: bool,
+    ) -> datafusion::logical_expr::LogicalPlan {
+        use crate::serde::logical_plan_ext::BallistaExplainNode;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::logical_expr::{EmptyRelation, Extension, LogicalPlan};
+
+        let inner = LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::empty()),
+        });
+        let schema = Arc::new(
+            DFSchema::try_from(Schema::new(vec![
+                Field::new("plan_type", DataType::Utf8, false),
+                Field::new("plan", DataType::Utf8, false),
+            ]))
+            .unwrap(),
+        );
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(BallistaExplainNode {
+                verbose,
+                explain_format: format,
+                plan: Arc::new(inner),
+                schema,
+            }),
+        })
+    }
+
+    /// All four `ExplainFormat` variants round-trip through the codec.
+    #[tokio::test]
+    async fn test_ballista_explain_node_codec_roundtrip() {
+        use crate::serde::logical_plan_ext::as_ballista_explain;
+        use datafusion::common::format::ExplainFormat;
+        use datafusion::logical_expr::LogicalPlan;
+
+        let ctx = SessionContext::new().task_ctx();
+        let codec = BallistaLogicalExtensionCodec::default();
+
+        for (format, verbose) in [
+            (ExplainFormat::Indent, false),
+            (ExplainFormat::Tree, false),
+            (ExplainFormat::PostgresJSON, true),
+            (ExplainFormat::Graphviz, true),
+        ] {
+            let original = wrap_in_explain(format.clone(), verbose);
+
+            let plan_message =
+                LogicalPlanNode::try_from_logical_plan(&original, &codec).unwrap();
+            let mut buf: Vec<u8> = vec![];
+            plan_message.try_encode(&mut buf).unwrap();
+
+            let decoded_message = LogicalPlanNode::try_decode(&buf).unwrap();
+            let decoded = decoded_message.try_into_logical_plan(&ctx, &codec).unwrap();
+
+            let LogicalPlan::Extension(ext) = &decoded else {
+                panic!("expected Extension, got {decoded:?}");
+            };
+            let ballista = as_ballista_explain(ext.node.as_ref())
+                .expect("decoded node must be BallistaExplainNode");
+            assert_eq!(ballista.verbose, verbose);
+            assert_eq!(ballista.explain_format, format);
+        }
+    }
+
+    /// `ExplainFormat` serializes to a stable set of string identifiers.
+    #[test]
+    fn test_explain_format_str_stable() {
+        use crate::serde::logical_plan_ext::BallistaExplainNode;
+        use datafusion::common::format::ExplainFormat;
+
+        for f in [
+            ExplainFormat::Indent,
+            ExplainFormat::Tree,
+            ExplainFormat::PostgresJSON,
+            ExplainFormat::Graphviz,
+        ] {
+            let s = BallistaExplainNode::format_as_str(&f);
+            let parsed =
+                BallistaExplainNode::format_from_str(s).expect("round-trip must succeed");
+            assert_eq!(parsed, f);
+        }
+        assert!(BallistaExplainNode::format_from_str("bogus").is_none());
     }
 }
