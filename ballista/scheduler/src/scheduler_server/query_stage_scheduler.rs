@@ -219,18 +219,25 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
                 error!("Job {job_id} failed: {fail_message}");
 
-                // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(&job_id, &fail_message));
-
-                if let Err(e) = self
+                // Persist terminal status before broadcasting so subscribers
+                // can immediately read the Failed status on receipt of the event.
+                match self
                     .state
                     .task_manager
-                    .fail_unscheduled_job(&job_id, fail_message)
+                    .fail_unscheduled_job(&job_id, fail_message.clone())
                     .await
                 {
-                    error!(
-                        "Fail to invoke fail_unscheduled_job for job {job_id} due to {e:?}"
-                    );
+                    Ok(()) => {
+                        self.broadcast_job_state(JobStateEvent::failed(
+                            &job_id,
+                            &fail_message,
+                        ));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Fail to invoke fail_unscheduled_job for job {job_id} due to {e:?}"
+                        );
+                    }
                 }
             }
             QueryStageSchedulerEvent::JobFinished {
@@ -243,13 +250,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
                 info!("Job {job_id} success");
 
-                // Broadcast job completed state
-                self.broadcast_job_state(JobStateEvent::completed(&job_id));
-
-                if let Err(e) = self.state.task_manager.succeed_job(&job_id).await {
-                    error!("Fail to invoke succeed_job for job {job_id} due to {e:?}");
+                // Persist terminal status BEFORE broadcasting completion so that
+                // subscribers (e.g. SpiceAI's QueryHandle) who receive the
+                // Completed event can immediately read the Successful status
+                // without hitting a retry/polling loop.
+                match self.state.task_manager.succeed_job(&job_id).await {
+                    Ok(()) => {
+                        // Broadcast job completed state after status is persisted
+                        self.broadcast_job_state(JobStateEvent::completed(&job_id));
+                        self.state.clean_up_successful_job(job_id);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Fail to invoke succeed_job for job {job_id} due to {e:?}"
+                        );
+                    }
                 }
-                self.state.clean_up_successful_job(job_id);
             }
             QueryStageSchedulerEvent::JobRunningFailed {
                 job_id,
@@ -262,28 +278,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
                 error!("Job {job_id} running failed");
 
-                // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(&job_id, &fail_message));
-
+                // Persist terminal status before broadcasting so subscribers
+                // can immediately read the Failed status on receipt of the event.
                 match self
                     .state
                     .task_manager
-                    .abort_job(&job_id, fail_message)
+                    .abort_job(&job_id, fail_message.clone())
                     .await
                 {
                     Ok((running_tasks, _pending_tasks)) => {
-                        if !running_tasks.is_empty() {
-                            event_sender
+                        // Broadcast job failed state immediately after status is persisted
+                        self.broadcast_job_state(JobStateEvent::failed(
+                            &job_id,
+                            &fail_message,
+                        ));
+                        if !running_tasks.is_empty()
+                            && let Err(e) = event_sender
                                 .post_event(QueryStageSchedulerEvent::CancelTasks(
                                     running_tasks,
                                 ))
-                                .await?;
+                                .await
+                        {
+                            error!(
+                                "Fail to post CancelTasks for job {job_id} due to {e:?}"
+                            );
                         }
                     }
                     Err(e) => {
                         error!("Fail to invoke abort_job for job {job_id} due to {e:?}");
                     }
                 }
+
                 self.state.clean_up_failed_job(job_id);
             }
             QueryStageSchedulerEvent::JobUpdated(job_id) => {
@@ -297,21 +322,29 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
                 info!("Job {job_id} Cancelled");
 
-                // Broadcast job cancelled state
-                self.broadcast_job_state(JobStateEvent::cancelled(&job_id));
-
+                // Persist terminal status before broadcasting so subscribers
+                // can immediately read the terminal status on receipt of the event.
+                // Note: cancel_job routes to abort_job, persisting a Failed status.
                 match self.state.task_manager.cancel_job(&job_id).await {
                     Ok((running_tasks, _pending_tasks)) => {
-                        event_sender
+                        // Broadcast cancelled state immediately after status is persisted
+                        self.broadcast_job_state(JobStateEvent::cancelled(&job_id));
+                        if let Err(e) = event_sender
                             .post_event(QueryStageSchedulerEvent::CancelTasks(
                                 running_tasks,
                             ))
-                            .await?;
+                            .await
+                        {
+                            error!(
+                                "Fail to post CancelTasks for job {job_id} due to {e:?}"
+                            );
+                        }
                     }
                     Err(e) => {
                         error!("Fail to invoke cancel_job for job {job_id} due to {e:?}");
                     }
                 }
+
                 self.state.clean_up_failed_job(job_id);
             }
             QueryStageSchedulerEvent::TaskUpdating(executor_id, tasks_status) => {

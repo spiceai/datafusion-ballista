@@ -20,6 +20,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::datasource::source_as_provider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::any::type_name;
 use std::collections::HashMap;
@@ -477,7 +478,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
         let start = Instant::now();
-        let session_config = Arc::new(session_ctx.copied_config());
         if log::max_level() >= log::Level::Debug {
             // optimizing the plan here is redundant because the physical planner will do this again
             // but it is helpful to see what the optimized plan will be
@@ -527,17 +527,47 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             Ok(TreeNodeRecursion::Continue)
         })?;
 
+        // Enable broadcast (CollectLeft) joins for distributed execution.
+        // Shuffling is much more expensive than broadcasting in a distributed
+        // system, so we set a higher threshold than the DataFusion default.
+        // The restricted config previously forced these to 0 due to bug #1055
+        // (LEFT/FULL OUTER join incorrect with CollectLeft). The distributed
+        // planner now has a safety transform that reverts CollectLeft to
+        // Partitioned for non-INNER join types, so INNER joins can safely
+        // benefit from broadcast.
+        const BROADCAST_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+        const BROADCAST_THRESHOLD_ROWS: u64 = 10_000_000; // 10M rows
+
+        let adjusted_config = session_ctx
+            .copied_config()
+            .with_create_default_catalog_and_schema(false)
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                BROADCAST_THRESHOLD_BYTES,
+            )
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                BROADCAST_THRESHOLD_ROWS,
+            );
+
+        // Use the adjusted config for both physical planning, stage resolution,
+        // and EXPLAIN generation so they all reflect the same configuration.
+        let session_config = Arc::new(adjusted_config.clone());
+        let adjusted_state = SessionStateBuilder::new_from_existing(session_ctx.state())
+            .with_config(adjusted_config)
+            .build();
+
         let explain_distributed_plan = if let Some(inner_lp) = explain_inner_logical_plan
         {
             Some(
-                generate_distributed_explain_plan(job_id, session_ctx.clone(), inner_lp)
+                generate_distributed_explain_plan(job_id, &adjusted_state, inner_lp)
                     .await?,
             )
         } else {
             None
         };
 
-        let plan = session_ctx.state().create_physical_plan(plan).await?;
+        let plan = adjusted_state.create_physical_plan(plan).await?;
         debug!(
             "Physical plan: {}",
             DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
