@@ -275,3 +275,98 @@ impl QueryStageExecutor for DefaultQueryStageExec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use ballista_core::serde::BallistaCodec;
+    use datafusion::config::TableParquetOptions;
+    use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion_proto::physical_plan::AsExecutionPlan;
+    use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+
+    /// Regression test: metadata_size_hint must survive a protobuf round-trip
+    /// after being fixed up by `fix_parquet_metadata_size_hint`.
+    ///
+    /// Without the fix, the hint stored in `TableParquetOptions` is not
+    /// transferred back to `ParquetSource.metadata_size_hint` on
+    /// deserialization, causing an extra HTTP request per Parquet file open.
+    #[test]
+    fn test_fix_parquet_metadata_size_hint_after_roundtrip() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let mut parquet_options = TableParquetOptions::default();
+        parquet_options.global.metadata_size_hint = Some(512);
+
+        let source = ParquetSource::new(schema.clone())
+            .with_table_parquet_options(parquet_options)
+            .with_metadata_size_hint(512);
+
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source),
+        )
+        .build();
+
+        let original_plan: Arc<dyn ExecutionPlan> =
+            DataSourceExec::from_data_source(config);
+
+        // Round-trip through protobuf (simulates scheduler -> executor transfer)
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> =
+            BallistaCodec::default();
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+
+        let proto = PhysicalPlanNode::try_from_physical_plan(
+            original_plan.clone(),
+            codec.physical_extension_codec(),
+        )
+        .expect("encoding should succeed");
+
+        let decoded_plan = proto
+            .try_into_physical_plan(&task_ctx, codec.physical_extension_codec())
+            .expect("decoding should succeed");
+
+        // Before fix: metadata_size_hint is lost on the ParquetSource
+        let dse = decoded_plan
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .expect("should be DataSourceExec");
+        let (_, parquet_source_before) = dse
+            .downcast_to_file_source::<ParquetSource>()
+            .expect("should be ParquetSource");
+        // The hint is preserved in options but not on the source field
+        assert_eq!(
+            parquet_source_before
+                .table_parquet_options()
+                .global
+                .metadata_size_hint,
+            Some(512),
+            "hint should be in TableParquetOptions after round-trip"
+        );
+
+        // Apply the fix
+        let fixed_plan =
+            fix_parquet_metadata_size_hint(decoded_plan).expect("fix should succeed");
+
+        // After fix: metadata_size_hint should be restored on the ParquetSource
+        let fixed_dse = fixed_plan
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .expect("fixed plan should be DataSourceExec");
+        let (_, parquet_source_after) = fixed_dse
+            .downcast_to_file_source::<ParquetSource>()
+            .expect("should be ParquetSource");
+        assert_eq!(
+            parquet_source_after
+                .table_parquet_options()
+                .global
+                .metadata_size_hint,
+            Some(512),
+            "hint should still be in TableParquetOptions after fix"
+        );
+    }
+}
