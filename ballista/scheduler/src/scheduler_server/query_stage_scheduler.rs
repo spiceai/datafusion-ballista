@@ -247,12 +247,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 // subscribers (e.g. SpiceAI's QueryHandle) who receive the
                 // Completed event can immediately read the Successful status
                 // without hitting a retry/polling loop.
-                if let Err(e) = self.state.task_manager.succeed_job(&job_id).await {
-                    error!("Fail to invoke succeed_job for job {job_id} due to {e:?}");
+                match self.state.task_manager.succeed_job(&job_id).await {
+                    Ok(()) => {
+                        // Broadcast job completed state after status is persisted
+                        self.broadcast_job_state(JobStateEvent::completed(&job_id));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Fail to invoke succeed_job for job {job_id} due to {e:?}"
+                        );
+                    }
                 }
-
-                // Broadcast job completed state after status is persisted
-                self.broadcast_job_state(JobStateEvent::completed(&job_id));
 
                 self.state.clean_up_successful_job(job_id);
             }
@@ -283,14 +288,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                                 ))
                                 .await?;
                         }
+                        // Broadcast job failed state after status is persisted
+                        self.broadcast_job_state(JobStateEvent::failed(
+                            &job_id,
+                            &fail_message,
+                        ));
                     }
                     Err(e) => {
                         error!("Fail to invoke abort_job for job {job_id} due to {e:?}");
                     }
                 }
-
-                // Broadcast job failed state after status is persisted
-                self.broadcast_job_state(JobStateEvent::failed(&job_id, &fail_message));
 
                 self.state.clean_up_failed_job(job_id);
             }
@@ -306,7 +313,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 info!("Job {job_id} Cancelled");
 
                 // Persist terminal status before broadcasting so subscribers
-                // can immediately read the Cancelled status on receipt of the event.
+                // can immediately read the terminal status on receipt of the event.
+                // Note: cancel_job routes to abort_job, persisting a Failed status.
                 match self.state.task_manager.cancel_job(&job_id).await {
                     Ok((running_tasks, _pending_tasks)) => {
                         event_sender
@@ -314,14 +322,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                                 running_tasks,
                             ))
                             .await?;
+                        // Broadcast cancelled state after status is persisted
+                        self.broadcast_job_state(JobStateEvent::cancelled(&job_id));
                     }
                     Err(e) => {
                         error!("Fail to invoke cancel_job for job {job_id} due to {e:?}");
                     }
                 }
-
-                // Broadcast cancelled state after status is persisted
-                self.broadcast_job_state(JobStateEvent::cancelled(&job_id));
 
                 self.state.clean_up_failed_job(job_id);
             }
