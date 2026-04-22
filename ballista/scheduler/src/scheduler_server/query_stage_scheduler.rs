@@ -316,6 +316,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 if let Err(e) = self.state.task_manager.update_job(&job_id).await {
                     error!("Fail to invoke update_job for job {job_id} due to {e:?}");
                 }
+
+                // After update_job revives newly resolved stages (Resolved → Running),
+                // trigger scheduling so tasks for those stages are actually bound and
+                // launched. Without this, newly Running stages could sit idle if the
+                // preceding ReviveOffers consumed all slots before these stages were
+                // resolved.
+                if self.state.config.is_push_staged_scheduling() {
+                    event_sender
+                        .post_event(QueryStageSchedulerEvent::ReviveOffers)
+                        .await?;
+                }
             }
             QueryStageSchedulerEvent::JobCancel(job_id) => {
                 self.metrics_collector.record_cancelled(&job_id);
@@ -412,6 +423,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                         );
                         error!("{msg}");
                     }
+                }
+
+                // After executor_lost resets tasks (task_info → None), trigger
+                // scheduling so those tasks can be re-bound to surviving executors.
+                if self.state.config.is_push_staged_scheduling() {
+                    event_sender
+                        .post_event(QueryStageSchedulerEvent::ReviveOffers)
+                        .await?;
                 }
             }
             QueryStageSchedulerEvent::CancelTasks(tasks) => {
@@ -533,5 +552,104 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    fn test_join_plan_logical(partitions: usize) -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("gmv", DataType::UInt64, false),
+        ]);
+
+        let left_plan =
+            scan_empty_with_partitions(Some("left"), &schema, None, partitions).unwrap();
+        let right_plan =
+            scan_empty_with_partitions(Some("right"), &schema, None, partitions)
+                .unwrap()
+                .build()
+                .unwrap();
+
+        left_plan
+            .join(
+                right_plan,
+                datafusion::prelude::JoinType::Inner,
+                (vec!["id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .aggregate(vec![col("left.id")], vec![sum(col("left.gmv"))])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Regression test: a multi-stage job (join) should complete end-to-end
+    /// through the scheduler's push-based scheduling pipeline.
+    ///
+    /// This tests for a bug where jobs with dependent stages would hang
+    /// after the leaf stages completed because newly resolved stages were
+    /// never picked up for scheduling.
+    #[tokio::test]
+    async fn test_multi_stage_job_completes_push_scheduling() -> Result<()> {
+        let config = SchedulerConfig::default()
+            .with_scheduler_policy(TaskSchedulingPolicy::PushStaged);
+        let metrics = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(config, metrics.clone(), 2, 4, None).await?;
+
+        // Join plan creates multiple stages with dependencies
+        let plan = test_join_plan_logical(4);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            test.run("multi_stage_join", &plan),
+        )
+        .await;
+
+        match result {
+            Ok(Ok((status, _job_id))) => {
+                assert!(
+                    matches!(status.status, Some(ballista_core::serde::protobuf::job_status::Status::Successful(_))),
+                    "Expected job to succeed but got: {:?}",
+                    status.status
+                );
+            }
+            Ok(Err(e)) => panic!("Job execution error: {e}"),
+            Err(_) => panic!(
+                "Job timed out after 30s - suspected scheduling deadlock where \
+                 dependent stages are never picked up after leaf stages complete"
+            ),
+        }
+
+        Ok(())
+    }
+
+    /// Test that a simple aggregation also completes via push scheduling.
+    #[tokio::test]
+    async fn test_aggregation_completes_push_scheduling() -> Result<()> {
+        let config = SchedulerConfig::default()
+            .with_scheduler_policy(TaskSchedulingPolicy::PushStaged);
+        let metrics = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(config, metrics, 2, 4, None).await?;
+
+        let plan = test_plan(4);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), test.run("agg_test", &plan))
+                .await;
+
+        match result {
+            Ok(Ok((status, _job_id))) => {
+                assert!(
+                    matches!(status.status, Some(ballista_core::serde::protobuf::job_status::Status::Successful(_))),
+                    "Expected job to succeed but got: {:?}",
+                    status.status
+                );
+            }
+            Ok(Err(e)) => panic!("Job execution error: {e}"),
+            Err(_) => panic!("Aggregation job timed out - scheduling deadlock"),
+        }
+
+        Ok(())
     }
 }
