@@ -26,12 +26,11 @@ use ballista_core::serde::protobuf::{
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
     ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams,
-    GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
-    HeartBeatParams, HeartBeatResult, PollWorkParams, PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
-    execute_query_failure_result, execute_query_result,
+    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
+    PollWorkParams, PollWorkResult, RegisterExecutorParams, RegisterExecutorResult,
+    RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
+    UpdateTaskStatusResult, execute_query_failure_result, execute_query_result,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;

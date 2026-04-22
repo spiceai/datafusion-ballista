@@ -141,10 +141,12 @@ pub(crate) fn construct_distributed_explain_exec(
             vec!["physical_plan", "distributed_plan"],
             vec![&physical_txt, &distributed_txt],
         ),
-        ExplainFormat::Indent | ExplainFormat::PostgresJSON | ExplainFormat::Graphviz => (
-            vec!["logical_plan", "physical_plan", "distributed_plan"],
-            vec![&logical_txt, &physical_txt, &distributed_txt],
-        ),
+        ExplainFormat::Indent | ExplainFormat::PostgresJSON | ExplainFormat::Graphviz => {
+            (
+                vec!["logical_plan", "physical_plan", "distributed_plan"],
+                vec![&logical_txt, &physical_txt, &distributed_txt],
+            )
+        }
     };
 
     // construct list_type from plan_types

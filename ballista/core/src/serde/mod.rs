@@ -197,44 +197,43 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
 
             match wrapper.node {
                 Some(ExtNode::Explain(explain)) => {
-                    if inputs.len() != 1 {
-                        return Err(DataFusionError::Internal(format!(
-                            "BallistaExplainNode expects 1 input, got {}",
-                            inputs.len()
-                        )));
-                    }
-                    let explain_format =
+                    if let Some(explain_format) =
                         BallistaExplainNode::format_from_str(&explain.explain_format)
-                            .ok_or_else(|| {
-                                DataFusionError::Internal(format!(
-                                    "Unknown ExplainFormat: {}",
-                                    explain.explain_format
-                                ))
-                            })?;
-                    // Build the output schema for explain: (plan_type, plan).
-                    let schema = Arc::new(datafusion::common::DFSchema::try_from(
-                        datafusion::arrow::datatypes::Schema::new(vec![
-                            datafusion::arrow::datatypes::Field::new(
-                                "plan_type",
-                                datafusion::arrow::datatypes::DataType::Utf8,
-                                false,
-                            ),
-                            datafusion::arrow::datatypes::Field::new(
-                                "plan",
-                                datafusion::arrow::datatypes::DataType::Utf8,
-                                false,
-                            ),
-                        ]),
-                    )?);
-                    let node = BallistaExplainNode {
-                        verbose: explain.verbose,
-                        explain_format,
-                        plan: Arc::new(inputs[0].clone()),
-                        schema,
-                    };
-                    return Ok(Extension {
-                        node: Arc::new(node),
-                    });
+                    {
+                        if inputs.len() != 1 {
+                            return Err(DataFusionError::Internal(format!(
+                                "BallistaExplainNode expects 1 input, got {}",
+                                inputs.len()
+                            )));
+                        }
+                        // Build the output schema for explain: (plan_type, plan).
+                        let schema = Arc::new(datafusion::common::DFSchema::try_from(
+                            datafusion::arrow::datatypes::Schema::new(vec![
+                                datafusion::arrow::datatypes::Field::new(
+                                    "plan_type",
+                                    datafusion::arrow::datatypes::DataType::Utf8,
+                                    false,
+                                ),
+                                datafusion::arrow::datatypes::Field::new(
+                                    "plan",
+                                    datafusion::arrow::datatypes::DataType::Utf8,
+                                    false,
+                                ),
+                            ]),
+                        )?);
+                        let node = BallistaExplainNode {
+                            verbose: explain.verbose,
+                            explain_format,
+                            plan: Arc::new(inputs[0].clone()),
+                            schema,
+                        };
+                        return Ok(Extension {
+                            node: Arc::new(node),
+                        });
+                    }
+                    // Unknown explain format likely means this payload decoded
+                    // permissively into the Ballista wrapper by accident. Fall
+                    // through to the default codec instead of erroring.
                 }
                 None => {
                     // Fall through to default codec.
