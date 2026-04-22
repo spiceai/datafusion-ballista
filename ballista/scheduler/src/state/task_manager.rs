@@ -266,11 +266,34 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     ///
     /// A pending task is a task that is available to schedule on an executor
     /// but cannot be scheduled because no resources are available.
+    ///
+    /// NOTE: This method iterates over all active jobs and acquires read locks
+    /// on each execution graph. It should NOT be called frequently (e.g., in a
+    /// hot loop or after every event) as it can cause lock contention with
+    /// concurrent task binding operations.
     pub async fn total_pending_tasks(&self) -> usize {
         let mut total = 0;
         for entry in self.active_job_cache.iter() {
-            let graph = entry.value().execution_graph.read().await;
-            total += graph.available_tasks();
+            // Use a timeout to avoid blocking indefinitely if there's lock contention.
+            // If we can't acquire the lock within the timeout, skip this job's count
+            // rather than blocking the metrics collection.
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                entry.value().execution_graph.read(),
+            )
+            .await
+            {
+                Ok(graph) => {
+                    total += graph.available_tasks();
+                }
+                Err(_) => {
+                    // Lock acquisition timed out, skip this job
+                    trace!(
+                        "Skipping pending task count for job {} due to lock contention",
+                        entry.key()
+                    );
+                }
+            }
         }
         total
     }

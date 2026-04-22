@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod catalog_serialize_ext;
-pub mod remote_function_serialize_ext;
-pub mod remote_scalar_udf;
-pub mod remote_table_provider;
+fn main() {
+    pyo3_build_config::add_extension_module_link_args();
+}

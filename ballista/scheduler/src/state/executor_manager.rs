@@ -119,17 +119,39 @@ impl ExecutorManager {
 
     /// Sends RPC requests to executors to cancel the specified running tasks.
     pub async fn cancel_running_tasks(&self, tasks: Vec<RunningTaskInfo>) -> Result<()> {
-        let mut tasks_to_cancel: HashMap<String, Vec<protobuf::RunningTaskInfo>> =
+        let mut tasks_by_executor: HashMap<String, Vec<RunningTaskInfo>> =
             Default::default();
 
         for task_info in tasks {
-            let infos = tasks_to_cancel.entry(task_info.executor_id).or_default();
-            infos.push(protobuf::RunningTaskInfo {
-                task_id: task_info.task_id as u32,
-                job_id: task_info.job_id,
-                stage_id: task_info.stage_id as u32,
-                partition_id: task_info.partition_id as u32,
-            });
+            tasks_by_executor
+                .entry(task_info.executor_id.clone())
+                .or_default()
+                .push(task_info);
+        }
+
+        if let Some(cancel_callback) = &self.config.on_cancel_tasks {
+            for (executor_id, infos) in tasks_by_executor {
+                cancel_callback(&executor_id, infos);
+            }
+            return Ok(());
+        }
+
+        let mut tasks_to_cancel: HashMap<String, Vec<protobuf::RunningTaskInfo>> =
+            Default::default();
+
+        for (executor_id, infos) in tasks_by_executor {
+            tasks_to_cancel.insert(
+                executor_id,
+                infos
+                    .into_iter()
+                    .map(|task_info| protobuf::RunningTaskInfo {
+                        task_id: task_info.task_id as u32,
+                        job_id: task_info.job_id,
+                        stage_id: task_info.stage_id as u32,
+                        partition_id: task_info.partition_id as u32,
+                    })
+                    .collect(),
+            );
         }
 
         let executor_manager = self.clone();
@@ -483,5 +505,67 @@ impl ExecutorManager {
     #[cfg(test)]
     async fn test_connectivity(_metadata: &ExecutorMetadata) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::memory::InMemoryClusterState;
+
+    #[tokio::test]
+    async fn cancel_running_tasks_uses_callback() {
+        let captured: Arc<std::sync::Mutex<HashMap<String, Vec<RunningTaskInfo>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let callback_capture = Arc::clone(&captured);
+
+        let config = SchedulerConfig {
+            on_cancel_tasks: Some(Arc::new(move |executor_id, tasks| {
+                callback_capture
+                    .lock()
+                    .expect("callback capture lock")
+                    .insert(executor_id.to_string(), tasks);
+            })),
+            ..SchedulerConfig::default()
+        };
+
+        let manager = ExecutorManager::new(
+            Arc::new(InMemoryClusterState::default()),
+            Arc::new(config),
+        );
+
+        let tasks = vec![
+            RunningTaskInfo {
+                task_id: 1,
+                job_id: "job-1".to_string(),
+                stage_id: 1,
+                partition_id: 0,
+                executor_id: "executor-a".to_string(),
+            },
+            RunningTaskInfo {
+                task_id: 2,
+                job_id: "job-1".to_string(),
+                stage_id: 1,
+                partition_id: 1,
+                executor_id: "executor-a".to_string(),
+            },
+            RunningTaskInfo {
+                task_id: 3,
+                job_id: "job-2".to_string(),
+                stage_id: 2,
+                partition_id: 0,
+                executor_id: "executor-b".to_string(),
+            },
+        ];
+
+        manager
+            .cancel_running_tasks(tasks)
+            .await
+            .expect("cancel should succeed");
+
+        let captured = captured.lock().expect("capture lock");
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured.get("executor-a").map(std::vec::Vec::len), Some(2));
+        assert_eq!(captured.get("executor-b").map(std::vec::Vec::len), Some(1));
     }
 }

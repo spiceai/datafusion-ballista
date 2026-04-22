@@ -433,6 +433,8 @@ pub async fn start_executor_process(
                 executor.clone(),
                 default_codec,
                 None,
+                None, // poll_now_notify: not used in standalone executor
+                None, // available_task_slots: use internal semaphore
             )));
         }
     };

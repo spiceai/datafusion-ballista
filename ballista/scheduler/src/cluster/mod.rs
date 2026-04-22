@@ -447,6 +447,7 @@ pub(crate) async fn bind_task_bias(
             continue;
         }
         let mut graph = job_info.execution_graph.write().await;
+
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
         while let Some((running_stage, task_id_gen)) =
@@ -548,6 +549,7 @@ pub(crate) async fn bind_task_round_robin(
             continue;
         }
         let mut graph = job_info.execution_graph.write().await;
+
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
         while let Some((running_stage, task_id_gen)) =

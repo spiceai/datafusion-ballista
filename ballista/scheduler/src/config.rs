@@ -39,6 +39,24 @@ use tonic::transport::{Endpoint, Error as TonicTransportError};
 pub type EndpointOverrideFn =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, TonicTransportError> + Send + Sync>;
 
+/// Callback invoked when new work becomes available for executors.
+///
+/// This is called after:
+/// - A job is submitted and tasks are ready to be scheduled
+/// - Tasks complete and new stages become runnable
+///
+/// This allows external systems to notify executors to poll immediately
+/// rather than waiting for their next poll interval.
+pub type OnWorkAvailableFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Callback invoked when running tasks should be cancelled on an executor.
+///
+/// Arguments are:
+/// - executor_id
+/// - running tasks to cancel on that executor
+pub type OnCancelTasksFn =
+    Arc<dyn Fn(&str, Vec<crate::state::execution_graph::RunningTaskInfo>) + Send + Sync>;
+
 /// Command-line configuration for the scheduler binary.
 #[cfg(feature = "build-binary")]
 #[derive(clap::Parser, Debug)]
@@ -248,6 +266,11 @@ pub struct SchedulerConfig {
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
     /// [SchedulerMetricsCollector] override option
     pub override_metrics_collector: Option<Arc<dyn SchedulerMetricsCollector>>,
+    /// Callback invoked when new work becomes available for executors.
+    /// The string argument is a reason/description for debugging purposes.
+    pub on_work_available: Option<OnWorkAvailableFn>,
+    /// Callback invoked when running tasks should be cancelled on an executor.
+    pub on_cancel_tasks: Option<OnCancelTasksFn>,
 }
 
 impl Default for SchedulerConfig {
@@ -276,6 +299,8 @@ impl Default for SchedulerConfig {
             override_physical_codec: None,
             override_create_grpc_client_endpoint: None,
             override_metrics_collector: None,
+            on_work_available: None,
+            on_cancel_tasks: None,
         }
     }
 }
@@ -527,6 +552,8 @@ impl TryFrom<Config> for SchedulerConfig {
             override_session_builder: None,
             override_create_grpc_client_endpoint: None,
             override_metrics_collector: None,
+            on_work_available: None,
+            on_cancel_tasks: None,
         };
 
         Ok(config)

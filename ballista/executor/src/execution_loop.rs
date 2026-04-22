@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
 /// Main execution loop that polls the scheduler for available tasks.
@@ -70,11 +70,22 @@ const QUIET_AFTER_FAILURES: u32 = 5;
 ///
 /// This function polls the scheduler for new tasks to execute and runs them,
 /// ensuring no more than the configured number of tasks run simultaneously.
+///
+/// # Arguments
+///
+/// * `scheduler` - gRPC client for communicating with the scheduler
+/// * `executor` - The executor instance that runs tasks
+/// * `codec` - Codec for serializing/deserializing plans
+/// * `readiness` - Optional channel to signal when the executor is ready
+/// * `poll_now_notify` - Optional notify to wake the poll loop immediately when new work is available
+/// * `available_task_slots` - Optional semaphore for controlling task concurrency. If None, creates one internally.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
     readiness: Option<OneShotSender<String>>,
+    poll_now_notify: Option<Arc<Notify>>,
+    available_task_slots: Option<Arc<Semaphore>>,
 ) -> Result<(), BallistaError>
 where
     C: tonic::client::GrpcService<tonic::body::Body>,
@@ -89,8 +100,9 @@ where
         .unwrap()
         .clone()
         .into();
-    let available_task_slots =
-        Arc::new(Semaphore::new(executor_specification.task_slots as usize));
+    let available_task_slots = available_task_slots.unwrap_or_else(|| {
+        Arc::new(Semaphore::new(executor_specification.task_slots as usize))
+    });
 
     let (task_status_sender, mut task_status_receiver) =
         std::sync::mpsc::channel::<TaskStatus>();
@@ -264,7 +276,20 @@ where
         }
 
         if !active_job {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Wait for either the poll interval or a poll_now notification
+            match &poll_now_notify {
+                Some(notify) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        () = notify.notified() => {
+                            debug!("Received poll_now notification, polling immediately");
+                        }
+                    }
+                }
+                None => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
 }
