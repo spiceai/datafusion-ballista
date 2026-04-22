@@ -68,7 +68,7 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use super::shuffle_writer_trait::ShuffleWriter;
 
@@ -348,7 +348,30 @@ impl ShuffleWriterExec {
                 now.elapsed().as_secs_f64()
             );
 
-            if use_memory {
+            // Watchdog: log periodically if no progress is made
+            let watchdog_job_id = job_id.clone();
+            let watchdog_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let watchdog_flag_clone = watchdog_flag.clone();
+            let _watchdog = tokio::task::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    if watchdog_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    warn!(
+                        "ShuffleWriter {}/{} partition {}: STALLED - no first batch received after {:.0}s",
+                        watchdog_job_id,
+                        stage_id,
+                        input_partition,
+                        now.elapsed().as_secs_f64()
+                    );
+                }
+            });
+
+            let result = if use_memory {
                 // Use in-memory shuffle storage with configurable format
                 Self::execute_shuffle_write_memory(
                     &job_id,
@@ -393,7 +416,9 @@ impl ShuffleWriterExec {
                     file_ext,
                 )
                 .await
-            }
+            };
+            watchdog_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
         }
     }
 
@@ -470,9 +495,25 @@ impl ShuffleWriterExec {
                 )?;
 
                 let schema = stream.schema();
+                let mut batch_count: u64 = 0;
+                let mut total_rows: u64 = 0;
 
                 while let Some(result) = stream.next().await {
                     let input_batch = result?;
+                    batch_count += 1;
+                    total_rows += input_batch.num_rows() as u64;
+                    if batch_count == 1 {
+                        info!(
+                            "ShuffleWriter partition {input_partition}: received first batch ({} rows) after {:.2}s",
+                            input_batch.num_rows(),
+                            now.elapsed().as_secs_f64()
+                        );
+                    } else if batch_count % 100 == 0 {
+                        info!(
+                            "ShuffleWriter partition {input_partition}: processed {batch_count} batches ({total_rows} rows) in {:.2}s",
+                            now.elapsed().as_secs_f64()
+                        );
+                    }
 
                     write_metrics.input_rows.add(input_batch.num_rows());
 

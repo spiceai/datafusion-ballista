@@ -170,7 +170,8 @@ impl ExecutionPlan for ShuffleReaderExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
-        info!("ShuffleReaderExec::execute({task_id}) partition={partition}, num_locations={}, stage_id={}",
+        info!(
+            "ShuffleReaderExec::execute({task_id}) partition={partition}, num_locations={}, stage_id={}",
             self.partition.get(partition).map(|p| p.len()).unwrap_or(0),
             self.stage_id,
         );
@@ -496,7 +497,10 @@ fn send_fetch_partitions(
     );
     info!(
         "send_fetch_partitions: {} total locations (memory={}, local={}, object_store={}, remote={})",
-        locations.memory.len() + locations.local.len() + locations.object_store.len() + locations.remote.len(),
+        locations.memory.len()
+            + locations.local.len()
+            + locations.object_store.len()
+            + locations.remote.len(),
         locations.memory.len(),
         locations.local.len(),
         locations.object_store.len(),
@@ -522,8 +526,18 @@ fn send_fetch_partitions(
     let customize_endpoint_c = customize_endpoint.clone();
     let metrics_callback_c = metrics_callback.clone();
     let local_locations = locations.local;
+    let local_count = local_locations.len();
     spawned_tasks.push(SpawnedTask::spawn(async move {
-        for p in local_locations {
+        for (i, p) in local_locations.into_iter().enumerate() {
+            info!(
+                "fetch_local[{}/{}]: reading {}/{}/{} from {}",
+                i + 1,
+                local_count,
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                p.path
+            );
             let start_time = std::time::Instant::now();
             let r = PartitionReaderEnum::Local
                 .fetch_partition(
@@ -534,6 +548,17 @@ fn send_fetch_partitions(
                     use_tls,
                 )
                 .await;
+            let ok = r.is_ok();
+            info!(
+                "fetch_local[{}/{}]: {}/{}/{} completed in {:.3}s, ok={}",
+                i + 1,
+                local_count,
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                start_time.elapsed().as_secs_f64(),
+                ok
+            );
 
             // Record local read metrics if callback is set and read succeeded
             if r.is_ok()
@@ -712,8 +737,7 @@ async fn fetch_partition_remote(
     let port = metadata.port;
     info!(
         "fetch_partition_remote: fetching {}/{}/{} from {}:{}",
-        partition_id.job_id, partition_id.stage_id, partition_id.partition_id,
-        host, port
+        partition_id.job_id, partition_id.stage_id, partition_id.partition_id, host, port
     );
     let mut ballista_client = BallistaClient::try_new(
         host,
