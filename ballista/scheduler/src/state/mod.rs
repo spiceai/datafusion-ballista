@@ -209,9 +209,35 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
             .await?;
         if binding_result.bound_tasks.is_empty() {
-            debug!("No schedulable tasks found to be launched");
+            info!(
+                "ReviveOffers: no schedulable tasks bound (either no available executor slots or no pending tasks)"
+            );
             return Ok(());
         }
+        info!(
+            "ReviveOffers: bound {} tasks to executors: [{}]",
+            binding_result.bound_tasks.len(),
+            {
+                let mut summary: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (executor_id, task) in &binding_result.bound_tasks {
+                    summary
+                        .entry(executor_id.clone())
+                        .or_default()
+                        .push(format!(
+                            "{}/{}/{}",
+                            task.partition.job_id,
+                            task.partition.stage_id,
+                            task.partition.partition_id
+                        ));
+                }
+                summary
+                    .into_iter()
+                    .map(|(exe, tasks)| format!("{exe}: {tasks:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
 
         // Record shuffle affinity metrics
         for affinity in &binding_result.shuffle_affinity {

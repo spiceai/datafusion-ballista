@@ -376,12 +376,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     .await
                 {
                     Ok(stage_events) => {
-                        info!(
-                            "TaskUpdating from executor {executor_id}: {num_status} tasks processed, \
-                             {} stage events emitted: {:?}",
-                            stage_events.len(),
-                            stage_events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
-                        );
+                        if !stage_events.is_empty() {
+                            info!(
+                                "TaskUpdating from executor {executor_id}: {num_status} tasks processed, \
+                                 {} stage events emitted: {:?}",
+                                stage_events.len(),
+                                stage_events
+                                    .iter()
+                                    .map(|e| format!("{e:?}"))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
 
                         if self.state.config.is_push_staged_scheduling() {
                             event_sender
@@ -409,6 +414,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 }
             }
             QueryStageSchedulerEvent::ReviveOffers => {
+                trace!("Processing ReviveOffers event");
                 self.state.revive_offers(event_sender).await?;
             }
             QueryStageSchedulerEvent::ExecutorLost(executor_id, _) => {

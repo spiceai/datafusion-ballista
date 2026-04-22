@@ -66,7 +66,7 @@ use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use itertools::Itertools;
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use rand::prelude::SliceRandom;
 use rand::rng;
 use tokio::sync::{Semaphore, mpsc};
@@ -170,7 +170,10 @@ impl ExecutionPlan for ShuffleReaderExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
-        debug!("ShuffleReaderExec::execute({task_id})");
+        info!("ShuffleReaderExec::execute({task_id}) partition={partition}, num_locations={}, stage_id={}",
+            self.partition.get(partition).map(|p| p.len()).unwrap_or(0),
+            self.stage_id,
+        );
 
         let config = context.session_config();
 
@@ -491,6 +494,14 @@ fn send_fetch_partitions(
         locations.object_store.len(),
         locations.remote.len()
     );
+    info!(
+        "send_fetch_partitions: {} total locations (memory={}, local={}, object_store={}, remote={})",
+        locations.memory.len() + locations.local.len() + locations.object_store.len() + locations.remote.len(),
+        locations.memory.len(),
+        locations.local.len(),
+        locations.object_store.len(),
+        locations.remote.len()
+    );
 
     // Read memory partitions first (fastest path)
     let response_sender_m = response_sender.clone();
@@ -697,10 +708,13 @@ async fn fetch_partition_remote(
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
-    // TODO for shuffle client connections, we should avoid creating new connections again and again.
-    // And we should also avoid to keep alive too many connections for long time.
     let host = metadata.host.as_str();
     let port = metadata.port;
+    info!(
+        "fetch_partition_remote: fetching {}/{}/{} from {}:{}",
+        partition_id.job_id, partition_id.stage_id, partition_id.partition_id,
+        host, port
+    );
     let mut ballista_client = BallistaClient::try_new(
         host,
         port,

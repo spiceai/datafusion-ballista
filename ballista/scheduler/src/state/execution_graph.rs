@@ -397,18 +397,25 @@ impl StaticExecutionGraph {
         let mut job_err_msg = "".to_owned();
         let mut stage_metrics = StageMetricsInfo::default();
 
-        info!(
-            "Job {job_id} processing_stages_update: resolved_stages={:?}, successful_stages={:?}, \
-             failed_stages={:?}, rollback_running_stages={:?}, resubmit_successful_stages={:?}",
-            updated_stages.resolved_stages,
-            updated_stages.successful_stages,
-            updated_stages.failed_stages.keys().collect::<Vec<_>>(),
-            updated_stages
-                .rollback_running_stages
-                .keys()
-                .collect::<Vec<_>>(),
-            updated_stages.resubmit_successful_stages,
-        );
+        let has_activity = !updated_stages.resolved_stages.is_empty()
+            || !updated_stages.successful_stages.is_empty()
+            || !updated_stages.failed_stages.is_empty()
+            || !updated_stages.rollback_running_stages.is_empty()
+            || !updated_stages.resubmit_successful_stages.is_empty();
+        if has_activity {
+            info!(
+                "Job {job_id} processing_stages_update: resolved_stages={:?}, successful_stages={:?}, \
+                 failed_stages={:?}, rollback_running_stages={:?}, resubmit_successful_stages={:?}",
+                updated_stages.resolved_stages,
+                updated_stages.successful_stages,
+                updated_stages.failed_stages.keys().collect::<Vec<_>>(),
+                updated_stages
+                    .rollback_running_stages
+                    .keys()
+                    .collect::<Vec<_>>(),
+                updated_stages.resubmit_successful_stages,
+            );
+        }
 
         for stage_id in updated_stages.resolved_stages {
             self.resolve_stage(stage_id)?;
@@ -526,7 +533,7 @@ impl StaticExecutionGraph {
                     ExecutionStage::Failed(_) => format!("stage {id}: Failed"),
                 }
             }).collect();
-            info!(
+            debug!(
                 "Job {job_id} no terminal event emitted (not failed, not successful, no newly resolved). Stage states: [{}]",
                 stage_summary.join(", ")
             );
@@ -544,11 +551,19 @@ impl StaticExecutionGraph {
     ) -> Result<Vec<usize>> {
         let mut resolved_stages = vec![];
         let job_id = &self.job_id;
-        info!(
-            "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
-             num_locations={}, output_links={output_links:?}",
-            locations.len()
-        );
+        if is_completed {
+            info!(
+                "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
+                 num_locations={}, output_links={output_links:?}",
+                locations.len()
+            );
+        } else {
+            debug!(
+                "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
+                 num_locations={}, output_links={output_links:?}",
+                locations.len()
+            );
+        }
         if output_links.is_empty() {
             // If `output_links` is empty, then this is a final stage
             self.output_locations.extend(locations);
@@ -569,18 +584,20 @@ impl StaticExecutionGraph {
 
                         // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
                         let resolvable = linked_unresolved_stage.resolvable();
-                        info!(
-                            "Job {job_id} stage {link} (child of {stage_id}): input complete={is_completed}, resolvable={resolvable}, \
-                             inputs_status=[{}]",
-                            linked_unresolved_stage
-                                .inputs
-                                .iter()
-                                .map(|(id, inp)| {
-                                    format!("{id}:complete={}", inp.is_complete())
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+                        if is_completed || resolvable {
+                            info!(
+                                "Job {job_id} stage {link} (child of {stage_id}): input complete={is_completed}, resolvable={resolvable}, \
+                                 inputs_status=[{}]",
+                                linked_unresolved_stage
+                                    .inputs
+                                    .iter()
+                                    .map(|(id, inp)| {
+                                        format!("{id}:complete={}", inp.is_complete())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
                         if resolvable {
                             resolved_stages.push(linked_unresolved_stage.stage_id);
                         }

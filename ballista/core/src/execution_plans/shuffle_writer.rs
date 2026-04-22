@@ -339,7 +339,14 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            info!(
+                "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: creating execution stream"
+            );
             let mut stream = plan.execute(input_partition, context)?;
+            info!(
+                "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: stream created in {:.2}s, starting write (memory={use_memory}, object_store={use_object_store})",
+                now.elapsed().as_secs_f64()
+            );
 
             if use_memory {
                 // Use in-memory shuffle storage with configurable format
