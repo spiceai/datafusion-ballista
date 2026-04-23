@@ -361,12 +361,31 @@ impl ShuffleWriterExec {
                     if watchdog_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
+                    // Probe: spawn a trivial task to check runtime responsiveness
+                    let probe_start = std::time::Instant::now();
+                    let probe = tokio::task::spawn(async { 42u64 });
+                    let probe_ok = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        probe,
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            format!(
+                                "ok in {:.3}ms",
+                                probe_start.elapsed().as_secs_f64() * 1000.0
+                            )
+                        }
+                        Ok(Err(e)) => format!("join error: {e}"),
+                        Err(_) => "TIMEOUT (5s) - runtime may be starved!".to_string(),
+                    };
                     warn!(
-                        "ShuffleWriter {}/{} partition {}: STALLED - no first batch received after {:.0}s",
+                        "ShuffleWriter {}/{} partition {}: STALLED - no first batch received after {:.0}s (runtime probe: {})",
                         watchdog_job_id,
                         stage_id,
                         input_partition,
-                        now.elapsed().as_secs_f64()
+                        now.elapsed().as_secs_f64(),
+                        probe_ok,
                     );
                 }
             });
@@ -498,6 +517,9 @@ impl ShuffleWriterExec {
                 let mut batch_count: u64 = 0;
                 let mut total_rows: u64 = 0;
 
+                info!(
+                    "ShuffleWriter partition {input_partition}: entering write loop, about to poll stream for first batch"
+                );
                 while let Some(result) = stream.next().await {
                     let input_batch = result?;
                     batch_count += 1;

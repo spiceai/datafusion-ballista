@@ -66,11 +66,92 @@ use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use itertools::Itertools;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use rand::prelude::SliceRandom;
 use rand::rng;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+
+/// A stream wrapper that logs when it is first polled and when it first yields data.
+/// This is used to diagnose hangs in the execution pipeline: if "first_poll" appears
+/// but "first_batch" doesn't, the inner stream is stuck.
+struct InstrumentedStream {
+    inner: SendableRecordBatchStream,
+    label: String,
+    first_poll_logged: bool,
+    first_batch_logged: bool,
+    poll_count: u64,
+    start: std::time::Instant,
+}
+
+impl InstrumentedStream {
+    fn new(inner: SendableRecordBatchStream, label: String) -> Self {
+        Self {
+            inner,
+            label,
+            first_poll_logged: false,
+            first_batch_logged: false,
+            poll_count: 0,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Stream for InstrumentedStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if !this.first_poll_logged {
+            this.first_poll_logged = true;
+            info!("InstrumentedStream({}): first poll", this.label);
+        }
+        this.poll_count += 1;
+
+        let result = this.inner.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(Some(Ok(batch))) => {
+                if !this.first_batch_logged {
+                    this.first_batch_logged = true;
+                    info!(
+                        "InstrumentedStream({}): first batch ({} rows) after {:.3}s, {} polls",
+                        this.label,
+                        batch.num_rows(),
+                        this.start.elapsed().as_secs_f64(),
+                        this.poll_count
+                    );
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                warn!(
+                    "InstrumentedStream({}): error after {:.3}s: {}",
+                    this.label,
+                    this.start.elapsed().as_secs_f64(),
+                    e
+                );
+            }
+            Poll::Ready(None) => {
+                info!(
+                    "InstrumentedStream({}): stream ended after {:.3}s, {} polls",
+                    this.label,
+                    this.start.elapsed().as_secs_f64(),
+                    this.poll_count
+                );
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl RecordBatchStream for InstrumentedStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
 
 /// ShuffleReaderExec reads partitions that have already been materialized by a ShuffleWriterExec
 /// being executed by an executor
@@ -231,8 +312,13 @@ impl ExecutionPlan for ShuffleReaderExec {
             response_receiver.try_flatten(),
         ));
 
-        Ok(Box::pin(CoalescedShuffleReaderStream::new(
+        let instrumented = Box::pin(InstrumentedStream::new(
             input_stream,
+            format!("ShuffleReader({task_id}/stg{}/p{partition})", self.stage_id),
+        ));
+
+        Ok(Box::pin(CoalescedShuffleReaderStream::new(
+            instrumented,
             batch_size,
             None,
             &self.metrics,
@@ -528,6 +614,7 @@ fn send_fetch_partitions(
     let local_locations = locations.local;
     let local_count = local_locations.len();
     spawned_tasks.push(SpawnedTask::spawn(async move {
+        info!("fetch_local_task: STARTED, {local_count} local files to read");
         for (i, p) in local_locations.into_iter().enumerate() {
             info!(
                 "fetch_local[{}/{}]: reading {}/{}/{} from {}",
