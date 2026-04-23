@@ -22,6 +22,7 @@ use std::sync::Arc;
 use ballista_core::error::Result;
 use datafusion::arrow::array::{ListArray, ListBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::format::ExplainFormat;
 use datafusion::common::{ScalarValue, UnnestOptions};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, PlanType, StringifiedPlan};
@@ -60,29 +61,64 @@ pub(crate) async fn generate_distributed_explain_plan(
 
 pub(crate) fn extract_logical_and_physical_plans(
     plans: &[StringifiedPlan],
+    format: &ExplainFormat,
 ) -> (String, String) {
-    let logical_txt = plans
-        .iter()
-        .rev()
-        .find(|p| matches!(p.plan_type, PlanType::FinalAnalyzedLogicalPlan))
-        .or_else(|| plans.first())
-        .map(|p| p.plan.to_string())
-        .unwrap_or("logical plan not available".to_string());
+    // For Tree format, DataFusion only emits the physical plan with tree
+    // rendering and omits the logical plan; we mirror that behavior so the
+    // Ballista-rendered table matches DataFusion's `EXPLAIN FORMAT TREE`.
+    match format {
+        ExplainFormat::Tree => {
+            let logical_txt = String::new();
+            let physical_txt = plans
+                .iter()
+                .find(|p| matches!(p.plan_type, PlanType::FinalPhysicalPlan))
+                .map(|p| p.plan.to_string())
+                .unwrap_or_else(|| "<physical plan not available>".to_string());
+            (logical_txt, physical_txt)
+        }
+        ExplainFormat::Indent
+        | ExplainFormat::PostgresJSON
+        | ExplainFormat::Graphviz => {
+            let logical_txt = plans
+                .iter()
+                .rev()
+                .find(|p| matches!(p.plan_type, PlanType::FinalAnalyzedLogicalPlan))
+                .or_else(|| {
+                    // Fall back to the pre-analysis FinalLogicalPlan when
+                    // the analyzed plan is not present.
+                    plans
+                        .iter()
+                        .find(|p| matches!(p.plan_type, PlanType::FinalLogicalPlan))
+                })
+                .or_else(|| plans.first())
+                .map(|p| p.plan.to_string())
+                .unwrap_or_else(|| "logical plan not available".to_string());
 
-    let physical_txt = plans
-        .iter()
-        .find(|p| matches!(p.plan_type, PlanType::FinalPhysicalPlan))
-        .map(|p| p.plan.to_string())
-        .unwrap_or_else(|| "<physical plan not available>".to_string());
+            let physical_txt = plans
+                .iter()
+                .find(|p| matches!(p.plan_type, PlanType::FinalPhysicalPlan))
+                .map(|p| p.plan.to_string())
+                .unwrap_or_else(|| "<physical plan not available>".to_string());
 
-    (logical_txt, physical_txt)
+            (logical_txt, physical_txt)
+        }
+    }
 }
 
 /// Build a distributed explain execution plan that produces a two-column table:
 ///
+/// For Indent / PostgresJSON / Graphviz format:
+///
 /// | plan_type        | plan            |
 /// |------------------|-----------------|
 /// | logical_plan     | logical_txt     |
+/// | physical_plan    | physical_txt    |
+/// | distributed_plan | distributed_txt |
+///
+/// For Tree format (matching DataFusion behavior - logical plan is omitted):
+///
+/// | plan_type        | plan            |
+/// |------------------|-----------------|
 /// | physical_plan    | physical_txt    |
 /// | distributed_plan | distributed_txt |
 ///
@@ -96,28 +132,43 @@ pub(crate) fn construct_distributed_explain_exec(
     logical_txt: String,
     physical_txt: String,
     distributed_txt: String,
+    format: &ExplainFormat,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let place_holder_row: Arc<PlaceholderRowExec> =
         Arc::new(PlaceholderRowExec::new(Arc::new(Schema::empty())));
 
-    // construct list_type as ["logical_plan","physical_plan","distributed_plan"]
+    // Tree format omits the `logical_plan` row to match DataFusion.
+    let (plan_types, plan_texts): (Vec<&str>, Vec<&str>) = match format {
+        ExplainFormat::Tree => (
+            vec!["physical_plan", "distributed_plan"],
+            vec![&physical_txt, &distributed_txt],
+        ),
+        ExplainFormat::Indent
+        | ExplainFormat::PostgresJSON
+        | ExplainFormat::Graphviz => (
+            vec!["logical_plan", "physical_plan", "distributed_plan"],
+            vec![&logical_txt, &physical_txt, &distributed_txt],
+        ),
+    };
+
+    // construct list_type from plan_types
     let mut type_list_builder = ListBuilder::new(StringBuilder::new());
     {
         let vb = type_list_builder.values();
-        vb.append_value("logical_plan");
-        vb.append_value("physical_plan");
-        vb.append_value("distributed_plan");
+        for plan_type in &plan_types {
+            vb.append_value(plan_type);
+        }
     }
     type_list_builder.append(true);
     let list_type_array: Arc<ListArray> = Arc::new(type_list_builder.finish());
 
-    // construct list_plan as [<logical_txt>, <physical_txt>, <distributed_txt>]
+    // construct list_plan from plan_texts
     let mut plan_list_builder = ListBuilder::new(StringBuilder::new());
     {
         let vb = plan_list_builder.values();
-        vb.append_value(&logical_txt);
-        vb.append_value(&physical_txt);
-        vb.append_value(&distributed_txt);
+        for plan_text in &plan_texts {
+            vb.append_value(plan_text);
+        }
     }
     plan_list_builder.append(true);
     let list_plan_array: Arc<ListArray> = Arc::new(plan_list_builder.finish());
