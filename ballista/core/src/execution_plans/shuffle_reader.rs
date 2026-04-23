@@ -107,7 +107,7 @@ impl Stream for InstrumentedStream {
         let this = &mut *self;
         if !this.first_poll_logged {
             this.first_poll_logged = true;
-            info!("InstrumentedStream({}): first poll", this.label);
+            debug!("InstrumentedStream({}): first poll", this.label);
         }
         this.poll_count += 1;
 
@@ -116,7 +116,7 @@ impl Stream for InstrumentedStream {
             Poll::Ready(Some(Ok(batch))) => {
                 if !this.first_batch_logged {
                     this.first_batch_logged = true;
-                    info!(
+                    debug!(
                         "InstrumentedStream({}): first batch ({} rows) after {:.3}s, {} polls",
                         this.label,
                         batch.num_rows(),
@@ -134,7 +134,7 @@ impl Stream for InstrumentedStream {
                 );
             }
             Poll::Ready(None) => {
-                info!(
+                debug!(
                     "InstrumentedStream({}): stream ended after {:.3}s, {} polls",
                     this.label,
                     this.start.elapsed().as_secs_f64(),
@@ -251,7 +251,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
-        info!(
+        debug!(
             "ShuffleReaderExec::execute({task_id}) partition={partition}, num_locations={}, stage_id={}",
             self.partition.get(partition).map(|p| p.len()).unwrap_or(0),
             self.stage_id,
@@ -581,7 +581,7 @@ fn send_fetch_partitions(
         locations.object_store.len(),
         locations.remote.len()
     );
-    info!(
+    debug!(
         "send_fetch_partitions: {} total locations (memory={}, local={}, object_store={}, remote={})",
         locations.memory.len()
             + locations.local.len()
@@ -614,9 +614,9 @@ fn send_fetch_partitions(
     let local_locations = locations.local;
     let local_count = local_locations.len();
     spawned_tasks.push(SpawnedTask::spawn(async move {
-        info!("fetch_local_task: STARTED, {local_count} local files to read");
+        debug!("fetch_local_task: STARTED, {local_count} local files to read");
         for (i, p) in local_locations.into_iter().enumerate() {
-            info!(
+            debug!(
                 "fetch_local[{}/{}]: reading {}/{}/{} from {}",
                 i + 1,
                 local_count,
@@ -636,7 +636,7 @@ fn send_fetch_partitions(
                 )
                 .await;
             let ok = r.is_ok();
-            info!(
+            debug!(
                 "fetch_local[{}/{}]: {}/{}/{} completed in {:.3}s, ok={}",
                 i + 1,
                 local_count,
@@ -822,7 +822,7 @@ async fn fetch_partition_remote(
     let partition_id = &location.partition_id;
     let host = metadata.host.as_str();
     let port = metadata.port;
-    info!(
+    debug!(
         "fetch_partition_remote: fetching {}/{}/{} from {}:{}",
         partition_id.job_id, partition_id.stage_id, partition_id.partition_id, host, port
     );

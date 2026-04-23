@@ -464,11 +464,11 @@ impl ShuffleWriterExec {
                     datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
                 );
             }
-            info!(
+            debug!(
                 "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: creating execution stream"
             );
             let mut stream = plan.execute(input_partition, context)?;
-            info!(
+            debug!(
                 "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: stream created in {:.2}s, starting write (memory={use_memory}, object_store={use_object_store})",
                 now.elapsed().as_secs_f64()
             );
@@ -642,7 +642,7 @@ impl ShuffleWriterExec {
                 let mut batch_count: u64 = 0;
                 let mut total_rows: u64 = 0;
 
-                info!(
+                debug!(
                     "ShuffleWriter partition {input_partition}: entering write loop, about to poll stream for first batch"
                 );
                 while let Some(result) = stream.next().await {
@@ -650,13 +650,13 @@ impl ShuffleWriterExec {
                     batch_count += 1;
                     total_rows += input_batch.num_rows() as u64;
                     if batch_count == 1 {
-                        info!(
+                        debug!(
                             "ShuffleWriter partition {input_partition}: received first batch ({} rows) after {:.2}s",
                             input_batch.num_rows(),
                             now.elapsed().as_secs_f64()
                         );
                     } else if batch_count % 100 == 0 {
-                        info!(
+                        debug!(
                             "ShuffleWriter partition {input_partition}: processed {batch_count} batches ({total_rows} rows) in {:.2}s",
                             now.elapsed().as_secs_f64()
                         );
