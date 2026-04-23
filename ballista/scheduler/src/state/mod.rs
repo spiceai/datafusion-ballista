@@ -43,9 +43,11 @@ use crate::metrics::SchedulerMetricsCollector;
 use crate::state::execution_graph::TaskDescription;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
+use ballista_core::extension::BallistaExplainNode;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::common::format::ExplainFormat;
+use datafusion::logical_expr::{Explain as DFExplain, LogicalPlan};
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::prelude::SessionContext;
@@ -104,6 +106,39 @@ pub fn encode_protobuf<T: Message + Default>(msg: &T) -> Result<Vec<u8>> {
         ))
     })?;
     Ok(value)
+}
+
+/// If the root `LogicalPlan` is a `BallistaExplainNode` extension wrapper,
+/// reconstruct an equivalent native `LogicalPlan::Explain` so the scheduler's
+/// downstream pipeline (which only knows about native `Explain`) can handle
+/// it as usual. Returns `None` if the plan is not the wrapper, in which case
+/// the caller should use the original plan unchanged.
+fn unwrap_ballista_explain(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    let LogicalPlan::Extension(ext) = plan else {
+        return None;
+    };
+    let explain = ext.node.as_any().downcast_ref::<BallistaExplainNode>()?;
+    let explain_format =
+        BallistaExplainNode::format_from_str(&explain.explain_format).unwrap_or_else(
+            || {
+                log::debug!(
+                    "unwrap_ballista_explain: unknown explain_format {:?}, defaulting to Indent",
+                    explain.explain_format
+                );
+                ExplainFormat::Indent
+            },
+        );
+    Some(LogicalPlan::Explain(DFExplain {
+        verbose: explain.verbose,
+        explain_format,
+        plan: explain.plan.clone(),
+        // Repopulated by the physical planner; the wire format does not
+        // carry these and the optimization-success flag is meaningless
+        // before re-optimization.
+        stringified_plans: vec![],
+        schema: explain.schema.clone(),
+        logical_optimization_succeeded: false,
+    }))
 }
 
 /// Shared state for the Ballista scheduler.
@@ -478,6 +513,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
         let start = Instant::now();
+
+        // Unwrap any `BallistaExplainNode` extension that the client used to
+        // preserve `explain_format` through `datafusion-proto` serialization,
+        // restoring a native `LogicalPlan::Explain` so the rest of submit_job
+        // (and DataFusion's physical planner) can handle it normally.
+        let unwrapped_plan = unwrap_ballista_explain(plan);
+        let plan = unwrapped_plan.as_ref().unwrap_or(plan);
+
         if log::max_level() >= log::Level::Debug {
             // optimizing the plan here is redundant because the physical planner will do this again
             // but it is helpful to see what the optimized plan will be
@@ -486,6 +529,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         }
 
         let mut explain_inner_logical_plan: Option<Arc<LogicalPlan>> = None;
+        let mut explain_format: Option<ExplainFormat> = None;
         plan.apply(&mut |plan: &LogicalPlan| {
             if let LogicalPlan::TableScan(scan) = plan {
                 let provider = source_as_provider(&scan.source)?;
@@ -523,6 +567,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 }
             } else if let LogicalPlan::Explain(explain_plan) = plan {
                 explain_inner_logical_plan = Some(explain_plan.plan.clone());
+                explain_format = Some(explain_plan.explain_format.clone());
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
@@ -559,9 +604,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
 
         let explain_distributed_plan = if let Some(inner_lp) = explain_inner_logical_plan
         {
+            // Default to Indent format if explain_format is not set
+            let fmt = explain_format.clone().unwrap_or(ExplainFormat::Indent);
             Some(
-                generate_distributed_explain_plan(job_id, &adjusted_state, inner_lp)
-                    .await?,
+                generate_distributed_explain_plan(
+                    job_id,
+                    &adjusted_state,
+                    inner_lp,
+                    &fmt,
+                )
+                .await?,
             )
         } else {
             None
@@ -572,6 +624,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             "Physical plan: {}",
             DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
         );
+
+        // Default to Indent format if not explicitly an EXPLAIN.
+        let explain_fmt = explain_format.unwrap_or(ExplainFormat::Indent);
 
         let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
             if node.output_partitioning().partition_count() == 0 {
@@ -585,7 +640,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             ) {
                 let plans = explain.stringified_plans();
                 let (logical_txt, physical_txt) =
-                    extract_logical_and_physical_plans(plans);
+                    extract_logical_and_physical_plans(plans, &explain_fmt);
                 let distributed_txt = explain_distributed_plan.clone();
 
                 let replaced: Arc<dyn ExecutionPlan> =
@@ -593,6 +648,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                         logical_txt,
                         physical_txt,
                         distributed_txt,
+                        &explain_fmt,
                     )
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 Ok(Transformed::yes(replaced))

@@ -974,6 +974,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "env_logger",
+ "insta",
  "log",
  "object_store",
  "rstest",
