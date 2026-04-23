@@ -72,6 +72,122 @@ use log::{debug, info, warn};
 
 use super::shuffle_writer_trait::ShuffleWriter;
 
+/// Wraps an ExecutionPlan tree to log every `execute()` call with the node name and partition.
+/// This helps diagnose which nodes in a complex plan are/aren't being executed.
+#[derive(Debug)]
+struct TracingExec {
+    inner: Arc<dyn ExecutionPlan>,
+    label: String,
+    children: Vec<Arc<dyn ExecutionPlan>>,
+}
+
+impl TracingExec {
+    /// Wrap an entire plan tree with tracing. Each node gets a label like "depth.index: NodeName".
+    fn wrap(
+        plan: Arc<dyn ExecutionPlan>,
+        job_id: &str,
+        stage_id: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        Self::wrap_recursive(plan, job_id, stage_id, 0)
+    }
+
+    fn wrap_recursive(
+        plan: Arc<dyn ExecutionPlan>,
+        job_id: &str,
+        stage_id: usize,
+        depth: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let children: Vec<Arc<dyn ExecutionPlan>> = plan
+            .children()
+            .into_iter()
+            .enumerate()
+            .map(|(_i, child)| {
+                Self::wrap_recursive(Arc::clone(child), job_id, stage_id, depth + 1)
+            })
+            .collect();
+
+        let name = plan.name().to_string();
+        let label = format!("{job_id}/{stage_id} d{depth} {name}");
+
+        Arc::new(TracingExec {
+            inner: plan,
+            label,
+            children,
+        })
+    }
+}
+
+impl DisplayAs for TracingExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        self.inner.fmt_as(t, f)
+    }
+}
+
+impl ExecutionPlan for TracingExec {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.children.iter().collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(TracingExec {
+            inner: Arc::clone(&self.inner),
+            label: self.label.clone(),
+            children,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        info!(
+            "TracingExec::execute({}) partition={}",
+            self.label, partition
+        );
+        // Replace children on inner plan with our traced children, then execute
+        let rebuilt = if self.children.is_empty() {
+            Arc::clone(&self.inner)
+        } else {
+            self.inner
+                .clone()
+                .with_new_children(self.children.clone())?
+        };
+        rebuilt.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner.metrics()
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        self.inner.statistics()
+    }
+}
+
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
 /// partition is re-partitioned and streamed to disk in Arrow IPC format. Future stages of the query
@@ -339,6 +455,15 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            // Wrap plan with tracing to log every execute() call
+            let plan = TracingExec::wrap(plan, &job_id, stage_id);
+            // Log the plan tree once (partition 0 only) to help debug execution issues
+            if input_partition == 0 {
+                info!(
+                    "ShuffleWriter {job_id}/{stage_id} plan tree:\n{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                );
+            }
             info!(
                 "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: creating execution stream"
             );
