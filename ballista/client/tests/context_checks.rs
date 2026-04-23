@@ -1150,17 +1150,12 @@ mod supported {
             .unwrap();
 
         let physical_plan_txt = plan_arr.value(0);
-        // Tree format uses box drawing characters like ┌, ─, ┐, │, └, ┘.
-        assert!(
-            physical_plan_txt.contains('┌') || physical_plan_txt.contains('│'),
-            "Expected tree format with box characters in physical_plan, got: {physical_plan_txt}"
-        );
-
         let distributed_plan_txt = plan_arr.value(1);
-        assert!(
-            !distributed_plan_txt.is_empty(),
-            "Expected non-empty distributed_plan"
-        );
+
+        // Snapshot the tree-rendered plans. Both standalone and remote cases
+        // should produce identical output, validating the codec round-trip.
+        insta::assert_snapshot!("explain_format_tree_physical_plan", physical_plan_txt);
+        insta::assert_snapshot!("explain_format_tree_distributed_plan", distributed_plan_txt);
     }
 
     #[rstest]
