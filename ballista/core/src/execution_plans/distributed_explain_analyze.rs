@@ -163,7 +163,12 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedExplainAnalyzeExec
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        assert_eq!(0, partition);
+        if partition != 0 {
+            return internal_err!(
+                "DistributedExplainAnalyzeExec only supports partition 0, got {}",
+                partition
+            );
+        }
 
         let child = Arc::clone(&self.child);
         let scheduler_url = self.scheduler_url.clone();
