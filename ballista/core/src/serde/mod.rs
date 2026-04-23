@@ -852,8 +852,7 @@ mod test {
             plan_message.try_encode(&mut buf).unwrap();
 
             let decoded_message = LogicalPlanNode::try_decode(&buf).unwrap();
-            let decoded =
-                decoded_message.try_into_logical_plan(&ctx, &codec).unwrap();
+            let decoded = decoded_message.try_into_logical_plan(&ctx, &codec).unwrap();
 
             let LogicalPlan::Extension(ext) = &decoded else {
                 panic!("expected Extension, got {decoded:?}");
@@ -889,8 +888,8 @@ mod test {
             ExplainFormat::Graphviz,
         ] {
             let s = BallistaExplainNode::format_as_str(&f);
-            let parsed = BallistaExplainNode::format_from_str(s)
-                .expect("round-trip must succeed");
+            let parsed =
+                BallistaExplainNode::format_from_str(s).expect("round-trip must succeed");
             assert_eq!(parsed, f);
         }
         assert!(BallistaExplainNode::format_from_str("bogus").is_none());

@@ -27,12 +27,12 @@ use ballista_core::serde::protobuf::{
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
     ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams,
-    GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
-    HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
-    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
-    execute_query_failure_result, execute_query_result,
+    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
+    JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
+    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
+    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
+    execute_query_result,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -783,18 +783,17 @@ fn serialize_stage_metrics(
         };
 
         let metrics = if plan.metrics().is_some() {
-            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet =
-                raw_metrics
-                    .get(metric_index)
-                    .ok_or_else(|| {
-                        BallistaError::Internal(format!(
-                            "Missing metrics for operator {} at depth {}",
-                            plan.name(),
-                            depth
-                        ))
-                    })?
-                    .clone()
-                    .try_into()?;
+            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet = raw_metrics
+                .get(metric_index)
+                .ok_or_else(|| {
+                    BallistaError::Internal(format!(
+                        "Missing metrics for operator {} at depth {}",
+                        plan.name(),
+                        depth
+                    ))
+                })?
+                .clone()
+                .try_into()?;
             metric_index += 1;
             metrics.metrics
         } else {

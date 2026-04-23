@@ -520,9 +520,9 @@ mod tests {
         CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryParams,
         ExecuteQueryResult, ExecutorRegistration, ExecutorStoppedParams,
         ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-        GetJobMetricsResult, GetJobStatusParams,
-        GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
-        HeartBeatParams, HeartBeatResult, RegisterExecutorParams, RegisterExecutorResult,
+        GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+        GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams,
+        HeartBeatResult, RegisterExecutorParams, RegisterExecutorResult,
         RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
         UpdateTaskStatusResult,
     };

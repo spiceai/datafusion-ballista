@@ -24,15 +24,15 @@ mod supported {
         standalone_context_with_state,
     };
     use ballista_core::config::BallistaConfig;
-    use datafusion::arrow::array::StringArray;
     use datafusion::arrow::array::Array;
+    use datafusion::arrow::array::StringArray;
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::*;
     use datafusion::{assert_batches_eq, prelude::SessionContext};
     use rstest::*;
-    use std::sync::Arc;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[rstest::fixture]
     fn test_data() -> String {
