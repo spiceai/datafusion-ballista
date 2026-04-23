@@ -821,15 +821,6 @@ impl SessionConfigHelperExt for SessionConfig {
                 "datafusion.optimizer.hash_join_single_partition_threshold_rows",
                 0,
             )
-            // Dynamic filter pushdown for hash joins uses a tokio::sync::Barrier
-            // that expects ALL probe-side partitions to call report_build_data().
-            // In Ballista's distributed execution, each task runs only ONE partition,
-            // so the barrier waits forever for the other partitions that never arrive.
-            // Disable until Ballista can handle the cross-partition synchronization.
-            .set_bool(
-                "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
-                false,
-            )
     }
 }
 
