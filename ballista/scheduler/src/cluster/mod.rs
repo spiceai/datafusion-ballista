@@ -28,7 +28,7 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::Stream;
-use log::{debug, info};
+use log::debug;
 
 use ballista_core::consistent_hash::ConsistentHash;
 use ballista_core::error::Result;
@@ -543,23 +543,11 @@ pub(crate) async fn bind_task_round_robin(
     let mut result = BindingResult::new();
 
     let mut total_slots = slots.iter().fold(0, |acc, s| acc + s.slots);
-    let slot_detail: Vec<String> = slots
-        .iter()
-        .map(|s| format!("{}={}", s.executor_id, s.slots))
-        .collect();
     if total_slots == 0 {
-        info!(
-            "bind_task_round_robin: 0 available executor slots across {} executors [{}]",
-            slots.len(),
-            slot_detail.join(", ")
-        );
+        debug!("Not enough available executor slots for task running!!!");
         return result;
     }
-    info!(
-        "bind_task_round_robin: {total_slots} available slots across {} executors [{}]",
-        slots.len(),
-        slot_detail.join(", ")
-    );
+    debug!("Total slot number is {total_slots}");
 
     // Sort the slots by descending order
     slots.sort_by(|a, b| Ord::cmp(&b.slots, &a.slots));

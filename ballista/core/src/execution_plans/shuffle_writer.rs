@@ -69,217 +69,11 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::RecordBatchStream;
 use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::Stream;
-use log::{debug, info, warn};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use log::{debug, info};
 
 use super::shuffle_writer_trait::ShuffleWriter;
-
-/// Stream wrapper used by TracingExec to log data flow through each plan node.
-/// Logs first_batch and stream_end to identify where data gets stuck.
-struct TracingStream {
-    inner: SendableRecordBatchStream,
-    label: String,
-    partition: usize,
-    batch_count: u64,
-    row_count: u64,
-    first_batch_logged: bool,
-    start: Instant,
-}
-
-impl Stream for TracingStream {
-    type Item = datafusion::error::Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        let result = this.inner.as_mut().poll_next(cx);
-        match &result {
-            Poll::Ready(Some(Ok(batch))) => {
-                this.batch_count += 1;
-                this.row_count += batch.num_rows() as u64;
-                if !this.first_batch_logged {
-                    this.first_batch_logged = true;
-                    info!(
-                        "TracingStream({} p={}): first_batch {} rows after {:.3}s",
-                        this.label,
-                        this.partition,
-                        batch.num_rows(),
-                        this.start.elapsed().as_secs_f64()
-                    );
-                }
-            }
-            Poll::Ready(Some(Err(e))) => {
-                warn!(
-                    "TracingStream({} p={}): error after {:.3}s, {} batches: {}",
-                    this.label,
-                    this.partition,
-                    this.start.elapsed().as_secs_f64(),
-                    this.batch_count,
-                    e
-                );
-            }
-            Poll::Ready(None) => {
-                info!(
-                    "TracingStream({} p={}): ended after {:.3}s, {} batches, {} rows",
-                    this.label,
-                    this.partition,
-                    this.start.elapsed().as_secs_f64(),
-                    this.batch_count,
-                    this.row_count
-                );
-            }
-            Poll::Pending => {}
-        }
-        result
-    }
-}
-
-impl RecordBatchStream for TracingStream {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-}
-
-/// Wraps an ExecutionPlan tree to log every `execute()` call with the node name and partition.
-/// This helps diagnose which nodes in a complex plan are/aren't being executed.
-#[derive(Debug)]
-struct TracingExec {
-    inner: Arc<dyn ExecutionPlan>,
-    label: String,
-    children: Vec<Arc<dyn ExecutionPlan>>,
-}
-
-impl TracingExec {
-    /// Wrap an entire plan tree with tracing. Each node gets a label like "depth.index: NodeName".
-    fn wrap(
-        plan: Arc<dyn ExecutionPlan>,
-        job_id: &str,
-        stage_id: usize,
-    ) -> Arc<dyn ExecutionPlan> {
-        Self::wrap_recursive(plan, job_id, stage_id, 0)
-    }
-
-    fn wrap_recursive(
-        plan: Arc<dyn ExecutionPlan>,
-        job_id: &str,
-        stage_id: usize,
-        depth: usize,
-    ) -> Arc<dyn ExecutionPlan> {
-        let children: Vec<Arc<dyn ExecutionPlan>> = plan
-            .children()
-            .into_iter()
-            .enumerate()
-            .map(|(_i, child)| {
-                Self::wrap_recursive(Arc::clone(child), job_id, stage_id, depth + 1)
-            })
-            .collect();
-
-        let name = plan.name().to_string();
-        let label = format!("{job_id}/{stage_id} d{depth} {name}");
-
-        Arc::new(TracingExec {
-            inner: plan,
-            label,
-            children,
-        })
-    }
-}
-
-impl DisplayAs for TracingExec {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        self.inner.fmt_as(t, f)
-    }
-}
-
-impl ExecutionPlan for TracingExec {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self.inner.as_any()
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        self.inner.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        self.children.iter().collect()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(TracingExec {
-            inner: Arc::clone(&self.inner),
-            label: self.label.clone(),
-            children,
-        }))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        debug!(
-            "TracingExec::execute({}) partition={}",
-            self.label, partition
-        );
-        // Replace children on inner plan with our traced children, then execute
-        let rebuilt = if self.children.is_empty() {
-            Arc::clone(&self.inner)
-        } else {
-            self.inner
-                .clone()
-                .with_new_children(self.children.clone())?
-        };
-        let stream = rebuilt.execute(partition, context)?;
-
-        // Wrap stream for non-ShuffleReaderExec nodes to trace data flow.
-        // ShuffleReaderExec is skipped because CoalescePartitionsExec spawns
-        // one per partition (44+), making it too noisy.
-        let name = self.inner.name();
-        if name == "ShuffleReaderExec" {
-            Ok(stream)
-        } else {
-            Ok(Box::pin(TracingStream {
-                inner: stream,
-                label: self.label.clone(),
-                partition,
-                batch_count: 0,
-                row_count: 0,
-                first_batch_logged: false,
-                start: Instant::now(),
-            }))
-        }
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        self.inner.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        self.inner.statistics()
-    }
-}
 
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
@@ -548,28 +342,26 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
-            // Strip dynamic-filter accumulators from HashJoinExec nodes.
-            // Custom DataFusion builds may re-inject SharedBuildAccumulator
-            // during deserialization. The cross-partition Barrier deadlocks
+            // Reconstruct HashJoinExec nodes via try_new() to strip any
+            // dynamic-filter accumulator (e.g. SharedBuildAccumulator).
+            // The accumulator uses a cross-partition Barrier that deadlocks
             // in Ballista where each task runs a single partition.
-            let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
-                if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
-                    let disp = displayable(node.as_ref()).one_line().to_string();
-                    if disp.contains("accumulator") {
-                        info!(
-                            "ShuffleWriter {job_id}/{stage_id}: stripping accumulator from {disp}"
-                        );
+            // try_new() never adds an accumulator, so this is always safe.
+            let plan = plan
+                .transform_down(&|node: Arc<dyn ExecutionPlan>| {
+                    if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
                         let left = Arc::clone(hj.left());
-                        let left: Arc<dyn ExecutionPlan> =
-                            if *hj.partition_mode() == PartitionMode::CollectLeft
-                                && left.properties().output_partitioning().partition_count() > 1
-                            {
-                                Arc::new(CoalescePartitionsExec::new(left))
-                            } else {
-                                left
-                            };
-                        let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
-                            HashJoinExec::try_new(
+                        let left: Arc<dyn ExecutionPlan> = if *hj.partition_mode()
+                            == PartitionMode::CollectLeft
+                            && left.properties().output_partitioning().partition_count()
+                                > 1
+                        {
+                            Arc::new(CoalescePartitionsExec::new(left))
+                        } else {
+                            left
+                        };
+                        let rebuilt: Arc<dyn ExecutionPlan> =
+                            Arc::new(HashJoinExec::try_new(
                                 left,
                                 Arc::clone(hj.right()),
                                 hj.on().to_vec(),
@@ -578,74 +370,15 @@ impl ShuffleWriterExec {
                                 hj.projection.clone(),
                                 *hj.partition_mode(),
                                 hj.null_equality(),
-                            )?
-                        );
+                            )?);
                         return Ok(Transformed::yes(rebuilt));
                     }
-                }
-                Ok(Transformed::no(node))
-            })?.data;
-            // Wrap plan with tracing to log every execute() call
-            let plan = TracingExec::wrap(plan, &job_id, stage_id);
-            // Log the plan tree once (partition 0 only) to help debug execution issues
-            if input_partition == 0 {
-                info!(
-                    "ShuffleWriter {job_id}/{stage_id} plan tree:\n{}",
-                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-                );
-            }
-            debug!(
-                "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: creating execution stream"
-            );
+                    Ok(Transformed::no(node))
+                })?
+                .data;
             let mut stream = plan.execute(input_partition, context)?;
-            debug!(
-                "ShuffleWriter {job_id}/{stage_id} partition {input_partition}: stream created in {:.2}s, starting write (memory={use_memory}, object_store={use_object_store})",
-                now.elapsed().as_secs_f64()
-            );
 
-            // Watchdog: log periodically if no progress is made
-            let watchdog_job_id = job_id.clone();
-            let watchdog_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let watchdog_flag_clone = watchdog_flag.clone();
-            let _watchdog = tokio::task::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(30));
-                interval.tick().await; // skip first immediate tick
-                loop {
-                    interval.tick().await;
-                    if watchdog_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    // Probe: spawn a trivial task to check runtime responsiveness
-                    let probe_start = std::time::Instant::now();
-                    let probe = tokio::task::spawn(async { 42u64 });
-                    let probe_ok = match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        probe,
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {
-                            format!(
-                                "ok in {:.3}ms",
-                                probe_start.elapsed().as_secs_f64() * 1000.0
-                            )
-                        }
-                        Ok(Err(e)) => format!("join error: {e}"),
-                        Err(_) => "TIMEOUT (5s) - runtime may be starved!".to_string(),
-                    };
-                    warn!(
-                        "ShuffleWriter {}/{} partition {}: STALLED - no first batch received after {:.0}s (runtime probe: {})",
-                        watchdog_job_id,
-                        stage_id,
-                        input_partition,
-                        now.elapsed().as_secs_f64(),
-                        probe_ok,
-                    );
-                }
-            });
-
-            let result = if use_memory {
+            if use_memory {
                 // Use in-memory shuffle storage with configurable format
                 Self::execute_shuffle_write_memory(
                     &job_id,
@@ -690,9 +423,7 @@ impl ShuffleWriterExec {
                     file_ext,
                 )
                 .await
-            };
-            watchdog_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            result
+            }
         }
     }
 
@@ -769,28 +500,9 @@ impl ShuffleWriterExec {
                 )?;
 
                 let schema = stream.schema();
-                let mut batch_count: u64 = 0;
-                let mut total_rows: u64 = 0;
 
-                debug!(
-                    "ShuffleWriter partition {input_partition}: entering write loop, about to poll stream for first batch"
-                );
                 while let Some(result) = stream.next().await {
                     let input_batch = result?;
-                    batch_count += 1;
-                    total_rows += input_batch.num_rows() as u64;
-                    if batch_count == 1 {
-                        debug!(
-                            "ShuffleWriter partition {input_partition}: received first batch ({} rows) after {:.2}s",
-                            input_batch.num_rows(),
-                            now.elapsed().as_secs_f64()
-                        );
-                    } else if batch_count % 100 == 0 {
-                        debug!(
-                            "ShuffleWriter partition {input_partition}: processed {batch_count} batches ({total_rows} rows) in {:.2}s",
-                            now.elapsed().as_secs_f64()
-                        );
-                    }
 
                     write_metrics.input_rows.add(input_batch.num_rows());
 

@@ -66,92 +66,11 @@ use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use itertools::Itertools;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace};
 use rand::prelude::SliceRandom;
 use rand::rng;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-
-/// A stream wrapper that logs when it is first polled and when it first yields data.
-/// This is used to diagnose hangs in the execution pipeline: if "first_poll" appears
-/// but "first_batch" doesn't, the inner stream is stuck.
-struct InstrumentedStream {
-    inner: SendableRecordBatchStream,
-    label: String,
-    first_poll_logged: bool,
-    first_batch_logged: bool,
-    poll_count: u64,
-    start: std::time::Instant,
-}
-
-impl InstrumentedStream {
-    fn new(inner: SendableRecordBatchStream, label: String) -> Self {
-        Self {
-            inner,
-            label,
-            first_poll_logged: false,
-            first_batch_logged: false,
-            poll_count: 0,
-            start: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Stream for InstrumentedStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        if !this.first_poll_logged {
-            this.first_poll_logged = true;
-            debug!("InstrumentedStream({}): first poll", this.label);
-        }
-        this.poll_count += 1;
-
-        let result = this.inner.as_mut().poll_next(cx);
-        match &result {
-            Poll::Ready(Some(Ok(batch))) => {
-                if !this.first_batch_logged {
-                    this.first_batch_logged = true;
-                    debug!(
-                        "InstrumentedStream({}): first batch ({} rows) after {:.3}s, {} polls",
-                        this.label,
-                        batch.num_rows(),
-                        this.start.elapsed().as_secs_f64(),
-                        this.poll_count
-                    );
-                }
-            }
-            Poll::Ready(Some(Err(e))) => {
-                warn!(
-                    "InstrumentedStream({}): error after {:.3}s: {}",
-                    this.label,
-                    this.start.elapsed().as_secs_f64(),
-                    e
-                );
-            }
-            Poll::Ready(None) => {
-                debug!(
-                    "InstrumentedStream({}): stream ended after {:.3}s, {} polls",
-                    this.label,
-                    this.start.elapsed().as_secs_f64(),
-                    this.poll_count
-                );
-            }
-            Poll::Pending => {}
-        }
-        result
-    }
-}
-
-impl RecordBatchStream for InstrumentedStream {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-}
 
 /// ShuffleReaderExec reads partitions that have already been materialized by a ShuffleWriterExec
 /// being executed by an executor
@@ -251,11 +170,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
-        debug!(
-            "ShuffleReaderExec::execute({task_id}) partition={partition}, num_locations={}, stage_id={}",
-            self.partition.get(partition).map(|p| p.len()).unwrap_or(0),
-            self.stage_id,
-        );
+        debug!("ShuffleReaderExec::execute({task_id})");
 
         let config = context.session_config();
 
@@ -312,13 +227,8 @@ impl ExecutionPlan for ShuffleReaderExec {
             response_receiver.try_flatten(),
         ));
 
-        let instrumented = Box::pin(InstrumentedStream::new(
-            input_stream,
-            format!("ShuffleReader({task_id}/stg{}/p{partition})", self.stage_id),
-        ));
-
         Ok(Box::pin(CoalescedShuffleReaderStream::new(
-            instrumented,
+            input_stream,
             batch_size,
             None,
             &self.metrics,
@@ -581,17 +491,6 @@ fn send_fetch_partitions(
         locations.object_store.len(),
         locations.remote.len()
     );
-    debug!(
-        "send_fetch_partitions: {} total locations (memory={}, local={}, object_store={}, remote={})",
-        locations.memory.len()
-            + locations.local.len()
-            + locations.object_store.len()
-            + locations.remote.len(),
-        locations.memory.len(),
-        locations.local.len(),
-        locations.object_store.len(),
-        locations.remote.len()
-    );
 
     // Read memory partitions first (fastest path)
     let response_sender_m = response_sender.clone();
@@ -612,19 +511,8 @@ fn send_fetch_partitions(
     let customize_endpoint_c = customize_endpoint.clone();
     let metrics_callback_c = metrics_callback.clone();
     let local_locations = locations.local;
-    let local_count = local_locations.len();
     spawned_tasks.push(SpawnedTask::spawn(async move {
-        debug!("fetch_local_task: STARTED, {local_count} local files to read");
-        for (i, p) in local_locations.into_iter().enumerate() {
-            debug!(
-                "fetch_local[{}/{}]: reading {}/{}/{} from {}",
-                i + 1,
-                local_count,
-                p.partition_id.job_id,
-                p.partition_id.stage_id,
-                p.partition_id.partition_id,
-                p.path
-            );
+        for p in local_locations {
             let start_time = std::time::Instant::now();
             let r = PartitionReaderEnum::Local
                 .fetch_partition(
@@ -635,17 +523,6 @@ fn send_fetch_partitions(
                     use_tls,
                 )
                 .await;
-            let ok = r.is_ok();
-            debug!(
-                "fetch_local[{}/{}]: {}/{}/{} completed in {:.3}s, ok={}",
-                i + 1,
-                local_count,
-                p.partition_id.job_id,
-                p.partition_id.stage_id,
-                p.partition_id.partition_id,
-                start_time.elapsed().as_secs_f64(),
-                ok
-            );
 
             // Record local read metrics if callback is set and read succeeded
             if r.is_ok()
@@ -820,12 +697,10 @@ async fn fetch_partition_remote(
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
+    // TODO for shuffle client connections, we should avoid creating new connections again and again.
+    // And we should also avoid to keep alive too many connections for long time.
     let host = metadata.host.as_str();
     let port = metadata.port;
-    debug!(
-        "fetch_partition_remote: fetching {}/{}/{} from {}:{}",
-        partition_id.job_id, partition_id.stage_id, partition_id.partition_id, host, port
-    );
     let mut ballista_client = BallistaClient::try_new(
         host,
         port,

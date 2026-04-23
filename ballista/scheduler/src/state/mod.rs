@@ -211,35 +211,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .bind_schedulable_tasks(self.task_manager.get_running_job_cache())
             .await?;
         if binding_result.bound_tasks.is_empty() {
-            info!(
-                "ReviveOffers: no schedulable tasks bound (either no available executor slots or no pending tasks)"
-            );
+            debug!("No schedulable tasks found to be launched");
             return Ok(());
         }
-        info!(
-            "ReviveOffers: bound {} tasks to executors: [{}]",
-            binding_result.bound_tasks.len(),
-            {
-                let mut summary: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for (executor_id, task) in &binding_result.bound_tasks {
-                    summary
-                        .entry(executor_id.clone())
-                        .or_default()
-                        .push(format!(
-                            "{}/{}/{}",
-                            task.partition.job_id,
-                            task.partition.stage_id,
-                            task.partition.partition_id
-                        ));
-                }
-                summary
-                    .into_iter()
-                    .map(|(exe, tasks)| format!("{exe}: {tasks:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        );
 
         // Record shuffle affinity metrics
         for affinity in &binding_result.shuffle_affinity {
@@ -604,66 +578,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             None
         };
 
-        let dyn_filter_cfg = adjusted_state
-            .config()
-            .options()
-            .optimizer
-            .enable_join_dynamic_filter_pushdown;
-        info!(
-            "Job {job_id}: physical planning with enable_join_dynamic_filter_pushdown = {dyn_filter_cfg}"
+        let plan = adjusted_state.create_physical_plan(plan).await?;
+        debug!(
+            "Physical plan: {}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
         );
 
-        let plan = adjusted_state.create_physical_plan(plan).await?;
-        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
-            .indent(false)
-            .to_string();
-        info!("Job {job_id}: physical plan:\n{plan_display}");
-        if plan_display.contains("accumulator") || plan_display.contains("dynamic_filter")
-        {
-            warn!(
-                "Job {job_id}: plan still contains dynamic filter / accumulator markers despite config override!"
-            );
-        }
-
         let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
-            // Strip dynamic-filter accumulators from HashJoinExec nodes.
-            // Custom DataFusion builds may inject SharedBuildAccumulator
-            // with a cross-partition Barrier that deadlocks in Ballista
-            // (each task runs one partition, so the barrier never completes).
-            // Reconstructing via try_new() produces a clean node without
-            // the accumulator.
+            // Reconstruct HashJoinExec nodes via try_new() to strip any
+            // dynamic-filter accumulator (e.g. SharedBuildAccumulator).
+            // The accumulator uses a cross-partition Barrier that deadlocks
+            // in Ballista where each task runs a single partition.
+            // try_new() never adds an accumulator, so this is always safe.
             if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
-                let display = DisplayableExecutionPlan::new(node.as_ref())
-                    .one_line()
-                    .to_string();
-                if display.contains("accumulator") {
-                    info!(
-                        "Job {job_id}: stripping dynamic-filter accumulator from {display}"
-                    );
-                    let left = Arc::clone(hash_join.left());
-                    let left: Arc<dyn ExecutionPlan> =
-                        if *hash_join.partition_mode() == PartitionMode::CollectLeft
-                            && left.properties().output_partitioning().partition_count() > 1
-                        {
-                            Arc::new(CoalescePartitionsExec::new(left))
-                        } else {
-                            left
-                        };
-                    let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
-                        HashJoinExec::try_new(
-                            left,
-                            Arc::clone(hash_join.right()),
-                            hash_join.on().to_vec(),
-                            hash_join.filter().cloned(),
-                            hash_join.join_type(),
-                            hash_join.projection.clone(),
-                            *hash_join.partition_mode(),
-                            hash_join.null_equality(),
-                        )
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                    );
-                    return Ok(Transformed::yes(rebuilt));
-                }
+                let left = Arc::clone(hash_join.left());
+                let left: Arc<dyn ExecutionPlan> = if *hash_join.partition_mode()
+                    == PartitionMode::CollectLeft
+                    && left.properties().output_partitioning().partition_count() > 1
+                {
+                    Arc::new(CoalescePartitionsExec::new(left))
+                } else {
+                    left
+                };
+                let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
+                    HashJoinExec::try_new(
+                        left,
+                        Arc::clone(hash_join.right()),
+                        hash_join.on().to_vec(),
+                        hash_join.filter().cloned(),
+                        hash_join.join_type(),
+                        hash_join.projection.clone(),
+                        *hash_join.partition_mode(),
+                        hash_join.null_equality(),
+                    )
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                );
+                return Ok(Transformed::yes(rebuilt));
             }
             if node.output_partitioning().partition_count() == 0 {
                 let empty: Arc<dyn ExecutionPlan> =

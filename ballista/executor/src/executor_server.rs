@@ -606,10 +606,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
         let mut task_runner_shutdown = shutdown_noti.subscribe_for_shutdown();
         let task_runner_complete = shutdown_noti.shutdown_complete_tx.clone();
         tokio::spawn(async move {
-            info!(
-                "Starting the task runner pool with {} threads",
-                executor_server.executor.concurrent_tasks
-            );
+            info!("Starting the task runner pool");
 
             // Use a dedicated executor for CPU bound tasks so that the main tokio
             // executor can still answer requests even when under load

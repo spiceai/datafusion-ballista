@@ -549,26 +549,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Updates the job state and returns the number of new available tasks.
     pub async fn update_job(&self, job_id: &str) -> Result<usize> {
-        info!("Update active job {job_id}");
+        debug!("Update active job {job_id}");
         if let Some(graph) = self.get_active_execution_graph(job_id) {
             let mut graph = graph.write().await;
 
             let curr_available_tasks = graph.available_tasks();
-            info!("Job {job_id} before revive: available_tasks={curr_available_tasks}");
 
             graph.revive();
-
-            let new_available_tasks = graph.available_tasks();
-            info!(
-                "Job {job_id} after revive: available_tasks={new_available_tasks} (new={})",
-                new_available_tasks - curr_available_tasks
-            );
 
             info!("Saving job with status {:?}", graph.status());
 
             self.state.save_job(job_id, &graph).await?;
 
-            let new_tasks = new_available_tasks - curr_available_tasks;
+            let new_tasks = graph.available_tasks() - curr_available_tasks;
 
             Ok(new_tasks)
         } else {

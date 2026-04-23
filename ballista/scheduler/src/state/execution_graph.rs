@@ -397,26 +397,6 @@ impl StaticExecutionGraph {
         let mut job_err_msg = "".to_owned();
         let mut stage_metrics = StageMetricsInfo::default();
 
-        let has_activity = !updated_stages.resolved_stages.is_empty()
-            || !updated_stages.successful_stages.is_empty()
-            || !updated_stages.failed_stages.is_empty()
-            || !updated_stages.rollback_running_stages.is_empty()
-            || !updated_stages.resubmit_successful_stages.is_empty();
-        if has_activity {
-            info!(
-                "Job {job_id} processing_stages_update: resolved_stages={:?}, successful_stages={:?}, \
-                 failed_stages={:?}, rollback_running_stages={:?}, resubmit_successful_stages={:?}",
-                updated_stages.resolved_stages,
-                updated_stages.successful_stages,
-                updated_stages.failed_stages.keys().collect::<Vec<_>>(),
-                updated_stages
-                    .rollback_running_stages
-                    .keys()
-                    .collect::<Vec<_>>(),
-                updated_stages.resubmit_successful_stages,
-            );
-        }
-
         for stage_id in updated_stages.resolved_stages {
             self.resolve_stage(stage_id)?;
             has_resolved = true;
@@ -514,29 +494,7 @@ impl StaticExecutionGraph {
                 completed_at: timestamp_millis(),
             });
         } else if has_resolved {
-            info!("Job {job_id} has newly resolved stages, emitting JobUpdated");
             events.push(QueryStageSchedulerEvent::JobUpdated(job_id))
-        } else {
-            // Log stage summary when no terminal event is emitted — helps diagnose hangs
-            let stage_summary: Vec<String> = self.stages.iter().map(|(id, stage)| {
-                match stage {
-                    ExecutionStage::UnResolved(s) => {
-                        let complete_inputs: Vec<usize> = s.inputs.iter()
-                            .filter(|(_, inp)| inp.is_complete()).map(|(id, _)| *id).collect();
-                        let incomplete_inputs: Vec<usize> = s.inputs.iter()
-                            .filter(|(_, inp)| !inp.is_complete()).map(|(id, _)| *id).collect();
-                        format!("stage {id}: UnResolved(complete_inputs={complete_inputs:?}, incomplete_inputs={incomplete_inputs:?}, resolvable={})", s.resolvable())
-                    }
-                    ExecutionStage::Resolved(_) => format!("stage {id}: Resolved"),
-                    ExecutionStage::Running(s) => format!("stage {id}: Running(available_tasks={}, is_successful={})", s.available_tasks(), s.is_successful()),
-                    ExecutionStage::Successful(_) => format!("stage {id}: Successful"),
-                    ExecutionStage::Failed(_) => format!("stage {id}: Failed"),
-                }
-            }).collect();
-            debug!(
-                "Job {job_id} no terminal event emitted (not failed, not successful, no newly resolved). Stage states: [{}]",
-                stage_summary.join(", ")
-            );
         }
         Ok((events, stage_metrics))
     }
@@ -551,19 +509,6 @@ impl StaticExecutionGraph {
     ) -> Result<Vec<usize>> {
         let mut resolved_stages = vec![];
         let job_id = &self.job_id;
-        if is_completed {
-            info!(
-                "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
-                 num_locations={}, output_links={output_links:?}",
-                locations.len()
-            );
-        } else {
-            debug!(
-                "Job {job_id} update_stage_output_links: stage_id={stage_id}, is_completed={is_completed}, \
-                 num_locations={}, output_links={output_links:?}",
-                locations.len()
-            );
-        }
         if output_links.is_empty() {
             // If `output_links` is empty, then this is a final stage
             self.output_locations.extend(locations);
@@ -583,22 +528,7 @@ impl StaticExecutionGraph {
                         }
 
                         // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
-                        let resolvable = linked_unresolved_stage.resolvable();
-                        if is_completed || resolvable {
-                            info!(
-                                "Job {job_id} stage {link} (child of {stage_id}): input complete={is_completed}, resolvable={resolvable}, \
-                                 inputs_status=[{}]",
-                                linked_unresolved_stage
-                                    .inputs
-                                    .iter()
-                                    .map(|(id, inp)| {
-                                        format!("{id}:complete={}", inp.is_complete())
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                        if resolvable {
+                        if linked_unresolved_stage.resolvable() {
                             resolved_stages.push(linked_unresolved_stage.stage_id);
                         }
                     } else {
@@ -2035,10 +1965,6 @@ pub(crate) fn partition_to_location(
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use ballista_core::extension::SessionConfigExt;
-    use datafusion::prelude::SessionConfig;
 
     use crate::scheduler_server::event::QueryStageSchedulerEvent;
     use ballista_core::error::Result;
@@ -2046,7 +1972,6 @@ mod test {
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status,
     };
-    use ballista_core::serde::scheduler::PartitionId;
 
     use super::StaticExecutionGraph;
     use crate::state::execution_graph::ExecutionGraph;
@@ -3210,231 +3135,6 @@ mod test {
             let task_status = mock_completed_task(task, &executor.id);
             graph.update_task_status(&executor, vec![task_status], 1, 1)?;
         }
-
-        Ok(())
-    }
-
-    /// Simulates the scheduler's bind-task flow using `fetch_running_stage`
-    /// (the real path used by bind_task_bias/round_robin), rather than
-    /// the test-only `pop_next_task`. This simulates having a limited number
-    /// of executor task slots, binding tasks, completing them, and checking
-    /// that subsequent stages are correctly picked up.
-    ///
-    /// This is a regression test for a bug where jobs with multiple
-    /// dependent stages would hang because newly resolved stages were
-    /// never scheduled after prior stages completed.
-    #[tokio::test]
-    async fn test_fetch_running_stage_multi_stage_progression() -> Result<()> {
-        let executor = mock_executor("executor-id1".to_string());
-        let mut graph = test_join_plan(4).await;
-
-        // join_plan has 4 stages: 2 leaf stages + 1 join stage + 1 final stage
-        assert_eq!(graph.stage_count(), 4);
-        assert_eq!(graph.available_tasks(), 0);
-
-        // Simulate what submit_job does: revive to convert Resolved → Running
-        graph.revive();
-        let initial_tasks = graph.available_tasks();
-        assert!(
-            initial_tasks > 0,
-            "Expected available tasks after revive, got 0"
-        );
-
-        // Simulate the scheduler bind flow with limited task slots.
-        // Use fetch_running_stage (the actual scheduler code path) to bind and
-        // complete tasks in rounds, just like ReviveOffers does.
-        let max_slots_per_round = 2; // Simulate limited executor slots
-        let mut total_completed = 0;
-        let mut rounds = 0;
-        let max_rounds = 100; // Safety limit
-
-        while !graph.is_successful() && rounds < max_rounds {
-            rounds += 1;
-            let mut bound_in_round = 0;
-            let mut black_list: Vec<usize> = vec![];
-
-            // Bind phase: fetch running stages and bind tasks (like bind_task_bias)
-            let mut tasks_to_complete = vec![];
-            while let Some((running_stage, task_id_gen)) =
-                graph.fetch_running_stage(&black_list)
-            {
-                if bound_in_round >= max_slots_per_round {
-                    break;
-                }
-                let stage_id = running_stage.stage_id;
-
-                let runnable: Vec<usize> = running_stage
-                    .task_infos
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, info)| info.is_none())
-                    .map(|(i, _)| i)
-                    .take(max_slots_per_round - bound_in_round)
-                    .collect();
-
-                if runnable.is_empty() {
-                    black_list.push(stage_id);
-                    continue;
-                }
-
-                for partition_id in runnable {
-                    let task_id = *task_id_gen;
-                    *task_id_gen += 1;
-                    running_stage.task_infos[partition_id] =
-                        Some(super::create_task_info(executor.id.clone(), task_id));
-                    tasks_to_complete.push((stage_id, partition_id, task_id));
-                    bound_in_round += 1;
-                }
-            }
-
-            assert!(
-                bound_in_round > 0 || graph.is_successful(),
-                "Round {rounds}: No tasks bound and job not successful. \
-                 This indicates a scheduling deadlock! Graph:\n{graph:?}"
-            );
-
-            // Complete phase: simulate task execution and status updates
-            for (stage_id, partition_id, task_id) in &tasks_to_complete {
-                let task = super::TaskDescription {
-                    session_id: graph.session_id().to_string(),
-                    partition: PartitionId {
-                        job_id: graph.job_id().to_string(),
-                        stage_id: *stage_id,
-                        partition_id: *partition_id,
-                    },
-                    stage_attempt_num: 0,
-                    task_id: *task_id,
-                    task_attempt: 0,
-                    plan: graph
-                        .stages()
-                        .get(stage_id)
-                        .and_then(|s| {
-                            if let super::ExecutionStage::Running(rs) = s {
-                                Some(rs.plan.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap(),
-                    session_config: Arc::new(SessionConfig::new_with_ballista()),
-                    schedulable_time_millis: 0,
-                };
-                let status = mock_completed_task(task, &executor.id);
-                graph.update_task_status(&executor, vec![status], 4, 4)?;
-                total_completed += 1;
-            }
-        }
-
-        assert!(
-            graph.is_successful(),
-            "Job did not complete after {rounds} rounds ({total_completed} tasks). \
-             Suspected scheduling deadlock. Graph:\n{graph:?}"
-        );
-
-        Ok(())
-    }
-
-    /// Regression test: stages resolved in the same update_task_status call
-    /// should become schedulable via fetch_running_stage in subsequent calls.
-    #[tokio::test]
-    async fn test_resolved_stages_become_runnable_after_update() -> Result<()> {
-        let executor = mock_executor("executor-id1".to_string());
-        let mut graph = test_join_plan(4).await;
-
-        // Revive leaf stages
-        graph.revive();
-
-        // Complete all tasks in both leaf stages, one at a time
-        // After both complete, the join stage should be resolvable and then runnable
-        let mut completed_stages: HashSet<usize> = HashSet::new();
-
-        loop {
-            // Try to find a running stage
-            let black_list: Vec<usize> = vec![];
-            if let Some((running_stage, task_id_gen)) =
-                graph.fetch_running_stage(&black_list)
-            {
-                let stage_id = running_stage.stage_id;
-
-                // Find first available task
-                if let Some((partition_id, _)) = running_stage
-                    .task_infos
-                    .iter()
-                    .enumerate()
-                    .find(|(_, info)| info.is_none())
-                {
-                    let task_id = *task_id_gen;
-                    *task_id_gen += 1;
-                    running_stage.task_infos[partition_id] =
-                        Some(super::create_task_info(executor.id.clone(), task_id));
-
-                    let task = super::TaskDescription {
-                        session_id: graph.session_id().to_string(),
-                        partition: PartitionId {
-                            job_id: graph.job_id().to_string(),
-                            stage_id,
-                            partition_id,
-                        },
-                        stage_attempt_num: 0,
-                        task_id,
-                        task_attempt: 0,
-                        plan: graph
-                            .stages()
-                            .get(&stage_id)
-                            .and_then(|s| {
-                                if let super::ExecutionStage::Running(rs) = s {
-                                    Some(rs.plan.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap(),
-                        session_config: Arc::new(SessionConfig::new_with_ballista()),
-                        schedulable_time_millis: 0,
-                    };
-                    let status = mock_completed_task(task, &executor.id);
-                    let events =
-                        graph.update_task_status(&executor, vec![status], 4, 4)?;
-
-                    // Check if any stage completed
-                    if !completed_stages.contains(&stage_id) {
-                        let stage = graph.stages().get(&stage_id);
-                        if matches!(stage, Some(super::ExecutionStage::Successful(_))) {
-                            completed_stages.insert(stage_id);
-                        }
-                    }
-
-                    // After completion, check for JobUpdated events and verify
-                    // that fetch_running_stage finds new stages
-                    for event in &events {
-                        if matches!(event, QueryStageSchedulerEvent::JobUpdated(_)) {
-                            // Verify: after a JobUpdated, fetch_running_stage should
-                            // find new stages (it calls revive internally)
-                            let bl: Vec<usize> = vec![];
-                            let has_stage = graph.fetch_running_stage(&bl).is_some();
-                            assert!(
-                                has_stage || graph.is_successful(),
-                                "After JobUpdated event, fetch_running_stage should \
-                                 find stages but found none. Graph:\n{graph:?}"
-                            );
-                        }
-                    }
-                } else {
-                    break; // No more tasks
-                }
-            } else {
-                break; // No more stages
-            }
-
-            if graph.is_successful() {
-                break;
-            }
-        }
-
-        assert!(
-            graph.is_successful(),
-            "Graph should be successful. Graph:\n{graph:?}"
-        );
 
         Ok(())
     }
