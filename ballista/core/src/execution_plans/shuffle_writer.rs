@@ -66,11 +66,83 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::RecordBatchStream;
 use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::Stream;
 use log::{debug, info, warn};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use super::shuffle_writer_trait::ShuffleWriter;
+
+/// Stream wrapper used by TracingExec to log data flow through each plan node.
+/// Logs first_batch and stream_end to identify where data gets stuck.
+struct TracingStream {
+    inner: SendableRecordBatchStream,
+    label: String,
+    partition: usize,
+    batch_count: u64,
+    row_count: u64,
+    first_batch_logged: bool,
+    start: Instant,
+}
+
+impl Stream for TracingStream {
+    type Item = datafusion::error::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let result = this.inner.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(Some(Ok(batch))) => {
+                this.batch_count += 1;
+                this.row_count += batch.num_rows() as u64;
+                if !this.first_batch_logged {
+                    this.first_batch_logged = true;
+                    info!(
+                        "TracingStream({} p={}): first_batch {} rows after {:.3}s",
+                        this.label,
+                        this.partition,
+                        batch.num_rows(),
+                        this.start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                warn!(
+                    "TracingStream({} p={}): error after {:.3}s, {} batches: {}",
+                    this.label,
+                    this.partition,
+                    this.start.elapsed().as_secs_f64(),
+                    this.batch_count,
+                    e
+                );
+            }
+            Poll::Ready(None) => {
+                info!(
+                    "TracingStream({} p={}): ended after {:.3}s, {} batches, {} rows",
+                    this.label,
+                    this.partition,
+                    this.start.elapsed().as_secs_f64(),
+                    this.batch_count,
+                    this.row_count
+                );
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl RecordBatchStream for TracingStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
 
 /// Wraps an ExecutionPlan tree to log every `execute()` call with the node name and partition.
 /// This helps diagnose which nodes in a complex plan are/aren't being executed.
@@ -164,7 +236,7 @@ impl ExecutionPlan for TracingExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        info!(
+        debug!(
             "TracingExec::execute({}) partition={}",
             self.label, partition
         );
@@ -176,7 +248,25 @@ impl ExecutionPlan for TracingExec {
                 .clone()
                 .with_new_children(self.children.clone())?
         };
-        rebuilt.execute(partition, context)
+        let stream = rebuilt.execute(partition, context)?;
+
+        // Wrap stream for non-ShuffleReaderExec nodes to trace data flow.
+        // ShuffleReaderExec is skipped because CoalescePartitionsExec spawns
+        // one per partition (44+), making it too noisy.
+        let name = self.inner.name();
+        if name == "ShuffleReaderExec" {
+            Ok(stream)
+        } else {
+            Ok(Box::pin(TracingStream {
+                inner: stream,
+                label: self.label.clone(),
+                partition,
+                batch_count: 0,
+                row_count: 0,
+                first_batch_logged: false,
+                start: Instant::now(),
+            }))
+        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
