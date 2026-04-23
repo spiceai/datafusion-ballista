@@ -600,19 +600,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 } else {
                     left
                 };
-                let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
-                    HashJoinExec::try_new(
-                        left,
-                        Arc::clone(hash_join.right()),
-                        hash_join.on().to_vec(),
-                        hash_join.filter().cloned(),
-                        hash_join.join_type(),
-                        hash_join.projection.clone(),
-                        *hash_join.partition_mode(),
-                        hash_join.null_equality(),
-                    )
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                );
+                let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                    left,
+                    Arc::clone(hash_join.right()),
+                    hash_join.on().to_vec(),
+                    hash_join.filter().cloned(),
+                    hash_join.join_type(),
+                    hash_join.projection.clone(),
+                    *hash_join.partition_mode(),
+                    hash_join.null_equality(),
+                )?);
                 return Ok(Transformed::yes(rebuilt));
             }
             if node.output_partitioning().partition_count() == 0 {
