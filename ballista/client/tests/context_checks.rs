@@ -1155,7 +1155,10 @@ mod supported {
         // Snapshot the tree-rendered plans. Both standalone and remote cases
         // should produce identical output, validating the codec round-trip.
         insta::assert_snapshot!("explain_format_tree_physical_plan", physical_plan_txt);
-        insta::assert_snapshot!("explain_format_tree_distributed_plan", distributed_plan_txt);
+        insta::assert_snapshot!(
+            "explain_format_tree_distributed_plan",
+            distributed_plan_txt
+        );
     }
 
     #[rstest]
