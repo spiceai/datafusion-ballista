@@ -45,6 +45,7 @@ pub(crate) async fn generate_distributed_explain_plan(
     job_id: &str,
     session_state: &SessionState,
     plan: Arc<LogicalPlan>,
+    format: &ExplainFormat,
 ) -> Result<String> {
     let session_config = Arc::new(session_state.config().clone());
 
@@ -56,7 +57,7 @@ pub(crate) async fn generate_distributed_explain_plan(
     let builder = ExecutionStageBuilder::new(session_config.clone());
     let stages = builder.build(shuffle_stages)?;
 
-    Ok(render_stages(stages))
+    Ok(render_stages(stages, format))
 }
 
 pub(crate) fn extract_logical_and_physical_plans(
@@ -226,13 +227,13 @@ pub(crate) fn construct_distributed_explain_exec(
     Ok(Arc::new(CoalescePartitionsExec::new(proj_final)) as Arc<dyn ExecutionPlan>)
 }
 
-fn render_stages(stages: HashMap<usize, ExecutionStage>) -> String {
+fn render_stages(stages: HashMap<usize, ExecutionStage>, format: &ExplainFormat) -> String {
     let mut buf = String::new();
     let mut keys: Vec<_> = stages.keys().cloned().collect();
     keys.sort();
     for k in keys {
         let stage = &stages[&k];
-        writeln!(buf, "{:#?}", stage).ok();
+        writeln!(buf, "{}", stage.format_with(format)).ok();
     }
     buf
 }

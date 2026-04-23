@@ -604,8 +604,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
 
         let explain_distributed_plan = if let Some(inner_lp) = explain_inner_logical_plan
         {
+            // Default to Indent format if explain_format is not set
+            let fmt = explain_format.clone().unwrap_or(ExplainFormat::Indent);
             Some(
-                generate_distributed_explain_plan(job_id, &adjusted_state, inner_lp)
+                generate_distributed_explain_plan(job_id, &adjusted_state, inner_lp, &fmt)
                     .await?,
             )
         } else {
