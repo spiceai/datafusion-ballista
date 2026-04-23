@@ -602,11 +602,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             None
         };
 
-        let plan = adjusted_state.create_physical_plan(plan).await?;
-        debug!(
-            "Physical plan: {}",
-            DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+        let dyn_filter_cfg = adjusted_state
+            .config()
+            .options()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown;
+        info!(
+            "Job {job_id}: physical planning with enable_join_dynamic_filter_pushdown = {dyn_filter_cfg}"
         );
+
+        let plan = adjusted_state.create_physical_plan(plan).await?;
+        let plan_display =
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(false).to_string();
+        info!("Job {job_id}: physical plan:\n{plan_display}");
+        if plan_display.contains("accumulator") || plan_display.contains("dynamic_filter") {
+            warn!("Job {job_id}: plan still contains dynamic filter / accumulator markers despite config override!");
+        }
 
         let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
             if node.output_partitioning().partition_count() == 0 {
