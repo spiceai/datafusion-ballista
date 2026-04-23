@@ -59,7 +59,8 @@ use datafusion::physical_plan::metrics::{
 };
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, displayable,
@@ -558,9 +559,18 @@ impl ShuffleWriterExec {
                         info!(
                             "ShuffleWriter {job_id}/{stage_id}: stripping accumulator from {disp}"
                         );
+                        let left = Arc::clone(hj.left());
+                        let left: Arc<dyn ExecutionPlan> =
+                            if *hj.partition_mode() == PartitionMode::CollectLeft
+                                && left.properties().output_partitioning().partition_count() > 1
+                            {
+                                Arc::new(CoalescePartitionsExec::new(left))
+                            } else {
+                                left
+                            };
                         let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
                             HashJoinExec::try_new(
-                                Arc::clone(hj.left()),
+                                left,
                                 Arc::clone(hj.right()),
                                 hj.on().to_vec(),
                                 hj.filter().cloned(),

@@ -46,9 +46,10 @@ use ballista_core::event_loop::EventSender;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::prelude::SessionContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -639,9 +640,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                     info!(
                         "Job {job_id}: stripping dynamic-filter accumulator from {display}"
                     );
+                    let left = Arc::clone(hash_join.left());
+                    let left: Arc<dyn ExecutionPlan> =
+                        if *hash_join.partition_mode() == PartitionMode::CollectLeft
+                            && left.properties().output_partitioning().partition_count() > 1
+                        {
+                            Arc::new(CoalescePartitionsExec::new(left))
+                        } else {
+                            left
+                        };
                     let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
                         HashJoinExec::try_new(
-                            Arc::clone(hash_join.left()),
+                            left,
                             Arc::clone(hash_join.right()),
                             hash_join.on().to_vec(),
                             hash_join.filter().cloned(),
