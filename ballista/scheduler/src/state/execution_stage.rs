@@ -1340,12 +1340,16 @@ mod tests {
         let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
 
         // Project id and name
-        let projection_exprs: Vec<(Arc<dyn datafusion::physical_plan::PhysicalExpr>, String)> = vec![
+        let projection_exprs: Vec<(
+            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            String,
+        )> = vec![
             (Arc::new(Column::new("id", 0)), "id".to_string()),
             (Arc::new(Column::new("name", 1)), "name".to_string()),
         ];
-        let projection =
-            Arc::new(ProjectionExec::try_new(projection_exprs, sort).expect("projection"));
+        let projection = Arc::new(
+            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
+        );
 
         ResolvedStage::new(
             1,
@@ -1383,12 +1387,16 @@ mod tests {
         .expect("non-empty sort expressions");
         let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
 
-        let projection_exprs: Vec<(Arc<dyn datafusion::physical_plan::PhysicalExpr>, String)> = vec![
+        let projection_exprs: Vec<(
+            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            String,
+        )> = vec![
             (Arc::new(Column::new("id", 0)), "id".to_string()),
             (Arc::new(Column::new("name", 1)), "name".to_string()),
         ];
-        let projection =
-            Arc::new(ProjectionExec::try_new(projection_exprs, sort).expect("projection"));
+        let projection = Arc::new(
+            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
+        );
 
         UnresolvedStage::new(
             1,

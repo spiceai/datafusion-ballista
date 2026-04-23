@@ -77,9 +77,7 @@ pub(crate) fn extract_logical_and_physical_plans(
                 .unwrap_or_else(|| "<physical plan not available>".to_string());
             (logical_txt, physical_txt)
         }
-        ExplainFormat::Indent
-        | ExplainFormat::PostgresJSON
-        | ExplainFormat::Graphviz => {
+        ExplainFormat::Indent | ExplainFormat::PostgresJSON | ExplainFormat::Graphviz => {
             let logical_txt = plans
                 .iter()
                 .rev()
@@ -144,12 +142,12 @@ pub(crate) fn construct_distributed_explain_exec(
             vec!["physical_plan", "distributed_plan"],
             vec![&physical_txt, &distributed_txt],
         ),
-        ExplainFormat::Indent
-        | ExplainFormat::PostgresJSON
-        | ExplainFormat::Graphviz => (
-            vec!["logical_plan", "physical_plan", "distributed_plan"],
-            vec![&logical_txt, &physical_txt, &distributed_txt],
-        ),
+        ExplainFormat::Indent | ExplainFormat::PostgresJSON | ExplainFormat::Graphviz => {
+            (
+                vec!["logical_plan", "physical_plan", "distributed_plan"],
+                vec![&logical_txt, &physical_txt, &distributed_txt],
+            )
+        }
     };
 
     // construct list_type from plan_types
@@ -227,7 +225,10 @@ pub(crate) fn construct_distributed_explain_exec(
     Ok(Arc::new(CoalescePartitionsExec::new(proj_final)) as Arc<dyn ExecutionPlan>)
 }
 
-fn render_stages(stages: HashMap<usize, ExecutionStage>, format: &ExplainFormat) -> String {
+fn render_stages(
+    stages: HashMap<usize, ExecutionStage>,
+    format: &ExplainFormat,
+) -> String {
     let mut buf = String::new();
     let mut keys: Vec<_> = stages.keys().cloned().collect();
     keys.sort();
