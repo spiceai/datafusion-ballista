@@ -58,6 +58,8 @@ use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, displayable,
@@ -545,6 +547,34 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            // Strip dynamic-filter accumulators from HashJoinExec nodes.
+            // Custom DataFusion builds may re-inject SharedBuildAccumulator
+            // during deserialization. The cross-partition Barrier deadlocks
+            // in Ballista where each task runs a single partition.
+            let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
+                if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
+                    let disp = displayable(node.as_ref()).one_line().to_string();
+                    if disp.contains("accumulator") {
+                        info!(
+                            "ShuffleWriter {job_id}/{stage_id}: stripping accumulator from {disp}"
+                        );
+                        let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
+                            HashJoinExec::try_new(
+                                Arc::clone(hj.left()),
+                                Arc::clone(hj.right()),
+                                hj.on().to_vec(),
+                                hj.filter().cloned(),
+                                hj.join_type(),
+                                hj.projection.clone(),
+                                *hj.partition_mode(),
+                                hj.null_equality(),
+                            )?
+                        );
+                        return Ok(Transformed::yes(rebuilt));
+                    }
+                }
+                Ok(Transformed::no(node))
+            })?.data;
             // Wrap plan with tracing to log every execute() call
             let plan = TracingExec::wrap(plan, &job_id, stage_id);
             // Log the plan tree once (partition 0 only) to help debug execution issues
