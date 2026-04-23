@@ -17,7 +17,7 @@
 
 //! `EXPLAIN ANALYZE` for distributed Ballista jobs.
 //!
-//! On the client side, [`BallistaQueryPlanner`] strips `LogicalPlan::Analyze`
+//! On the client side, `BallistaQueryPlanner` strips `LogicalPlan::Analyze`
 //! and runs the inner plan as a regular distributed job wrapped in
 //! [`DistributedExplainAnalyzeExec`]. After the child stream drains (i.e. the
 //! distributed job has succeeded), this exec calls the new
