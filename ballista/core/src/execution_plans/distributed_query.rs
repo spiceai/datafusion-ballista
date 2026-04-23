@@ -49,6 +49,7 @@ use datafusion_proto::logical_plan::{
 };
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, error, info};
+use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -84,6 +85,11 @@ pub struct DistributedQueryExec<T: 'static + AsLogicalPlan> {
     /// - job_execution_time_ms: Time spent executing on the cluster (ended_at - started_at)
     /// - job_scheduling_in_ms: Time job waited in scheduler queue (started_at - queued_at)
     metrics: ExecutionPlanMetricsSet,
+    /// Scheduler-assigned job id, populated once after the query is accepted.
+    /// Read by the parent `DistributedExplainAnalyzeExec` (when present) to
+    /// fetch per-stage metrics via the `GetJobMetrics` RPC after the result
+    /// stream drains.
+    job_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
@@ -105,6 +111,7 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,7 +134,15 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the scheduler-assigned job id once the query has been accepted.
+    /// Returns `None` if `execute` has not yet submitted the query, or if
+    /// submission failed.
+    pub fn job_id(&self) -> Option<String> {
+        self.job_id.lock().clone()
     }
 
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
@@ -197,6 +212,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.plan.schema().as_arrow().clone().into(),
             ),
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -258,6 +274,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                     self.config.default_grpc_client_max_message_size(),
                     GrpcClientConfig::from(&self.config),
                     Arc::new(self.metrics.clone()),
+                    Arc::clone(&self.job_id),
                     partition,
                     session_config,
                 )
@@ -285,6 +302,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                     self.config.default_grpc_client_max_message_size(),
                     GrpcClientConfig::from(&self.config),
                     Arc::new(self.metrics.clone()),
+                    Arc::clone(&self.job_id),
                     partition,
                     session_config,
                 )
@@ -330,6 +348,7 @@ async fn execute_query_pull(
     max_message_size: usize,
     grpc_config: GrpcClientConfig,
     metrics: Arc<ExecutionPlanMetricsSet>,
+    job_id_handle: Arc<Mutex<Option<String>>>,
     partition: usize,
     session_config: SessionConfig,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
@@ -387,6 +406,7 @@ async fn execute_query_pull(
     );
 
     let job_id = query_result.job_id;
+    *job_id_handle.lock() = Some(job_id.clone());
     let mut prev_status: Option<job_status::Status> = None;
 
     loop {
@@ -500,6 +520,7 @@ async fn execute_query_push(
     max_message_size: usize,
     grpc_config: GrpcClientConfig,
     metrics: Arc<ExecutionPlanMetricsSet>,
+    job_id_handle: Arc<Mutex<Option<String>>>,
     partition: usize,
     session_config: SessionConfig,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
@@ -561,6 +582,12 @@ async fn execute_query_push(
             .as_ref()
             .map(|s| s.job_id.to_owned())
             .unwrap_or("unknown_job_id".to_string()); // should not happen
+        if status.is_some() && job_id != "unknown_job_id" {
+            // Best-effort: publish the job id once it's known so a parent
+            // `DistributedExplainAnalyzeExec` can find it. Repeated writes are
+            // cheap and idempotent.
+            *job_id_handle.lock() = Some(job_id.clone());
+        }
         let status = status.and_then(|s| s.status);
         let has_status_change = prev_status != status;
         match status {

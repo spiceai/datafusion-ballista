@@ -519,9 +519,10 @@ mod tests {
         CancelJobParams, CancelJobResult, CleanJobDataParams, CleanJobDataResult,
         CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryParams,
         ExecuteQueryResult, ExecutorRegistration, ExecutorStoppedParams,
-        ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobStatusParams,
-        GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
-        HeartBeatParams, HeartBeatResult, RegisterExecutorParams, RegisterExecutorResult,
+        ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
+        GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+        GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams,
+        HeartBeatResult, RegisterExecutorParams, RegisterExecutorResult,
         RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
         UpdateTaskStatusResult,
     };
@@ -598,6 +599,13 @@ mod tests {
             &self,
             _request: Request<GetJobStatusParams>,
         ) -> Result<Response<GetJobStatusResult>, Status> {
+            Err(Status::unimplemented("not needed for test"))
+        }
+
+        async fn get_job_metrics(
+            &self,
+            _request: Request<GetJobMetricsParams>,
+        ) -> Result<Response<GetJobMetricsResult>, Status> {
             Err(Status::unimplemented("not needed for test"))
         }
 

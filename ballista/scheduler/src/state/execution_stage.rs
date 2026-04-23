@@ -21,6 +21,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use datafusion::common::format::ExplainFormat;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 //use datafusion::physical_optimizer::join_selection::JoinSelection;
@@ -105,6 +106,17 @@ impl ExecutionStage {
             ExecutionStage::Running(stage) => stage.plan.as_ref(),
             ExecutionStage::Successful(stage) => stage.plan.as_ref(),
             ExecutionStage::Failed(stage) => stage.plan.as_ref(),
+        }
+    }
+
+    /// Format the stage with the given explain format (Tree vs Indent)
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        match self {
+            ExecutionStage::UnResolved(s) => s.format_with(format),
+            ExecutionStage::Resolved(s) => s.format_with(format),
+            ExecutionStage::Running(s) => s.format_with(format),
+            ExecutionStage::Successful(s) => s.format_with(format),
+            ExecutionStage::Failed(s) => s.format_with(format),
         }
     }
 }
@@ -426,6 +438,29 @@ impl Debug for UnresolvedStage {
     }
 }
 
+impl UnresolvedStage {
+    /// Format the stage with the given explain format
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        let plan = match format {
+            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .tree_render()
+                .to_string(),
+            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .indent(false)
+                .to_string(),
+        };
+
+        format!(
+            "=========UnResolvedStage[stage_id={}.{}, children={}]=========\nInputs{:?}\n{}",
+            self.stage_id,
+            self.stage_attempt_num,
+            self.inputs.len(),
+            self.inputs,
+            plan
+        )
+    }
+}
+
 impl ResolvedStage {
     /// Creates a new resolved stage ready for task scheduling.
     pub fn new(
@@ -487,6 +522,25 @@ impl Debug for ResolvedStage {
 
         write!(
             f,
+            "=========ResolvedStage[stage_id={}.{}, partitions={}]=========\n{}",
+            self.stage_id, self.stage_attempt_num, self.partitions, plan
+        )
+    }
+}
+
+impl ResolvedStage {
+    /// Format the stage with the given explain format
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        let plan = match format {
+            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .tree_render()
+                .to_string(),
+            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .indent(false)
+                .to_string(),
+        };
+
+        format!(
             "=========ResolvedStage[stage_id={}.{}, partitions={}]=========\n{}",
             self.stage_id, self.stage_attempt_num, self.partitions, plan
         )
@@ -843,6 +897,31 @@ impl Debug for RunningStage {
     }
 }
 
+impl RunningStage {
+    /// Format the stage with the given explain format
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        let plan = match format {
+            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .tree_render()
+                .to_string(),
+            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .indent(false)
+                .to_string(),
+        };
+
+        format!(
+            "=========RunningStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}]=========\n{}",
+            self.stage_id,
+            self.stage_attempt_num,
+            self.partitions,
+            self.successful_tasks(),
+            self.scheduled_tasks(),
+            self.available_tasks(),
+            plan
+        )
+    }
+}
+
 impl SuccessfulStage {
     /// Change to the running state and bump the stage attempt number
     pub fn to_running(&self) -> RunningStage {
@@ -935,6 +1014,29 @@ impl Debug for SuccessfulStage {
     }
 }
 
+impl SuccessfulStage {
+    /// Format the stage with the given explain format
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        let plan = match format {
+            // Tree format doesn't include metrics (DisplayableBallistaExecutionPlan doesn't support tree)
+            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .tree_render()
+                .to_string(),
+            _ => DisplayableBallistaExecutionPlan::new(
+                self.plan.as_ref(),
+                &self.stage_metrics,
+            )
+            .indent()
+            .to_string(),
+        };
+
+        format!(
+            "=========SuccessfulStage[stage_id={}.{}, partitions={}]=========\n{}",
+            self.stage_id, self.stage_attempt_num, self.partitions, plan
+        )
+    }
+}
+
 impl FailedStage {
     /// Returns the number of successful tasks
     pub fn successful_tasks(&self) -> usize {
@@ -970,6 +1072,32 @@ impl Debug for FailedStage {
 
         write!(
             f,
+            "=========FailedStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}, error_message={}]=========\n{}",
+            self.stage_id,
+            self.stage_attempt_num,
+            self.partitions,
+            self.successful_tasks(),
+            self.scheduled_tasks(),
+            self.available_tasks(),
+            self.error_message,
+            plan
+        )
+    }
+}
+
+impl FailedStage {
+    /// Format the stage with the given explain format
+    pub fn format_with(&self, format: &ExplainFormat) -> String {
+        let plan = match format {
+            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .tree_render()
+                .to_string(),
+            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
+                .indent(false)
+                .to_string(),
+        };
+
+        format!(
             "=========FailedStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}, error_message={}]=========\n{}",
             self.stage_id,
             self.stage_attempt_num,
@@ -1059,7 +1187,16 @@ impl StageOutput {
 mod tests {
     use super::*;
     use ballista_core::serde::protobuf::{SuccessfulTask, TaskStatus, task_status};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::expressions::{Column, Literal};
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::prelude::SessionConfig;
     use std::collections::HashMap;
 
@@ -1171,5 +1308,130 @@ mod tests {
 
         // Should gracefully reject the update, not panic.
         assert!(!result);
+    }
+
+    /// Create a resolved stage with a multi-node plan for snapshot testing
+    /// Plan: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
+    fn make_resolved_stage_with_complex_plan() -> ResolvedStage {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Build: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
+        let placeholder = Arc::new(PlaceholderRowExec::new(schema.clone()));
+
+        // Filter: true (always pass)
+        let filter_expr = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let filter = Arc::new(
+            FilterExec::try_new(filter_expr, placeholder).expect("filter creation"),
+        );
+
+        // Coalesce batches
+        let coalesce = Arc::new(CoalesceBatchesExec::new(filter, 8192));
+
+        // Sort by id ASC
+        let sort_exprs = LexOrdering::new(vec![PhysicalSortExpr {
+            expr: Arc::new(Column::new("id", 0)),
+            options: Default::default(),
+        }])
+        .expect("non-empty sort expressions");
+        let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
+
+        // Project id and name
+        let projection_exprs: Vec<(
+            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            String,
+        )> = vec![
+            (Arc::new(Column::new("id", 0)), "id".to_string()),
+            (Arc::new(Column::new("name", 1)), "name".to_string()),
+        ];
+        let projection = Arc::new(
+            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
+        );
+
+        ResolvedStage::new(
+            1,
+            0,
+            projection,
+            vec![],
+            HashMap::new(),
+            HashSet::new(),
+            Arc::new(SessionConfig::default()),
+        )
+    }
+
+    /// Create an unresolved stage with a multi-node plan for snapshot testing
+    /// Plan: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
+    fn make_unresolved_stage_with_complex_plan() -> UnresolvedStage {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let placeholder = Arc::new(PlaceholderRowExec::new(schema.clone()));
+
+        let filter_expr = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let filter = Arc::new(
+            FilterExec::try_new(filter_expr, placeholder).expect("filter creation"),
+        );
+
+        let coalesce = Arc::new(CoalesceBatchesExec::new(filter, 8192));
+
+        let sort_exprs = LexOrdering::new(vec![PhysicalSortExpr {
+            expr: Arc::new(Column::new("id", 0)),
+            options: Default::default(),
+        }])
+        .expect("non-empty sort expressions");
+        let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
+
+        let projection_exprs: Vec<(
+            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            String,
+        )> = vec![
+            (Arc::new(Column::new("id", 0)), "id".to_string()),
+            (Arc::new(Column::new("name", 1)), "name".to_string()),
+        ];
+        let projection = Arc::new(
+            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
+        );
+
+        UnresolvedStage::new(
+            1,
+            projection,
+            vec![],
+            vec![],
+            Arc::new(SessionConfig::default()),
+        )
+    }
+
+    #[test]
+    fn test_resolved_stage_format_tree_snapshot() {
+        let stage = make_resolved_stage_with_complex_plan();
+        let output = stage.format_with(&ExplainFormat::Tree);
+        insta::assert_snapshot!("resolved_stage_tree_format", output);
+    }
+
+    #[test]
+    fn test_resolved_stage_format_indent_snapshot() {
+        let stage = make_resolved_stage_with_complex_plan();
+        let output = stage.format_with(&ExplainFormat::Indent);
+        insta::assert_snapshot!("resolved_stage_indent_format", output);
+    }
+
+    #[test]
+    fn test_unresolved_stage_format_tree_snapshot() {
+        let stage = make_unresolved_stage_with_complex_plan();
+        let output = stage.format_with(&ExplainFormat::Tree);
+        insta::assert_snapshot!("unresolved_stage_tree_format", output);
+    }
+
+    #[test]
+    fn test_unresolved_stage_format_indent_snapshot() {
+        let stage = make_unresolved_stage_with_complex_plan();
+        let output = stage.format_with(&ExplainFormat::Indent);
+        insta::assert_snapshot!("unresolved_stage_indent_format", output);
     }
 }
