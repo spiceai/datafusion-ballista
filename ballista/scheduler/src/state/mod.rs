@@ -48,10 +48,8 @@ use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
 use datafusion::common::format::ExplainFormat;
 use datafusion::logical_expr::{Explain as DFExplain, LogicalPlan};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::prelude::SessionContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -640,33 +638,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         let explain_fmt = explain_format.unwrap_or(ExplainFormat::Indent);
 
         let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
-            // Reconstruct HashJoinExec nodes via try_new() to strip any
-            // dynamic-filter accumulator (e.g. SharedBuildAccumulator).
-            // The accumulator uses a cross-partition Barrier that deadlocks
-            // in Ballista where each task runs a single partition.
-            // try_new() never adds an accumulator, so this is always safe.
-            if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
-                let left = Arc::clone(hash_join.left());
-                let left: Arc<dyn ExecutionPlan> = if *hash_join.partition_mode()
-                    == PartitionMode::CollectLeft
-                    && left.properties().output_partitioning().partition_count() > 1
-                {
-                    Arc::new(CoalescePartitionsExec::new(left))
-                } else {
-                    left
-                };
-                let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
-                    left,
-                    Arc::clone(hash_join.right()),
-                    hash_join.on().to_vec(),
-                    hash_join.filter().cloned(),
-                    hash_join.join_type(),
-                    hash_join.projection.clone(),
-                    *hash_join.partition_mode(),
-                    hash_join.null_equality(),
-                )?);
-                return Ok(Transformed::yes(rebuilt));
-            }
+            let node = match ballista_core::execution_plans::rebuild_hash_join_without_accumulator(node)? {
+                t if t.transformed => return Ok(t),
+                t => t.data,
+            };
             if node.output_partitioning().partition_count() == 0 {
                 let empty: Arc<dyn ExecutionPlan> =
                     Arc::new(EmptyExec::new(node.schema()));
