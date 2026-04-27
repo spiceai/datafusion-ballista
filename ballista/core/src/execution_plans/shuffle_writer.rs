@@ -58,6 +58,7 @@ use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 
+use datafusion::common::tree_node::TreeNode;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics, displayable,
@@ -339,6 +340,9 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            let plan = plan
+                .transform_down(&super::rebuild_hash_join_without_accumulator)?
+                .data;
             let mut stream = plan.execute(input_partition, context)?;
 
             if use_memory {

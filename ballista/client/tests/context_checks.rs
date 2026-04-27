@@ -1109,6 +1109,78 @@ mod supported {
         Ok(())
     }
 
+    /// Regression test: nested CollectLeft HashJoinExec with
+    /// CoalescePartitionsExec should not deadlock.
+    ///
+    /// This reproduces the pattern from TPC-H Q2 where a chain of
+    /// small-table inner joins (region→nation→supplier) is broadcast-joined
+    /// against a large partitioned table (partsupp). The scheduler enables
+    /// CollectLeft for inner joins under the broadcast threshold, and each
+    /// executor task runs exactly ONE partition. If any cross-partition
+    /// synchronisation (e.g. a tokio Barrier) is used in the build-side
+    /// completion path, it will deadlock because only one partition
+    /// participates per task.
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[tokio::test]
+    async fn nested_collect_left_should_not_deadlock(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+        test_data: String,
+    ) -> datafusion::error::Result<()> {
+        // Use alltypes_plain.parquet registered as 3 different tables
+        // to create a nested inner join query where the optimizer
+        // should choose CollectLeft for the small tables.
+        ctx.register_parquet(
+            "fact_table",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        ctx.register_parquet(
+            "dim_a",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        ctx.register_parquet(
+            "dim_b",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        // Query with nested inner joins: dim_b → dim_a → fact_table
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            ctx.sql(
+                "SELECT f.id, a.int_col, b.string_col
+                 FROM fact_table f
+                 INNER JOIN dim_a a ON f.id = a.id
+                 INNER JOIN dim_b b ON a.tinyint_col = b.tinyint_col
+                 ORDER BY f.id
+                 LIMIT 5",
+            )
+            .await?
+            .collect(),
+        )
+        .await
+        .expect("nested CollectLeft joins should complete within 120s, not deadlock");
+
+        let result = result?;
+        // Verify we got results
+        assert!(!result.is_empty(), "query should return results");
+        assert!(
+            result[0].num_rows() > 0,
+            "query should return at least one row"
+        );
+
+        Ok(())
+    }
+
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]

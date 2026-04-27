@@ -593,6 +593,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             .set_u64(
                 "datafusion.optimizer.hash_join_single_partition_threshold_rows",
                 BROADCAST_THRESHOLD_ROWS,
+            )
+            // Dynamic filter pushdown for hash joins may use cross-partition
+            // synchronisation (e.g. tokio::sync::Barrier) that expects ALL
+            // probe-side partitions to report before any can proceed. In
+            // Ballista each task runs a single partition, so the barrier
+            // waits forever. Disable to prevent deadlocks.
+            .set_bool(
+                "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+                false,
             );
 
         // Use the adjusted config for both physical planning, stage resolution,
@@ -629,6 +638,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         let explain_fmt = explain_format.unwrap_or(ExplainFormat::Indent);
 
         let plan = plan.transform_down(&|node: Arc<dyn ExecutionPlan>| {
+            let node = match ballista_core::execution_plans::rebuild_hash_join_without_accumulator(node)? {
+                t if t.transformed => return Ok(t),
+                t => t.data,
+            };
             if node.output_partitioning().partition_count() == 0 {
                 let empty: Arc<dyn ExecutionPlan> =
                     Arc::new(EmptyExec::new(node.schema()));
