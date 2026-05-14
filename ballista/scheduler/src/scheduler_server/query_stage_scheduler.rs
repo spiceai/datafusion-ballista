@@ -90,6 +90,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
         info!("Stopping QueryStageScheduler")
     }
 
+    fn event_label(&self, event: &QueryStageSchedulerEvent) -> &'static str {
+        match event {
+            QueryStageSchedulerEvent::JobQueued { .. } => "JobQueued",
+            QueryStageSchedulerEvent::JobSubmitted { .. } => "JobSubmitted",
+            QueryStageSchedulerEvent::JobPlanningFailed { .. } => "JobPlanningFailed",
+            QueryStageSchedulerEvent::JobFinished { .. } => "JobFinished",
+            QueryStageSchedulerEvent::JobRunningFailed { .. } => "JobRunningFailed",
+            QueryStageSchedulerEvent::JobUpdated(_) => "JobUpdated",
+            QueryStageSchedulerEvent::JobCancel(_) => "JobCancel",
+            QueryStageSchedulerEvent::JobDataClean(_) => "JobDataClean",
+            QueryStageSchedulerEvent::TaskUpdating(_, _) => "TaskUpdating",
+            QueryStageSchedulerEvent::ReviveOffers => "ReviveOffers",
+            QueryStageSchedulerEvent::ExecutorLost(_, _) => "ExecutorLost",
+            QueryStageSchedulerEvent::CancelTasks(_) => "CancelTasks",
+        }
+    }
+
     async fn on_receive(
         &self,
         event: QueryStageSchedulerEvent,
