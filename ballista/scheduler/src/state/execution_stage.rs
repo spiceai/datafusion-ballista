@@ -259,6 +259,14 @@ pub struct FailedStage {
 pub struct TaskInfo {
     /// Unique task identifier within the execution graph.
     pub task_id: usize,
+    /// ID of the executor that ran (or is running) this task.
+    ///
+    /// Carried at the top level so it survives terminal status transitions
+    /// to `Failed` — `FailedTask` does not embed an `executor_id`, so without
+    /// this field the scheduler would lose the executor mapping for any
+    /// failed partition. Populated at task launch and preserved through
+    /// `update_task_info`.
+    pub executor_id: String,
     /// Timestamp when the task was scheduled (in milliseconds since epoch).
     pub scheduled_time: u128,
     /// Timestamp when the task was launched on an executor (in milliseconds since epoch).
@@ -715,9 +723,11 @@ impl RunningStage {
             return false;
         }
         let scheduled_time = task_info.scheduled_time;
+        let executor_id = task_info.executor_id.clone();
         let task_status = status.status.unwrap();
         let updated_task_info = TaskInfo {
             task_id,
+            executor_id,
             scheduled_time,
             launch_time: status.launch_time as u128,
             start_exec_time: status.start_exec_time as u128,
@@ -977,6 +987,7 @@ impl SuccessfulStage {
                 } if *executor == *executor_id => {
                     *task = TaskInfo {
                         task_id: *task_id,
+                        executor_id: executor_id.clone(),
                         scheduled_time: *scheduled_time,
                         launch_time: 0,
                         start_exec_time: 0,
@@ -1256,6 +1267,7 @@ mod tests {
         // Simulate scheduling the task: populate the task slot.
         stage.task_infos[0] = Some(TaskInfo {
             task_id: 0,
+            executor_id: "executor-1".to_string(),
             scheduled_time: 50,
             launch_time: 0,
             start_exec_time: 0,
@@ -1285,6 +1297,7 @@ mod tests {
         for i in 0..2 {
             stage.task_infos[i] = Some(TaskInfo {
                 task_id: i,
+                executor_id: "executor-1".to_string(),
                 scheduled_time: 50,
                 launch_time: 100,
                 start_exec_time: 200,

@@ -1267,6 +1267,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 let task_attempt = stage.task_failure_numbers[partition_id];
                 let task_info = crate::state::execution_graph::TaskInfo {
                     task_id,
+                    executor_id: executor_id.to_owned(),
                     scheduled_time: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
