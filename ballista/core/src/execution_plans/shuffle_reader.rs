@@ -951,11 +951,14 @@ async fn fetch_partition_object_store_with_runtime(
 
     // Get the object store from the RuntimeEnv's registry
     // This uses the credentials configured in the runtime (e.g., SpiceObjectStoreRegistry)
-    let object_store_url = ObjectStoreUrl::parse(&url).map_err(|e| {
-        BallistaError::General(format!(
-            "Failed to parse object store URL '{path}': {e:?}"
-        ))
-    })?;
+    // ObjectStoreUrl::parse rejects anything beyond scheme + authority, so strip the path
+    // (which contains the object key) before parsing.
+    let object_store_url = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to parse object store URL '{path}': {e:?}"
+            ))
+        })?;
 
     let store = runtime_env.object_store(&object_store_url).map_err(|e| {
         BallistaError::FetchFailed(
@@ -2249,5 +2252,26 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Regression test: ObjectStoreUrl::parse rejects URLs containing a path,
+    /// so when resolving the object store for a shuffle file we must strip the
+    /// object key (everything past the authority) before parsing. Without this,
+    /// an S3 shuffle path like `s3://bucket/path/data.arrow` fails with
+    /// "ObjectStoreUrl must only contain scheme and authority".
+    #[test]
+    fn test_object_store_url_strips_path() {
+        let path =
+            "s3://my-bucket/shuffle/job-id/1/4i1vaNv/1/0/data-35.arrow".to_string();
+        let url = Url::parse(&path).unwrap();
+
+        ObjectStoreUrl::parse(&url[..url::Position::BeforePath])
+            .expect("scheme+authority slice must parse as an ObjectStoreUrl");
+
+        assert!(
+            ObjectStoreUrl::parse(url.as_str()).is_err(),
+            "passing the full URL (with object key) should still fail — \
+             this guards the invariant the fix relies on"
+        );
     }
 }
