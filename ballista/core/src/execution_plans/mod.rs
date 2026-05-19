@@ -21,7 +21,7 @@
 mod distributed_explain_analyze;
 mod distributed_query;
 mod shuffle_manager;
-mod shuffle_reader;
+pub(crate) mod shuffle_reader;
 mod shuffle_writer;
 mod shuffle_writer_trait;
 pub mod sort_shuffle;
