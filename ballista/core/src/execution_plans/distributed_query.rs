@@ -769,6 +769,9 @@ async fn fetch_partition(
     .await
     .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
+    // `BallistaClient::fetch_partition` dispatches object-store URLs (s3 / abfs / az / gs)
+    // to the object-store reader, bypassing the gRPC FetchPartition path that only
+    // understands local files and `memory://`.
     let stream = ballista_client
         .fetch_partition(
             &metadata.id,

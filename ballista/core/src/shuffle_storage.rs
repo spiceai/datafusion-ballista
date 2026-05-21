@@ -543,6 +543,30 @@ impl ObjectStoreShuffleStorage {
         }
     }
 
+    /// Constructs an `ObjectStoreShuffleStorage` for tests that need to inject an
+    /// in-memory or other custom `ObjectStore` instead of building an S3 / Azure
+    /// client. Applies the same `PrefixStore` wrapping as the production
+    /// constructors so the test setup matches behaviour.
+    #[doc(hidden)]
+    pub fn new_for_test(
+        inner_store: Arc<dyn ObjectStore>,
+        base_url: String,
+        path_prefix: String,
+        storage_type: ShuffleStorageType,
+    ) -> Self {
+        let store = if path_prefix.is_empty() {
+            inner_store
+        } else {
+            Arc::new(PrefixStore::new(inner_store, path_prefix.clone()))
+        };
+        Self {
+            store,
+            base_url,
+            path_prefix,
+            storage_type,
+        }
+    }
+
     /// Returns a reference to the underlying object store.
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
