@@ -64,7 +64,7 @@ use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use itertools::Itertools;
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use rand::prelude::SliceRandom;
 use rand::rng;
 use tokio::sync::{Semaphore, mpsc};
@@ -168,7 +168,14 @@ impl ExecutionPlan for ShuffleReaderExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
-        debug!("ShuffleReaderExec::execute({task_id})");
+        debug!(
+            target: "ballista_debug",
+            "BALLISTA_DEBUG shuffle_reader_execute task_id={} stage_id={} partition={} input_locations={}",
+            task_id,
+            self.stage_id,
+            partition,
+            self.partition.get(partition).map_or(0, Vec::len)
+        );
 
         let config = context.session_config();
 
@@ -480,12 +487,38 @@ fn send_fetch_partitions(
 
     let locations = split_partition_locations(partition_locations, force_remote_read);
 
-    debug!(
-        "memory shuffle partition count: {}, local shuffle file counts: {}, object store shuffle file count: {}, remote shuffle file count: {}.",
-        locations.memory.len(),
-        locations.local.len(),
-        locations.object_store.len(),
-        locations.remote.len()
+    let memory_count = locations.memory.len();
+    let local_count = locations.local.len();
+    let object_store_count = locations.object_store.len();
+    let remote_count = locations.remote.len();
+    let total_rows: u64 = locations
+        .memory
+        .iter()
+        .chain(locations.local.iter())
+        .chain(locations.object_store.iter())
+        .chain(locations.remote.iter())
+        .map(|p| p.partition_stats.num_rows().unwrap_or(0))
+        .sum();
+    let total_bytes: u64 = locations
+        .memory
+        .iter()
+        .chain(locations.local.iter())
+        .chain(locations.object_store.iter())
+        .chain(locations.remote.iter())
+        .map(|p| p.partition_stats.num_bytes().unwrap_or(0))
+        .sum();
+    info!(
+        target: "ballista_debug",
+        "BALLISTA_DEBUG shuffle_fetch_split memory_count={} local_count={} object_store_count={} remote_count={} total_rows={} total_bytes={} force_remote_read={} flight_transport={} max_request_num={}",
+        memory_count,
+        local_count,
+        object_store_count,
+        remote_count,
+        total_rows,
+        total_bytes,
+        force_remote_read,
+        flight_transport,
+        max_request_num
     );
 
     // Read memory partitions first (fastest path)
@@ -493,9 +526,22 @@ fn send_fetch_partitions(
     let memory_locations = locations.memory;
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in memory_locations {
+            let start_time = std::time::Instant::now();
             let r = PartitionReaderEnum::Memory
                 .fetch_partition(&p, max_message_size, flight_transport, None, false)
                 .await;
+            debug!(
+                target: "ballista_debug",
+                "BALLISTA_DEBUG shuffle_fetch_memory_done job_id={} stage_id={} partition_id={} source_executor_id={} bytes={} rows={} duration_ms={} ok={}",
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                p.executor_meta.id,
+                p.partition_stats.num_bytes().unwrap_or(0),
+                p.partition_stats.num_rows().unwrap_or(0),
+                start_time.elapsed().as_millis(),
+                r.is_ok()
+            );
             if let Err(e) = response_sender_m.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
@@ -538,6 +584,18 @@ fn send_fetch_partitions(
                 );
             }
 
+            debug!(
+                target: "ballista_debug",
+                "BALLISTA_DEBUG shuffle_fetch_local_done job_id={} stage_id={} partition_id={} source_executor_id={} bytes={} rows={} duration_ms={} ok={}",
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                p.executor_meta.id,
+                p.partition_stats.num_bytes().unwrap_or(0),
+                p.partition_stats.num_rows().unwrap_or(0),
+                start_time.elapsed().as_millis(),
+                r.is_ok()
+            );
             if let Err(e) = response_sender_c.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
@@ -549,7 +607,20 @@ fn send_fetch_partitions(
     let object_store_locations = locations.object_store;
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in object_store_locations {
+            let start_time = std::time::Instant::now();
             let r = fetch_partition_object_store_streaming(&p).await;
+            debug!(
+                target: "ballista_debug",
+                "BALLISTA_DEBUG shuffle_fetch_object_store_done job_id={} stage_id={} partition_id={} source_executor_id={} bytes={} rows={} duration_ms={} ok={}",
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                p.executor_meta.id,
+                p.partition_stats.num_bytes().unwrap_or(0),
+                p.partition_stats.num_rows().unwrap_or(0),
+                start_time.elapsed().as_millis(),
+                r.is_ok()
+            );
 
             if let Err(e) = response_sender_os.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
@@ -593,6 +664,19 @@ fn send_fetch_partitions(
                     duration_ms,
                 );
             }
+
+            debug!(
+                target: "ballista_debug",
+                "BALLISTA_DEBUG shuffle_fetch_remote_done job_id={} stage_id={} partition_id={} source_executor_id={} bytes={} rows={} duration_ms={} ok={}",
+                p.partition_id.job_id,
+                p.partition_id.stage_id,
+                p.partition_id.partition_id,
+                p.executor_meta.id,
+                p.partition_stats.num_bytes().unwrap_or(0),
+                p.partition_stats.num_rows().unwrap_or(0),
+                start_time.elapsed().as_millis(),
+                r.is_ok()
+            );
 
             // Block if the channel buffer is full.
             if let Err(e) = response_sender.send(r).await {
@@ -1349,6 +1433,13 @@ struct CoalescedShuffleReaderStream {
     batch_size: usize,
     limit: Option<usize>,
     completed: bool,
+    logged_completion: bool,
+    partition: usize,
+    started: std::time::Instant,
+    input_batches: u64,
+    input_rows: u64,
+    output_batches: u64,
+    output_rows: u64,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -1368,6 +1459,13 @@ impl CoalescedShuffleReaderStream {
             batch_size,
             limit,
             completed: false,
+            logged_completion: false,
+            partition,
+            started: std::time::Instant::now(),
+            input_batches: 0,
+            input_rows: 0,
+            output_batches: 0,
+            output_rows: 0,
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1389,11 +1487,26 @@ impl Stream for CoalescedShuffleReaderStream {
                 && let Some(batch) = coalescer.next_completed_batch()
             {
                 self.baseline_metrics.record_output(batch.num_rows());
+                self.output_batches += 1;
+                self.output_rows += batch.num_rows() as u64;
                 return Poll::Ready(Some(Ok(batch)));
             }
 
             // If the upstream is completed, then it is completed for this stream too
             if self.completed {
+                if !self.logged_completion {
+                    self.logged_completion = true;
+                    info!(
+                        target: "ballista_debug",
+                        "BALLISTA_DEBUG shuffle_reader_stream_done partition={} elapsed_ms={} input_batches={} input_rows={} output_batches={} output_rows={}",
+                        self.partition,
+                        self.started.elapsed().as_millis(),
+                        self.input_batches,
+                        self.input_rows,
+                        self.output_batches,
+                        self.output_rows
+                    );
+                }
                 return Poll::Ready(None);
             }
 
@@ -1410,6 +1523,8 @@ impl Stream for CoalescedShuffleReaderStream {
                 }
                 // If upstream is not completed, then push to coalescer
                 Some(Ok(batch)) => {
+                    self.input_batches += 1;
+                    self.input_rows += batch.num_rows() as u64;
                     if batch.num_rows() > 0 {
                         // Lazily initialize the coalescer from the first
                         // batch's actual schema to avoid type mismatches

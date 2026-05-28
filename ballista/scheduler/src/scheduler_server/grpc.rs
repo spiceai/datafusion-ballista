@@ -62,7 +62,7 @@ use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -89,6 +89,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             task_status,
         } = request.into_inner()
         {
+            let poll_started = Instant::now();
+            let reported_task_statuses = task_status.len();
             trace!("Received poll_work request for {metadata:?}");
             let executor_id = metadata.id.clone();
 
@@ -202,6 +204,40 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                         }
                     }
                 }
+            }
+            if !tasks.is_empty() || reported_task_statuses > 0 {
+                let task_summary = tasks
+                    .iter()
+                    .map(|task| {
+                        format!(
+                            "{}:{}.{}/{}.{},tid={}",
+                            task.job_id,
+                            task.stage_id,
+                            task.stage_attempt_num,
+                            task.partition_id,
+                            task.task_attempt_num,
+                            task.task_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let shuffle_affinity_hits = binding_result
+                    .shuffle_affinity
+                    .iter()
+                    .filter(|affinity| affinity.has_local_data)
+                    .count();
+                info!(
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG scheduler_poll_work executor_id={} poll_ms={} num_free_slots={} reported_task_statuses={} assigned_tasks={} shuffle_affinity_hits={} shuffle_affinity_total={} tasks={}",
+                    executor_id,
+                    poll_started.elapsed().as_millis(),
+                    num_free_slots,
+                    reported_task_statuses,
+                    tasks.len(),
+                    shuffle_affinity_hits,
+                    binding_result.shuffle_affinity.len(),
+                    task_summary
+                );
             }
             let jobs_to_clean = self
                 .state

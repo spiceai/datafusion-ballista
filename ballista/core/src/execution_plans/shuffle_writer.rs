@@ -340,6 +340,25 @@ impl ShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            let shuffle_mode = if use_memory {
+                "memory"
+            } else if use_object_store {
+                storage_type_str.as_str()
+            } else {
+                "local_disk"
+            };
+            info!(
+                target: "ballista_debug",
+                "BALLISTA_DEBUG shuffle_write_start job_id={} stage_id={} input_partition={} shuffle_mode={} shuffle_format={} storage_url={} work_dir={} output_partitioning={:?}",
+                job_id,
+                stage_id,
+                input_partition,
+                shuffle_mode,
+                shuffle_format,
+                storage_url.as_deref().unwrap_or(""),
+                path.display(),
+                output_partitioning
+            );
             let plan = plan
                 .transform_down(&super::rebuild_hash_join_without_accumulator)?
                 .data;
@@ -380,6 +399,8 @@ impl ShuffleWriterExec {
                 // 1. When memory_mode is disabled
                 // 2. For final stages (even if memory_mode is enabled)
                 Self::execute_shuffle_write_disk(
+                    &job_id,
+                    stage_id,
                     path,
                     input_partition,
                     &mut stream,
@@ -397,6 +418,8 @@ impl ShuffleWriterExec {
     /// Executes shuffle write to disk (original behavior).
     #[allow(clippy::too_many_arguments)]
     async fn execute_shuffle_write_disk(
+        job_id: &str,
+        stage_id: usize,
         mut path: PathBuf,
         input_partition: usize,
         stream: &mut std::pin::Pin<
@@ -436,10 +459,16 @@ impl ShuffleWriterExec {
                 timer.done();
 
                 info!(
-                    "Executed partition {} in {} seconds. Statistics: {}",
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG shuffle_write_disk_done job_id={} stage_id={} input_partition={} elapsed_ms={} rows={} batches={} bytes={} path={}",
+                    job_id,
+                    stage_id,
                     input_partition,
-                    now.elapsed().as_secs(),
-                    stats
+                    now.elapsed().as_millis(),
+                    stats.num_rows.unwrap_or(0),
+                    stats.num_batches.unwrap_or(0),
+                    stats.num_bytes.unwrap_or(0),
+                    path
                 );
 
                 Ok(vec![ShuffleWritePartition {
@@ -517,6 +546,9 @@ impl ShuffleWriterExec {
                 }
 
                 let mut part_locs = vec![];
+                let mut total_batches = 0_u64;
+                let mut total_rows = 0_u64;
+                let mut total_bytes = 0_u64;
 
                 for (i, w) in writers.into_iter().enumerate() {
                     if let Some(w) = w {
@@ -527,6 +559,9 @@ impl ShuffleWriterExec {
                             i, w.path, w.num_batches, w.num_rows, num_bytes
                         );
 
+                        total_batches += w.num_batches as u64;
+                        total_rows += w.num_rows as u64;
+                        total_bytes += num_bytes;
                         part_locs.push(ShuffleWritePartition {
                             partition_id: i as u64,
                             path: w.path.to_string_lossy().to_string(),
@@ -536,6 +571,19 @@ impl ShuffleWriterExec {
                         });
                     }
                 }
+                info!(
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG shuffle_write_disk_hash_done job_id={} stage_id={} input_partition={} elapsed_ms={} non_empty_output_partitions={} output_partitions={} rows={} batches={} bytes={}",
+                    job_id,
+                    stage_id,
+                    input_partition,
+                    now.elapsed().as_millis(),
+                    part_locs.len(),
+                    num_output_partitions,
+                    total_rows,
+                    total_batches,
+                    total_bytes
+                );
                 Ok(part_locs)
             }
 

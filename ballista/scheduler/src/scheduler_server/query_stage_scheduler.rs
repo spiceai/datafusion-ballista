@@ -212,7 +212,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 self.metrics_collector
                     .record_submitted(&job_id, queued_at, submitted_at);
 
-                info!("Job {job_id} submitted");
+                info!(
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG scheduler_job_submitted job_id={} queued_ms={}",
+                    job_id,
+                    submitted_at.saturating_sub(queued_at)
+                );
 
                 if self.state.config.is_push_staged_scheduling() {
                     event_sender
@@ -265,7 +270,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 self.metrics_collector
                     .record_completed(&job_id, queued_at, completed_at);
 
-                info!("Job {job_id} success");
+                info!(
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG scheduler_job_finished job_id={} elapsed_ms={}",
+                    job_id,
+                    completed_at.saturating_sub(queued_at)
+                );
 
                 // Persist terminal status BEFORE broadcasting completion so that
                 // subscribers (e.g. SpiceAI's QueryHandle) who receive the
@@ -370,6 +380,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 );
 
                 let num_status = tasks_status.len();
+                if num_status > 0 {
+                    info!(
+                        target: "ballista_debug",
+                        "BALLISTA_DEBUG scheduler_task_updating executor_id={} num_status={}",
+                        executor_id,
+                        num_status
+                    );
+                }
                 if self.state.config.is_push_staged_scheduling() {
                     self.state
                         .executor_manager
@@ -386,6 +404,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                             event_sender
                                 .post_event(QueryStageSchedulerEvent::ReviveOffers)
                                 .await?;
+                        }
+
+                        if !stage_events.is_empty() {
+                            let labels = stage_events
+                                .iter()
+                                .map(|event| self.event_label(event))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            info!(
+                                target: "ballista_debug",
+                                "BALLISTA_DEBUG scheduler_stage_events executor_id={} num_status={} event_count={} events={}",
+                                executor_id,
+                                num_status,
+                                stage_events.len(),
+                                labels
+                            );
                         }
 
                         // Notify external systems when new stages become runnable

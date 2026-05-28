@@ -50,7 +50,7 @@ use std::convert::TryInto;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
@@ -188,11 +188,14 @@ where
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;
 
+        let reported_task_statuses = task_status.len();
+        let free_slots = available_task_slots.available_permits() as u32;
+        let poll_started = Instant::now();
         let poll_work_result: Result<tonic::Response<PollWorkResult>, tonic::Status> =
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_slots: available_task_slots.available_permits() as u32,
+                    num_free_slots: free_slots,
                     task_status,
                 })
                 .await;
@@ -219,6 +222,34 @@ where
                     jobs_to_clean,
                 } = result.into_inner();
                 active_job = !tasks.is_empty();
+
+                if active_job || reported_task_statuses > 0 {
+                    let task_summary = tasks
+                        .iter()
+                        .map(|task| {
+                            format!(
+                                "{}:{}.{}/{}.{},tid={}",
+                                task.job_id,
+                                task.stage_id,
+                                task.stage_attempt_num,
+                                task.partition_id,
+                                task.task_attempt_num,
+                                task.task_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    info!(
+                        target: "ballista_debug",
+                        "BALLISTA_DEBUG executor_poll_work executor_id={} poll_ms={} reported_task_statuses={} requested_free_slots={} assigned_tasks={} tasks={}",
+                        executor.metadata.id,
+                        poll_started.elapsed().as_millis(),
+                        reported_task_statuses,
+                        free_slots,
+                        tasks.len(),
+                        task_summary
+                    );
+                }
 
                 // Clean up any state related to the listed jobs
                 for cleanup in jobs_to_clean {
@@ -381,7 +412,17 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let task_identity = format!(
         "TID {task_id} {job_id}/{stage_id}.{stage_attempt_num}/{partition_id}.{task_attempt_num}"
     );
-    info!("Received task: [{task_identity}]");
+    info!(
+        target: "ballista_debug",
+        "BALLISTA_DEBUG executor_task_received executor_id={} job_id={} stage_id={} stage_attempt_num={} partition_id={} task_id={} task_attempt_num={}",
+        executor.metadata.id,
+        job_id,
+        stage_id,
+        stage_attempt_num,
+        partition_id,
+        task_id,
+        task_attempt_num
+    );
 
     log::trace!(
         "Received task: [{}], task_properties: {:?}",
@@ -408,11 +449,16 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         runtime.clone(),
     ));
 
+    let decode_started = Instant::now();
     let plan: Arc<dyn ExecutionPlan> =
         U::try_decode(task.plan.as_slice()).and_then(|proto| {
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
+    let plan_name = plan.name().to_string();
+    let plan_partitions = plan.properties().output_partitioning().partition_count();
+    let decode_ms = decode_started.elapsed().as_millis();
 
+    let create_stage_started = Instant::now();
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),
         stage_id as usize,
@@ -420,6 +466,21 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         &executor.work_dir,
         task_context.session_config().options(),
     )?;
+    let create_stage_ms = create_stage_started.elapsed().as_millis();
+    info!(
+        target: "ballista_debug",
+        "BALLISTA_DEBUG executor_task_plan_ready executor_id={} job_id={} stage_id={} stage_attempt_num={} partition_id={} task_id={} plan_name={} plan_partitions={} decode_ms={} create_stage_ms={}",
+        executor.metadata.id,
+        job_id,
+        stage_id,
+        stage_attempt_num,
+        partition_id,
+        task_id,
+        plan_name,
+        plan_partitions,
+        decode_ms,
+        create_stage_ms
+    );
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
         let part = PartitionId {
@@ -428,6 +489,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             partition_id: partition_id as usize,
         };
 
+        let execution_started = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
             task_id as usize,
             part.clone(),
@@ -445,7 +507,21 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             }
         };
 
-        info!("Done with task {task_identity}");
+        let execution_ms = execution_started.elapsed().as_millis();
+        let execution_ok = execution_result.is_ok();
+        info!(
+            target: "ballista_debug",
+            "BALLISTA_DEBUG executor_task_done executor_id={} job_id={} stage_id={} stage_attempt_num={} partition_id={} task_id={} task_attempt_num={} execution_ms={} execution_ok={}",
+            executor.metadata.id,
+            job_id,
+            stage_id,
+            stage_attempt_num,
+            partition_id,
+            task_id,
+            task_attempt_num,
+            execution_ms,
+            execution_ok
+        );
         debug!("Statistics: {execution_result:?}");
 
         let plan_metrics = query_stage_exec.collect_plan_metrics();

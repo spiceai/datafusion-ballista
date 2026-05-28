@@ -552,6 +552,14 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             false
         } else {
             for running_stage in running_stages {
+                info!(
+                    target: "ballista_debug",
+                    "BALLISTA_DEBUG scheduler_stage_running job_id={} stage_id={} stage_attempt_num={} partitions={}",
+                    self.job_id(),
+                    running_stage.stage_id,
+                    running_stage.stage_attempt_num,
+                    running_stage.partitions
+                );
                 self.stages.insert(
                     running_stage.stage_id,
                     ExecutionStage::Running(running_stage),
@@ -612,6 +620,35 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 //
 
                 if let ExecutionStage::Running(running_stage) = stage {
+                    let status_count = stage_task_statuses.len();
+                    let successful_count = stage_task_statuses
+                        .iter()
+                        .filter(|status| {
+                            matches!(
+                                status.status,
+                                Some(task_status::Status::Successful(_))
+                            )
+                        })
+                        .count();
+                    let failed_count = stage_task_statuses
+                        .iter()
+                        .filter(|status| {
+                            matches!(status.status, Some(task_status::Status::Failed(_)))
+                        })
+                        .count();
+                    info!(
+                        target: "ballista_debug",
+                        "BALLISTA_DEBUG scheduler_stage_task_statuses job_id={} executor_id={} stage_id={} stage_attempt_num={} status_count={} successful_count={} failed_count={} available_before={} partitions={}",
+                        job_id,
+                        executor.id,
+                        stage_id,
+                        running_stage.stage_attempt_num,
+                        status_count,
+                        successful_count,
+                        failed_count,
+                        running_stage.available_tasks(),
+                        running_stage.partitions
+                    );
                     let mut locations = vec![];
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
@@ -787,6 +824,15 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         && !reset_running_stages.contains_key(&stage_id);
 
                     if is_final_successful {
+                        info!(
+                            target: "ballista_debug",
+                            "BALLISTA_DEBUG scheduler_stage_success job_id={} stage_id={} stage_attempt_num={} partitions={} output_locations={}",
+                            job_id,
+                            stage_id,
+                            running_stage.stage_attempt_num,
+                            running_stage.partitions,
+                            locations.len()
+                        );
                         successful_stages.insert(stage_id);
                         // if this stage is final successful, we want to combine
                         // the stage metrics to plan's metric set and print out the plan
