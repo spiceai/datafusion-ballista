@@ -75,7 +75,7 @@ pub struct DistributedQueryExec<T: 'static + AsLogicalPlan> {
     /// Session id
     session_id: String,
     /// Plan properties
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Execution metrics, currently exposes:
     /// - output_rows: Total number of rows returned
     /// - transferred_bytes: Total bytes transferred from executors
@@ -130,13 +130,13 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
-        PlanProperties::new(
+    fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        )
+        ))
     }
 }
 
@@ -174,7 +174,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         self.plan.schema().as_arrow().clone().into()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -307,7 +307,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         }
     }
 
-    fn statistics(&self) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // This execution plan sends the logical plan to the scheduler without
         // performing the node by node conversion to a full physical plan.
         // This implies that we cannot infer the statistics at this stage.

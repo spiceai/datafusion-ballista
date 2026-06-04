@@ -250,9 +250,10 @@ pub(crate) fn try_collect_left(
                     hash_join.on().to_vec(),
                     hash_join.filter().cloned(),
                     hash_join.join_type(),
-                    hash_join.projection.clone(),
+                    hash_join.projection.as_ref().map(|v| v.to_vec()),
                     PartitionMode::CollectLeft,
                     hash_join.null_equality(),
+                false,
                 )?)))
             }
         }
@@ -262,9 +263,10 @@ pub(crate) fn try_collect_left(
             hash_join.on().to_vec(),
             hash_join.filter().cloned(),
             hash_join.join_type(),
-            hash_join.projection.clone(),
+            hash_join.projection.as_ref().map(|v| v.to_vec()),
             PartitionMode::CollectLeft,
             hash_join.null_equality(),
+        false,
         )?))),
         (false, true) => {
             if hash_join.join_type().supports_swap() {
@@ -297,9 +299,10 @@ pub(crate) fn partitioned_hash_join(
             hash_join.on().to_vec(),
             hash_join.filter().cloned(),
             hash_join.join_type(),
-            hash_join.projection.clone(),
+            hash_join.projection.as_ref().map(|v| v.to_vec()),
             PartitionMode::Partitioned,
             hash_join.null_equality(),
+        false,
         )?))
     }
 }

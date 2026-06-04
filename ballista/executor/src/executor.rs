@@ -493,20 +493,20 @@ mod test {
     /// An ExecutionPlan which will never terminate
     #[derive(Debug)]
     pub struct NeverendingOperator {
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl NeverendingOperator {
         fn new() -> Self {
             NeverendingOperator {
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     datafusion::physical_expr::EquivalenceProperties::new(Arc::new(
                         Schema::empty(),
                     )),
                     Partitioning::UnknownPartitioning(1),
                     datafusion::physical_plan::execution_plan::EmissionType::Incremental,
                     datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-                ),
+                )),
             }
         }
     }
@@ -540,7 +540,7 @@ mod test {
             Arc::new(Schema::empty())
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 

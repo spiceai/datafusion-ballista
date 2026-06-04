@@ -34,7 +34,7 @@ use log::{debug, error};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::io::{BufReader, Cursor};

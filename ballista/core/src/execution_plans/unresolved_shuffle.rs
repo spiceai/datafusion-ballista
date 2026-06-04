@@ -41,18 +41,18 @@ pub struct UnresolvedShuffleExec {
     /// The partition count this node will have once it is replaced with a ShuffleReaderExec.
     pub output_partition_count: usize,
 
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl UnresolvedShuffleExec {
     /// Create a new UnresolvedShuffleExec
     pub fn new(stage_id: usize, schema: SchemaRef, partitioning: Partitioning) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
             partitioning,
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Self {
             stage_id,
             schema,
@@ -100,7 +100,7 @@ impl ExecutionPlan for UnresolvedShuffleExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -132,7 +132,7 @@ impl ExecutionPlan for UnresolvedShuffleExec {
         ))
     }
 
-    fn statistics(&self) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // The full statistics are computed in the `ShuffleReaderExec` node
         // that replaces this one once the previous stage is completed.
         Ok(Statistics::new_unknown(&self.schema()))

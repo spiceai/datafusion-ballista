@@ -105,7 +105,7 @@ impl VortexWriteTracker {
 
             // Convert to IPC bytes
             let ipc_data = array_iter
-                .into_ipc()
+                .into_ipc(&*LEGACY_SESSION)
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 .collect_to_buffer()
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -267,7 +267,7 @@ pub async fn write_stream_to_disk_vortex(
 
         // Convert to IPC bytes
         let ipc_data = array_iter
-            .into_ipc()
+            .into_ipc(&*LEGACY_SESSION)
             .map_err(|e| {
                 BallistaError::General(format!("Failed to create Vortex IPC: {e}"))
             })?

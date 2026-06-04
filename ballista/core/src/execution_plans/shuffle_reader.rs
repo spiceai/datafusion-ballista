@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 
@@ -83,7 +84,7 @@ pub struct ShuffleReaderExec {
     pub partition: Vec<Vec<PartitionLocation>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ShuffleReaderExec {
@@ -94,12 +95,12 @@ impl ShuffleReaderExec {
         schema: SchemaRef,
         partitioning: Partitioning,
     ) -> Result<Self> {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
             partitioning,
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Ok(Self {
             stage_id,
             schema,
@@ -144,7 +145,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -29,6 +29,7 @@ use ballista_core::error::Result;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use datafusion::prelude::SessionConfig;
 use rand::distr::Alphanumeric;
+use rand::distr::Distribution;
 
 use crate::cluster::JobState;
 use ballista_core::serde::BallistaCodec;
@@ -764,7 +765,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub fn generate_job_id(&self) -> String {
         let mut rng = rng();
         std::iter::repeat(())
-            .map(|()| rng.sample(Alphanumeric))
+            .map(|()| Alphanumeric.sample(&mut rng))
             .map(char::from)
             .take(7)
             .collect()
