@@ -563,7 +563,7 @@ mod test {
             Ok(Box::pin(NeverendingRecordBatchStream))
         }
 
-        fn statistics(&self) -> Result<Statistics> {
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
             Ok(Statistics::new_unknown(&self.schema()))
         }
     }

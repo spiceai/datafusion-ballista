@@ -1221,6 +1221,7 @@ mod test {
                 range: None,
                 extensions: None,
                 statistics: None,
+                ordering: None,
                 metadata_size_hint: None,
             }]);
         }

@@ -39,6 +39,7 @@ use log::debug;
 use vortex_array::ArrayRef;
 use vortex_array::LEGACY_SESSION;
 use vortex_array::arrow::FromArrowArray;
+#[allow(deprecated)]
 use vortex_array::arrow::IntoArrowArray;
 use vortex_array::iter::ArrayIteratorAdapter;
 use vortex_error::VortexResult;
@@ -105,7 +106,7 @@ impl VortexWriteTracker {
 
             // Convert to IPC bytes
             let ipc_data = array_iter
-                .into_ipc(&*LEGACY_SESSION)
+                .into_ipc(&LEGACY_SESSION)
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 .collect_to_buffer()
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -180,6 +181,7 @@ impl LocalVortexShuffleStream {
 impl Stream for LocalVortexShuffleStream {
     type Item = Result<RecordBatch>;
 
+    #[allow(deprecated)]
     fn poll_next(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -267,7 +269,7 @@ pub async fn write_stream_to_disk_vortex(
 
         // Convert to IPC bytes
         let ipc_data = array_iter
-            .into_ipc(&*LEGACY_SESSION)
+            .into_ipc(&LEGACY_SESSION)
             .map_err(|e| {
                 BallistaError::General(format!("Failed to create Vortex IPC: {e}"))
             })?

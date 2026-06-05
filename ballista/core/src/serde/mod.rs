@@ -19,8 +19,8 @@
 //! as convenience code for interacting with the generated code.
 
 use crate::extension::BallistaCacheNode;
-use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
 use crate::{error::BallistaError, serde::scheduler::Action as BallistaAction};
+use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
 
 use arrow_flight::sql::ProstMessageExt;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -347,7 +347,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     ctx,
                     input.schema().as_ref(),
                     self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter,
+                    &DefaultPhysicalProtoConverter,
                 )?;
 
                 Ok(Arc::new(ShuffleWriterExec::try_new(
@@ -366,7 +366,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     ctx,
                     input.schema().as_ref(),
                     self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter,
+                    &DefaultPhysicalProtoConverter,
                 )?;
 
                 let partitioning = shuffle_output_partitioning.ok_or_else(|| {
@@ -423,7 +423,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     ctx,
                     schema.as_ref(),
                     self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter,
+                    &DefaultPhysicalProtoConverter,
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
@@ -443,7 +443,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     ctx,
                     schema.as_ref(),
                     self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter,
+                    &DefaultPhysicalProtoConverter,
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
@@ -566,7 +566,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             let partitioning = serialize_partitioning(
                 &exec.properties().partitioning,
                 self.default_codec.as_ref(),
-            &DefaultPhysicalProtoConverter,
+                &DefaultPhysicalProtoConverter,
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ShuffleReader(
@@ -589,7 +589,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             let partitioning = serialize_partitioning(
                 &exec.properties().partitioning,
                 self.default_codec.as_ref(),
-            &DefaultPhysicalProtoConverter,
+                &DefaultPhysicalProtoConverter,
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::UnresolvedShuffle(

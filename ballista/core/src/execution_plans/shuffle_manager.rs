@@ -103,6 +103,7 @@ impl ShufflePartitionData {
     }
 
     /// Returns the batches if stored in Arrow format, otherwise converts from Vortex.
+    #[allow(deprecated)]
     pub fn to_batches(&self) -> Result<Vec<RecordBatch>> {
         match &self.data {
             InMemoryShuffleData::Arrow(batches) => Ok(batches.clone()),

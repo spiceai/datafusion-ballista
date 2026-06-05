@@ -496,10 +496,6 @@ impl ExecutionPlan for MockPartitionedScan {
         unimplemented!("should not be called")
     }
 
-    fn statistics(&self) -> datafusion::common::Result<Statistics> {
-        Ok(self.statistics.clone())
-    }
-
     fn partition_statistics(
         &self,
         _partition: Option<usize>,

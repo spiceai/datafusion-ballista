@@ -1410,7 +1410,7 @@ fn serialize_vortex_arrays_to_bytes(
         .map(|a| Ok(a) as VortexResult<vortex_array::ArrayRef>);
     let array_iter = ArrayIteratorAdapter::new(dtype, iter);
     let ipc_data = array_iter
-        .into_ipc(&*vortex_array::LEGACY_SESSION)
+        .into_ipc(&vortex_array::LEGACY_SESSION)
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .collect_to_buffer()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;

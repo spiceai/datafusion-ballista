@@ -545,6 +545,7 @@ fn read_vortex_partition(
 
 /// Read Vortex arrays and send them as record batches
 #[cfg(feature = "vortex")]
+#[allow(deprecated)]
 fn read_vortex_batches(
     arrays: Vec<vortex_array::ArrayRef>,
     tx: Sender<Result<RecordBatch, FlightError>>,
