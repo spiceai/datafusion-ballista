@@ -47,7 +47,7 @@ use datafusion::error::Result;
 use crate::extension::BallistaConfigGrpcEndpoint;
 use crate::serde::protobuf;
 
-use crate::utils::{GrpcClientConfig, create_grpc_client_endpoint};
+use crate::utils::create_grpc_client_endpoint;
 
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
@@ -80,14 +80,7 @@ impl BallistaClient {
         let addr = format!("{scheme}://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
 
-        // Apply the same transport defaults (connect_timeout, tcp_keepalive,
-        // http2 keepalive) the scheduler's flight proxy uses for its own
-        // executor connections. Without this the shuffle client gets a bare
-        // tonic Endpoint with no timeouts and no keepalive — a single bad peer
-        // can hang the fetch indefinitely, and a half-open connection isn't
-        // detected.
-        let grpc_config = GrpcClientConfig::default();
-        let mut endpoint = create_grpc_client_endpoint(addr.clone(), Some(&grpc_config))
+        let mut endpoint = create_grpc_client_endpoint(addr.clone(), None)
             .map_err(|e| {
                 BallistaError::GrpcConnectionError(format!(
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
@@ -104,42 +97,11 @@ impl BallistaClient {
                 })?;
         }
 
-        // Retry transient connect failures with the same budget the do_get /
-        // do_action paths below use. A single TCP RST during connection setup
-        // (typically when many shuffle clients dial the same executor at once)
-        // would otherwise propagate straight to FetchFailed without any retry,
-        // since the IO_RETRIES_TIMES loop in execute_do_get only applies after
-        // the channel is established.
-        let mut last_err: Option<tonic::transport::Error> = None;
-        let mut connection = None;
-        for attempt in 0..IO_RETRIES_TIMES {
-            if attempt > 0 {
-                warn!(
-                    "Connection to {addr} failed (attempt {attempt}/{IO_RETRIES_TIMES}), sleeping {IO_RETRY_WAIT_TIME_MS} ms before retry"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    IO_RETRY_WAIT_TIME_MS,
-                ))
-                .await;
-            }
-            match endpoint.connect().await {
-                Ok(c) => {
-                    connection = Some(c);
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        let connection = match connection {
-            Some(c) => c,
-            None => {
-                return Err(BallistaError::GrpcConnectionError(format!(
-                    "Error connecting to Ballista scheduler or executor at {addr} after {IO_RETRIES_TIMES} attempts: {:?}",
-                    last_err
-                        .expect("at least one attempt failed when connection is None")
-                )));
-            }
-        };
+        let connection = endpoint.connect().await.map_err(|e| {
+            BallistaError::GrpcConnectionError(format!(
+                "Error connecting to Ballista scheduler or executor at {addr}: {e:?}"
+            ))
+        })?;
 
         let flight_client = FlightServiceClient::new(connection)
             .max_decoding_message_size(max_message_size)
@@ -164,20 +126,6 @@ impl BallistaClient {
         port: u16,
         flight_transport: bool,
     ) -> BResult<SendableRecordBatchStream> {
-        // When the writer-side stored this partition in object store (s3 / abfs / az / gs),
-        // skip the gRPC FetchPartition path entirely — the executor's handler only knows
-        // local paths and `memory://` and would `tokio::fs::File::open("s3://...")`, failing
-        // with `No such file or directory`. Read straight from object store instead.
-        if crate::execution_plans::shuffle_reader::path_is_object_store(path) {
-            return crate::execution_plans::shuffle_reader::fetch_object_store_partition_stream(
-                path,
-                executor_id,
-                partition_id.stage_id,
-                partition_id.partition_id,
-            )
-            .await;
-        }
-
         let action = Action::FetchPartition {
             job_id: partition_id.job_id.clone(),
             stage_id: partition_id.stage_id,

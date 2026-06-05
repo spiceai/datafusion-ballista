@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::planner::DefaultDistributedPlanner;
-use crate::state::execution_stage::ExecutionStage;
 
 use crate::state::execution_graph::{
     ExecutionGraphBox, RunningTaskInfo, StaticExecutionGraph, TaskDescription,
@@ -30,6 +29,7 @@ use ballista_core::error::Result;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use datafusion::prelude::SessionConfig;
 use rand::distr::Alphanumeric;
+use rand::distr::Distribution;
 
 use crate::cluster::JobState;
 use ballista_core::serde::BallistaCodec;
@@ -60,91 +60,6 @@ type ActiveJobCache = Arc<DashMap<String, JobInfoCache>>;
 pub const TASK_MAX_FAILURES: usize = 4;
 /// Default maximum number of failure attempts for stage-level retry before the stage is considered failed.
 pub const STAGE_MAX_FAILURES: usize = 4;
-
-/// One active job's progress at a single point in time, as captured by
-/// [`TaskManager::capture_progress_snapshot`]. Compared cycle-over-cycle
-/// by the scheduler's stuck-query detector.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JobProgressSnapshot {
-    pub job_id: String,
-    pub is_terminal: bool,
-    pub stages: JobProgressStages,
-}
-
-/// Per-stage progress for one job, or a marker that we could not read
-/// the graph within our timeout budget (itself a diagnostic state).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum JobProgressStages {
-    Readable(Vec<StageProgress>),
-    /// The graph's read lock could not be acquired within the snapshot
-    /// budget. Most commonly this means a writer is holding the lock,
-    /// but it can also happen under runtime starvation or extreme
-    /// read contention.
-    Unreadable,
-}
-
-/// One row of the per-stage progress snapshot.
-///
-/// For a `Running` stage:
-/// - `partitions` is the total number of partitions the stage will produce.
-/// - `assigned` is the number of partitions that have been bound to an
-///   executor (whether or not that task has completed).
-/// - `completed` is reported as `0`. The execution graph does not surface
-///   per-partition completion within a running stage, so this field only
-///   becomes meaningful once the stage transitions to `Successful`.
-///
-/// For a `Resolved` stage `partitions` is set and `assigned`/`completed`
-/// are both `0` (no work has begun). For `Unresolved` the partition count
-/// is not yet known. For `Successful` all three fields are equal. For
-/// `Failed` only `partitions` is meaningful.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StageProgress {
-    pub stage_id: usize,
-    pub variant: StageVariant,
-    pub partitions: usize,
-    pub assigned: usize,
-    pub completed: usize,
-}
-
-/// Discriminant for an [`ExecutionStage`], used by the progress snapshot
-/// and the stuck-query detector. Mirrors the variants of `ExecutionStage`
-/// so that exhaustive `match`es here will fail to compile if a new stage
-/// variant is added upstream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StageVariant {
-    Unresolved,
-    Resolved,
-    Running,
-    Successful,
-    Failed,
-}
-
-fn stage_snapshot(stage_id: usize, stage: &ExecutionStage) -> StageProgress {
-    let (variant, partitions, assigned, completed) = match stage {
-        // UnResolved stages have no partition count yet — they are waiting
-        // on upstream output to materialize their partitioning.
-        ExecutionStage::UnResolved(_) => (StageVariant::Unresolved, 0, 0, 0),
-        ExecutionStage::Resolved(s) => (StageVariant::Resolved, s.partitions, 0, 0),
-        ExecutionStage::Running(s) => {
-            let assigned = s.task_infos.iter().filter(|i| i.is_some()).count();
-            (StageVariant::Running, s.partitions, assigned, 0)
-        }
-        ExecutionStage::Successful(s) => (
-            StageVariant::Successful,
-            s.partitions,
-            s.partitions,
-            s.partitions,
-        ),
-        ExecutionStage::Failed(s) => (StageVariant::Failed, s.partitions, 0, 0),
-    };
-    StageProgress {
-        stage_id,
-        variant,
-        partitions,
-        assigned,
-        completed,
-    }
-}
 
 /// Trait for launching tasks on executors.
 ///
@@ -351,53 +266,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         self.active_job_cache.len()
     }
 
-    /// Capture one snapshot of every active job's per-stage progress for
-    /// the scheduler's stuck-query detector. Uses a 500ms read-acquire
-    /// budget per graph; a job whose read cannot be acquired in time is
-    /// recorded as [`JobProgressStages::Unreadable`] rather than blocking
-    /// the snapshot. This budget exhaustion is itself a useful diagnostic
-    /// state — most often it means a writer is holding the lock, though
-    /// runtime starvation or extreme read contention can produce the same
-    /// outcome.
-    ///
-    /// Returned snapshots are diffed cycle-over-cycle by the detector; a
-    /// long run of identical snapshots while executors are alive and the
-    /// job is not terminal is what triggers the operator-facing warning.
-    pub(crate) async fn capture_progress_snapshot(&self) -> Vec<JobProgressSnapshot> {
-        let mut out = Vec::with_capacity(self.active_job_cache.len());
-        for entry in self.active_job_cache.iter() {
-            let job_id = entry.key().clone();
-            let job_info = entry.value();
-            let is_terminal = matches!(
-                job_info.status,
-                Some(job_status::Status::Successful(_))
-                    | Some(job_status::Status::Failed(_))
-            );
-            let stages = match tokio::time::timeout(
-                Duration::from_millis(500),
-                job_info.execution_graph.read(),
-            )
-            .await
-            {
-                Ok(graph) => {
-                    let mut stages = Vec::new();
-                    for (stage_id, stage) in graph.stages() {
-                        stages.push(stage_snapshot(*stage_id, stage));
-                    }
-                    stages.sort_by_key(|s| s.stage_id);
-                    JobProgressStages::Readable(stages)
-                }
-                Err(_) => JobProgressStages::Unreadable,
-            };
-            out.push(JobProgressSnapshot {
-                job_id,
-                is_terminal,
-                stages,
-            });
-        }
-        out
-    }
-
     /// Get the total number of pending tasks across all active jobs.
     ///
     /// A pending task is a task that is available to schedule on an executor
@@ -541,11 +409,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Get the execution graph of of a job. First look in the active cache.
     /// If no one found, then in the Active/Completed jobs.
-    ///
-    /// Exposed as `pub` so embedded callers (e.g., Spice's distributed
-    /// task_history writer) can walk per-stage and per-task state directly
-    /// without going through a gRPC method.
-    pub async fn get_job_execution_graph(
+    #[cfg(feature = "rest-api")]
+    pub(crate) async fn get_job_execution_graph(
         &self,
         job_id: &str,
     ) -> Result<Option<ExecutionGraphBox>> {
@@ -900,7 +765,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub fn generate_job_id(&self) -> String {
         let mut rng = rng();
         std::iter::repeat(())
-            .map(|()| rng.sample(Alphanumeric))
+            .map(|()| Alphanumeric.sample(&mut rng))
             .map(char::from)
             .take(7)
             .collect()

@@ -1320,8 +1320,8 @@ impl ExecutionGraph for StaticExecutionGraph {
     /// Return all currently running tasks along with the executor ID on which they are assigned
     fn running_tasks(&self) -> Vec<RunningTaskInfo> {
         self.stages
-            .values()
-            .flat_map(|stage| {
+            .iter()
+            .flat_map(|(_, stage)| {
                 if let ExecutionStage::Running(stage) = stage {
                     stage
                         .running_tasks()
@@ -1658,7 +1658,6 @@ impl ExecutionGraph for StaticExecutionGraph {
                 let task_attempt = stage.task_failure_numbers[partition_id];
                 let task_info = TaskInfo {
                     task_id,
-                    executor_id: executor_id.to_owned(),
                     scheduled_time: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -1743,7 +1742,6 @@ impl Debug for StaticExecutionGraph {
 pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
     TaskInfo {
         task_id,
-        executor_id: executor_id.clone(),
         scheduled_time: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ballista_core::JobStatusSubscriber;
 use ballista_core::error::Result;
-use ballista_core::event_loop::{EventInFlight, EventLoop, EventSender};
+use ballista_core::event_loop::{EventLoop, EventSender};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
 use tokio::sync::broadcast;
@@ -43,9 +43,7 @@ use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
 use crate::state::executor_manager::ExecutorManager;
 
 use crate::state::SchedulerState;
-use crate::state::task_manager::{
-    JobProgressSnapshot, JobProgressStages, StageProgress, StageVariant, TaskLauncher,
-};
+use crate::state::task_manager::TaskLauncher;
 
 // include the generated protobuf source as a submodule
 #[cfg(feature = "keda-scaler")]
@@ -193,7 +191,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
         self.start_pending_tasks_metrics_loop();
-        self.start_progress_monitor_loop();
 
         Ok(())
     }
@@ -396,99 +393,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         Ok(())
     }
 
-    /// Spawns a background task that watches every active job for forward
-    /// progress and emits an operator-facing warning when a job has gone
-    /// multiple sampling cycles without any change.
-    ///
-    /// The detector samples each active job once per
-    /// `PROGRESS_SAMPLE_INTERVAL`; a job counts as stuck after
-    /// `STUCK_CYCLES_THRESHOLD` consecutive samples with identical state,
-    /// as long as the cluster has at least one alive executor and the job
-    /// is not in a terminal state. While the condition holds, the loop
-    /// emits one `warn!` block per cycle containing every diagnostic the
-    /// detector can collect: per-stage progress (or "could not be read"
-    /// if the graph's read lock could not be acquired in time), executor
-    /// counts, and the event handler currently running in the scheduler's
-    /// event loop (with its elapsed time).
-    fn start_progress_monitor_loop(&self) {
-        const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
-        // Four samples ≈ ~2 minutes of zero movement before warning. Long
-        // enough to avoid false positives for legitimately slow stages.
-        const STUCK_CYCLES_THRESHOLD: u32 = 4;
-        // Only flag the event-loop "step" line when the in-flight handler
-        // has been running materially longer than a normal handler.
-        const IN_FLIGHT_REPORT_THRESHOLD: Duration = Duration::from_secs(30);
-
-        let state = self.state.clone();
-        let in_flight_signal = self.query_stage_event_loop.in_flight_signal();
-        tokio::task::spawn(async move {
-            let mut trackers: std::collections::HashMap<String, ProgressTracker> =
-                std::collections::HashMap::new();
-            loop {
-                tokio::time::sleep(PROGRESS_SAMPLE_INTERVAL).await;
-                let snapshots = state.task_manager.capture_progress_snapshot().await;
-                let alive_executors = state.executor_manager.get_alive_executors().len();
-
-                // Drop trackers for jobs that are no longer active. We
-                // observe terminal jobs once and remove them.
-                let active_ids: std::collections::HashSet<&str> =
-                    snapshots.iter().map(|s| s.job_id.as_str()).collect();
-                trackers.retain(|id, _| active_ids.contains(id.as_str()));
-
-                for snapshot in &snapshots {
-                    if snapshot.is_terminal {
-                        trackers.remove(&snapshot.job_id);
-                        continue;
-                    }
-                    let tracker = trackers.entry(snapshot.job_id.clone()).or_default();
-
-                    if tracker
-                        .last_stages
-                        .as_ref()
-                        .is_some_and(|prev| prev == &snapshot.stages)
-                    {
-                        tracker.unchanged_cycles += 1;
-                    } else {
-                        tracker.unchanged_cycles = 1;
-                        tracker.last_stages = Some(snapshot.stages.clone());
-                    }
-
-                    if tracker.unchanged_cycles < STUCK_CYCLES_THRESHOLD {
-                        continue;
-                    }
-                    if alive_executors == 0 {
-                        // If no executors are alive the cluster has bigger
-                        // problems; don't conflate the two failure modes.
-                        continue;
-                    }
-
-                    // Derive elapsed time directly from the number of
-                    // identical samples we've taken. With
-                    // `unchanged_cycles == 4` and a 30s interval we have 3
-                    // intervals' worth of observed no-progress, i.e. 90s.
-                    // This avoids reporting "0s" on the first warning,
-                    // which would happen if we only began tracking time
-                    // at warning-emit moment.
-                    let stuck_for = PROGRESS_SAMPLE_INTERVAL
-                        .saturating_mul(tracker.unchanged_cycles.saturating_sub(1));
-
-                    // Read the event-loop heartbeat without holding the lock
-                    // across any await — this is just a clone of an Option.
-                    let in_flight =
-                        in_flight_signal.lock().ok().and_then(|guard| guard.clone());
-
-                    emit_stuck_warning(
-                        snapshot,
-                        stuck_for,
-                        alive_executors,
-                        in_flight.as_ref(),
-                        IN_FLIGHT_REPORT_THRESHOLD,
-                    );
-                }
-            }
-        });
-    }
-
     /// Spawns a background task that periodically updates the pending tasks metric.
     ///
     /// This metric requires iterating over all active jobs and acquiring read locks,
@@ -600,206 +504,6 @@ pub fn timestamp_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis() as u64
-}
-
-/// Per-job state held by the progress monitor between sampling cycles.
-#[derive(Default)]
-struct ProgressTracker {
-    /// Most recent per-stage snapshot for this job.
-    last_stages: Option<JobProgressStages>,
-    /// Consecutive samples (including the current one) with identical state.
-    /// The reported "stuck for N" duration is derived from this directly:
-    /// `(unchanged_cycles - 1) * PROGRESS_SAMPLE_INTERVAL`.
-    unchanged_cycles: u32,
-}
-
-/// Emit one operator-facing block when a job has gone several sampling
-/// cycles without progress. Fires once per cycle while the condition
-/// holds, so the elapsed time in the primary line keeps ticking up.
-fn emit_stuck_warning(
-    snapshot: &JobProgressSnapshot,
-    stuck_for: Duration,
-    alive_executors: usize,
-    in_flight: Option<&EventInFlight>,
-    in_flight_report_threshold: Duration,
-) {
-    let pending = pending_task_count(&snapshot.stages);
-
-    warn!(
-        "Query {} has not made progress for {}; {} task{} pending.",
-        snapshot.job_id,
-        format_duration(stuck_for),
-        pending,
-        if pending == 1 { "" } else { "s" },
-    );
-
-    match &snapshot.stages {
-        JobProgressStages::Readable(stages) => {
-            for stage in stages {
-                match stage.variant {
-                    StageVariant::Running
-                        if stage.assigned < stage.partitions
-                            || stage.completed < stage.partitions =>
-                    {
-                        let unassigned = stage.partitions.saturating_sub(stage.assigned);
-                        warn!(
-                            "  Stage {}: {} of {} partitions complete, {} not \
-                             yet assigned to an executor.",
-                            stage.stage_id, stage.completed, stage.partitions, unassigned,
-                        );
-                    }
-                    StageVariant::Resolved => {
-                        warn!(
-                            "  Stage {}: {} partitions waiting to start.",
-                            stage.stage_id, stage.partitions,
-                        );
-                    }
-                    StageVariant::Unresolved => {
-                        warn!(
-                            "  Stage {}: waiting on upstream stage output.",
-                            stage.stage_id,
-                        );
-                    }
-                    // Running with everything complete, Successful, and
-                    // Failed are not part of the stuck shape.
-                    _ => {}
-                }
-            }
-        }
-        JobProgressStages::Unreadable => {
-            warn!(
-                "  Tried to read this job's scheduler state but the read \
-                 could not be acquired within 500ms (most likely a writer \
-                 is holding the lock).",
-            );
-        }
-    }
-
-    warn!(
-        "  {} executor{} alive.",
-        alive_executors,
-        if alive_executors == 1 { "" } else { "s" },
-    );
-
-    if let Some(event) = in_flight {
-        let elapsed = event.started_at.elapsed();
-        if elapsed >= in_flight_report_threshold {
-            warn!(
-                "  The scheduler has been processing a '{}' step for {}.",
-                event.label,
-                format_duration(elapsed),
-            );
-        }
-    }
-}
-
-/// Sum of partitions still pending across every non-terminal stage in
-/// the snapshot. Running stages contribute their incomplete partitions;
-/// Resolved stages contribute all of their partitions (no work has begun
-/// yet); Unresolved stages can't be counted (partition count unknown).
-/// Returns 0 if the graph couldn't be read this cycle.
-fn pending_task_count(stages: &JobProgressStages) -> usize {
-    match stages {
-        JobProgressStages::Readable(stages) => stages
-            .iter()
-            .map(|s: &StageProgress| match s.variant {
-                StageVariant::Running => s.partitions.saturating_sub(s.completed),
-                StageVariant::Resolved => s.partitions,
-                StageVariant::Unresolved
-                | StageVariant::Successful
-                | StageVariant::Failed => 0,
-            })
-            .sum(),
-        JobProgressStages::Unreadable => 0,
-    }
-}
-
-/// Format a duration as a compact human-readable string suitable for the
-/// operator-facing log line, e.g. "2m0s" or "1h3m17s".
-fn format_duration(d: Duration) -> String {
-    let total = d.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{hours}h{minutes}m{seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m{seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-#[cfg(test)]
-mod progress_tests {
-    use super::*;
-
-    fn running(stage_id: usize, partitions: usize, assigned: usize) -> StageProgress {
-        StageProgress {
-            stage_id,
-            variant: StageVariant::Running,
-            partitions,
-            assigned,
-            completed: 0,
-        }
-    }
-
-    fn complete(stage_id: usize, partitions: usize) -> StageProgress {
-        StageProgress {
-            stage_id,
-            variant: StageVariant::Successful,
-            partitions,
-            assigned: partitions,
-            completed: partitions,
-        }
-    }
-
-    fn resolved(stage_id: usize, partitions: usize) -> StageProgress {
-        StageProgress {
-            stage_id,
-            variant: StageVariant::Resolved,
-            partitions,
-            assigned: 0,
-            completed: 0,
-        }
-    }
-
-    #[test]
-    fn duration_format() {
-        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(Duration::from_secs(120)), "2m0s");
-        assert_eq!(format_duration(Duration::from_secs(125)), "2m5s");
-        assert_eq!(format_duration(Duration::from_secs(3661)), "1h1m1s");
-    }
-
-    #[test]
-    fn pending_count_includes_running_and_resolved_only() {
-        // Stage 1: Successful (96/96 done) contributes 0.
-        // Stage 4: Running, 96 partitions, 0 completed → 96 pending.
-        // Stage 5: Resolved, 32 partitions, none started → 32 pending.
-        let stages = JobProgressStages::Readable(vec![
-            complete(1, 96),
-            running(4, 96, 64),
-            resolved(5, 32),
-        ]);
-        assert_eq!(pending_task_count(&stages), 96 + 32);
-    }
-
-    #[test]
-    fn pending_count_zero_when_unreadable() {
-        assert_eq!(pending_task_count(&JobProgressStages::Unreadable), 0);
-    }
-
-    #[test]
-    fn stage_progress_equality_drives_unchanged_cycles() {
-        let a = JobProgressStages::Readable(vec![running(4, 96, 64)]);
-        let b = JobProgressStages::Readable(vec![running(4, 96, 64)]);
-        let c = JobProgressStages::Readable(vec![running(4, 96, 65)]);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(JobProgressStages::Unreadable, JobProgressStages::Unreadable);
-    }
 }
 
 #[cfg(test)]

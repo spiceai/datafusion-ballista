@@ -30,9 +30,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use url::Url;
 
 use crate::client::BallistaClient;
@@ -81,7 +84,7 @@ pub struct ShuffleReaderExec {
     pub partition: Vec<Vec<PartitionLocation>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ShuffleReaderExec {
@@ -92,12 +95,12 @@ impl ShuffleReaderExec {
         schema: SchemaRef,
         partitioning: Partitioning,
     ) -> Result<Self> {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
             partitioning,
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Ok(Self {
             stage_id,
             schema,
@@ -142,7 +145,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -217,6 +220,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             customize_endpoint,
             use_tls,
             metrics_callback,
+            context.runtime_env(),
         );
 
         let input_stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -473,6 +477,7 @@ fn send_fetch_partitions(
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
     metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
     let semaphore = Arc::new(Semaphore::new(max_request_num));
@@ -544,12 +549,17 @@ fn send_fetch_partitions(
         }
     }));
 
-    // Read S3-backed shuffle partitions (writer wrote them as s3://... paths).
+    // Read object store partitions using the RuntimeEnv's registered object stores
     let response_sender_os = response_sender.clone();
+    let runtime_env_clone = Arc::clone(&runtime_env);
     let object_store_locations = locations.object_store;
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in object_store_locations {
-            let r = fetch_partition_object_store_streaming(&p).await;
+            let r = fetch_partition_object_store_with_runtime(
+                &p,
+                Arc::clone(&runtime_env_clone),
+            )
+            .await;
 
             if let Err(e) = response_sender_os.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
@@ -916,44 +926,23 @@ impl RecordBatchStream for InMemoryShuffleStream {
     }
 }
 
-/// Fetch a shuffle partition that was written to S3.
+/// Fetch partition from object store using the RuntimeEnv's registered object stores.
+/// This uses the credentials and configuration from the runtime environment.
 ///
-/// Builds the S3 client via `AmazonS3Builder::from_env()`, picking up credentials
-/// the writer-side ([`crate::shuffle_storage::ObjectStoreShuffleStorage::new_s3`])
-/// also reads from the environment. This is a deliberate shortcut: the writer
-/// also supports explicit overrides (region, endpoint, static access keys) via
-/// `S3ShuffleConfig`, but no current call path populates them, so in practice
-/// writer and reader land on the same credentials. The proper fix is to register
-/// the shuffle store on `RuntimeEnv` at executor startup (using whatever secret
-/// store the host runtime already wires up for datasets) — tracked as follow-up.
-///
-/// Streams the response body so partitions are decoded incrementally rather than
-/// buffered in memory.
-async fn fetch_partition_object_store_streaming(
+/// This implementation streams data from the object store and decodes record batches
+/// incrementally using Arrow's `StreamDecoder`, avoiding buffering the entire partition
+/// in memory.
+async fn fetch_partition_object_store_with_runtime(
     location: &PartitionLocation,
-) -> result::Result<SendableRecordBatchStream, BallistaError> {
-    fetch_object_store_partition_stream(
-        &location.path,
-        &location.executor_meta.id,
-        location.partition_id.stage_id,
-        location.partition_id.partition_id,
-    )
-    .await
-}
-
-/// Streams a shuffle / result partition directly from object store. Used by both the
-/// intermediate shuffle reader and the driver-side final-stage fetch in
-/// `distributed_query`; the two call sites have differently-shaped `PartitionLocation`
-/// types but only need the path and identifiers, so this helper takes plain args.
-pub(crate) async fn fetch_object_store_partition_stream(
-    path: &str,
-    executor_id: &str,
-    stage_id: usize,
-    partition_id: usize,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     use object_store::path::Path as ObjectPath;
 
-    debug!("Fetching shuffle partition from object store: {path}");
+    let path = &location.path;
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+
+    debug!("Fetching shuffle partition from object store using runtime_env: {path}");
 
     let url = Url::parse(path).map_err(|e| {
         BallistaError::General(format!(
@@ -961,58 +950,44 @@ pub(crate) async fn fetch_object_store_partition_stream(
         ))
     })?;
 
-    let store = build_shuffle_object_store(&url).map_err(|e| {
+    // Get the object store from the RuntimeEnv's registry
+    // This uses the credentials configured in the runtime (e.g., SpiceObjectStoreRegistry)
+    let object_store_url = ObjectStoreUrl::parse(&url).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{path}': {e:?}"
+        ))
+    })?;
+
+    let store = runtime_env.object_store(&object_store_url).map_err(|e| {
         BallistaError::FetchFailed(
-            executor_id.to_owned(),
-            stage_id,
-            partition_id,
-            format!("Failed to build object store client for '{path}': {e:?}"),
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!("Failed to get object store for URL '{path}': {e:?}"),
         )
     })?;
 
+    // Extract the object path from the URL
     let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
 
     debug!("Reading object from path: {object_path:?}");
 
     let get_result = store.get(&object_path).await.map_err(|e| {
         BallistaError::FetchFailed(
-            executor_id.to_owned(),
-            stage_id,
-            partition_id,
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
             format!("Failed to read object from {path}: {e:?}"),
         )
     })?;
 
+    // Convert to a streaming byte stream instead of loading all bytes into memory
     let byte_stream = get_result.into_stream();
-    let stream = ObjectStoreShuffleStream::try_new(byte_stream, path.to_owned()).await?;
+
+    // Create the streaming decoder
+    let stream = ObjectStoreShuffleStream::try_new(byte_stream, path.clone()).await?;
 
     Ok(Box::pin(stream))
-}
-
-/// Builds an S3 object store client for a shuffle URL. Credentials come from
-/// the environment (same as the writer in practice). Non-S3 schemes return an
-/// error — Azure shuffle is on the same architectural footing but its writer-
-/// side path doesn't go through this code today; rather than add a divergent
-/// reader, we leave it to the registry-based follow-up to handle both.
-fn build_shuffle_object_store(
-    url: &Url,
-) -> result::Result<Arc<dyn ObjectStore>, BallistaError> {
-    let scheme = url.scheme();
-    match scheme {
-        "s3" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No bucket in S3 URL: {url}"))
-            })?;
-            let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-            let store = builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create S3 client: {e:?}"))
-            })?;
-            Ok(Arc::new(store))
-        }
-        _ => Err(BallistaError::General(format!(
-            "Unsupported object store scheme for shuffle reader: {scheme}. Only 's3' is supported."
-        ))),
-    }
 }
 
 /// Maximum length of message with schema definition for object store streaming.
@@ -1193,24 +1168,7 @@ impl RecordBatchStream for ObjectStoreShuffleStream {
     }
 }
 
-/// Returns true when the given path is an object-store URL the streaming shuffle
-/// reader can handle. Exposed so non-shuffle-reader callers (e.g. the driver-side
-/// final-stage fetch via [`crate::client::BallistaClient::fetch_partition`]) can
-/// route around the gRPC `FetchPartition` path, which only understands local files
-/// and `memory://`.
-///
-/// Scoped to `s3://` to match [`build_shuffle_object_store`]: the writer-side
-/// `ObjectStoreShuffleStorage::new_azure` exists but is not wired through the
-/// registry-based credential path yet, so `abfs://` / `az://` / `gs://` URLs would
-/// be routed away from gRPC and then fail in `build_shuffle_object_store`.
-/// Broaden this alongside `build_shuffle_object_store` once those backends are
-/// supported.
-pub(crate) fn path_is_object_store(path: &str) -> bool {
-    path.starts_with("s3://")
-}
-
-/// Check if the location is an object store path the broad
-/// `fetch_partition_object_store_inner` reader supports (s3 / abfs / az / gs).
+/// Check if the location is an object store path (S3 or Azure).
 fn check_is_object_store_location(location: &PartitionLocation) -> bool {
     let path = location.path.as_str();
     path.starts_with("s3://")
@@ -1341,13 +1299,7 @@ async fn fetch_partition_object_store_inner(
 struct CoalescedShuffleReaderStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
-    /// The coalescer is lazily initialized from the first batch's actual schema
-    /// rather than the declared schema to avoid type mismatches (e.g., the plan
-    /// declares LargeUtf8 but the IPC shuffle data contains Utf8).
-    coalescer: Option<LimitedBatchCoalescer>,
-    /// Batch size and limit for lazy coalescer initialization.
-    batch_size: usize,
-    limit: Option<usize>,
+    coalescer: LimitedBatchCoalescer,
     completed: bool,
     baseline_metrics: BaselineMetrics,
 }
@@ -1362,11 +1314,9 @@ impl CoalescedShuffleReaderStream {
     ) -> Self {
         let schema = input.schema();
         Self {
-            schema,
+            schema: schema.clone(),
             input,
-            coalescer: None,
-            batch_size,
-            limit,
+            coalescer: LimitedBatchCoalescer::new(schema, batch_size, limit),
             completed: false,
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
@@ -1385,9 +1335,7 @@ impl Stream for CoalescedShuffleReaderStream {
 
         loop {
             // If there is already a completed batch ready, return it directly
-            if let Some(ref mut coalescer) = self.coalescer
-                && let Some(batch) = coalescer.next_completed_batch()
-            {
+            if let Some(batch) = self.coalescer.next_completed_batch() {
                 self.baseline_metrics.record_output(batch.num_rows());
                 return Poll::Ready(Some(Ok(batch)));
             }
@@ -1399,34 +1347,18 @@ impl Stream for CoalescedShuffleReaderStream {
 
             // Pull from upstream
             match ready!(self.input.poll_next_unpin(cx)) {
-                // If upstream is completed, then flush remaining buffered batches
+                // If upstream is completed, then flush remaning buffered batches
                 None => {
                     self.completed = true;
-                    if let Some(ref mut coalescer) = self.coalescer
-                        && let Err(e) = coalescer.finish()
-                    {
+                    if let Err(e) = self.coalescer.finish() {
                         return Poll::Ready(Some(Err(e)));
                     }
                 }
                 // If upstream is not completed, then push to coalescer
                 Some(Ok(batch)) => {
                     if batch.num_rows() > 0 {
-                        // Lazily initialize the coalescer from the first
-                        // batch's actual schema to avoid type mismatches
-                        // (e.g., plan declares LargeUtf8 but IPC data has Utf8).
-                        if self.coalescer.is_none() {
-                            self.coalescer = Some(LimitedBatchCoalescer::new(
-                                batch.schema(),
-                                self.batch_size,
-                                self.limit,
-                            ));
-                        }
-
-                        let coalescer =
-                            self.coalescer.as_mut().expect("just initialized");
-
                         // Try to push to coalescer
-                        match coalescer.push_batch(batch) {
+                        match self.coalescer.push_batch(batch) {
                             // If push is successful, then continue
                             Ok(PushBatchStatus::Continue) => {
                                 continue;
@@ -1434,9 +1366,7 @@ impl Stream for CoalescedShuffleReaderStream {
                             // If limit is reached, then finish coalescer and set completed to true
                             Ok(PushBatchStatus::LimitReached) => {
                                 self.completed = true;
-                                let coalescer =
-                                    self.coalescer.as_mut().expect("just initialized");
-                                if let Err(e) = coalescer.finish() {
+                                if let Err(e) = self.coalescer.finish() {
                                     return Poll::Ready(Some(Err(e)));
                                 }
                             }
@@ -1851,6 +1781,7 @@ mod tests {
             None,
             false,
             None, // No metrics callback in tests
+            Arc::new(RuntimeEnv::default()),
         );
 
         let stream = RecordBatchStreamAdapter::new(
@@ -2291,35 +2222,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    /// `build_shuffle_object_store` must accept an S3 URL that includes a path
-    /// component (the shuffle key) — earlier versions of the reader funneled
-    /// the full URL through `ObjectStoreUrl::parse`, which rejected anything
-    /// beyond scheme+authority and failed with
-    /// "ObjectStoreUrl must only contain scheme and authority".
-    #[test]
-    fn test_build_shuffle_object_store_accepts_s3_with_path() {
-        let url = Url::parse("s3://my-bucket/shuffle/job-id/1/4i1vaNv/1/0/data-35.arrow")
-            .unwrap();
-
-        build_shuffle_object_store(&url)
-            .expect("a fully-qualified S3 shuffle URL must build a client");
-    }
-
-    #[test]
-    fn test_build_shuffle_object_store_rejects_non_s3_schemes() {
-        for url in [
-            "file:///tmp/shuffle/data.arrow",
-            "abfs://container@account.dfs.core.windows.net/data.arrow",
-            "az://container/data.arrow",
-            "gs://bucket/data.arrow",
-        ] {
-            let parsed = Url::parse(url).unwrap();
-            assert!(
-                build_shuffle_object_store(&parsed).is_err(),
-                "expected {url} to be rejected — only s3 is supported on the reader today"
-            );
-        }
     }
 }

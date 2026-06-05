@@ -33,23 +33,12 @@ import "datafusion_common.proto";
 message BallistaLogicalPlanNode {
   oneof LogicalPlanType {
     LogicalPlanCacheNode cache_node = 1;
-    LogicalPlanExplainNode explain_node = 2;
   }
 }
 
 message LogicalPlanCacheNode {
   string cache_id = 1;
   string session_id = 2;
-}
-
-// Ballista wrapper around datafusion's Explain logical plan node.
-// Used to preserve `explain_format` across the client -> scheduler boundary,
-// because `datafusion-proto`'s `ExplainNode` does not encode that field.
-message LogicalPlanExplainNode {
-  bool verbose = 1;
-  // One of: "indent", "tree", "pgjson", "graphviz". See `BallistaExplainNode`
-  // in `core/src/extension.rs` for the canonical mapping.
-  string explain_format = 2;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -642,31 +631,6 @@ message ExecuteQueryFailureResult {
   }
 }
 
-message GetJobMetricsParams {
-  string job_id = 1;
-}
-
-message JobStageMetrics {
-  uint32 stage_id = 1;
-  uint32 partitions = 2;
-  repeated OperatorWithMetrics operators = 3;
-}
-
-message OperatorWithMetrics {
-  // Pre-order DFS depth in the stage's plan tree (root = 0).
-  uint32 depth = 1;
-  // ExecutionPlan::name(), e.g. "FilterExec".
-  string operator_type = 2;
-  // Single-line operator description, equivalent to
-  // `DisplayableExecutionPlan::indent` for that node only.
-  string operator_desc = 3;
-  repeated OperatorMetric metrics = 4;
-}
-
-message GetJobMetricsResult {
-  repeated JobStageMetrics stages = 1;
-}
-
 message GetJobStatusParams {
   string job_id = 1;
 }
@@ -869,11 +833,6 @@ service SchedulerGrpc {
   rpc ExecuteQuery (ExecuteQueryParams) returns (ExecuteQueryResult) {}
 
   rpc GetJobStatus (GetJobStatusParams) returns (GetJobStatusResult) {}
-
-  // Returns per-stage / per-operator metrics for a successfully-finished job.
-  // Used by the client `DistributedExplainAnalyzeExec` to render an
-  // `EXPLAIN ANALYZE` result without changing the wire format of normal jobs.
-  rpc GetJobMetrics (GetJobMetricsParams) returns (GetJobMetricsResult) {}
 
   // Used by Executor to tell Scheduler it is stopped.
   rpc ExecutorStopped (ExecutorStoppedParams) returns (ExecutorStoppedResult) {}

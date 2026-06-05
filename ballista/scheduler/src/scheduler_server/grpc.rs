@@ -26,13 +26,12 @@ use ballista_core::serde::protobuf::{
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
-    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
-    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
-    JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
-    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
-    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
-    execute_query_result,
+    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobStatusParams,
+    GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
+    HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
+    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    execute_query_failure_result, execute_query_result,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -564,65 +563,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         }
     }
 
-    async fn get_job_metrics(
-        &self,
-        request: Request<GetJobMetricsParams>,
-    ) -> Result<Response<GetJobMetricsResult>, Status> {
-        let job_id = request.into_inner().job_id;
-        trace!("Received get_job_metrics request for job {}", job_id);
-
-        let graph = self
-            .state
-            .task_manager
-            .get_job_execution_graph(&job_id)
-            .await
-            .map_err(|e| {
-                let msg = format!(
-                    "Error fetching execution graph for job {job_id}: {e:?}"
-                );
-                error!("{msg}");
-                Status::internal(msg)
-            })?
-            .ok_or_else(|| {
-                // Most commonly hit when delayed job cleanup ran before the
-                // client requested metrics. Clients (in particular
-                // `DistributedExplainAnalyzeExec`) must call this RPC promptly
-                // after the inner result stream drains.
-                Status::not_found(format!(
-                    "Execution graph not found for job {job_id} (may have been cleaned up)"
-                ))
-            })?;
-
-        let mut stage_metrics_list = graph
-            .stages()
-            .iter()
-            .filter_map(|(stage_id, stage)| {
-                let successful = match stage {
-                    crate::state::execution_graph::ExecutionStage::Successful(stage) => {
-                        stage
-                    }
-                    _ => return None,
-                };
-
-                Some(
-                    serialize_stage_metrics(*stage_id, &job_id, successful).map_err(
-                        |e| {
-                            Status::internal(format!(
-                                "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
-                            ))
-                        },
-                    ),
-                )
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-
-        stage_metrics_list.sort_by_key(|stage| stage.stage_id);
-
-        Ok(Response::new(GetJobMetricsResult {
-            stages: stage_metrics_list,
-        }))
-    }
-
     async fn executor_stopped(
         &self,
         request: Request<ExecutorStoppedParams>,
@@ -742,91 +682,6 @@ fn extract_connect_info<T>(request: &Request<T>) -> Option<ConnectInfo<SocketAdd
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .cloned()
-}
-
-/// Pre-order DFS over a successful stage's plan, pairing each operator with
-/// the metrics recorded for it on the executor side.
-///
-/// Wire-format invariant: the producer side
-/// (`ballista_core::utils::collect_plan_metrics`, called from
-/// `executor::executor_server` and the executor's execution loop) walks the
-/// stage plan in pre-order DFS with `plan.children()` left-to-right, pushing
-/// one entry per node whose `metrics()` returns `Some`. This function MUST
-/// use the exact same traversal order so positional indexing into
-/// `successful.stage_metrics` lines up.
-fn serialize_stage_metrics(
-    stage_id: usize,
-    job_id: &str,
-    successful: &crate::state::execution_stage::SuccessfulStage,
-) -> ballista_core::error::Result<ballista_core::serde::protobuf::JobStageMetrics> {
-    use ballista_core::error::BallistaError;
-    use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
-
-    let raw_metrics = &successful.stage_metrics;
-    let mut operators = Vec::with_capacity(raw_metrics.len());
-    let mut metric_index = 0usize;
-    let mut stack = vec![(successful.plan.as_ref(), 0u32)];
-
-    while let Some((plan, depth)) = stack.pop() {
-        // Format just this node (not its children) using the same default
-        // display format DataFusion uses for `EXPLAIN`.
-        let operator_desc = {
-            struct DisplayableOperator<'a> {
-                plan: &'a dyn ExecutionPlan,
-            }
-            impl std::fmt::Display for DisplayableOperator<'_> {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    self.plan.fmt_as(DisplayFormatType::Default, f)
-                }
-            }
-            DisplayableOperator { plan }.to_string()
-        };
-
-        let metrics = if plan.metrics().is_some() {
-            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet = raw_metrics
-                .get(metric_index)
-                .ok_or_else(|| {
-                    BallistaError::Internal(format!(
-                        "Missing metrics for operator {} at depth {}",
-                        plan.name(),
-                        depth
-                    ))
-                })?
-                .clone()
-                .try_into()?;
-            metric_index += 1;
-            metrics.metrics
-        } else {
-            vec![]
-        };
-
-        operators.push(ballista_core::serde::protobuf::OperatorWithMetrics {
-            depth,
-            operator_type: plan.name().to_string(),
-            operator_desc,
-            metrics,
-        });
-
-        // Push children in reverse so the next pop visits the leftmost child
-        // first, matching `collect_plan_metrics`'s `children().iter()` order.
-        for child in plan.children().into_iter().rev() {
-            stack.push((child.as_ref(), depth.saturating_add(1)));
-        }
-    }
-
-    if metric_index != raw_metrics.len() {
-        return Err(BallistaError::Internal(format!(
-            "Stage metrics size mismatch for job {job_id} stage {stage_id}: \
-             consumed {metric_index} != stage_metrics.len() {}",
-            raw_metrics.len()
-        )));
-    }
-
-    Ok(ballista_core::serde::protobuf::JobStageMetrics {
-        stage_id: stage_id as u32,
-        partitions: successful.partitions as u32,
-        operators,
-    })
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {

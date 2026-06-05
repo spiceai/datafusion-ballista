@@ -920,8 +920,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
     /// Return all currently running tasks along with the executor ID on which they are assigned
     fn running_tasks(&self) -> Vec<RunningTaskInfo> {
         self.stages
-            .values()
-            .flat_map(|stage| {
+            .iter()
+            .flat_map(|(_, stage)| {
                 if let ExecutionStage::Running(stage) = stage {
                     stage
                         .running_tasks()
@@ -1267,7 +1267,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 let task_attempt = stage.task_failure_numbers[partition_id];
                 let task_info = crate::state::execution_graph::TaskInfo {
                     task_id,
-                    executor_id: executor_id.to_owned(),
                     scheduled_time: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()

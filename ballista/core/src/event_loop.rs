@@ -18,37 +18,13 @@
 //! Event loop infrastructure for asynchronous message processing.
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use async_trait::async_trait;
 use log::{error, info};
 use tokio::sync::mpsc;
 
 use crate::error::{BallistaError, Result};
-
-/// Snapshot of the event handler currently executing in an [`EventLoop`].
-///
-/// Populated by the loop on entry to [`EventAction::on_receive`] and cleared
-/// on return. External diagnostic code (see the scheduler's stuck-query
-/// detector) reads this to attribute a hang to a specific event variant
-/// and learn how long it has been in flight.
-#[derive(Clone, Debug)]
-pub struct EventInFlight {
-    /// Short, stable identifier for the event variant being processed,
-    /// supplied by [`EventAction::event_label`].
-    pub label: &'static str,
-    /// Instant the handler began.
-    pub started_at: Instant,
-}
-
-/// Shared slot tracking which event is currently being processed by the
-/// loop. `Some(_)` while a handler runs, `None` otherwise.
-///
-/// Uses a synchronous mutex — the lock is held only to swap a small Option
-/// at the start and end of each `on_receive`, never across an await.
-pub type EventProgressSignal = Arc<Mutex<Option<EventInFlight>>>;
 
 /// Trait defining actions to be performed in response to events in an event loop.
 #[async_trait]
@@ -69,14 +45,6 @@ pub trait EventAction<E>: Send + Sync {
 
     /// Called when an error occurs during event processing.
     fn on_error(&self, error: BallistaError);
-
-    /// Short, stable label for the given event variant, used by external
-    /// diagnostic code to identify which handler is currently running.
-    /// Default returns an empty string, meaning the event loop will not
-    /// publish a tracking entry for events from this action.
-    fn event_label(&self, _event: &E) -> &'static str {
-        ""
-    }
 }
 
 /// An asynchronous event loop that processes events through a channel.
@@ -89,7 +57,6 @@ pub struct EventLoop<E> {
     stopped: Arc<AtomicBool>,
     action: Arc<dyn EventAction<E>>,
     tx_event: Option<mpsc::Sender<E>>,
-    in_flight: EventProgressSignal,
 }
 
 impl<E: Send + 'static> EventLoop<E> {
@@ -105,15 +72,7 @@ impl<E: Send + 'static> EventLoop<E> {
             stopped: Arc::new(AtomicBool::new(false)),
             action,
             tx_event: None,
-            in_flight: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// Returns a handle to the shared signal that tracks the event
-    /// currently being processed. Used by diagnostic code to attribute
-    /// a stuck condition to a specific handler.
-    pub fn in_flight_signal(&self) -> EventProgressSignal {
-        self.in_flight.clone()
     }
 
     fn run(&self, mut rx_event: mpsc::Receiver<E>) {
@@ -125,27 +84,11 @@ impl<E: Send + 'static> EventLoop<E> {
         let name = self.name.clone();
         let stopped = self.stopped.clone();
         let action = self.action.clone();
-        let in_flight = self.in_flight.clone();
         tokio::spawn(async move {
             info!("Starting the event loop {name}");
             while !stopped.load(Ordering::SeqCst) {
                 if let Some(event) = rx_event.recv().await {
-                    let label = action.event_label(&event);
-                    if !label.is_empty()
-                        && let Ok(mut slot) = in_flight.lock()
-                    {
-                        *slot = Some(EventInFlight {
-                            label,
-                            started_at: Instant::now(),
-                        });
-                    }
-                    let result = action.on_receive(event, &tx_event, &rx_event).await;
-                    if !label.is_empty()
-                        && let Ok(mut slot) = in_flight.lock()
-                    {
-                        *slot = None;
-                    }
-                    if let Err(e) = result {
+                    if let Err(e) = action.on_receive(event, &tx_event, &rx_event).await {
                         error!("Fail to process event due to {e}");
                         action.on_error(e);
                     }

@@ -55,12 +55,6 @@ use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
-// Maximum time to wait for a free task slot before sending poll_work anyway.
-// In pull-based scheduling, poll_work also serves as the heartbeat to the
-// scheduler. If we block indefinitely waiting for a free slot, the scheduler
-// will declare this executor dead after executor_timeout_seconds.
-const SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Main execution loop that polls the scheduler for available tasks.
 ///
 /// This function runs indefinitely, periodically asking the scheduler for
@@ -86,7 +80,7 @@ const QUIET_AFTER_FAILURES: u32 = 5;
 /// * `poll_now_notify` - Optional notify to wake the poll loop immediately when new work is available
 /// * `available_task_slots` - Optional semaphore for controlling task concurrency. If None, creates one internally.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
-    scheduler: SchedulerGrpcClient<C>,
+    mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
     readiness: Option<OneShotSender<String>>,
@@ -110,41 +104,19 @@ where
         Arc::new(Semaphore::new(executor_specification.task_slots as usize))
     });
 
-    poll_loop_with_slots(
-        scheduler,
-        executor,
-        codec,
-        available_task_slots,
-        readiness,
-        poll_now_notify,
-    )
-    .await
-}
-
-async fn poll_loop_with_slots<
-    T: 'static + AsLogicalPlan,
-    U: 'static + AsExecutionPlan,
-    C,
->(
-    mut scheduler: SchedulerGrpcClient<C>,
-    executor: Arc<Executor>,
-    codec: BallistaCodec<T, U>,
-    available_task_slots: Arc<Semaphore>,
-    readiness: Option<OneShotSender<String>>,
-    poll_now_notify: Option<Arc<Notify>>,
-) -> Result<(), BallistaError>
-where
-    C: tonic::client::GrpcService<tonic::body::Body>,
-    C::Error: Into<StdError>,
-    C::ResponseBody: Body<Data = Bytes> + Send + 'static,
-    <C::ResponseBody as Body>::Error: Into<StdError> + Send,
-{
     let (task_status_sender, mut task_status_receiver) =
         std::sync::mpsc::channel::<TaskStatus>();
     info!("Starting poll work loop with scheduler");
 
     let dedicated_executor =
-        DedicatedExecutor::new("task_runner", executor.concurrent_tasks);
+        DedicatedExecutor::new("task_runner", executor_specification.task_slots as usize);
+
+    let report_ready = LazyCell::new(|| {
+        if let Some(chan) = readiness {
+            chan.send(executor.metadata.id.clone())
+                .expect("Must send readiness")
+        }
+    });
 
     // Track consecutive scheduler connection failures for backoff and log suppression
     let mut consecutive_failures: u32 = 0;
@@ -155,35 +127,11 @@ where
         ..ExponentialBackoff::default()
     };
 
-    let report_ready = LazyCell::new(|| {
-        if let Some(chan) = readiness {
-            chan.send(executor.metadata.id.clone())
-                .expect("Must send readiness")
-        }
-    });
-
     loop {
-        // Wait for task slots to be available, but don't block indefinitely.
-        // We must call poll_work periodically even when all slots are busy to
-        // maintain the heartbeat with the scheduler (poll_work updates executor
-        // metadata/heartbeat on the scheduler side).
-        match tokio::time::timeout(SLOT_WAIT_TIMEOUT, available_task_slots.acquire())
-            .await
-        {
-            Ok(Ok(permit)) => drop(permit),
-            Ok(Err(_)) => {
-                // Semaphore closed - should not happen in normal operation
-                warn!("Task slot semaphore closed unexpectedly");
-                return Err(BallistaError::General(
-                    "Task slot semaphore closed unexpectedly".to_string(),
-                ));
-            }
-            Err(_) => {
-                // Timeout: all task slots are busy. Continue to call poll_work
-                // with 0 free slots so the scheduler updates our heartbeat.
-                debug!("All task slots occupied, sending heartbeat-only poll_work");
-            }
-        }
+        // Wait for task slots to be available before asking for new work
+        let permit = available_task_slots.acquire().await.unwrap();
+        // Make the slot available again
+        drop(permit);
 
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;
@@ -197,11 +145,11 @@ where
                 })
                 .await;
 
+        *report_ready;
+
         // Keeps track of whether we received task in last iteration
         // to avoid going in sleep mode between polling
         let active_job;
-
-        *report_ready;
 
         match poll_work_result {
             Ok(result) => {
@@ -332,8 +280,8 @@ where
             match &poll_now_notify {
                 Some(notify) => {
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                        _ = notify.notified() => {
+                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        () = notify.notified() => {
                             debug!("Received poll_now notification, polling immediately");
                         }
                     }
@@ -418,7 +366,6 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         stage_id as usize,
         plan,
         &executor.work_dir,
-        task_context.session_config().options(),
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
@@ -503,281 +450,4 @@ async fn sample_tasks_status(
     }
 
     task_status
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::executor::Executor;
-    use crate::metrics::LoggingMetricsCollector;
-    use ballista_core::RuntimeProducer;
-    use ballista_core::serde::BallistaCodec;
-    use ballista_core::serde::protobuf::scheduler_grpc_server::{
-        SchedulerGrpc, SchedulerGrpcServer,
-    };
-    use ballista_core::serde::protobuf::{
-        CancelJobParams, CancelJobResult, CleanJobDataParams, CleanJobDataResult,
-        CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryParams,
-        ExecuteQueryResult, ExecutorRegistration, ExecutorStoppedParams,
-        ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-        GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
-        GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams,
-        HeartBeatResult, RegisterExecutorParams, RegisterExecutorResult,
-        RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
-        UpdateTaskStatusResult,
-    };
-    use ballista_core::utils::default_config_producer;
-    use datafusion::execution::context::SessionContext;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use tonic::{Request, Response, Status};
-
-    /// A mock scheduler that counts poll_work calls and always returns no tasks.
-    struct MockScheduler {
-        poll_work_count: Arc<AtomicU32>,
-    }
-
-    #[tonic::async_trait]
-    impl SchedulerGrpc for MockScheduler {
-        async fn poll_work(
-            &self,
-            _request: Request<PollWorkParams>,
-        ) -> Result<Response<PollWorkResult>, Status> {
-            self.poll_work_count.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::new(PollWorkResult {
-                tasks: vec![],
-                jobs_to_clean: vec![],
-            }))
-        }
-
-        async fn register_executor(
-            &self,
-            _request: Request<RegisterExecutorParams>,
-        ) -> Result<Response<RegisterExecutorResult>, Status> {
-            Ok(Response::new(RegisterExecutorResult { success: true }))
-        }
-
-        async fn heart_beat_from_executor(
-            &self,
-            _request: Request<HeartBeatParams>,
-        ) -> Result<Response<HeartBeatResult>, Status> {
-            Ok(Response::new(HeartBeatResult { reregister: false }))
-        }
-
-        async fn update_task_status(
-            &self,
-            _request: Request<UpdateTaskStatusParams>,
-        ) -> Result<Response<UpdateTaskStatusResult>, Status> {
-            Ok(Response::new(UpdateTaskStatusResult { success: true }))
-        }
-
-        async fn create_update_session(
-            &self,
-            _request: Request<CreateUpdateSessionParams>,
-        ) -> Result<Response<CreateUpdateSessionResult>, Status> {
-            Ok(Response::new(CreateUpdateSessionResult {
-                session_id: String::new(),
-            }))
-        }
-
-        async fn remove_session(
-            &self,
-            _request: Request<RemoveSessionParams>,
-        ) -> Result<Response<RemoveSessionResult>, Status> {
-            Ok(Response::new(RemoveSessionResult { success: true }))
-        }
-
-        async fn execute_query(
-            &self,
-            _request: Request<ExecuteQueryParams>,
-        ) -> Result<Response<ExecuteQueryResult>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-
-        async fn get_job_status(
-            &self,
-            _request: Request<GetJobStatusParams>,
-        ) -> Result<Response<GetJobStatusResult>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-
-        async fn get_job_metrics(
-            &self,
-            _request: Request<GetJobMetricsParams>,
-        ) -> Result<Response<GetJobMetricsResult>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-
-        async fn executor_stopped(
-            &self,
-            _request: Request<ExecutorStoppedParams>,
-        ) -> Result<Response<ExecutorStoppedResult>, Status> {
-            Ok(Response::new(ExecutorStoppedResult {}))
-        }
-
-        async fn cancel_job(
-            &self,
-            _request: Request<CancelJobParams>,
-        ) -> Result<Response<CancelJobResult>, Status> {
-            Ok(Response::new(CancelJobResult { cancelled: true }))
-        }
-
-        async fn clean_job_data(
-            &self,
-            _request: Request<CleanJobDataParams>,
-        ) -> Result<Response<CleanJobDataResult>, Status> {
-            Ok(Response::new(CleanJobDataResult {}))
-        }
-
-        type ExecuteQueryPushStream =
-            tokio_stream::wrappers::ReceiverStream<Result<GetJobStatusResult, Status>>;
-
-        async fn execute_query_push(
-            &self,
-            _request: Request<ExecuteQueryParams>,
-        ) -> Result<Response<Self::ExecuteQueryPushStream>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-
-        async fn get_catalog(
-            &self,
-            _request: Request<GetCatalogParams>,
-        ) -> Result<Response<GetCatalogResult>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-
-        async fn get_remote_functions(
-            &self,
-            _request: Request<GetRemoteFunctionsParams>,
-        ) -> Result<Response<GetRemoteFunctionsResult>, Status> {
-            Err(Status::unimplemented("not needed for test"))
-        }
-    }
-
-    /// Start a mock scheduler gRPC server on an ephemeral port and return
-    /// the address and the poll_work call counter.
-    async fn start_mock_scheduler() -> (SocketAddr, Arc<AtomicU32>) {
-        let poll_work_count = Arc::new(AtomicU32::new(0));
-        let svc = MockScheduler {
-            poll_work_count: poll_work_count.clone(),
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-            tonic::transport::Server::builder()
-                .add_service(SchedulerGrpcServer::new(svc))
-                .serve_with_incoming(incoming)
-                .await
-                .unwrap();
-        });
-
-        // Give the server a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        (addr, poll_work_count)
-    }
-
-    fn make_test_executor(task_slots: usize) -> Arc<Executor> {
-        let work_dir = tempfile::TempDir::new()
-            .unwrap()
-            .keep()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let metadata = ExecutorRegistration {
-            id: "test-executor".to_string(),
-            port: 0,
-            grpc_port: 0,
-            specification: Some(
-                ballista_core::serde::protobuf::ExecutorSpecification {
-                    resources: vec![
-                        ballista_core::serde::protobuf::ExecutorResource {
-                            resource: Some(
-                                ballista_core::serde::protobuf::executor_resource::Resource::TaskSlots(task_slots as u32),
-                            ),
-                        },
-                    ],
-                },
-            ),
-            host: None,
-        };
-        let config_producer = Arc::new(default_config_producer);
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env().clone();
-        let runtime_producer: RuntimeProducer =
-            Arc::new(move |_| Ok(runtime_env.clone()));
-        Arc::new(Executor::new(
-            metadata,
-            &work_dir,
-            runtime_producer,
-            config_producer,
-            Default::default(),
-            Arc::new(LoggingMetricsCollector::default()),
-            task_slots,
-            None,
-        ))
-    }
-
-    /// Regression test: In pull-based scheduling, poll_work is the heartbeat
-    /// mechanism. When all task slots are occupied by running queries, the
-    /// executor must still call poll_work periodically so the scheduler
-    /// updates the heartbeat timestamp. Otherwise the scheduler declares
-    /// the executor dead after executor_timeout_seconds.
-    ///
-    /// Before the fix, poll_loop blocked indefinitely at:
-    ///   let permit = available_task_slots.acquire().await.unwrap();
-    /// This starved all subsequent poll_work calls (heartbeats).
-    #[tokio::test]
-    async fn test_poll_loop_sends_heartbeat_when_all_slots_occupied() {
-        let task_slots = 2usize;
-        let (addr, poll_work_count) = start_mock_scheduler().await;
-
-        let executor = make_test_executor(task_slots);
-        let codec: BallistaCodec = BallistaCodec::default();
-        let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let scheduler_client = SchedulerGrpcClient::new(channel);
-
-        // Create the semaphore externally so we can hold all permits,
-        // simulating all task slots being occupied by running queries.
-        let available_task_slots = Arc::new(Semaphore::new(task_slots));
-        let _held_permits: Vec<_> = {
-            let mut permits = Vec::new();
-            for _ in 0..task_slots {
-                permits.push(available_task_slots.clone().acquire_owned().await.unwrap());
-            }
-            permits
-        };
-        assert_eq!(available_task_slots.available_permits(), 0);
-
-        // Start poll_loop with all slots held — before the fix this would
-        // block forever and poll_work (the heartbeat) would never be called.
-        let handle = tokio::spawn(poll_loop_with_slots(
-            scheduler_client,
-            executor.clone(),
-            codec,
-            available_task_slots.clone(),
-            None,
-            None,
-        ));
-
-        // Wait long enough for the SLOT_WAIT_TIMEOUT (15s) to fire at least
-        // once, plus margin. We use 20s to be safe. With the old code,
-        // poll_work_count would remain 0 forever.
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        let count = poll_work_count.load(Ordering::SeqCst);
-        assert!(
-            count > 0,
-            "poll_work must be called even when all task slots are occupied \
-             (heartbeat must not be starved). Got {count} calls in 20s."
-        );
-
-        handle.abort();
-    }
 }

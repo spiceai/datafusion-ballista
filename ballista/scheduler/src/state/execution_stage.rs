@@ -21,7 +21,6 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::common::format::ExplainFormat;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 //use datafusion::physical_optimizer::join_selection::JoinSelection;
@@ -106,17 +105,6 @@ impl ExecutionStage {
             ExecutionStage::Running(stage) => stage.plan.as_ref(),
             ExecutionStage::Successful(stage) => stage.plan.as_ref(),
             ExecutionStage::Failed(stage) => stage.plan.as_ref(),
-        }
-    }
-
-    /// Format the stage with the given explain format (Tree vs Indent)
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        match self {
-            ExecutionStage::UnResolved(s) => s.format_with(format),
-            ExecutionStage::Resolved(s) => s.format_with(format),
-            ExecutionStage::Running(s) => s.format_with(format),
-            ExecutionStage::Successful(s) => s.format_with(format),
-            ExecutionStage::Failed(s) => s.format_with(format),
         }
     }
 }
@@ -259,14 +247,6 @@ pub struct FailedStage {
 pub struct TaskInfo {
     /// Unique task identifier within the execution graph.
     pub task_id: usize,
-    /// ID of the executor that ran (or is running) this task.
-    ///
-    /// Carried at the top level so it survives terminal status transitions
-    /// to `Failed` — `FailedTask` does not embed an `executor_id`, so without
-    /// this field the scheduler would lose the executor mapping for any
-    /// failed partition. Populated at task launch and preserved through
-    /// `update_task_info`.
-    pub executor_id: String,
     /// Timestamp when the task was scheduled (in milliseconds since epoch).
     pub scheduled_time: u128,
     /// Timestamp when the task was launched on an executor (in milliseconds since epoch).
@@ -446,29 +426,6 @@ impl Debug for UnresolvedStage {
     }
 }
 
-impl UnresolvedStage {
-    /// Format the stage with the given explain format
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        let plan = match format {
-            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .tree_render()
-                .to_string(),
-            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .indent(false)
-                .to_string(),
-        };
-
-        format!(
-            "=========UnResolvedStage[stage_id={}.{}, children={}]=========\nInputs{:?}\n{}",
-            self.stage_id,
-            self.stage_attempt_num,
-            self.inputs.len(),
-            self.inputs,
-            plan
-        )
-    }
-}
-
 impl ResolvedStage {
     /// Creates a new resolved stage ready for task scheduling.
     pub fn new(
@@ -530,25 +487,6 @@ impl Debug for ResolvedStage {
 
         write!(
             f,
-            "=========ResolvedStage[stage_id={}.{}, partitions={}]=========\n{}",
-            self.stage_id, self.stage_attempt_num, self.partitions, plan
-        )
-    }
-}
-
-impl ResolvedStage {
-    /// Format the stage with the given explain format
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        let plan = match format {
-            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .tree_render()
-                .to_string(),
-            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .indent(false)
-                .to_string(),
-        };
-
-        format!(
             "=========ResolvedStage[stage_id={}.{}, partitions={}]=========\n{}",
             self.stage_id, self.stage_attempt_num, self.partitions, plan
         )
@@ -708,12 +646,7 @@ impl RunningStage {
     /// Update the TaskInfo for task partition
     pub fn update_task_info(&mut self, partition_id: usize, status: TaskStatus) -> bool {
         debug!("Updating TaskInfo for partition {partition_id}");
-        let Some(task_info) = self.task_infos[partition_id].as_ref() else {
-            warn!(
-                "Ignore TaskStatus update for partition {partition_id} because the task was already reset (executor lost)"
-            );
-            return false;
-        };
+        let task_info = self.task_infos[partition_id].as_ref().unwrap();
         let task_id = task_info.task_id;
         if (status.task_id as usize) < task_id {
             warn!(
@@ -723,11 +656,9 @@ impl RunningStage {
             return false;
         }
         let scheduled_time = task_info.scheduled_time;
-        let executor_id = task_info.executor_id.clone();
         let task_status = status.status.unwrap();
         let updated_task_info = TaskInfo {
             task_id,
-            executor_id,
             scheduled_time,
             launch_time: status.launch_time as u128,
             start_exec_time: status.start_exec_time as u128,
@@ -907,31 +838,6 @@ impl Debug for RunningStage {
     }
 }
 
-impl RunningStage {
-    /// Format the stage with the given explain format
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        let plan = match format {
-            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .tree_render()
-                .to_string(),
-            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .indent(false)
-                .to_string(),
-        };
-
-        format!(
-            "=========RunningStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}]=========\n{}",
-            self.stage_id,
-            self.stage_attempt_num,
-            self.partitions,
-            self.successful_tasks(),
-            self.scheduled_tasks(),
-            self.available_tasks(),
-            plan
-        )
-    }
-}
-
 impl SuccessfulStage {
     /// Change to the running state and bump the stage attempt number
     pub fn to_running(&self) -> RunningStage {
@@ -987,7 +893,6 @@ impl SuccessfulStage {
                 } if *executor == *executor_id => {
                     *task = TaskInfo {
                         task_id: *task_id,
-                        executor_id: executor_id.clone(),
                         scheduled_time: *scheduled_time,
                         launch_time: 0,
                         start_exec_time: 0,
@@ -1019,29 +924,6 @@ impl Debug for SuccessfulStage {
 
         write!(
             f,
-            "=========SuccessfulStage[stage_id={}.{}, partitions={}]=========\n{}",
-            self.stage_id, self.stage_attempt_num, self.partitions, plan
-        )
-    }
-}
-
-impl SuccessfulStage {
-    /// Format the stage with the given explain format
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        let plan = match format {
-            // Tree format doesn't include metrics (DisplayableBallistaExecutionPlan doesn't support tree)
-            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .tree_render()
-                .to_string(),
-            _ => DisplayableBallistaExecutionPlan::new(
-                self.plan.as_ref(),
-                &self.stage_metrics,
-            )
-            .indent()
-            .to_string(),
-        };
-
-        format!(
             "=========SuccessfulStage[stage_id={}.{}, partitions={}]=========\n{}",
             self.stage_id, self.stage_attempt_num, self.partitions, plan
         )
@@ -1083,32 +965,6 @@ impl Debug for FailedStage {
 
         write!(
             f,
-            "=========FailedStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}, error_message={}]=========\n{}",
-            self.stage_id,
-            self.stage_attempt_num,
-            self.partitions,
-            self.successful_tasks(),
-            self.scheduled_tasks(),
-            self.available_tasks(),
-            self.error_message,
-            plan
-        )
-    }
-}
-
-impl FailedStage {
-    /// Format the stage with the given explain format
-    pub fn format_with(&self, format: &ExplainFormat) -> String {
-        let plan = match format {
-            ExplainFormat::Tree => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .tree_render()
-                .to_string(),
-            _ => DisplayableExecutionPlan::new(self.plan.as_ref())
-                .indent(false)
-                .to_string(),
-        };
-
-        format!(
             "=========FailedStage[stage_id={}.{}, partitions={}, successful_tasks={}, scheduled_tasks={}, available_tasks={}, error_message={}]=========\n{}",
             self.stage_id,
             self.stage_attempt_num,
@@ -1191,260 +1047,5 @@ impl StageOutput {
         }
 
         partition_locations
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ballista_core::serde::protobuf::{SuccessfulTask, TaskStatus, task_status};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::ScalarValue;
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
-    use datafusion::physical_plan::empty::EmptyExec;
-    use datafusion::physical_plan::expressions::{Column, Literal};
-    use datafusion::physical_plan::filter::FilterExec;
-    use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
-    use datafusion::physical_plan::projection::ProjectionExec;
-    use datafusion::physical_plan::sorts::sort::SortExec;
-    use datafusion::prelude::SessionConfig;
-    use std::collections::HashMap;
-
-    fn make_running_stage(partitions: usize) -> RunningStage {
-        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        RunningStage::new(
-            1,
-            0,
-            plan,
-            partitions,
-            vec![],
-            HashMap::new(),
-            Arc::new(SessionConfig::default()),
-        )
-    }
-
-    fn make_task_status(task_id: u32, partition_id: u32) -> TaskStatus {
-        TaskStatus {
-            task_id,
-            job_id: "test-job".to_string(),
-            stage_id: 1,
-            stage_attempt_num: 0,
-            partition_id,
-            launch_time: 100,
-            start_exec_time: 200,
-            end_exec_time: 300,
-            status: Some(task_status::Status::Successful(SuccessfulTask {
-                executor_id: "executor-1".to_string(),
-                partitions: vec![],
-            })),
-            metrics: vec![],
-        }
-    }
-
-    /// Regression test: `update_task_info` must not panic when the task slot
-    /// is `None` (task was reset after executor heartbeat timeout).
-    #[test]
-    fn test_update_task_info_after_reset_does_not_panic() {
-        let mut stage = make_running_stage(2);
-
-        // Both task slots start as None (not yet scheduled).
-        // Simulates receiving a status update for a task that was already
-        // reset (e.g., executor heartbeat timed out).
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        // Should return false (update rejected), not panic.
-        assert!(!result);
-    }
-
-    /// Verify that a normal update succeeds when the task slot is populated.
-    #[test]
-    fn test_update_task_info_normal_update_succeeds() {
-        let mut stage = make_running_stage(2);
-
-        // Simulate scheduling the task: populate the task slot.
-        stage.task_infos[0] = Some(TaskInfo {
-            task_id: 0,
-            executor_id: "executor-1".to_string(),
-            scheduled_time: 50,
-            launch_time: 0,
-            start_exec_time: 0,
-            end_exec_time: 0,
-            finish_time: 0,
-            task_status: task_status::Status::Running(RunningTask {
-                executor_id: "executor-1".to_string(),
-            }),
-        });
-
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        assert!(result);
-        assert!(matches!(
-            stage.task_infos[0].as_ref().unwrap().task_status,
-            task_status::Status::Successful(_)
-        ));
-    }
-
-    /// After reset_tasks sets a slot to None, update_task_info must not panic.
-    #[test]
-    fn test_update_task_info_after_executor_lost() {
-        let mut stage = make_running_stage(2);
-
-        // Populate tasks as running on executor-1.
-        for i in 0..2 {
-            stage.task_infos[i] = Some(TaskInfo {
-                task_id: i,
-                executor_id: "executor-1".to_string(),
-                scheduled_time: 50,
-                launch_time: 100,
-                start_exec_time: 200,
-                end_exec_time: 0,
-                finish_time: 0,
-                task_status: task_status::Status::Running(RunningTask {
-                    executor_id: "executor-1".to_string(),
-                }),
-            });
-        }
-
-        // Executor heartbeat times out - tasks are reset.
-        let reset_count = stage.reset_tasks("executor-1");
-        assert_eq!(reset_count, 2);
-        assert!(stage.task_infos[0].is_none());
-        assert!(stage.task_infos[1].is_none());
-
-        // Executor sends a late status update for partition 0.
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        // Should gracefully reject the update, not panic.
-        assert!(!result);
-    }
-
-    /// Create a resolved stage with a multi-node plan for snapshot testing
-    /// Plan: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
-    fn make_resolved_stage_with_complex_plan() -> ResolvedStage {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("value", DataType::Float64, true),
-        ]));
-
-        // Build: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
-        let placeholder = Arc::new(PlaceholderRowExec::new(schema.clone()));
-
-        // Filter: true (always pass)
-        let filter_expr = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
-        let filter = Arc::new(
-            FilterExec::try_new(filter_expr, placeholder).expect("filter creation"),
-        );
-
-        // Coalesce batches
-        let coalesce = Arc::new(CoalesceBatchesExec::new(filter, 8192));
-
-        // Sort by id ASC
-        let sort_exprs = LexOrdering::new(vec![PhysicalSortExpr {
-            expr: Arc::new(Column::new("id", 0)),
-            options: Default::default(),
-        }])
-        .expect("non-empty sort expressions");
-        let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
-
-        // Project id and name
-        let projection_exprs: Vec<(
-            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-            String,
-        )> = vec![
-            (Arc::new(Column::new("id", 0)), "id".to_string()),
-            (Arc::new(Column::new("name", 1)), "name".to_string()),
-        ];
-        let projection = Arc::new(
-            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
-        );
-
-        ResolvedStage::new(
-            1,
-            0,
-            projection,
-            vec![],
-            HashMap::new(),
-            HashSet::new(),
-            Arc::new(SessionConfig::default()),
-        )
-    }
-
-    /// Create an unresolved stage with a multi-node plan for snapshot testing
-    /// Plan: PlaceholderRowExec -> FilterExec -> CoalesceBatchesExec -> SortExec -> ProjectionExec
-    fn make_unresolved_stage_with_complex_plan() -> UnresolvedStage {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("value", DataType::Float64, true),
-        ]));
-
-        let placeholder = Arc::new(PlaceholderRowExec::new(schema.clone()));
-
-        let filter_expr = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
-        let filter = Arc::new(
-            FilterExec::try_new(filter_expr, placeholder).expect("filter creation"),
-        );
-
-        let coalesce = Arc::new(CoalesceBatchesExec::new(filter, 8192));
-
-        let sort_exprs = LexOrdering::new(vec![PhysicalSortExpr {
-            expr: Arc::new(Column::new("id", 0)),
-            options: Default::default(),
-        }])
-        .expect("non-empty sort expressions");
-        let sort = Arc::new(SortExec::new(sort_exprs, coalesce));
-
-        let projection_exprs: Vec<(
-            Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-            String,
-        )> = vec![
-            (Arc::new(Column::new("id", 0)), "id".to_string()),
-            (Arc::new(Column::new("name", 1)), "name".to_string()),
-        ];
-        let projection = Arc::new(
-            ProjectionExec::try_new(projection_exprs, sort).expect("projection"),
-        );
-
-        UnresolvedStage::new(
-            1,
-            projection,
-            vec![],
-            vec![],
-            Arc::new(SessionConfig::default()),
-        )
-    }
-
-    #[test]
-    fn test_resolved_stage_format_tree_snapshot() {
-        let stage = make_resolved_stage_with_complex_plan();
-        let output = stage.format_with(&ExplainFormat::Tree);
-        insta::assert_snapshot!("resolved_stage_tree_format", output);
-    }
-
-    #[test]
-    fn test_resolved_stage_format_indent_snapshot() {
-        let stage = make_resolved_stage_with_complex_plan();
-        let output = stage.format_with(&ExplainFormat::Indent);
-        insta::assert_snapshot!("resolved_stage_indent_format", output);
-    }
-
-    #[test]
-    fn test_unresolved_stage_format_tree_snapshot() {
-        let stage = make_unresolved_stage_with_complex_plan();
-        let output = stage.format_with(&ExplainFormat::Tree);
-        insta::assert_snapshot!("unresolved_stage_tree_format", output);
-    }
-
-    #[test]
-    fn test_unresolved_stage_format_indent_snapshot() {
-        let stage = make_unresolved_stage_with_complex_plan();
-        let output = stage.format_with(&ExplainFormat::Indent);
-        insta::assert_snapshot!("unresolved_stage_indent_format", output);
     }
 }

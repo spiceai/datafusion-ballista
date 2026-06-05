@@ -31,13 +31,10 @@ use ballista_core::{
     },
     serde::scheduler::PartitionLocation,
 };
-use datafusion::common::JoinType;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
@@ -106,12 +103,6 @@ impl DistributedPlanner for DefaultDistributedPlanner {
         config: &ConfigOptions,
     ) -> Result<Vec<Arc<dyn ShuffleWriter>>> {
         info!("planning query stages for job {job_id}");
-        // Safety: revert CollectLeft to Partitioned for non-INNER joins.
-        // CollectLeft broadcasts the build side to all partitions, but in
-        // distributed mode each executor independently emits "unmatched"
-        // build rows for outer/semi/anti joins, producing duplicates.
-        // See https://github.com/apache/datafusion-ballista/issues/1055
-        let execution_plan = revert_non_inner_collect_left(execution_plan)?;
         let (new_plan, mut stages) =
             self.plan_query_stages_internal(job_id, execution_plan, config)?;
         stages.push(create_shuffle_writer_with_config(
@@ -169,51 +160,23 @@ impl DefaultDistributedPlanner {
                 with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
                 stages,
             ))
-        } else if let Some(sort_preserving_merge) = execution_plan
+        } else if let Some(_sort_preserving_merge) = execution_plan
             .as_any()
             .downcast_ref::<SortPreservingMergeExec>(
         ) {
-            // For TopK queries (SortPreservingMergeExec with a small fetch/limit),
-            // skip the stage break and keep the merge in the same stage as its children.
-            // This avoids the overhead of shuffle write/read for a small number of rows,
-            // which dominates execution time for TopK queries in distributed mode.
-            //
-            // Note on parallelism: because SortPreservingMergeExec has an output
-            // partitioning of 1, the entire stage becomes a single task assigned to
-            // one executor (ShuffleWriterExec::input_partition_count() == 1).
-            // This does sacrifice cluster-level parallelism (no cross-executor
-            // distribution). However, within that executor the child partitions
-            // still execute as parallel async streams, so intra-executor parallelism
-            // is preserved. For small fetch values this trade-off is worthwhile as
-            // the shuffle coordination overhead far exceeds the merge cost.
-            const TOPK_FETCH_THRESHOLD: usize = 1000;
-            if sort_preserving_merge
-                .fetch()
-                .is_some_and(|f| f <= TOPK_FETCH_THRESHOLD)
-            {
-                Ok((
-                    with_new_children_if_necessary(execution_plan, children)?,
-                    stages,
-                ))
-            } else {
-                let shuffle_writer = create_shuffle_writer_with_config(
-                    job_id,
-                    self.next_stage_id(),
-                    children[0].clone(),
-                    None,
-                    config,
-                )?;
-                let unresolved_shuffle =
-                    create_unresolved_shuffle(shuffle_writer.as_ref());
-                stages.push(shuffle_writer);
-                Ok((
-                    with_new_children_if_necessary(
-                        execution_plan,
-                        vec![unresolved_shuffle],
-                    )?,
-                    stages,
-                ))
-            }
+            let shuffle_writer = create_shuffle_writer_with_config(
+                job_id,
+                self.next_stage_id(),
+                children[0].clone(),
+                None,
+                config,
+            )?;
+            let unresolved_shuffle = create_unresolved_shuffle(shuffle_writer.as_ref());
+            stages.push(shuffle_writer);
+            Ok((
+                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                stages,
+            ))
         } else if let Some(repart) =
             execution_plan.as_any().downcast_ref::<RepartitionExec>()
         {
@@ -263,70 +226,6 @@ fn create_unresolved_shuffle(
         shuffle_writer.schema(),
         shuffle_writer.properties().output_partitioning().clone(),
     ))
-}
-
-/// Revert CollectLeft hash joins to Partitioned for non-INNER join types.
-///
-/// In distributed execution, CollectLeft broadcasts the build side to every
-/// partition/task. For INNER joins this is correct — each task independently
-/// produces matching rows. For LEFT/RIGHT/FULL OUTER and SEMI/ANTI joins,
-/// each task would independently emit "unmatched" build rows, producing
-/// duplicate or incorrect results across executors.
-///
-/// This replaces non-INNER CollectLeft joins with Partitioned joins and
-/// inserts the necessary RepartitionExec(Hash) nodes on both sides so the
-/// distributed planner creates proper shuffle stages.
-fn revert_non_inner_collect_left(
-    plan: Arc<dyn ExecutionPlan>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    plan.transform_up(|node| {
-        if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>()
-            && *hash_join.partition_mode() == PartitionMode::CollectLeft
-                && hash_join.join_type() != &JoinType::Inner
-            {
-                info!(
-                    "Reverting CollectLeft to Partitioned for {:?} join (bug #1055 workaround)",
-                    hash_join.join_type()
-                );
-                let left = hash_join.left().clone();
-                let right = hash_join.right().clone();
-                let on = hash_join.on();
-                let partition_count = right
-                    .properties()
-                    .output_partitioning()
-                    .partition_count();
-
-                // Build hash expressions for both sides from join keys
-                let left_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
-                    on.iter().map(|(l, _)| l.clone()).collect();
-                let right_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
-                    on.iter().map(|(_, r)| r.clone()).collect();
-
-                let left_repart = Arc::new(RepartitionExec::try_new(
-                    left,
-                    Partitioning::Hash(left_exprs, partition_count),
-                )?) as Arc<dyn ExecutionPlan>;
-                let right_repart = Arc::new(RepartitionExec::try_new(
-                    right,
-                    Partitioning::Hash(right_exprs, partition_count),
-                )?) as Arc<dyn ExecutionPlan>;
-
-                let new_join = Arc::new(HashJoinExec::try_new(
-                    left_repart,
-                    right_repart,
-                    on.to_vec(),
-                    hash_join.filter().cloned(),
-                    hash_join.join_type(),
-                    hash_join.projection.clone(),
-                    PartitionMode::Partitioned,
-                    hash_join.null_equality(),
-                )?);
-                return Ok(Transformed::yes(new_join as Arc<dyn ExecutionPlan>));
-            }
-        Ok(Transformed::no(node))
-    })
-    .map(|t| t.data)
-    .map_err(|e| BallistaError::DataFusionError(Box::new(e)))
 }
 
 /// Returns all unresolved shuffle nodes in the execution plan.
@@ -486,24 +385,18 @@ fn create_shuffle_writer_with_config(
 
 #[cfg(test)]
 mod test {
-    use crate::planner::{
-        DefaultDistributedPlanner, DistributedPlanner, revert_non_inner_collect_left,
-    };
+    use crate::planner::{DefaultDistributedPlanner, DistributedPlanner};
     use crate::test_utils::datafusion_test_context;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
     use ballista_core::serde::BallistaCodec;
     use datafusion::arrow::compute::SortOptions;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-    use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::filter::FilterExec;
-    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion::physical_plan::joins::HashJoinExec;
     use datafusion::physical_plan::projection::ProjectionExec;
-    use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use datafusion::physical_plan::windows::BoundedWindowAggExec;
@@ -966,189 +859,5 @@ order by
         let result_exec_plan: Arc<dyn ExecutionPlan> =
             (proto).try_into_physical_plan(ctx, codec.physical_extension_codec())?;
         Ok(result_exec_plan)
-    }
-
-    /// Verifies that TopK queries (ORDER BY ... LIMIT N, where N is small)
-    /// do NOT create a stage break at SortPreservingMergeExec, avoiding
-    /// shuffle overhead for small result sets.
-    #[tokio::test]
-    async fn test_topk_avoids_stage_break() -> Result<(), BallistaError> {
-        use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
-        use std::io::Write;
-
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let schema = "id,value\n";
-        for i in 0..4 {
-            let path = tmp_dir.path().join(format!("part{i:02}.csv"));
-            let mut f = std::fs::File::create(&path).unwrap();
-            write!(f, "{schema}").unwrap();
-            for j in 0..10 {
-                writeln!(f, "{},{}", i * 10 + j, (i * 10 + j) * 100).unwrap();
-            }
-        }
-
-        let config = SessionConfig::new().with_target_partitions(4);
-        let ctx = SessionContext::new_with_config(config);
-        ctx.register_csv(
-            "test_table",
-            tmp_dir.path().to_str().unwrap(),
-            CsvReadOptions::new(),
-        )
-        .await?;
-
-        // TopK query with small LIMIT — should produce a single stage
-        let df = ctx
-            .sql("SELECT id, value FROM test_table ORDER BY value DESC LIMIT 10")
-            .await?;
-        let plan = df.into_optimized_plan()?;
-        let plan = ctx.state().create_physical_plan(&plan).await?;
-
-        let mut planner = DefaultDistributedPlanner::new();
-        let stages = planner.plan_query_stages(
-            "job-topk",
-            plan,
-            ctx.state().config().options(),
-        )?;
-
-        for (i, stage) in stages.iter().enumerate() {
-            println!(
-                "TopK Stage {i}:\n{}",
-                displayable(stage.as_ref()).indent(false)
-            );
-        }
-
-        // Should be a single stage (no shuffle for TopK with small limit)
-        assert_eq!(
-            1,
-            stages.len(),
-            "TopK with small LIMIT should produce 1 stage, got {}",
-            stages.len()
-        );
-
-        // The single stage should contain SortPreservingMergeExec
-        let root = stages[0].children()[0].clone();
-        let _merge = downcast_exec!(root, SortPreservingMergeExec);
-
-        // Without LIMIT, the same query should produce 2 stages (with shuffle)
-        let df_no_limit = ctx
-            .sql("SELECT id, value FROM test_table ORDER BY value DESC")
-            .await?;
-        let plan_no_limit = df_no_limit.into_optimized_plan()?;
-        let plan_no_limit = ctx.state().create_physical_plan(&plan_no_limit).await?;
-
-        let mut planner2 = DefaultDistributedPlanner::new();
-        let stages_no_limit = planner2.plan_query_stages(
-            "job-no-limit",
-            plan_no_limit,
-            ctx.state().config().options(),
-        )?;
-
-        assert_eq!(
-            2,
-            stages_no_limit.len(),
-            "ORDER BY without LIMIT should produce 2 stages, got {}",
-            stages_no_limit.len()
-        );
-
-        Ok(())
-    }
-
-    fn memory_exec(
-        schema: Arc<Schema>,
-        partition_count: usize,
-    ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(EmptyExec::new(schema).with_partitions(partition_count))
-    }
-
-    #[test]
-    fn revert_non_inner_collect_left_rewrites_left_join() {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let left = memory_exec(schema.clone(), 1);
-        let right = memory_exec(schema, 4);
-
-        let join_on = vec![(
-            Arc::new(Column::new("a", 0)) as _,
-            Arc::new(Column::new("a", 0)) as _,
-        )];
-
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            HashJoinExec::try_new(
-                left,
-                right,
-                join_on,
-                None,
-                &JoinType::Left,
-                None,
-                PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNothing,
-            )
-            .unwrap(),
-        );
-
-        let rewritten = revert_non_inner_collect_left(plan).unwrap();
-
-        let rewritten_join = rewritten
-            .as_any()
-            .downcast_ref::<HashJoinExec>()
-            .expect("expected HashJoinExec after rewrite");
-        assert_eq!(*rewritten_join.partition_mode(), PartitionMode::Partitioned);
-        assert_eq!(*rewritten_join.join_type(), JoinType::Left);
-
-        // Both children should be RepartitionExec(Hash)
-        let left_repart = rewritten_join
-            .left()
-            .as_any()
-            .downcast_ref::<RepartitionExec>()
-            .expect("expected left child to be RepartitionExec");
-        let right_repart = rewritten_join
-            .right()
-            .as_any()
-            .downcast_ref::<RepartitionExec>()
-            .expect("expected right child to be RepartitionExec");
-
-        assert!(matches!(
-            left_repart.partitioning(),
-            Partitioning::Hash(_, 4)
-        ));
-        assert!(matches!(
-            right_repart.partitioning(),
-            Partitioning::Hash(_, 4)
-        ));
-    }
-
-    #[test]
-    fn revert_non_inner_collect_left_preserves_inner_join() {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let left = memory_exec(schema.clone(), 1);
-        let right = memory_exec(schema, 4);
-
-        let join_on = vec![(
-            Arc::new(Column::new("a", 0)) as _,
-            Arc::new(Column::new("a", 0)) as _,
-        )];
-
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            HashJoinExec::try_new(
-                left,
-                right,
-                join_on,
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNothing,
-            )
-            .unwrap(),
-        );
-
-        let rewritten = revert_non_inner_collect_left(plan).unwrap();
-
-        let rewritten_join = rewritten
-            .as_any()
-            .downcast_ref::<HashJoinExec>()
-            .expect("expected HashJoinExec");
-        // CollectLeft should be preserved for INNER joins
-        assert_eq!(*rewritten_join.partition_mode(), PartitionMode::CollectLeft);
-        assert_eq!(*rewritten_join.join_type(), JoinType::Inner);
     }
 }

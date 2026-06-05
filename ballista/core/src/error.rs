@@ -21,7 +21,6 @@ use std::{
     error::Error,
     fmt::{Display, Formatter},
     io, result,
-    sync::Arc,
 };
 
 use crate::serde::protobuf::failed_task::FailedReason;
@@ -114,86 +113,11 @@ impl From<parser::ParserError> for BallistaError {
 
 impl From<DataFusionError> for BallistaError {
     fn from(e: DataFusionError) -> Self {
-        // BallistaError::FetchFailed must reach the top level so FailedTask::from
-        // routes it to FailedReason::FetchPartitionError (the scheduler's
-        // map-stage rerun path). When a stream is shared between consumers,
-        // DataFusion wraps the underlying error as
-        //   DataFusionError::Shared(Arc(DataFusionError::ArrowError(
-        //     ArrowError::ExternalError(BallistaError::FetchFailed(...)))))
-        // and similar wrappers appear for Context, Diagnostic, Collection, and
-        // External. Drill through them so the inner BallistaError surfaces.
         match e {
             DataFusionError::ArrowError(e, _) => Self::from(*e),
-            DataFusionError::External(e) => match e.downcast::<BallistaError>() {
-                Ok(b) => *b,
-                Err(e) => match e.downcast::<DataFusionError>() {
-                    Ok(d) => Self::from(*d),
-                    Err(e) => BallistaError::DataFusionError(Box::new(
-                        DataFusionError::External(e),
-                    )),
-                },
-            },
-            DataFusionError::Context(_, inner) => Self::from(*inner),
-            DataFusionError::Diagnostic(_, inner) => Self::from(*inner),
-            DataFusionError::Collection(mut errs) if !errs.is_empty() => {
-                Self::from(errs.swap_remove(0))
-            }
-            DataFusionError::Shared(arc) => match Arc::try_unwrap(arc) {
-                Ok(inner) => Self::from(inner),
-                Err(arc) => find_fetch_failed(arc.as_ref()).unwrap_or_else(|| {
-                    BallistaError::DataFusionError(Box::new(DataFusionError::Shared(arc)))
-                }),
-            },
             _ => BallistaError::DataFusionError(Box::new(e)),
         }
     }
-}
-
-/// Walk a borrowed [`DataFusionError`] chain looking for a buried
-/// [`BallistaError::FetchFailed`], reconstructing it from its cloneable fields.
-///
-/// Used when ownership of the inner error cannot be taken — e.g. for
-/// [`DataFusionError::Shared`] with multiple strong references — so the
-/// classification path in `From<BallistaError> for FailedTask` still sees the
-/// FetchFailed variant.
-fn find_fetch_failed(e: &DataFusionError) -> Option<BallistaError> {
-    match e {
-        DataFusionError::ArrowError(arrow, _) => find_fetch_failed_in_arrow(arrow),
-        DataFusionError::External(err) => find_fetch_failed_in_dyn(err.as_ref()),
-        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
-            find_fetch_failed(inner)
-        }
-        DataFusionError::Collection(errs) => errs.iter().find_map(find_fetch_failed),
-        DataFusionError::Shared(arc) => find_fetch_failed(arc.as_ref()),
-        _ => None,
-    }
-}
-
-fn find_fetch_failed_in_arrow(e: &ArrowError) -> Option<BallistaError> {
-    match e {
-        ArrowError::ExternalError(err) => find_fetch_failed_in_dyn(err.as_ref()),
-        _ => None,
-    }
-}
-
-fn find_fetch_failed_in_dyn(err: &(dyn Error + 'static)) -> Option<BallistaError> {
-    if let Some(BallistaError::FetchFailed(executor_id, map_stage, map_partition, desc)) =
-        err.downcast_ref::<BallistaError>()
-    {
-        return Some(BallistaError::FetchFailed(
-            executor_id.clone(),
-            *map_stage,
-            *map_partition,
-            desc.clone(),
-        ));
-    }
-    if let Some(df) = err.downcast_ref::<DataFusionError>() {
-        return find_fetch_failed(df);
-    }
-    if let Some(arrow) = err.downcast_ref::<ArrowError>() {
-        return find_fetch_failed_in_arrow(arrow);
-    }
-    None
 }
 
 impl From<io::Error> for BallistaError {
@@ -332,90 +256,3 @@ impl From<BallistaError> for FailedTask {
 }
 
 impl Error for BallistaError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fetch_failed() -> BallistaError {
-        BallistaError::FetchFailed(
-            "executor-1:50052".to_string(),
-            1,
-            74,
-            "Error connecting to Ballista scheduler or executor".to_string(),
-        )
-    }
-
-    fn assert_routes_to_fetch_partition_error(err: BallistaError) {
-        let failed: FailedTask = err.into();
-        match failed.failed_reason {
-            Some(FailedReason::FetchPartitionError(fp)) => {
-                assert_eq!(fp.executor_id, "executor-1:50052");
-                assert_eq!(fp.map_stage_id, 1);
-                assert_eq!(fp.map_partition_id, 74);
-            }
-            other => panic!(
-                "expected FetchPartitionError, got {other:?} (error: {})",
-                failed.error
-            ),
-        }
-    }
-
-    #[test]
-    fn fetch_failed_through_arrow_external_routes_to_fetch_partition_error() {
-        let arrow = ArrowError::ExternalError(Box::new(fetch_failed()));
-        let df = DataFusionError::ArrowError(Box::new(arrow), Some(String::new()));
-        assert_routes_to_fetch_partition_error(BallistaError::from(df));
-    }
-
-    #[test]
-    fn fetch_failed_through_shared_routes_to_fetch_partition_error() {
-        // Reproduces the production wrapping from a shared shuffle stream:
-        //   DataFusionError::Shared(Arc(ArrowError(ExternalError(FetchFailed))))
-        let arrow = ArrowError::ExternalError(Box::new(fetch_failed()));
-        let inner = DataFusionError::ArrowError(Box::new(arrow), Some(String::new()));
-        let shared = DataFusionError::Shared(Arc::new(inner));
-        assert_routes_to_fetch_partition_error(BallistaError::from(shared));
-    }
-
-    #[test]
-    fn fetch_failed_through_shared_with_extra_refs_still_routes() {
-        // When Arc::try_unwrap fails (extra strong refs alive), the borrow-walk
-        // fallback must still surface the inner FetchFailed.
-        let arrow = ArrowError::ExternalError(Box::new(fetch_failed()));
-        let inner = DataFusionError::ArrowError(Box::new(arrow), Some(String::new()));
-        let arc = Arc::new(inner);
-        let extra_ref = Arc::clone(&arc);
-        let shared = DataFusionError::Shared(arc);
-        assert_routes_to_fetch_partition_error(BallistaError::from(shared));
-        drop(extra_ref);
-    }
-
-    #[test]
-    fn fetch_failed_through_context_routes_to_fetch_partition_error() {
-        let arrow = ArrowError::ExternalError(Box::new(fetch_failed()));
-        let inner = DataFusionError::ArrowError(Box::new(arrow), Some(String::new()));
-        let ctx =
-            DataFusionError::Context("reading shuffle".to_string(), Box::new(inner));
-        assert_routes_to_fetch_partition_error(BallistaError::from(ctx));
-    }
-
-    #[test]
-    fn fetch_failed_through_external_routes_to_fetch_partition_error() {
-        let external = DataFusionError::External(Box::new(fetch_failed()));
-        assert_routes_to_fetch_partition_error(BallistaError::from(external));
-    }
-
-    #[test]
-    fn unrelated_shared_error_is_not_misclassified() {
-        let inner = DataFusionError::Plan("planning failed".to_string());
-        let shared = DataFusionError::Shared(Arc::new(inner));
-        let bal = BallistaError::from(shared);
-        let failed: FailedTask = bal.into();
-        assert!(
-            matches!(failed.failed_reason, Some(FailedReason::ExecutionError(_))),
-            "expected ExecutionError, got {:?}",
-            failed.failed_reason
-        );
-    }
-}
