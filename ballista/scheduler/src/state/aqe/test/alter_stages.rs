@@ -173,8 +173,7 @@ async fn should_insert_new_stage() -> datafusion::error::Result<()> {
       CrossJoinExec
         CoalescePartitionsExec
           ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=pending, stage_resolved=false
-            CooperativeExec
-              StatisticsExec: col_count=1, row_count=Inexact(262144)
+            StatisticsExec: col_count=1, row_count=Inexact(262144)
         CooperativeExec
           MockPartitionedScan: num_partitions=2, statistics=[Rows=Inexact(1024), Bytes=Inexact(8192), [(Col[0]:)]]
     ");
@@ -182,10 +181,9 @@ async fn should_insert_new_stage() -> datafusion::error::Result<()> {
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
 
-    assert_plan!(stages[0].plan.as_ref(),  @ r"
+    assert_plan!(stages[0].plan.as_ref(),  @ "
     ShuffleWriterExec: partitioning: Hash([big_col@0], 2)
-      CooperativeExec
-        StatisticsExec: col_count=1, row_count=Inexact(262144)
+      StatisticsExec: col_count=1, row_count=Inexact(262144)
     ");
 
     planner.finalise_stage_internal(0, big_statistics_exchange())?;

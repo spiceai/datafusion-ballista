@@ -157,25 +157,19 @@ mod unsupported {
             .collect()
             .await;
 
-        // at the moment its not supported
-        assert!(result.is_err());
+        // Reading Arrow files is now supported (DataFusion 53).
+        let result = result?;
+        let expected = [
+            "+------------+---------------------+",
+            "| string_col | timestamp_col       |",
+            "+------------+---------------------+",
+            "| 31         | 2009-03-01T00:01:00 |",
+            "| 30         | 2009-04-01T00:00:00 |",
+            "| 31         | 2009-04-01T00:01:00 |",
+            "+------------+---------------------+",
+        ];
 
-        // let result = ctx
-        //     .sql("select string_col, timestamp_col from test where id > 4")
-        //     .await?
-        //     .collect()
-        //     .await?;
-        // let expected = [
-        //     "+------------+---------------------+",
-        //     "| string_col | timestamp_col       |",
-        //     "+------------+---------------------+",
-        //     "| 31         | 2009-03-01T00:01:00 |",
-        //     "| 30         | 2009-04-01T00:00:00 |",
-        //     "| 31         | 2009-04-01T00:01:00 |",
-        //     "+------------+---------------------+",
-        // ];
-
-        // assert_batches_eq!(expected, &result);
+        assert_batches_eq!(expected, &result);
 
         Ok(())
     }
