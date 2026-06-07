@@ -25,14 +25,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::serde::protobuf::ExecutorOperatingSystemSpecification;
-use datafusion::DATAFUSION_VERSION;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{error, info, warn};
-use sysinfo::{Disks, System};
 use tempfile::TempDir;
 use tokio::fs::DirEntry;
 use tokio::signal;
@@ -41,10 +38,17 @@ use tokio::task::JoinHandle;
 use tokio::{fs, time};
 use uuid::Uuid;
 
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::SessionConfig;
 
+use crate::execution_engine::ExecutionEngine;
+use crate::executor::{Executor, TasksDrainedFuture};
+use crate::executor_server::TERMINATING;
+use crate::flight_service::BallistaFlightService;
+use crate::metrics::LoggingMetricsCollector;
+use crate::shutdown::Shutdown;
+use crate::shutdown::ShutdownNotifier;
+use crate::{ArrowFlightServerProvider, terminate};
+use crate::{execution_loop, executor_server};
 use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
 use ballista_core::error::BallistaError;
 use ballista_core::extension::{EndpointOverrideFn, SessionConfigExt};
@@ -62,45 +66,6 @@ use ballista_core::utils::{
     default_config_producer, get_time_before,
 };
 use ballista_core::{BALLISTA_VERSION, ConfigProducer, RuntimeProducer};
-
-use crate::client_pool::DefaultBallistaClientPool;
-use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
-use crate::executor::{Executor, TasksDrainedFuture};
-use crate::executor_server::TERMINATING;
-use crate::flight_service::BallistaFlightService;
-use crate::metrics::ExecutorMetricCollectionPolicy;
-use crate::metrics::LoggingMetricsCollector;
-use crate::shutdown::Shutdown;
-use crate::shutdown::ShutdownNotifier;
-use crate::{ArrowFlightServerProvider, terminate};
-use crate::{execution_loop, executor_server};
-
-/// Wrap a [`RuntimeProducer`] so that every produced
-/// [`RuntimeEnv`](datafusion::execution::runtime_env::RuntimeEnv) carries a
-/// fresh [`FairSpillPool`] of size `total_bytes / concurrent_tasks`.
-///
-/// Returns an error if the per-task share would be zero (i.e. `total_bytes <
-/// concurrent_tasks`). The inner env's disk manager, cache manager, and
-/// object store registry are preserved via [`RuntimeEnvBuilder::from_runtime_env`].
-fn wrap_runtime_producer_with_memory_pool(
-    inner: RuntimeProducer,
-    total_bytes: u64,
-    concurrent_tasks: usize,
-) -> Result<RuntimeProducer, BallistaError> {
-    let per_task = (total_bytes / concurrent_tasks as u64) as usize;
-    if per_task == 0 {
-        return Err(BallistaError::Configuration(format!(
-            "memory_pool_size ({total_bytes} bytes) is smaller than concurrent_tasks ({concurrent_tasks})"
-        )));
-    }
-    Ok(Arc::new(move |session_config: &SessionConfig| {
-        let inner_env = inner(session_config)?;
-        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(per_task));
-        RuntimeEnvBuilder::from_runtime_env(&inner_env)
-            .with_memory_pool(pool)
-            .build_arc()
-    }))
-}
 
 /// Configuration for the executor process.
 ///
@@ -148,13 +113,6 @@ pub struct ExecutorProcessConfig {
     pub grpc_server_config: GrpcServerConfig,
     /// Interval in seconds between heartbeat messages.
     pub executor_heartbeat_interval_seconds: u64,
-    /// Metric collection policy of this executor instance
-    pub metric_collection_policy: ExecutorMetricCollectionPolicy,
-    /// Optional total memory pool size in bytes. When set, every task's
-    /// runtime env receives a FairSpillPool of size
-    /// `memory_pool_size / concurrent_tasks`. When `None`, no pool is
-    /// installed and DataFusion falls back to its unbounded default.
-    pub memory_pool_size: Option<u64>,
     /// Optional execution engine to use to execute physical plans, will default to
     /// DataFusion if none is provided.
     pub override_execution_engine: Option<Arc<dyn ExecutionEngine>>,
@@ -172,8 +130,6 @@ pub struct ExecutorProcessConfig {
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
     /// Override function for customizing gRPC client endpoints before they are used
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
-    /// Number of seconds established client connection should be cached (0 means no cache)
-    pub client_ttl: u64,
 }
 
 impl ExecutorProcessConfig {
@@ -212,8 +168,6 @@ impl Default for ExecutorProcessConfig {
             grpc_max_encoding_message_size: 16777216,
             grpc_server_config: Default::default(),
             executor_heartbeat_interval_seconds: 60,
-            metric_collection_policy: ExecutorMetricCollectionPolicy::default(),
-            memory_pool_size: None,
             override_execution_engine: None,
             override_function_registry: None,
             override_runtime_producer: None,
@@ -222,7 +176,6 @@ impl Default for ExecutorProcessConfig {
             override_physical_codec: None,
             override_arrow_flight_service: None,
             override_create_grpc_client_endpoint: None,
-            client_ttl: 0,
         }
     }
 }
@@ -269,18 +222,23 @@ pub async fn start_executor_process(
     let task_scheduling_policy = opt.task_scheduling_policy;
     // assign this executor an unique ID
     let executor_id = Uuid::new_v4().to_string();
-    info!(
-        "Ballista Executor v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) starting ..."
-    );
+    info!("Executor starting ... (Datafusion Ballista {BALLISTA_VERSION})");
     info!("Executor id: {executor_id}");
     info!("Executor working directory: {work_dir}");
-    info!(
-        "Executor number of concurrent tasks (available CPU cores): {concurrent_tasks}"
-    );
+    info!("Executor number of concurrent tasks: {concurrent_tasks}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
-    let executor_meta =
-        structure_executor_metadata(&executor_id, &opt, concurrent_tasks as u32);
+    let executor_meta = ExecutorRegistration {
+        id: executor_id.clone(),
+        host: opt.external_host.clone(),
+        port: opt.port as u32,
+        grpc_port: opt.grpc_port as u32,
+        specification: Some(ExecutorSpecification {
+            resources: vec![ExecutorResource {
+                resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
+            }],
+        }),
+    };
 
     // put them to session config
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());
@@ -300,21 +258,6 @@ pub async fn start_executor_process(
             })
         });
 
-    let runtime_producer = if let Some(total) = opt.memory_pool_size {
-        let producer = wrap_runtime_producer_with_memory_pool(
-            runtime_producer,
-            total,
-            concurrent_tasks,
-        )?;
-        let per_task = total / concurrent_tasks as u64;
-        info!(
-            "Memory pool: total {total} bytes split into {concurrent_tasks} tasks ({per_task} bytes each)"
-        );
-        producer
-    } else {
-        runtime_producer
-    };
-
     let logical = opt
         .override_logical_codec
         .clone()
@@ -331,24 +274,14 @@ pub async fn start_executor_process(
     > = BallistaCodec::new(logical, physical);
 
     let executor = Arc::new(Executor::new(
-        executor_meta.clone(),
+        executor_meta,
         &work_dir,
         runtime_producer,
         config_producer,
         opt.override_function_registry.clone().unwrap_or_default(),
         metrics_collector,
         concurrent_tasks,
-        opt.override_execution_engine.clone().unwrap_or_else(|| {
-            if opt.client_ttl > 0 {
-                let client_pool =
-                    Arc::new(DefaultBallistaClientPool::with_eviction_thread(
-                        Duration::from_secs(opt.client_ttl),
-                    ));
-                Arc::new(DefaultExecutionEngine::with_client_pool(client_pool))
-            } else {
-                Arc::new(DefaultExecutionEngine::new())
-            }
-        }),
+        opt.override_execution_engine.clone(),
     ));
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
@@ -441,7 +374,6 @@ pub async fn start_executor_process(
 
     // Graceful shutdown notification
     let shutdown_notification = ShutdownNotifier::new();
-    let flight_work_dir = work_dir.clone();
 
     if opt.job_data_clean_up_interval_seconds > 0 {
         let mut interval_time =
@@ -481,14 +413,10 @@ pub async fn start_executor_process(
     // Channels used to receive stop requests from Executor grpc service.
     let (stop_send, mut stop_recv) = mpsc::channel::<bool>(10);
 
-    // Starting main executor process based on the TaskSchedulingPolicy
-    //
-    // PushStaged => starting new executor_server that waits for tasks from the schedule
-    // PullStaged => executor is polling the scheduler when it is idle
     match scheduler_policy {
         TaskSchedulingPolicy::PushStaged => {
             service_handlers.push(
-                // If there is executor registration error during startup, return the error and stop early.
+                //If there is executor registration error during startup, return the error and stop early.
                 executor_server::startup(
                     scheduler.clone(),
                     opt.clone(),
@@ -505,6 +433,9 @@ pub async fn start_executor_process(
                 scheduler.clone(),
                 executor.clone(),
                 default_codec,
+                None,
+                None, // poll_now_notify: not used in standalone executor
+                None, // available_task_slots: use internal semaphore
             )));
         }
     };
@@ -515,7 +446,6 @@ pub async fn start_executor_process(
         None => {
             info!("Starting built-in arrow flight service");
             flight_server_task(
-                flight_work_dir,
                 address,
                 shutdown,
                 opt.grpc_max_encoding_message_size as usize,
@@ -526,12 +456,7 @@ pub async fn start_executor_process(
         }
         Some(flight_provider) => {
             info!("Starting custom, user provided, arrow flight service");
-            (flight_provider)(
-                flight_work_dir,
-                address,
-                shutdown,
-                opt.grpc_server_config.clone(),
-            )
+            (flight_provider)(address, shutdown, opt.grpc_server_config.clone())
         }
     });
 
@@ -575,7 +500,17 @@ pub async fn start_executor_process(
                 status: Some(ExecutorStatus {
                     status: Some(Status::Terminating(String::default())),
                 }),
-                metadata: Some(executor_meta),
+                metadata: Some(ExecutorRegistration {
+                    id: executor_id.clone(),
+                    host: opt.external_host.clone(),
+                    port: opt.port as u32,
+                    grpc_port: opt.grpc_port as u32,
+                    specification: Some(ExecutorSpecification {
+                        resources: vec![ExecutorResource {
+                            resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
+                        }],
+                    }),
+                }),
             })
             .await
         {
@@ -621,7 +556,6 @@ pub async fn start_executor_process(
 
 // Arrow flight service
 async fn flight_server_task(
-    work_dir: String,
     address: SocketAddr,
     mut grpc_shutdown: Shutdown,
     max_encoding_message_size: usize,
@@ -635,7 +569,7 @@ async fn flight_server_task(
 
         let server_future = create_grpc_server(&grpc_server_config)
             .add_service(
-                FlightServiceServer::new(BallistaFlightService::new(work_dir))
+                FlightServiceServer::new(BallistaFlightService::new())
                     .max_decoding_message_size(max_decoding_message_size)
                     .max_encoding_message_size(max_encoding_message_size),
             )
@@ -830,56 +764,6 @@ pub async fn satisfy_dir_ttl(
     Ok(false)
 }
 
-/// Structuring executor's metadata to start the main process
-pub fn structure_executor_metadata(
-    executor_id: &str,
-    options: &Arc<ExecutorProcessConfig>,
-    concurrent_tasks: u32,
-) -> ExecutorRegistration {
-    let system_name =
-        System::name().unwrap_or_else(|| String::from("Unknown system name"));
-    let os_ver =
-        System::os_version().unwrap_or_else(|| String::from("Unknown OS version"));
-    let os_ver_long = System::long_os_version()
-        .unwrap_or_else(|| String::from("Unknown long OS version"));
-    let kernel_ver = System::kernel_long_version();
-
-    let physical_cores = System::physical_core_count().unwrap_or(0) as u32;
-    let open_files_limit = System::open_files_limit().unwrap_or(0) as u64;
-
-    let disks = Disks::new_with_refreshed_list();
-    let num_disks = disks.list().len() as u32;
-    let mut total_disk_space: u64 = 0;
-    let mut total_available_disk_space: u64 = 0;
-    for disk in &disks {
-        total_disk_space += disk.total_space();
-        total_available_disk_space += disk.available_space();
-    }
-
-    ExecutorRegistration {
-        id: executor_id.to_string().clone(),
-        host: options.external_host.clone(),
-        port: options.port as u32,
-        grpc_port: options.grpc_port as u32,
-        specification: Some(ExecutorSpecification {
-            resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks)),
-            }],
-        }),
-        os_info: Some(ExecutorOperatingSystemSpecification {
-            system_name,
-            kernel_ver,
-            os_ver,
-            os_ver_long,
-            physical_cores,
-            num_disks,
-            total_disk_space,
-            total_available_disk_space,
-            open_files_limit,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::executor_process::is_subdirectory;
@@ -926,7 +810,7 @@ mod tests {
     async fn test_arrow_flight_provider_ergonomics() {
         let config = crate::executor_process::ExecutorProcessConfig {
             override_arrow_flight_service: Some(std::sync::Arc::new(
-                move |work_dir, address, mut grpc_shutdown, ballista_config| {
+                move |address, mut grpc_shutdown, ballista_config| {
                     tokio::spawn(async move {
                         log::info!(
                             "custom arrow flight server listening on: {address:?}"
@@ -937,9 +821,7 @@ mod tests {
                         )
                         .add_service(
                             arrow_flight::flight_service_server::FlightServiceServer::new(
-                                crate::flight_service::BallistaFlightService::new(
-                                    work_dir,
-                                ),
+                                crate::flight_service::BallistaFlightService::new(),
                             ),
                         )
                         .serve_with_shutdown(address, grpc_shutdown.recv());
@@ -990,67 +872,5 @@ mod tests {
             fs::create_dir(&path).unwrap();
         }
         path
-    }
-}
-
-#[cfg(test)]
-mod memory_pool_tests {
-    use super::*;
-    use datafusion::execution::memory_pool::MemoryLimit;
-    use datafusion::execution::object_store::DefaultObjectStoreRegistry;
-    use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-    use std::sync::Arc;
-
-    fn baseline_producer() -> RuntimeProducer {
-        Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())))
-    }
-
-    #[test]
-    fn returns_error_when_total_smaller_than_concurrent_tasks() {
-        let inner = baseline_producer();
-        let result = wrap_runtime_producer_with_memory_pool(inner, 4, 8);
-        assert!(result.is_err());
-        let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("memory_pool_size"));
-        assert!(msg.contains("concurrent_tasks"));
-    }
-
-    #[test]
-    fn produces_runtime_with_fair_spill_pool_of_per_task_size() {
-        let total = 8u64 * 1024 * 1024 * 1024;
-        let concurrent = 8usize;
-        let expected_per_task = (total / concurrent as u64) as usize;
-
-        let wrapped = wrap_runtime_producer_with_memory_pool(
-            baseline_producer(),
-            total,
-            concurrent,
-        )
-        .unwrap();
-        let env = wrapped(&SessionConfig::new()).unwrap();
-
-        match env.memory_pool.memory_limit() {
-            MemoryLimit::Finite(n) => assert_eq!(n, expected_per_task),
-            MemoryLimit::Infinite => panic!("expected Finite limit, got Infinite"),
-            MemoryLimit::Unknown => panic!("expected Finite limit, got Unknown"),
-        }
-    }
-
-    #[test]
-    fn preserves_inner_object_store_registry() {
-        let registry: Arc<dyn datafusion::execution::object_store::ObjectStoreRegistry> =
-            Arc::new(DefaultObjectStoreRegistry::new());
-        let registry_for_inner = registry.clone();
-        let inner: RuntimeProducer = Arc::new(move |_| {
-            let env = RuntimeEnvBuilder::new()
-                .with_object_store_registry(registry_for_inner.clone())
-                .build()?;
-            Ok(Arc::new(env))
-        });
-
-        let wrapped = wrap_runtime_producer_with_memory_pool(inner, 1024, 1).unwrap();
-        let env = wrapped(&SessionConfig::new()).unwrap();
-
-        assert!(Arc::ptr_eq(&env.object_store_registry, &registry));
     }
 }

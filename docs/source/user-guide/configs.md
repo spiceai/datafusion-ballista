@@ -88,23 +88,6 @@ let expected = [
 ];
 ```
 
-## Shuffle Settings
-
-The following session-level keys control Ballista's shuffle behavior. See
-the [tuning guide](tuning-guide.md#shuffle-implementation) for an
-explanation of the sort-based (default) and hash-based shuffle writers.
-
-| key                                           | type    | default   | description                                                                                                                                                         |
-| --------------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ballista.shuffle.max_concurrent_read_requests | UInt64  | 64        | Maximum number of concurrent fetch requests the shuffle reader will issue.                                                                                          |
-| ballista.shuffle.force_remote_read            | Boolean | false     | Forces the shuffle reader to fetch every partition through Arrow Flight, even when the data is local. Intended for testing.                                         |
-| ballista.shuffle.remote_read_prefer_flight    | Boolean | false     | For remote reads, prefer the Arrow Flight reader over the block reader. The block reader is generally faster.                                                       |
-| ballista.shuffle.sort_based.enabled           | Boolean | true      | Enables the sort-based shuffle writer (consolidated data file per input partition with an index, instead of one file per (input partition, output partition) pair). |
-| ballista.shuffle.sort_based.buffer_size       | UInt64  | 1048576   | Per-partition buffer size in bytes for the sort-based writer (1 MiB default).                                                                                       |
-| ballista.shuffle.sort_based.memory_limit      | UInt64  | 268435456 | Total in-memory budget across all output-partition buffers for the sort-based writer (256 MiB default).                                                             |
-| ballista.shuffle.sort_based.spill_threshold   | Utf8    | "0.8"     | Fraction of `memory_limit` at which the largest buffers spill to disk. Must be in the range 0–1.                                                                    |
-| ballista.shuffle.sort_based.batch_size        | UInt64  | 8192      | Target row count when coalescing buffered batches before they are written or spilled.                                                                               |
-
 ## Ballista Scheduler Configuration Settings
 
 Besides the BallistaContext configuration settings, a few configuration settings for the Ballista scheduler to better
@@ -120,6 +103,6 @@ _Example: Specifying configuration options when starting the scheduler_
 | -------------------------------------------- | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
 | scheduler-policy                             | Utf8   | pull-staged | Sets the task scheduling policy for the scheduler, possible values: pull-staged, push-staged.                              |
 | event-loop-buffer-size                       | UInt32 | 10000       | Sets the event loop buffer size. for a system of high throughput, a larger value like 1000000 is recommended.              |
-| task-distribution                            | Utf8   | bias        | Sets the task distribution policy for the scheduler, possible values: bias, round-robin                                    |
+| task-distribution                            | Utf8   | bias        | Sets the task distribution policy for the scheduler, possible values: bias, round-robin, consistent-hash.                  |
 | finished-job-data-clean-up-interval-seconds  | UInt64 | 300         | Sets the delayed interval for cleaning up finished job data, mainly the shuffle data, 0 means the cleaning up is disabled. |
 | finished-job-state-clean-up-interval-seconds | UInt64 | 3600        | Sets the delayed interval for cleaning up finished job state stored in the backend, 0 means the cleaning up is disabled.   |

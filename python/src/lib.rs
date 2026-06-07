@@ -17,15 +17,11 @@
 
 use crate::utils::wait_for_future;
 use ballista::prelude::*;
-use ballista_core::extension::SessionConfigHelperExt;
-use ballista_core::serde::protobuf::KeyValuePair;
 use cluster::{PyExecutor, PyScheduler};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use datafusion_proto::bytes::logical_plan_from_bytes;
-use datafusion_python::errors::from_datafusion_error;
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 mod cluster;
 mod utils;
@@ -52,45 +48,83 @@ fn _internal_ballista(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+#[pyclass(name = "BallistaBuilder", module = "ballista", subclass)]
+pub struct PyBallistaBuilder {
+    session_config: SessionConfig,
+}
+
+impl Default for PyBallistaBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[pymethods]
+impl PyBallistaBuilder {
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            session_config: SessionConfig::new_with_ballista(),
+        }
+    }
+
+    pub fn config(
+        mut slf: PyRefMut<'_, Self>,
+        key: &str,
+        value: &str,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        let _ = slf.session_config.options_mut().set(key, value);
+
+        Ok(slf.into_pyobject(py)?.into())
+    }
+
+    /// Construct the standalone instance from the SessionContext
+    pub fn standalone(&self, py: Python) -> PyResult<PySessionContext> {
+        let state = SessionStateBuilder::new()
+            .with_config(self.session_config.clone())
+            .with_default_features()
+            .build();
+
+        let ctx = wait_for_future(py, SessionContext::standalone_with_state(state))?;
+
+        Ok(ctx.into())
+    }
+
+    /// Construct the remote instance from the SessionContext
+    pub fn remote(&self, url: &str, py: Python) -> PyResult<PySessionContext> {
+        let state = SessionStateBuilder::new()
+            .with_config(self.session_config.clone())
+            .with_default_features()
+            .build();
+
+        let ctx = wait_for_future(py, SessionContext::remote_with_state(url, state))?;
+
+        Ok(ctx.into())
+    }
+
+    #[classattr]
+    pub fn version() -> &'static str {
+        ballista_core::BALLISTA_VERSION
+    }
+}
+
 /// Creates a DataFrame which runs on ballista session context.
 ///
-/// `config_overrides` is an optional dictionary of DataFusion / Ballista
-/// configuration keys (e.g. `datafusion.execution.target_partitions`) that
-/// will be applied on top of `SessionConfig::new_with_ballista()` and
-/// propagated to the scheduler-side session.
-///
-/// Returned DataFrame will execute its plan on ballista.
+/// Returned DataFrame will executed plan on ballista.
 #[pyfunction]
-#[pyo3(signature = (plan_blob, url, session_id, config_overrides=None))]
 fn create_ballista_data_frame(
     py: Python,
     plan_blob: &[u8],
     url: &str,
     session_id: &str,
-    config_overrides: Option<HashMap<String, String>>,
 ) -> PyResult<datafusion_python::dataframe::PyDataFrame> {
-    let mut session_config = SessionConfig::new_with_ballista();
-    if let Some(overrides) = config_overrides {
-        let pairs: Vec<KeyValuePair> = overrides
-            .into_iter()
-            .map(|(key, value)| KeyValuePair {
-                key,
-                value: Some(value),
-            })
-            .collect();
-        session_config.update_from_key_value_pair_mut(&pairs);
-    }
-
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_config(session_config)
+    let state = SessionStateBuilder::new_with_default_features()
         .with_session_id(session_id.to_string())
         .build();
 
-    let ctx = wait_for_future(py, SessionContext::remote_with_state(url, state))
-        .map_err(from_datafusion_error)?;
-    let plan = logical_plan_from_bytes(plan_blob, &ctx.task_ctx())
-        .map_err(from_datafusion_error)?;
+    let ctx = wait_for_future(py, SessionContext::remote_with_state(url, state))?;
+    let plan = logical_plan_from_bytes(plan_blob, &ctx.task_ctx())?;
 
     Ok(datafusion_python::dataframe::PyDataFrame::new(
         DataFrame::new(ctx.state(), plan),

@@ -228,6 +228,7 @@ fn sanitize(str: &str, max_len: Option<usize>) -> String {
     }
     sanitized
 }
+
 #[allow(deprecated)]
 fn get_operator_name(plan: &dyn ExecutionPlan) -> String {
     if let Some(exec) = plan.as_any().downcast_ref::<FilterExec>() {
@@ -429,19 +430,19 @@ mod tests {
         let expected = r#"digraph G {
 	subgraph cluster0 {
 		label = "Stage 1 [Resolved]";
-		stage_1_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_1_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_1_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_1_0_0 -> stage_1_0
 	}
 	subgraph cluster1 {
 		label = "Stage 2 [Resolved]";
-		stage_2_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_2_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_2_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_2_0_0 -> stage_2_0
 	}
 	subgraph cluster2 {
 		label = "Stage 3 [Unresolved]";
-		stage_3_0 [shape=box, label="SortShuffleWriter [48 partitions]"]
+		stage_3_0 [shape=box, label="ShuffleWriter [48 partitions]"]
 		stage_3_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
@@ -453,7 +454,7 @@ filter_expr="]
 	}
 	subgraph cluster3 {
 		label = "Stage 4 [Resolved]";
-		stage_4_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_4_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_4_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_4_0_0 -> stage_4_0
 	}
@@ -486,7 +487,7 @@ filter_expr="]
             .map_err(|e| BallistaError::Internal(format!("{e:?}")))?;
 
         let expected = r#"digraph G {
-		stage_3_0 [shape=box, label="SortShuffleWriter [48 partitions]"]
+		stage_3_0 [shape=box, label="ShuffleWriter [48 partitions]"]
 		stage_3_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
@@ -510,19 +511,19 @@ filter_expr="]
         let expected = r#"digraph G {
 	subgraph cluster0 {
 		label = "Stage 1 [Resolved]";
-		stage_1_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_1_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_1_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_1_0_0 -> stage_1_0
 	}
 	subgraph cluster1 {
 		label = "Stage 2 [Resolved]";
-		stage_2_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_2_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_2_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_2_0_0 -> stage_2_0
 	}
 	subgraph cluster2 {
 		label = "Stage 3 [Resolved]";
-		stage_3_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_3_0 [shape=box, label="ShuffleWriter [2 partitions]"]
 		stage_3_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_3_0_0 -> stage_3_0
 	}
@@ -613,7 +614,6 @@ filter_expr="]
             0,
             Arc::new(SessionConfig::new_with_ballista()),
             &mut planner,
-            None,
         )
     }
 
@@ -650,7 +650,6 @@ filter_expr="]
             0,
             Arc::new(SessionConfig::new_with_ballista()),
             &mut planner,
-            None,
         )
     }
 }

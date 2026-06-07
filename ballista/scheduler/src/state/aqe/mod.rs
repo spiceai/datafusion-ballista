@@ -26,7 +26,7 @@ use crate::state::execution_graph::{
 use crate::state::execution_stage::RunningStage;
 use crate::state::task_manager::UpdatedStages;
 use ballista_core::error::BallistaError;
-use ballista_core::execution_plans::ShuffleWriter;
+use ballista_core::execution_plans::ShuffleWriterExec;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{
@@ -39,19 +39,11 @@ use datafusion::prelude::SessionConfig;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
-// TODO: the AQE planner runs DataFusion's DefaultPhysicalPlanner with a
-// list of PhysicalOptimizerRules and never goes through
-// DefaultDistributedPlanner::plan_query_stages_internal, so neither
-// maybe_promote_to_broadcast nor the HashJoinExec(CollectLeft) shuffle
-// lowering fire here. Joins that would broadcast under the default
-// planner stay on the Partitioned shuffle path. Move the lowering into
-// an AQE optimizer rule in a follow-up PR.
-
 mod adapter;
-pub(crate) mod coalesce;
-pub(crate) mod execution_plan;
+mod execution_plan;
 pub mod optimizer_rule;
 pub mod planner;
 #[cfg(test)]
@@ -117,10 +109,6 @@ pub(crate) struct AdaptiveExecutionGraph {
     failed_stage_attempts: HashMap<usize, HashSet<usize>>,
     /// Session config for this job
     session_config: Arc<SessionConfig>,
-    /// Logical plan as a human-readable string, captured at submission time.
-    logical_plan: Option<String>,
-    /// Physical plan, captured at submission time.
-    physical_plan: Arc<dyn ExecutionPlan>,
 }
 
 impl AdaptiveExecutionGraph {
@@ -137,10 +125,9 @@ impl AdaptiveExecutionGraph {
         plan: Arc<dyn ExecutionPlan>,
         queued_at: u64,
         session_config: Arc<SessionConfig>,
-        logical_plan: Option<String>,
     ) -> ballista_core::error::Result<Self> {
         let mut planner =
-            AdaptivePlanner::try_new(&session_config, plan.clone(), job_name.to_owned())?;
+            AdaptivePlanner::try_new(&session_config, plan, job_name.to_owned())?;
 
         //let stages = HashMap::new();
         let started_at = timestamp_millis();
@@ -191,8 +178,6 @@ impl AdaptiveExecutionGraph {
             task_id_gen: 0,
             failed_stage_attempts: HashMap::new(),
             session_config,
-            logical_plan,
-            physical_plan: plan,
         })
     }
 }
@@ -200,7 +185,7 @@ impl AdaptiveExecutionGraph {
 impl AdaptiveExecutionGraph {
     fn create_resolved_stage(
         session_config: Arc<SessionConfig>,
-        stage: Arc<dyn ShuffleWriter>,
+        stage: Arc<ShuffleWriterExec>,
     ) -> ballista_core::error::Result<(usize, ExecutionStage)> {
         let stage_id = stage.stage_id();
         let stage = ExecutionStage::Resolved(ResolvedStage::new(
@@ -516,14 +501,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
     fn status(&self) -> &JobStatus {
         &self.status
-    }
-
-    fn logical_plan(&self) -> Option<&str> {
-        self.logical_plan.as_deref()
-    }
-
-    fn physical_plan(&self) -> Arc<dyn ExecutionPlan> {
-        self.physical_plan.clone()
     }
 
     fn start_time(&self) -> u64 {
@@ -1167,8 +1144,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
     /// fail job with error message
     fn fail_job(&mut self, error: String) {
-        self.end_time = timestamp_millis();
-
         self.status = JobStatus {
             job_id: self.job_id.clone(),
             job_name: self.job_name.clone(),
@@ -1196,7 +1171,10 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             .map(|l| l.try_into())
             .collect::<ballista_core::error::Result<Vec<_>>>()?;
 
-        self.end_time = timestamp_millis();
+        self.end_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
 
         self.status = JobStatus {
             job_id: self.job_id.clone(),
@@ -1289,7 +1267,10 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 let task_attempt = stage.task_failure_numbers[partition_id];
                 let task_info = crate::state::execution_graph::TaskInfo {
                     task_id,
-                    scheduled_time: timestamp_millis() as u128,
+                    scheduled_time: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
                     // Those times will be updated when the task finish
                     launch_time: 0,
                     start_exec_time: 0,
@@ -1310,7 +1291,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     task_id,
                     task_attempt,
                     plan: stage.plan.clone(),
-                    session_config: self.session_config.clone()
+                    session_config: self.session_config.clone(),
+                    schedulable_time_millis: 0,
                 })
             } else {
                 Err(BallistaError::General(format!("Stage {stage_id} is not a running stage")))

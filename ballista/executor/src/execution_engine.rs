@@ -22,17 +22,14 @@
 //! for creating query stage executors from physical plans.
 
 use async_trait::async_trait;
-use ballista_core::client_pool::BallistaClientPool;
+use ballista_core::execution_plans::ShuffleWriterExec;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
-use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::prelude::SessionConfig;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -51,10 +48,8 @@ pub trait ExecutionEngine: Sync + Send {
         &self,
         job_id: String,
         stage_id: usize,
-        partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
-        config: &SessionConfig,
     ) -> Result<Arc<dyn QueryStageExecutor>>;
 }
 
@@ -78,59 +73,28 @@ pub trait QueryStageExecutor: Sync + Send + Debug + Display {
 
     /// Collects execution metrics from all operators in the plan.
     fn collect_plan_metrics(&self) -> Vec<MetricsSet>;
+
+    /// Returns a reference to the underlying execution plan.
+    ///
+    /// This is used to walk the plan tree and extract metrics from specific
+    /// operators like ShuffleReaderExec.
+    fn plan(&self) -> &dyn ExecutionPlan;
 }
 
 /// Default execution engine using DataFusion's ShuffleWriterExec.
 ///
 /// This implementation expects the input plan to be wrapped in a
 /// ShuffleWriterExec and creates a DefaultQueryStageExec to execute it.
-#[derive(Default)]
-pub struct DefaultExecutionEngine {
-    client_pool: Option<Arc<dyn BallistaClientPool>>,
-}
-
-impl DefaultExecutionEngine {
-    /// Creates new Default Execution Engine without client pooling
-    pub fn new() -> Self {
-        Self { client_pool: None }
-    }
-    /// Creates new Default Execution Engine with client pooling
-    pub fn with_client_pool(client_pool: Arc<dyn BallistaClientPool>) -> Self {
-        Self {
-            client_pool: Some(client_pool),
-        }
-    }
-}
+pub struct DefaultExecutionEngine {}
 
 impl ExecutionEngine for DefaultExecutionEngine {
     fn create_query_stage_exec(
         &self,
         job_id: String,
         stage_id: usize,
-        _partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
-        _config: &SessionConfig,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
-        let plan = plan
-            .transform(|p| {
-                if let Some(reader) = p.as_any().downcast_ref::<ShuffleReaderExec>() {
-                    match &self.client_pool {
-                        Some(client_pool) => Ok(Transformed::yes(Arc::new(
-                            reader
-                                .with_work_dir(work_dir.to_string())
-                                .with_client_pool(client_pool.clone()),
-                        ))),
-                        None => Ok(Transformed::yes(Arc::new(
-                            reader.with_work_dir(work_dir.to_string()),
-                        ))),
-                    }
-                } else {
-                    Ok(Transformed::no(p))
-                }
-            })?
-            .data;
-
         // the query plan created by the scheduler always starts with a shuffle writer
         // (either ShuffleWriterExec or SortShuffleWriterExec)
         if let Some(shuffle_writer) = plan.as_any().downcast_ref::<ShuffleWriterExec>() {
@@ -257,6 +221,13 @@ impl QueryStageExecutor for DefaultQueryStageExec {
         match &self.shuffle_writer {
             ShuffleWriterVariant::Hash(writer) => utils::collect_plan_metrics(writer),
             ShuffleWriterVariant::Sort(writer) => utils::collect_plan_metrics(writer),
+        }
+    }
+
+    fn plan(&self) -> &dyn ExecutionPlan {
+        match &self.shuffle_writer {
+            ShuffleWriterVariant::Hash(writer) => writer,
+            ShuffleWriterVariant::Sort(writer) => writer,
         }
     }
 }

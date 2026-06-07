@@ -58,14 +58,12 @@ docs/example1.dat
 docs/example3.dat
 python/.eggs/
 python/doc/
-python/examples/.ipynb_checkpoints
 # Egg metadata
 *.egg-info
 
 .vscode
 .idea/
 .pytest_cache/
-.ruff_cache/
 pkgs
 docker_cache
 .gdb_history
@@ -110,9 +108,3 @@ logs/
 
 # Claude Code guidance file (local only)
 CLAUDE.md
-.claude/
-
-# git worktrees (local only)
-.worktrees/
-# ignore insta captures
-*-snap

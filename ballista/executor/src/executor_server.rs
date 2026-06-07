@@ -22,13 +22,11 @@
 //! heartbeat communication, and status reporting.
 
 use ballista_core::BALLISTA_VERSION;
-use memory_stats::memory_stats;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sysinfo::{MemoryRefreshKind, System};
 use tokio::sync::mpsc;
 
 use log::{debug, error, info, warn};
@@ -36,6 +34,7 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::global_shuffle_manager;
 use ballista_core::extension::EndpointOverrideFn;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
@@ -64,7 +63,6 @@ use tokio::task::JoinHandle;
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::{ExecutorProcessConfig, remove_job_dir};
-use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::shutdown::ShutdownNotifier;
 use crate::{TaskExecutionTimes, as_task_status};
 
@@ -119,7 +117,6 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         config.grpc_max_encoding_message_size as usize,
         config.grpc_max_decoding_message_size as usize,
         config.override_create_grpc_client_endpoint.clone(),
-        config.metric_collection_policy,
     );
 
     // 1. Start executor grpc service
@@ -219,8 +216,6 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     grpc_max_encoding_message_size: usize,
     /// Maximum size for incoming gRPC messages.
     grpc_max_decoding_message_size: usize,
-    /// Metric collection policy for this specifix executor
-    metric_collection_policy: ExecutorMetricCollectionPolicy,
     override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
@@ -241,7 +236,6 @@ unsafe impl Sync for ExecutorEnv {}
 pub static TERMINATING: AtomicBool = AtomicBool::new(false);
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T, U> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         scheduler_to_register: SchedulerGrpcClient<Channel>,
         executor: Arc<Executor>,
@@ -250,7 +244,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
         override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
-        metric_collection_policy: ExecutorMetricCollectionPolicy,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
@@ -265,7 +258,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             grpc_max_encoding_message_size,
             grpc_max_decoding_message_size,
             override_create_grpc_client_endpoint,
-            metric_collection_policy,
         }
     }
 
@@ -354,6 +346,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             }
         }
     }
+
     /// This method should not return Err. If task fails, a failure task status should be sent
     /// to the channel to notify the scheduler.
     async fn run_task(&self, task_identity: String, curator_task: CuratorTaskDefinition) {
@@ -377,233 +370,92 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             partition_id,
         };
 
-        let exec = self.executor.execution_engine.create_query_stage_exec(
-            job_id.clone(),
-            stage_id,
-            partition_id,
-            plan,
-            &self.executor.work_dir,
-            &task.session_config,
+        let query_stage_exec = self
+            .executor
+            .execution_engine
+            .create_query_stage_exec(
+                job_id.clone(),
+                stage_id,
+                plan,
+                &self.executor.work_dir,
+            )
+            .unwrap();
+
+        let task_context = {
+            let function_registry = task.function_registry;
+            let runtime = self.executor.produce_runtime(&task.session_config).unwrap();
+
+            Arc::new(TaskContext::new(
+                Some(task_identity.clone()),
+                task.session_id,
+                task.session_config,
+                function_registry.scalar_functions.clone(),
+                function_registry.aggregate_functions.clone(),
+                function_registry.window_functions.clone(),
+                runtime,
+            ))
+        };
+
+        info!("Start to execute shuffle write for task {task_identity}");
+
+        let execution_result = self
+            .executor
+            .execute_query_stage(
+                task_id,
+                part.clone(),
+                query_stage_exec.clone(),
+                task_context,
+            )
+            .await;
+        info!("Done with task {task_identity}");
+        debug!("Statistics: {execution_result:?}");
+
+        let plan_metrics = query_stage_exec.collect_plan_metrics();
+        let operator_metrics = plan_metrics
+            .into_iter()
+            .map(|m| m.try_into())
+            .collect::<Result<Vec<_>, BallistaError>>()
+            .ok();
+        let executor_id = &self.executor.metadata.id;
+
+        let end_exec_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let task_execution_times = TaskExecutionTimes {
+            launch_time: task.launch_time,
+            start_exec_time,
+            end_exec_time,
+        };
+
+        let task_status = as_task_status(
+            execution_result,
+            executor_id.clone(),
+            task_id,
+            stage_attempt_num,
+            part,
+            operator_metrics,
+            task_execution_times,
         );
 
-        let runtime = self.executor.produce_runtime(&task.session_config);
-
-        match (exec, runtime) {
-            (Ok(exec), Ok(runtime)) => {
-                let task_context = {
-                    let function_registry = task.function_registry;
-
-                    Arc::new(TaskContext::new(
-                        Some(task_identity.clone()),
-                        task.session_id,
-                        task.session_config,
-                        function_registry.scalar_functions.clone(),
-                        function_registry.aggregate_functions.clone(),
-                        function_registry.window_functions.clone(),
-                        runtime,
-                    ))
-                };
-
-                info!("Execute task: {task_identity}");
-
-                let execution_result = self
-                    .executor
-                    .execute_query_stage(
-                        task_id,
-                        part.clone(),
-                        exec.clone(),
-                        task_context,
-                    )
-                    .await;
-                info!("Done with task {task_identity}");
-                debug!("Task {task_identity} statistics: {execution_result:?}");
-
-                let plan_metrics = exec.collect_plan_metrics();
-                let operator_metrics = plan_metrics
-                    .into_iter()
-                    .map(|m| m.try_into())
-                    .collect::<Result<Vec<_>, BallistaError>>()
-                    .ok();
-                let executor_id = &self.executor.metadata.id;
-
-                let end_exec_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let task_execution_times = TaskExecutionTimes {
-                    launch_time: task.launch_time,
-                    start_exec_time,
-                    end_exec_time,
-                };
-
-                let task_status = as_task_status(
-                    execution_result,
-                    executor_id.clone(),
-                    task_id,
-                    stage_attempt_num,
-                    part,
-                    operator_metrics,
-                    task_execution_times,
-                );
-
-                let _ = self
-                    .executor_env
-                    .tx_task_status
-                    .send(CuratorTaskStatus {
-                        scheduler_id: curator_task.scheduler_id,
-                        task_status,
-                    })
-                    .await;
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                let e = BallistaError::from(e);
-                let end_exec_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let task_status = as_task_status(
-                    Err(e),
-                    self.executor.metadata.id.clone(),
-                    task_id,
-                    stage_attempt_num,
-                    part,
-                    None,
-                    TaskExecutionTimes {
-                        launch_time: task.launch_time,
-                        start_exec_time,
-                        end_exec_time,
-                    },
-                );
-                let _ = self
-                    .executor_env
-                    .tx_task_status
-                    .send(CuratorTaskStatus {
-                        scheduler_id: curator_task.scheduler_id,
-                        task_status,
-                    })
-                    .await;
-            }
-        };
+        let scheduler_id = curator_task.scheduler_id;
+        let task_status_sender = self.executor_env.tx_task_status.clone();
+        task_status_sender
+            .send(CuratorTaskStatus {
+                scheduler_id,
+                task_status,
+            })
+            .await
+            .unwrap();
     }
 
-    /// Getting executor's metrics
+    // TODO populate with real metrics
     fn get_executor_metrics(&self) -> Vec<ExecutorMetric> {
-        match self.metric_collection_policy {
-            ExecutorMetricCollectionPolicy::SystemOnly => {
-                let mut executor_system = System::new_all();
-                executor_system
-                    .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-
-                let system_metrics = vec![
-                    ExecutorMetric {
-                        metric: Some(executor_metric::Metric::TotalMemory(
-                            executor_system.total_memory(),
-                        )),
-                    },
-                    ExecutorMetric {
-                        metric: Some(executor_metric::Metric::AvailableMemory(
-                            executor_system.available_memory(),
-                        )),
-                    },
-                    ExecutorMetric {
-                        metric: Some(executor_metric::Metric::UsedMemory(
-                            executor_system.used_memory(),
-                        )),
-                    },
-                ];
-                system_metrics
-            }
-            ExecutorMetricCollectionPolicy::ProcessOnly => {
-                if let Some(usage) = memory_stats() {
-                    let process_metrics = vec![
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::ProcPhysicalMemory(
-                                usage.physical_mem as u64,
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::ProcVirtualMemory(
-                                usage.virtual_mem as u64,
-                            )),
-                        },
-                    ];
-                    process_metrics
-                } else {
-                    warn!("Could not get current process memory usage!");
-                    let process_metrics: Vec<ExecutorMetric> = vec![];
-                    process_metrics
-                }
-            }
-            ExecutorMetricCollectionPolicy::SystemAndProcess => {
-                if let Some(usage) = memory_stats() {
-                    let mut process_metrics = vec![
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::ProcPhysicalMemory(
-                                usage.physical_mem as u64,
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::ProcVirtualMemory(
-                                usage.virtual_mem as u64,
-                            )),
-                        },
-                    ];
-                    let mut executor_system = System::new_all();
-                    executor_system.refresh_memory_specifics(
-                        MemoryRefreshKind::nothing().with_ram(),
-                    );
-
-                    let system_metrics = vec![
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::TotalMemory(
-                                executor_system.total_memory(),
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::AvailableMemory(
-                                executor_system.available_memory(),
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::UsedMemory(
-                                executor_system.used_memory(),
-                            )),
-                        },
-                    ];
-                    process_metrics.extend(system_metrics);
-
-                    process_metrics
-                } else {
-                    warn!(
-                        "Could not get current process memory usage! Defauling to system-wide metrics"
-                    );
-                    let mut executor_system = System::new_all();
-                    executor_system.refresh_memory_specifics(
-                        MemoryRefreshKind::nothing().with_ram(),
-                    );
-
-                    let system_metrics = vec![
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::TotalMemory(
-                                executor_system.total_memory(),
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::AvailableMemory(
-                                executor_system.available_memory(),
-                            )),
-                        },
-                        ExecutorMetric {
-                            metric: Some(executor_metric::Metric::UsedMemory(
-                                executor_system.used_memory(),
-                            )),
-                        },
-                    ];
-                    system_metrics
-                }
-            }
-            ExecutorMetricCollectionPolicy::Off => vec![],
-        }
+        let available_memory = ExecutorMetric {
+            metric: Some(executor_metric::Metric::AvailableMemory(u64::MAX)),
+        };
+        let executor_metrics = vec![available_memory];
+        executor_metrics
     }
 }
 
@@ -924,6 +776,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
     ) -> Result<Response<RemoveJobDataResult>, Status> {
         let job_id = request.into_inner().job_id;
 
+        // Clean up in-memory shuffle partitions for this job
+        let shuffle_manager = global_shuffle_manager();
+        shuffle_manager.remove_job_partitions(&job_id);
+
+        // Clean up disk-based shuffle data
         remove_job_dir(&self.executor.work_dir, &job_id)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;

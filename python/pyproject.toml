@@ -41,15 +41,10 @@ classifiers = [
 ]
 dependencies = [
     "pyarrow>=21.0.0",
-    "datafusion==52",
+    "datafusion==51",
     "typing-extensions;python_version<'3.13'",
 ]
 dynamic = ["version"]
-
-[project.optional-dependencies]
-jupyter = [
-    "ipython>=8.0.0",
-]
 
 [project.urls]
 homepage = "https://datafusion.apache.org/ballista"
@@ -72,7 +67,7 @@ locked = true
 [dependency-groups]
 dev = [
     "maturin>=1.8.1",
-    "pytest>=9.0.3",
+    "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
     "ruff>=0.9.1",
     "toml>=0.10.2",

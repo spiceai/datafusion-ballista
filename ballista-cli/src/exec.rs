@@ -21,7 +21,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use datafusion::common::Result;
@@ -96,11 +95,7 @@ pub async fn exec_from_files(
 }
 
 /// run and execute SQL statements and commands against a context with the given print options
-pub async fn exec_from_repl(
-    ctx: &SessionContext,
-    print_options: &mut PrintOptions,
-    tui_mode: Arc<AtomicBool>,
-) {
+pub async fn exec_from_repl(ctx: &SessionContext, print_options: &mut PrintOptions) {
     let mut rl = Editor::new().expect("created editor");
     rl.set_helper(Some(CliHelper::new(
         &ctx.task_ctx().session_config().options().sql_parser.dialect,
@@ -137,10 +132,7 @@ pub async fn exec_from_repl(
                             }
                         }
                         _ => {
-                            if let Err(e) = cmd
-                                .execute(ctx, &mut print_options, tui_mode.clone())
-                                .await
-                            {
+                            if let Err(e) = cmd.execute(ctx, &mut print_options).await {
                                 eprintln!("{e}")
                             }
                         }

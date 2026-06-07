@@ -41,8 +41,7 @@ use ballista_core::serde::protobuf::{
     TaskId, TaskStatus, task_status,
 };
 use ballista_core::serde::scheduler::{
-    ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
-    ExecutorSpecification,
+    ExecutorData, ExecutorMetadata, ExecutorSpecification,
 };
 use ballista_core::serde::{BallistaCodec, protobuf};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -293,11 +292,10 @@ pub fn default_task_runner() -> impl TaskRunner {
         let partitions: Vec<ShuffleWritePartition> = (0..partitions)
             .map(|i| ShuffleWritePartition {
                 partition_id: i as u64,
+                path: String::default(),
                 num_batches: 1,
                 num_rows: 1,
                 num_bytes: 1,
-                file_id: None,
-                is_sort_shuffle: false,
             })
             .collect();
 
@@ -456,9 +454,9 @@ impl SchedulerTest {
                 host: String::default(),
                 port: 0,
                 grpc_port: 0,
-                specification: ExecutorSpecification::default()
-                    .with_task_slots(task_slots as u32),
-                os_info: ExecutorOperatingSystemSpecification::default(),
+                specification: ExecutorSpecification {
+                    task_slots: task_slots as u32,
+                },
             };
 
             let executor_data = ExecutorData {
@@ -772,6 +770,57 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
     }
 
     fn set_pending_tasks_queue_size(&self, _value: u64) {}
+    fn set_pending_jobs_queue_size(&self, _value: u64) {}
+
+    // Stage lifecycle
+    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, _task_count: usize) {}
+    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, _duration_ms: u64) {
+    }
+    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, _error_type: &str) {}
+    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {}
+
+    // Task scheduling
+    fn record_task_scheduled(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        _latency_ms: u64,
+    ) {
+    }
+    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+    }
+    fn record_task_failed(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        _error_type: &str,
+    ) {
+    }
+    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+    }
+
+    // Executor management
+    fn set_active_executor_count(&self, _count: usize) {}
+    fn record_executor_registered(&self, _executor_id: &str) {}
+    fn record_executor_deregistered(&self, _executor_id: &str) {}
+
+    // Planning
+    fn record_planning_duration(&self, _job_id: &str, _duration_ms: u64) {}
 
     fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
         Ok(None)
@@ -912,6 +961,7 @@ pub async fn test_aggregation_plan_with_job_id(
         DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
     );
     let mut planner = DefaultDistributedPlanner::new();
+
     StaticExecutionGraph::new(
         "localhost:50050",
         job_id,
@@ -921,7 +971,6 @@ pub async fn test_aggregation_plan_with_job_id(
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap()
 }
@@ -970,7 +1019,6 @@ pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGrap
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap()
 }
@@ -1011,7 +1059,6 @@ pub async fn test_coalesce_plan(partition: usize) -> StaticExecutionGraph {
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap()
 }
@@ -1072,7 +1119,6 @@ pub async fn test_join_plan(partition: usize) -> StaticExecutionGraph {
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap();
 
@@ -1115,7 +1161,6 @@ pub async fn test_union_all_plan(partition: usize) -> StaticExecutionGraph {
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap();
 
@@ -1158,7 +1203,6 @@ pub async fn test_union_plan(partition: usize) -> StaticExecutionGraph {
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
-        None,
     )
     .unwrap();
 
@@ -1174,8 +1218,7 @@ pub fn mock_executor(executor_id: String) -> ExecutorMetadata {
         host: "localhost2".to_string(),
         port: 8080,
         grpc_port: 9090,
-        specification: ExecutorSpecification::default().with_task_slots(1),
-        os_info: ExecutorOperatingSystemSpecification::default(),
+        specification: ExecutorSpecification { task_slots: 1 },
     }
 }
 
@@ -1188,11 +1231,15 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
+            path: format!(
+                "/{}/{}/{}",
+                task.partition.job_id,
+                task.partition.stage_id,
+                task.partition.partition_id
+            ),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,
-            file_id: None,
-            is_sort_shuffle: false,
         })
     }
 
@@ -1223,11 +1270,15 @@ pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskS
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
+            path: format!(
+                "/{}/{}/{}",
+                task.partition.job_id,
+                task.partition.stage_id,
+                task.partition.partition_id
+            ),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,
-            file_id: None,
-            is_sort_shuffle: false,
         })
     }
 

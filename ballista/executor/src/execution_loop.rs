@@ -24,7 +24,12 @@
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::remove_job_dir;
+
 use crate::{TaskExecutionTimes, as_task_status};
+
+use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
+
 use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::BallistaCodec;
@@ -38,14 +43,16 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use futures::FutureExt;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::any::Any;
+use std::cell::LazyCell;
 use std::convert::TryInto;
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot::Sender as OneShotSender;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
 /// Main execution loop that polls the scheduler for available tasks.
@@ -56,10 +63,29 @@ use tonic::codegen::{Body, Bytes, StdError};
 ///
 /// The loop respects the executor's concurrent task limit via a semaphore,
 /// ensuring no more than the configured number of tasks run simultaneously.
+/// Number of consecutive failures before reducing log level from WARN to DEBUG.
+const QUIET_AFTER_FAILURES: u32 = 5;
+
+/// Main polling loop for executor task execution.
+///
+/// This function polls the scheduler for new tasks to execute and runs them,
+/// ensuring no more than the configured number of tasks run simultaneously.
+///
+/// # Arguments
+///
+/// * `scheduler` - gRPC client for communicating with the scheduler
+/// * `executor` - The executor instance that runs tasks
+/// * `codec` - Codec for serializing/deserializing plans
+/// * `readiness` - Optional channel to signal when the executor is ready
+/// * `poll_now_notify` - Optional notify to wake the poll loop immediately when new work is available
+/// * `available_task_slots` - Optional semaphore for controlling task concurrency. If None, creates one internally.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,
     codec: BallistaCodec<T, U>,
+    readiness: Option<OneShotSender<String>>,
+    poll_now_notify: Option<Arc<Notify>>,
+    available_task_slots: Option<Arc<Semaphore>>,
 ) -> Result<(), BallistaError>
 where
     C: tonic::client::GrpcService<tonic::body::Body>,
@@ -74,8 +100,9 @@ where
         .unwrap()
         .clone()
         .into();
-    let available_task_slots =
-        Arc::new(Semaphore::new(executor_specification.task_slots as usize));
+    let available_task_slots = available_task_slots.unwrap_or_else(|| {
+        Arc::new(Semaphore::new(executor_specification.task_slots as usize))
+    });
 
     let (task_status_sender, mut task_status_receiver) =
         std::sync::mpsc::channel::<TaskStatus>();
@@ -84,15 +111,27 @@ where
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.task_slots as usize);
 
+    let report_ready = LazyCell::new(|| {
+        if let Some(chan) = readiness {
+            chan.send(executor.metadata.id.clone())
+                .expect("Must send readiness")
+        }
+    });
+
+    // Track consecutive scheduler connection failures for backoff and log suppression
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff = ExponentialBackoff {
+        initial_interval: Duration::from_millis(100),
+        max_interval: Duration::from_secs(30),
+        max_elapsed_time: None, // Never give up
+        ..ExponentialBackoff::default()
+    };
+
     loop {
         // Wait for task slots to be available before asking for new work
         let permit = available_task_slots.acquire().await.unwrap();
         // Make the slot available again
         drop(permit);
-
-        // Keeps track of whether we received task in last iteration
-        // to avoid going in sleep mode between polling
-        let mut active_job = false;
 
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;
@@ -106,8 +145,23 @@ where
                 })
                 .await;
 
+        *report_ready;
+
+        // Keeps track of whether we received task in last iteration
+        // to avoid going in sleep mode between polling
+        let active_job;
+
         match poll_work_result {
             Ok(result) => {
+                // Reset backoff state on successful connection
+                if consecutive_failures > 0 {
+                    info!(
+                        "Scheduler connection restored after {consecutive_failures} failed attempts"
+                    );
+                }
+                consecutive_failures = 0;
+                backoff.reset();
+
                 let PollWorkResult {
                     tasks,
                     jobs_to_clean,
@@ -199,11 +253,43 @@ where
                 warn!(
                     "Executor poll work loop failed. If this continues to happen the Scheduler might be marked as dead. Error: {error}"
                 );
+
+                consecutive_failures = consecutive_failures.saturating_add(1);
+
+                // Log at WARN level for first few failures, then reduce to DEBUG to avoid log spam
+                if consecutive_failures <= QUIET_AFTER_FAILURES {
+                    warn!(
+                        "Executor poll work loop failed (attempt {consecutive_failures}). If this continues, the scheduler might be unavailable. Error: {error}"
+                    );
+                } else {
+                    debug!(
+                        "Executor poll work loop failed (attempt {consecutive_failures}). Error: {error}"
+                    );
+                }
+
+                // Apply exponential backoff before retrying
+                if let Some(duration) = backoff.next_backoff() {
+                    tokio::time::sleep(duration).await;
+                }
+                continue;
             }
         }
 
         if !active_job {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for either the poll interval or a poll_now notification
+            match &poll_now_notify {
+                Some(notify) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        () = notify.notified() => {
+                            debug!("Received poll_now notification, polling immediately");
+                        }
+                    }
+                }
+                None => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
 }
@@ -245,9 +331,10 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     );
     info!("Received task: [{task_identity}]");
 
-    trace!(
+    log::trace!(
         "Received task: [{}], task_properties: {:?}",
-        task_identity, task.props
+        task_identity,
+        task.props
     );
     let session_config = executor.produce_config();
     let session_config = session_config.update_from_key_value_pair(&task.props);
@@ -277,10 +364,8 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),
         stage_id as usize,
-        partition_id as usize,
         plan,
         &executor.work_dir,
-        task_context.session_config(),
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;

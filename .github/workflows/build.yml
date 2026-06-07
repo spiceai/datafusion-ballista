@@ -26,12 +26,12 @@ concurrency:
 
 on:
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - 'python/**'
   push:
-    tags: [ "*-rc*" ]
-    branches: [ "branch-*" ]
+    tags: ["*-rc*"]
+    branches: ["branch-*"]
     paths:
       - 'python/**'
 
@@ -54,7 +54,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
@@ -62,7 +61,7 @@ jobs:
           version: "27.4"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -114,14 +113,14 @@ jobs:
           path: LICENSE.txt
 
   build-python-mac-win:
-    needs: [ generate-license ]
+    needs: [generate-license]
     name: Mac/Win
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.10" ]
-        os: [ macos-latest, windows-latest ]
+        python-version: ["3.10"]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6.0.2
 
@@ -130,12 +129,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
-        with:
-          # FIXME: temporary workaround, see: https://github.com/Swatinem/rust-cache/issues/341
-          cache-bin: ${{ matrix.os != 'macos-latest' }}
-          workspaces: |
-            python -> target
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
@@ -177,15 +170,63 @@ jobs:
           name: dist-${{ matrix.os  }}
           path: python/target/wheels/*
 
+  build-macos-x86_64:
+    needs: [generate-license]
+    name: Mac x86_64
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10"]
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: rm LICENSE.txt
+      - name: Download LICENSE.txt
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-license
+          path: .
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run --no-project maturin build --release --strip
+
+      - name: List Mac wheels
+        run: find python/target/wheels/
+
+      - name: Archive wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-aarch64
+          path: python/target/wheels/*
+
   build-manylinux-x86_64:
-    needs: [ generate-license ]
+    needs: [generate-license]
     name: Manylinux x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
@@ -219,14 +260,13 @@ jobs:
           path: python/target/wheels/*
 
   build-manylinux-aarch64:
-    needs: [ generate-license ]
+    needs: [generate-license]
     name: Manylinux arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
@@ -260,14 +300,13 @@ jobs:
           path: python/target/wheels/*
 
   build-sdist:
-    needs: [ generate-license ]
+    needs: [generate-license]
     name: Source distribution
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
 
       - run: rm LICENSE.txt
       - name: Download LICENSE.txt
@@ -308,6 +347,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - build-python-mac-win
+      - build-macos-x86_64
       - build-manylinux-x86_64
       - build-manylinux-aarch64
       - build-sdist

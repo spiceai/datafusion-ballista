@@ -277,8 +277,6 @@ impl SubstraitSchedulerClient {
             successful_job.partition_location,
             self.max_message_size,
             self.use_flight_transport,
-            self.grpc_config.io_retries_times,
-            self.grpc_config.io_retry_wait_time_ms,
         )
         .await?;
 
@@ -378,16 +376,12 @@ impl SubstraitSchedulerClient {
         partition_locations: Vec<PartitionLocation>,
         max_message_size: usize,
         use_flight_transport: bool,
-        io_retries_times: u8,
-        io_retry_wait_time_ms: u64,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
         let streams = partition_locations.into_iter().map(move |partition| {
             let f = Self::fetch_partition_internal(
                 partition,
                 max_message_size,
                 use_flight_transport,
-                io_retries_times,
-                io_retry_wait_time_ms,
             )
             .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
@@ -401,8 +395,6 @@ impl SubstraitSchedulerClient {
         location: PartitionLocation,
         max_message_size: usize,
         flight_transport: bool,
-        io_retries_times: u8,
-        io_retry_wait_time_ms: u64,
     ) -> Result<SendableRecordBatchStream> {
         let metadata = location.executor_meta.ok_or_else(|| {
             DataFusionError::Internal("Received empty executor metadata".to_owned())
@@ -414,24 +406,18 @@ impl SubstraitSchedulerClient {
         let host = metadata.host.as_str();
         let port = metadata.port as u16;
 
-        let mut ballista_client = BallistaClient::try_new(
-            host,
-            port,
-            max_message_size,
-            false,
-            None,
-            io_retries_times,
-            io_retry_wait_time_ms,
-        )
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+        let mut ballista_client =
+            BallistaClient::try_new(host, port, max_message_size, false, None)
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
         ballista_client
             .fetch_partition(
                 &metadata.id,
                 &partition_id.into(),
-                location.file_id,
-                location.is_sort_shuffle,
+                &location.path,
+                host,
+                port,
                 flight_transport,
             )
             .await

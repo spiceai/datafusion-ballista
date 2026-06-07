@@ -33,10 +33,10 @@ pub fn print_version() {
 
 /// Client utilities for connecting to Ballista schedulers.
 pub mod client;
-/// Connection pool for reusing `BallistaClient` instances across requests.
-pub mod client_pool;
 /// Configuration options and settings for Ballista components.
 pub mod config;
+/// Consistent hashing implementation for data distribution.
+pub mod consistent_hash;
 /// Utilities for generating execution plan diagrams.
 pub mod diagram;
 /// Error types and result definitions for Ballista operations.
@@ -47,15 +47,18 @@ pub mod event_loop;
 pub mod execution_plans;
 /// Extension traits and utilities for DataFusion integration.
 pub mod extension;
-#[cfg(feature = "build-binary")]
 /// Object store configuration and utilities for distributed file access.
 pub mod object_store;
 /// Query planning utilities for distributed execution.
 pub mod planner;
 /// Runtime registry for codec and function registration.
 pub mod registry;
+/// Remote catalog for distributed function and table registration.
+pub mod remote_catalog;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+/// Shuffle storage abstraction for local and object store backends.
+pub mod shuffle_storage;
 /// General utility functions for Ballista operations.
 pub mod utils;
 

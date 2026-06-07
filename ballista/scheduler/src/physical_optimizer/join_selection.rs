@@ -237,41 +237,39 @@ pub(crate) fn try_collect_left(
             threshold_num_rows,
         );
 
-    // Swapping into `CollectLeft` puts the current right onto the build side,
-    // and `HashJoinExec` requires the build side to have exactly one partition
-    // in that mode. Ballista has no post-`JoinSelection` distribution pass to
-    // fix this, so any swap that would break the invariant must be skipped.
-    let right_one_partition = right.output_partitioning().partition_count() == 1;
     match (left_can_collect, right_can_collect) {
         (true, true) => {
-            // Don't swap null-aware anti joins as they have specific side requirements
             if hash_join.join_type().supports_swap()
-                && !hash_join.null_aware
-                && right_one_partition
                 && should_swap_join_order(&**left, &**right)?
             {
                 Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
             } else {
-                Ok(Some(Arc::new(
-                    hash_join
-                        .builder()
-                        .with_partition_mode(PartitionMode::CollectLeft)
-                        .build()?,
-                )))
+                Ok(Some(Arc::new(HashJoinExec::try_new(
+                    Arc::clone(left),
+                    Arc::clone(right),
+                    hash_join.on().to_vec(),
+                    hash_join.filter().cloned(),
+                    hash_join.join_type(),
+                    hash_join.projection.as_ref().map(|v| v.to_vec()),
+                    PartitionMode::CollectLeft,
+                    hash_join.null_equality(),
+                    false,
+                )?)))
             }
         }
-        (true, false) => Ok(Some(Arc::new(
-            hash_join
-                .builder()
-                .with_partition_mode(PartitionMode::CollectLeft)
-                .build()?,
-        ))),
+        (true, false) => Ok(Some(Arc::new(HashJoinExec::try_new(
+            Arc::clone(left),
+            Arc::clone(right),
+            hash_join.on().to_vec(),
+            hash_join.filter().cloned(),
+            hash_join.join_type(),
+            hash_join.projection.as_ref().map(|v| v.to_vec()),
+            PartitionMode::CollectLeft,
+            hash_join.null_equality(),
+            false,
+        )?))),
         (false, true) => {
-            // Don't swap null-aware anti joins as they have specific side requirements
-            if hash_join.join_type().supports_swap()
-                && !hash_join.null_aware
-                && right_one_partition
-            {
+            if hash_join.join_type().supports_swap() {
                 hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
             } else {
                 Ok(None)
@@ -280,6 +278,7 @@ pub(crate) fn try_collect_left(
         (false, false) => Ok(None),
     }
 }
+
 /// Creates a partitioned hash join execution plan, swapping inputs if beneficial.
 ///
 /// Checks if the join order should be swapped based on the join type and input statistics.
@@ -290,29 +289,21 @@ pub(crate) fn partitioned_hash_join(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
-    // Don't swap null-aware anti joins as they have specific side requirements
-    if hash_join.join_type().supports_swap()
-        && !hash_join.null_aware
-        && should_swap_join_order(&**left, &**right)?
+    if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
     {
         hash_join.swap_inputs(PartitionMode::Partitioned)
     } else {
-        // Null-aware anti joins must use CollectLeft mode because they track probe-side state
-        // (probe_side_non_empty, probe_side_has_null) per-partition, but need global knowledge
-        // for correct null handling. With partitioning, a partition might not see probe rows
-        // even if the probe side is globally non-empty, leading to incorrect NULL row handling.
-        let partition_mode = if hash_join.null_aware {
-            PartitionMode::CollectLeft
-        } else {
-            PartitionMode::Partitioned
-        };
-
-        Ok(Arc::new(
-            hash_join
-                .builder()
-                .with_partition_mode(partition_mode)
-                .build()?,
-        ))
+        Ok(Arc::new(HashJoinExec::try_new(
+            Arc::clone(left),
+            Arc::clone(right),
+            hash_join.on().to_vec(),
+            hash_join.filter().cloned(),
+            hash_join.join_type(),
+            hash_join.projection.as_ref().map(|v| v.to_vec()),
+            PartitionMode::Partitioned,
+            hash_join.null_equality(),
+            false,
+        )?))
     }
 }
 
@@ -751,114 +742,6 @@ mod test {
             optimizer_options.hash_join_single_partition_threshold_rows,
             optimizer_options.hash_join_single_partition_threshold,
         )
-    }
-    // Regression for https://github.com/apache/datafusion-ballista/issues/1681
-    //
-    // `JoinSelection` must not swap a `HashJoinExec(CollectLeft)` join's
-    // inputs in a way that puts a multi-partition reader on the build side.
-    // Ballista's pipeline has no `EnforceDistribution` pass after this rule,
-    // so the swapped plan reaches the executor unchanged and trips
-    // `HashJoinExec::execute`'s assertion that `left_partitions == 1` in
-    // `CollectLeft` mode.
-    #[tokio::test]
-    async fn collect_left_swap_preserves_one_partition_build() {
-        use datafusion::{
-            common::NullEquality,
-            config::ConfigOptions,
-            physical_expr::expressions::Column,
-            physical_optimizer::PhysicalOptimizerRule,
-            physical_plan::{
-                ExecutionPlanProperties, coalesce_partitions::CoalescePartitionsExec,
-                joins::HashJoinExec, joins::PartitionMode,
-            },
-        };
-
-        use crate::physical_optimizer::join_selection::JoinSelection;
-
-        let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
-
-        // Build side: 1 logical partition (e.g. a Ballista broadcast
-        // ShuffleReaderExec) but BIG total_byte_size.
-        let big_inner = Arc::new(StatisticsExec::new(
-            Statistics {
-                num_rows: Precision::Exact(10_000),
-                total_byte_size: Precision::Exact(1_000_000),
-                column_statistics: vec![ColumnStatistics::new_unknown()],
-            },
-            schema.clone(),
-        ));
-        let left =
-            Arc::new(CoalescePartitionsExec::new(big_inner)) as Arc<dyn ExecutionPlan>;
-        assert_eq!(left.output_partitioning().partition_count(), 1);
-
-        // Probe side: 2 partitions (the raw StatisticsExec default), SMALL
-        // total_byte_size. Stand-in for a multi-partition hash shuffle reader.
-        let right = Arc::new(StatisticsExec::new(
-            Statistics {
-                num_rows: Precision::Exact(3_000),
-                total_byte_size: Precision::Exact(200_000),
-                column_statistics: vec![ColumnStatistics::new_unknown()],
-            },
-            schema.clone(),
-        )) as Arc<dyn ExecutionPlan>;
-        assert!(right.output_partitioning().partition_count() > 1);
-
-        let on = vec![(
-            Arc::new(Column::new_with_schema("k", &left.schema()).unwrap()) as _,
-            Arc::new(Column::new_with_schema("k", &right.schema()).unwrap()) as _,
-        )];
-
-        let join = Arc::new(
-            HashJoinExec::try_new(
-                Arc::clone(&left),
-                Arc::clone(&right),
-                on,
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNothing,
-                false,
-            )
-            .unwrap(),
-        ) as Arc<dyn ExecutionPlan>;
-
-        let optimized = JoinSelection::new()
-            .optimize(join, &ConfigOptions::new())
-            .unwrap();
-
-        // `swap_inputs` for Inner wraps the join in a ProjectionExec to
-        // restore the output column order. Walk the tree to find the join.
-        fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<&HashJoinExec> {
-            if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
-                return Some(hj);
-            }
-            for child in plan.children() {
-                if let Some(hj) = find_hash_join(child) {
-                    return Some(hj);
-                }
-            }
-            None
-        }
-
-        let hj =
-            find_hash_join(&optimized).expect("HashJoinExec missing from optimized plan");
-
-        assert_eq!(*hj.partition_mode(), PartitionMode::CollectLeft);
-        assert_eq!(
-            hj.left().output_partitioning().partition_count(),
-            1,
-            "JoinSelection swapped a CollectLeft join's inputs and ended up \
-             with a multi-partition reader on the build side, which violates \
-             CollectLeft's invariant",
-        );
-        assert_eq!(
-            hj.right().output_partitioning().partition_count(),
-            2,
-            "JoinSelection swapped a CollectLeft join's inputs and ended up \
-             with a multi-partition reader on the build side, which violates \
-             CollectLeft's invariant",
-        );
     }
 
     /// Create join filter for NLJoinExec with expression `big_col > small_col`

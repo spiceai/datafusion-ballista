@@ -26,12 +26,12 @@ use ballista_core::serde::protobuf::{
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
-    ExecutorStoppedResult, GetJobMetricsParams, GetJobMetricsResult, GetJobStatusParams,
-    GetJobStatusResult, HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair,
-    PollWorkParams, PollWorkResult, RegisterExecutorParams, RegisterExecutorResult,
-    RemoveSessionParams, RemoveSessionResult, UpdateTaskStatusParams,
-    UpdateTaskStatusResult, execute_query_failure_result, execute_query_result,
-    executor_metric::Metric,
+    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobStatusParams,
+    GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
+    HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
+    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    execute_query_failure_result, execute_query_result,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -49,19 +49,20 @@ use {
     datafusion_substrait::serializer::deserialize_bytes,
 };
 
-use crate::cluster::{bind_task_bias, bind_task_round_robin};
+use std::ops::Deref;
+
+use crate::cluster::{BindingResult, bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
+use crate::scheduler_server::SchedulerServer;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
+use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
+use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
-
-use crate::scheduler_server::SchedulerServer;
 
 #[tonic::async_trait]
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
@@ -101,7 +102,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
-                    os_info: metadata.os_info.unwrap().into(),
                 };
                 if let Err(e) = self
                     .state
@@ -130,23 +130,68 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             }];
             let available_slots = available_slots.iter_mut().collect();
             let running_jobs = self.state.task_manager.get_running_job_cache();
-            let schedulable_tasks = match self.state.config.task_distribution {
+
+            let binding_result = match self.state.config.task_distribution {
                 TaskDistributionPolicy::Bias => {
                     bind_task_bias(available_slots, running_jobs, |_| false).await
                 }
                 TaskDistributionPolicy::RoundRobin => {
                     bind_task_round_robin(available_slots, running_jobs, |_| false).await
                 }
+                TaskDistributionPolicy::ConsistentHash { .. } => {
+                    return Err(Status::unimplemented(
+                        "ConsistentHash TaskDistribution is not feasible for pull-based task scheduling",
+                    ));
+                }
 
-                TaskDistributionPolicy::Custom(ref policy) => policy
-                    .bind_tasks(available_slots, running_jobs)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?,
+                TaskDistributionPolicy::Custom(ref policy) => BindingResult::from_tasks(
+                    policy
+                        .bind_tasks(available_slots, running_jobs)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                ),
             };
 
+            // Record shuffle affinity metrics
+            for affinity in &binding_result.shuffle_affinity {
+                if affinity.has_local_data {
+                    self.state
+                        .metrics_collector
+                        .record_task_shuffle_affinity_hit(
+                            &affinity.job_id,
+                            affinity.stage_id,
+                            &affinity.executor_id,
+                        );
+                } else {
+                    self.state
+                        .metrics_collector
+                        .record_task_shuffle_affinity_miss(
+                            &affinity.job_id,
+                            affinity.stage_id,
+                            &affinity.executor_id,
+                        );
+                }
+            }
+
             let mut tasks = vec![];
-            for (_, task) in schedulable_tasks {
+            let now_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+
+            for (_, task) in binding_result.bound_tasks {
                 let job_id = task.partition.job_id.clone();
+                let stage_id = task.partition.stage_id;
+
+                // Record task scheduling metric with actual latency
+                let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
+                self.state.metrics_collector.record_task_scheduled(
+                    &job_id,
+                    stage_id,
+                    &executor_id,
+                    latency_ms as u64,
+                );
+
                 match self.state.task_manager.prepare_task_definition(task) {
                     Ok(task_definition) => tasks.push(task_definition),
                     Err(e) => {
@@ -192,7 +237,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 port: metadata.port as u16,
                 grpc_port: metadata.grpc_port as u16,
                 specification: metadata.specification.unwrap().into(),
-                os_info: metadata.os_info.unwrap().into(),
             };
 
             self.do_register_executor(metadata).await.map_err(|e| {
@@ -238,7 +282,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
-                    os_info: metadata.os_info.unwrap().into(),
                 };
 
                 self.do_register_executor(metadata).await.map_err(|e| {
@@ -252,35 +295,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 )));
             }
         }
-        // Extract current process memory from incoming metrics
-        let current_proc_physical = metrics
-            .iter()
-            .find_map(|m| match m.metric {
-                Some(Metric::ProcPhysicalMemory(v)) => Some(v),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        let current_proc_virtual = metrics
-            .iter()
-            .find_map(|m| match m.metric {
-                Some(Metric::ProcVirtualMemory(v)) => Some(v),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        // Compare against previous peaks
-        let (peak_proc_physical_memory, peak_proc_virtual_memory) = self
-            .state
-            .executor_manager
-            .get_executor_hearbeat(&executor_id)
-            .map(|hb| {
-                (
-                    hb.peak_proc_physical_memory.max(current_proc_physical),
-                    hb.peak_proc_virtual_memory.max(current_proc_virtual),
-                )
-            })
-            .unwrap_or((current_proc_physical, current_proc_virtual));
 
         let executor_heartbeat = ExecutorHeartbeat {
             executor_id,
@@ -290,8 +304,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .as_secs(),
             metrics,
             status,
-            peak_proc_physical_memory,
-            peak_proc_virtual_memory,
         };
 
         self.state
@@ -551,134 +563,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         }
     }
 
-    async fn get_job_metrics(
-        &self,
-        request: Request<GetJobMetricsParams>,
-    ) -> Result<Response<GetJobMetricsResult>, Status> {
-        let job_id = request.into_inner().job_id;
-        trace!("Received get_job_metrics request for job {}", job_id);
-
-        let graph = self
-            .state
-            .task_manager
-            .get_job_execution_graph(&job_id)
-            .await
-            .map_err(|e| {
-                let msg =
-                    format!("Error fetching execution graph for job {job_id}: {e:?}");
-                error!("{msg}");
-                Status::internal(msg)
-            })?
-            .ok_or_else(|| {
-                Status::not_found(format!("Execution graph not found for job {job_id}"))
-            })?;
-
-        let mut stage_metrics_list = graph
-            .stages()
-            .iter()
-            .filter_map(|(stage_id, stage)| {
-                let successful = match stage {
-                    crate::state::execution_graph::ExecutionStage::Successful(stage) => {
-                        stage
-                    }
-                    _ => return None,
-                };
-
-                let raw_metrics = &successful.stage_metrics;
-                let mut operators = Vec::with_capacity(raw_metrics.len());
-                let mut metric_index = 0;
-                let operators = (|| -> Result<
-                    Vec<ballista_core::serde::protobuf::OperatorWithMetrics>,
-                    BallistaError,
-                > {
-                    let mut stack = vec![(successful.plan.as_ref(), 0_u32)];
-
-                    while let Some((plan, depth)) = stack.pop() {
-                        let operator_desc = {
-                            struct DisplayableOperator<'a> {
-                                plan: &'a dyn ExecutionPlan,
-                            }
-
-                            impl std::fmt::Display for DisplayableOperator<'_> {
-                                fn fmt(
-                                    &self,
-                                    f: &mut std::fmt::Formatter<'_>,
-                                ) -> std::fmt::Result {
-                                    self.plan.fmt_as(DisplayFormatType::Default, f)
-                                }
-                            }
-
-                            DisplayableOperator { plan }.to_string()
-                        };
-                        let metrics = if plan.metrics().is_some() {
-                            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet =
-                                raw_metrics
-                                    .get(metric_index)
-                                    .ok_or_else(|| {
-                                        BallistaError::Internal(format!(
-                                            "Missing metrics for operator {} at depth {}",
-                                            plan.name(),
-                                            depth
-                                        ))
-                                    })?
-                                    .clone()
-                                    .try_into()?;
-                            metric_index += 1;
-                            metrics.metrics
-                        } else {
-                            vec![]
-                        };
-
-                        operators.push(
-                            ballista_core::serde::protobuf::OperatorWithMetrics {
-                                depth,
-                                operator_type: plan.name().to_string(),
-                                operator_desc,
-                                metrics,
-                            },
-                        );
-
-                        for child in plan.children().into_iter().rev() {
-                            stack.push((child.as_ref(), depth + 1));
-                        }
-                    }
-
-                    Ok(operators)
-                })()
-                .and_then(|operators| {
-                    if metric_index == raw_metrics.len() {
-                        Ok(operators)
-                    } else {
-                        Err(BallistaError::Internal(format!(
-                            "Stage metrics size mismatch for job {job_id} stage {stage_id}: operators {} != stage metrics {}",
-                            metric_index,
-                            raw_metrics.len()
-                        )))
-                    }
-                })
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
-                    ))
-                });
-
-                Some(operators.map(|operators| {
-                    ballista_core::serde::protobuf::JobStageMetrics {
-                        stage_id: *stage_id as u32,
-                        partitions: successful.partitions as u32,
-                        operators,
-                    }
-                }))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-
-        stage_metrics_list.sort_by_key(|stage| stage.stage_id);
-
-        Ok(Response::new(GetJobMetricsResult {
-            stages: stage_metrics_list,
-        }))
-    }
-
     async fn executor_stopped(
         &self,
         request: Request<ExecutorStoppedParams>,
@@ -693,6 +577,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         );
 
         let executor_manager = self.state.executor_manager.clone();
+        let metrics_collector = self.state.metrics_collector.clone();
         let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
             let msg = format!("Get query stage event loop error due to {e:?}");
             error!("{msg}");
@@ -702,6 +587,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         Self::remove_executor(
             executor_manager,
             event_sender,
+            metrics_collector,
             &executor_id,
             Some(reason),
             self.config.executor_termination_grace_period,
@@ -748,6 +634,46 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 Status::internal(msg)
             })?;
         Ok(Response::new(CleanJobDataResult {}))
+    }
+
+    async fn get_catalog(
+        &self,
+        request: Request<GetCatalogParams>,
+    ) -> Result<Response<GetCatalogResult>, Status> {
+        let GetCatalogParams { session_id } = request.into_inner();
+        let ctx = self
+            .state
+            .session_manager
+            .create_or_update_session(
+                session_id.as_str(),
+                &self.state.session_manager.produce_config(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Error creating session {e}")))?;
+
+        Ok(Response::new(GetCatalogResult {
+            catalogs: ctx.serialize_catalogs().await,
+        }))
+    }
+
+    async fn get_remote_functions(
+        &self,
+        request: Request<GetRemoteFunctionsParams>,
+    ) -> Result<Response<GetRemoteFunctionsResult>, Status> {
+        let GetRemoteFunctionsParams { session_id } = request.into_inner();
+        let ctx = self
+            .state
+            .session_manager
+            .create_or_update_session(
+                session_id.as_str(),
+                &self.state.session_manager.produce_config(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Error creating session {e}")))?;
+
+        Ok(Response::new(GetRemoteFunctionsResult {
+            udfs: ctx.serialize_udfs(),
+        }))
     }
 }
 
@@ -844,9 +770,7 @@ mod test {
         ExecutorRegistration, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
         PollWorkParams, RegisterExecutorParams, executor_status,
     };
-    use ballista_core::serde::scheduler::{
-        ExecutorOperatingSystemSpecification, ExecutorSpecification,
-    };
+    use ballista_core::serde::scheduler::ExecutorSpecification;
 
     use crate::state::SchedulerState;
     use crate::test_utils::await_condition;
@@ -875,10 +799,7 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(
-                ExecutorSpecification::default().with_task_slots(2).into(),
-            ),
-            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
@@ -896,6 +817,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 
@@ -928,6 +850,7 @@ mod test {
             SchedulerState::new_with_default_scheduler_name(
                 cluster.clone(),
                 BallistaCodec::default(),
+                default_metrics_collector().unwrap(),
             );
         state.init().await?;
 
@@ -966,10 +889,7 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(
-                ExecutorSpecification::default().with_task_slots(2).into(),
-            ),
-            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1054,10 +974,7 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(
-                ExecutorSpecification::default().with_task_slots(2).into(),
-            ),
-            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -1110,10 +1027,7 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(
-                ExecutorSpecification::default().with_task_slots(2).into(),
-            ),
-            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1199,10 +1113,7 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(
-                ExecutorSpecification::default().with_task_slots(2).into(),
-            ),
-            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
         };
 
         let request: Request<RegisterExecutorParams> =

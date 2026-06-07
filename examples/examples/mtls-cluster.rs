@@ -366,7 +366,6 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
                 resource: Some(Resource::TaskSlots(4)),
             }],
         }),
-        os_info: None,
     };
 
     let config_producer = create_tls_config_producer(tls.client_tls.clone());
@@ -381,7 +380,7 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
 
-    let executor = Arc::new(Executor::with_default_execution_engine(
+    let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir_str,
         runtime_producer,
@@ -389,13 +388,13 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
         Default::default(), // function_registry
         Arc::new(LoggingMetricsCollector::default()), // metrics_collector
         4,                  // concurrent_tasks
+        None,               // execution_engine
     ));
 
     // Start Flight service with mTLS for serving shuffle data
-    let flight_service =
-        FlightServiceServer::new(BallistaFlightService::new(work_dir_str))
-            .max_decoding_message_size(16 * 1024 * 1024)
-            .max_encoding_message_size(16 * 1024 * 1024);
+    let flight_service = FlightServiceServer::new(BallistaFlightService::new())
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .max_encoding_message_size(16 * 1024 * 1024);
 
     // Spawn Flight server with TLS
     let server_tls = tls.server_tls_config();
@@ -430,7 +429,7 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
     // This registers the executor and starts polling for tasks
     info!("Starting execution poll loop...");
     let poll_handle = tokio::spawn(async move {
-        execution_loop::poll_loop(scheduler, executor, codec).await
+        execution_loop::poll_loop(scheduler, executor, codec, None, None, None).await
     });
 
     tokio::select! {

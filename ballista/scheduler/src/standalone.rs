@@ -30,7 +30,6 @@ use ballista_core::{
     BALLISTA_VERSION, error::Result,
     serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
 };
-use datafusion::DATAFUSION_VERSION;
 use datafusion::execution::SessionState;
 use datafusion::prelude::SessionConfig;
 use datafusion_proto::protobuf::LogicalPlanNode;
@@ -105,9 +104,7 @@ pub async fn new_standalone_scheduler_with_builder(
     // Let the OS assign a random, free port
     let listener = TcpListener::bind("localhost:0").await?;
     let addr = listener.local_addr()?;
-    info!(
-        "Ballista Scheduler v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) listening on {addr:?}"
-    );
+    info!("Ballista v{BALLISTA_VERSION} Rust Scheduler listening on {addr:?}");
     tokio::spawn(
         create_grpc_server(&GrpcServerConfig::default())
             .add_service(server)

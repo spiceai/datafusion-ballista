@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
 use crate::state::execution_graph::{
     ExecutionGraphBox, RunningTaskInfo, StaticExecutionGraph, TaskDescription,
+    TaskStatusUpdateResult,
 };
 use crate::state::executor_manager::ExecutorManager;
 
@@ -30,6 +29,7 @@ use ballista_core::error::Result;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use datafusion::prelude::SessionConfig;
 use rand::distr::Alphanumeric;
+use rand::distr::Distribution;
 
 use crate::cluster::JobState;
 use ballista_core::serde::BallistaCodec;
@@ -45,7 +45,7 @@ use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::{AsExecutionPlan, PhysicalExtensionCodec};
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use log::{debug, error, info, trace, warn};
-use rand::{RngExt, rng};
+use rand::rng;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -54,6 +54,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 type ActiveJobCache = Arc<DashMap<String, JobInfoCache>>;
+
+// TODO move to configuration file
+/// Default maximum number of failure attempts for task-level retry before the task is considered failed.
+pub const TASK_MAX_FAILURES: usize = 4;
+/// Default maximum number of failure attempts for stage-level retry before the stage is considered failed.
+pub const STAGE_MAX_FAILURES: usize = 4;
 
 /// Trait for launching tasks on executors.
 ///
@@ -131,10 +137,6 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     active_job_cache: ActiveJobCache,
     /// Task launcher implementation.
     launcher: Arc<dyn TaskLauncher>,
-    /// Maximum number of failure attempts for task-level retry before the task is considered failed
-    task_max_failures: usize,
-    /// Maximum number of failure attempts for stage-level retry before the stage is considered failed.
-    stage_max_failures: usize,
 }
 
 /// Cache for active job information managed by this scheduler.
@@ -222,7 +224,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         state: Arc<dyn JobState>,
         codec: BallistaCodec<T, U>,
         scheduler_id: String,
-        config: Arc<SchedulerConfig>,
     ) -> Self {
         Self {
             state,
@@ -230,8 +231,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             scheduler_id: scheduler_id.clone(),
             active_job_cache: Arc::new(DashMap::new()),
             launcher: Arc::new(DefaultTaskLauncher::new(scheduler_id)),
-            task_max_failures: config.task_max_failures,
-            stage_max_failures: config.stage_max_failures,
         }
     }
 
@@ -241,7 +240,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         codec: BallistaCodec<T, U>,
         scheduler_id: String,
         launcher: Arc<dyn TaskLauncher>,
-        config: Arc<SchedulerConfig>,
     ) -> Self {
         Self {
             state,
@@ -249,8 +247,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             scheduler_id,
             active_job_cache: Arc::new(DashMap::new()),
             launcher,
-            task_max_failures: config.task_max_failures,
-            stage_max_failures: config.stage_max_failures,
         }
     }
 
@@ -270,6 +266,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         self.active_job_cache.len()
     }
 
+    /// Get the total number of pending tasks across all active jobs.
+    ///
+    /// A pending task is a task that is available to schedule on an executor
+    /// but cannot be scheduled because no resources are available.
+    ///
+    /// NOTE: This method iterates over all active jobs and acquires read locks
+    /// on each execution graph. It should NOT be called frequently (e.g., in a
+    /// hot loop or after every event) as it can cause lock contention with
+    /// concurrent task binding operations.
+    pub async fn total_pending_tasks(&self) -> usize {
+        let mut total = 0;
+        for entry in self.active_job_cache.iter() {
+            // Use a timeout to avoid blocking indefinitely if there's lock contention.
+            // If we can't acquire the lock within the timeout, skip this job's count
+            // rather than blocking the metrics collection.
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                entry.value().execution_graph.read(),
+            )
+            .await
+            {
+                Ok(graph) => {
+                    total += graph.available_tasks();
+                }
+                Err(_) => {
+                    // Lock acquisition timed out, skip this job
+                    trace!(
+                        "Skipping pending task count for job {} due to lock contention",
+                        entry.key()
+                    );
+                }
+            }
+        }
+        total
+    }
+
     /// Generate an ExecutionGraph for the job and save it to the persistent state.
     /// By default, this job will be curated by the scheduler which receives it.
     /// Then we will also save it to the active execution graph
@@ -283,7 +315,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         queued_at: u64,
         session_config: Arc<SessionConfig>,
         subscriber: Option<JobStatusSubscriber>,
-        logical_plan: Option<String>,
     ) -> Result<()> {
         let mut planner = DefaultDistributedPlanner::new();
 
@@ -300,7 +331,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 plan,
                 queued_at,
                 session_config,
-                logical_plan,
             )?) as ExecutionGraphBox
         } else {
             debug!("Using static query planner for job planning");
@@ -313,7 +343,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 queued_at,
                 session_config,
                 &mut planner,
-                logical_plan,
             )?) as ExecutionGraphBox
         };
 
@@ -346,12 +375,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         Arc::new(ret)
     }
 
-    /// Get a list of jobs from the active cache only (running and queued jobs).
-    ///
-    /// Unlike [`Self::get_all_jobs`], this does not include completed or failed jobs
-    /// that have been evicted from the cache. Prefer [`Self::get_all_jobs`] for a
-    /// complete view.
-    pub async fn get_running_jobs(&self) -> Result<Vec<JobOverview>> {
+    /// Get a list of active job ids
+    pub async fn get_jobs(&self) -> Result<Vec<JobOverview>> {
         let job_ids = self.state.get_jobs().await?;
 
         let mut jobs = vec![];
@@ -365,44 +390,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     .await?
                     .ok_or_else(|| BallistaError::Internal(format!("Error getting job overview, no execution graph found for job {job_id}")))?;
                 jobs.push((&graph).into());
-            }
-        }
-        Ok(jobs)
-    }
-
-    /// Get all jobs optionally filtered by status.
-    /// When `status` is None, returns all jobs regardless of status.
-    pub async fn get_all_jobs(&self) -> Result<Vec<JobOverview>> {
-        let job_ids = self.state.get_all_jobs().await?;
-
-        let mut jobs = vec![];
-        for job_id in &job_ids {
-            if let Some(cached) = self.get_active_execution_graph(job_id) {
-                let graph = cached.read().await;
-                jobs.push(graph.deref().into());
-            } else if let Some(graph) = self.state.get_execution_graph(job_id).await? {
-                jobs.push((&graph).into());
-            } else if let Some(job_status) = self.state.get_job_status(job_id).await? {
-                let (start_time, end_time) = match &job_status.status {
-                    Some(job_status::Status::Running(r)) => (r.started_at, 0),
-                    Some(job_status::Status::Successful(s)) => (s.started_at, s.ended_at),
-                    Some(job_status::Status::Failed(f)) => (f.started_at, f.ended_at),
-                    // Queued jobs have no start or end time yet
-                    _ => (0, 0),
-                };
-                jobs.push(JobOverview {
-                    job_id: job_status.job_id.clone(),
-                    job_name: job_status.job_name.clone(),
-                    status: job_status,
-                    start_time,
-                    end_time,
-                    num_stages: 0,
-                    completed_stages: 0,
-                });
-            } else {
-                warn!(
-                    "Job {job_id} not found in active cache, execution graph, or job status"
-                );
             }
         }
         Ok(jobs)
@@ -422,6 +409,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Get the execution graph of of a job. First look in the active cache.
     /// If no one found, then in the Active/Completed jobs.
+    #[cfg(feature = "rest-api")]
     pub(crate) async fn get_job_execution_graph(
         &self,
         job_id: &str,
@@ -437,14 +425,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
     }
 
-    /// Update given task statuses in the respective job and return a tuple containing:
-    /// 1. A list of QueryStageSchedulerEvent to publish.
-    /// 2. A list of reservations that can now be offered.
+    /// Update given task statuses in the respective job and return a `TaskStatusUpdateResult`
+    /// containing:
+    /// 1. A list of `QueryStageSchedulerEvent` to publish.
+    /// 2. Metrics information about stage/task lifecycle changes.
     pub(crate) async fn update_task_statuses(
         &self,
         executor: &ExecutorMetadata,
         task_status: Vec<TaskStatus>,
-    ) -> Result<Vec<QueryStageSchedulerEvent>> {
+    ) -> Result<TaskStatusUpdateResult> {
         let mut job_updates: HashMap<String, Vec<TaskStatus>> = HashMap::new();
         for status in task_status {
             trace!("Task Update\n{status:?}");
@@ -453,21 +442,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             job_task_statuses.push(status);
         }
 
-        let mut events: Vec<QueryStageSchedulerEvent> = vec![];
+        let mut combined_result = TaskStatusUpdateResult::default();
         for (job_id, statuses) in job_updates {
             let num_tasks = statuses.len();
             debug!("Updating {num_tasks} tasks in job {job_id}");
 
-            // let graph = self.get_active_execution_graph(&job_id).await;
-            let job_events = if let Some(cached) =
-                self.get_active_execution_graph(&job_id)
-            {
+            let events = if let Some(cached) = self.get_active_execution_graph(&job_id) {
                 let mut graph = cached.write().await;
                 graph.update_task_status(
                     executor,
                     statuses,
-                    self.task_max_failures,
-                    self.stage_max_failures,
+                    TASK_MAX_FAILURES,
+                    STAGE_MAX_FAILURES,
                 )?
             } else {
                 // TODO Deal with curator changed case
@@ -477,12 +463,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 vec![]
             };
 
-            for event in job_events {
-                events.push(event);
-            }
+            // Combine events from all jobs
+            combined_result.events.extend(events);
+            // Note: metrics are not available through the trait interface.
+            // Use update_task_status_with_metrics on StaticExecutionGraph for metrics tracking.
         }
 
-        Ok(events)
+        Ok(combined_result)
     }
 
     /// Mark a job to success. This will create a key under the CompletedJobs keyspace
@@ -778,7 +765,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub fn generate_job_id(&self) -> String {
         let mut rng = rng();
         std::iter::repeat(())
-            .map(|()| rng.sample(Alphanumeric))
+            .map(|()| Alphanumeric.sample(&mut rng))
             .map(char::from)
             .take(7)
             .collect()

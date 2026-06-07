@@ -18,8 +18,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
-/// Connection pool for `BallistaClient` instances.
-mod client_pool;
 /// Execution plan for collecting distributed query results into a single partition.
 pub mod collect;
 /// Command-line configuration for the executor binary.
@@ -66,15 +64,13 @@ use ballista_core::utils::GrpcServerConfig;
 
 /// [ArrowFlightServerProvider] provides a function which creates a new Arrow Flight server.
 ///
-/// The function should take four arguments:
-/// [String] - executor work directory
+/// The function should take two arguments:
 /// [SocketAddr] - the address to bind the server to
 /// [Shutdown] - a shutdown signal to gracefully shutdown the server
 /// [GrpcServerConfig] - the gRPC server configuration for timeout settings
 /// Returns a [tokio::task::JoinHandle] which will be registered as service handler
 ///
 pub type ArrowFlightServerProvider = dyn Fn(
-        String,
         SocketAddr,
         Shutdown,
         GrpcServerConfig,

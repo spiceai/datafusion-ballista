@@ -37,8 +37,8 @@ use crate::extension::SessionConfigHelperExt;
 use crate::serde::protobuf::{NamedPruningMetrics, NamedRatio};
 use crate::serde::scheduler::{
     Action, BallistaFunctionRegistry, ExecutorData, ExecutorMetadata,
-    ExecutorOperatingSystemSpecification, ExecutorSpecification, PartitionId,
-    PartitionLocation, PartitionStats, TaskDefinition,
+    ExecutorSpecification, PartitionId, PartitionLocation, PartitionStats,
+    TaskDefinition,
 };
 
 use crate::RuntimeProducer;
@@ -55,10 +55,9 @@ impl TryInto<Action> for protobuf::Action {
                     job_id: fetch.job_id,
                     stage_id: fetch.stage_id as usize,
                     partition_id: fetch.partition_id as usize,
-                    file_id: fetch.file_id,
+                    path: fetch.path,
                     host: fetch.host,
                     port: fetch.port as u16,
-                    is_sort_shuffle: fetch.is_sort_shuffle,
                 })
             }
             _ => Err(BallistaError::General(
@@ -124,8 +123,7 @@ impl TryInto<PartitionLocation> for protobuf::PartitionLocation {
                     )
                 })?
                 .into(),
-            file_id: self.file_id,
-            is_sort_shuffle: self.is_sort_shuffle,
+            path: self.path,
         })
     }
 }
@@ -266,7 +264,6 @@ impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
             port: self.port as u16,
             grpc_port: self.grpc_port as u16,
             specification: self.specification.unwrap().into(),
-            os_info: self.os_info.unwrap().into(),
         }
     }
 }
@@ -276,35 +273,13 @@ impl Into<ExecutorSpecification> for protobuf::ExecutorSpecification {
     fn into(self) -> ExecutorSpecification {
         let mut ret = ExecutorSpecification { task_slots: 0 };
         for resource in self.resources {
-            if let Some(resource_spec) = resource.resource {
-                match resource_spec {
-                    protobuf::executor_resource::Resource::TaskSlots(num_slots) => {
-                        ret.task_slots = num_slots
-                    }
-                }
+            if let Some(protobuf::executor_resource::Resource::TaskSlots(task_slots)) =
+                resource.resource
+            {
+                ret.task_slots = task_slots
             }
         }
-
         ret
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<ExecutorOperatingSystemSpecification>
-    for protobuf::ExecutorOperatingSystemSpecification
-{
-    fn into(self) -> ExecutorOperatingSystemSpecification {
-        ExecutorOperatingSystemSpecification {
-            system_name: self.system_name,
-            kernel_ver: self.kernel_ver,
-            os_ver: self.os_ver,
-            os_ver_long: self.os_ver_long,
-            physical_cores: self.physical_cores,
-            num_disks: self.num_disks,
-            total_disk_space: self.total_disk_space,
-            total_available_disk_space: self.total_available_disk_space,
-            open_files_limit: self.open_files_limit,
-        }
     }
 }
 

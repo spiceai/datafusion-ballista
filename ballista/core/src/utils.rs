@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::config::BallistaConfig;
+use crate::config::{BallistaConfig, ShuffleFormat};
 use crate::error::{BallistaError, Result};
 use crate::extension::SessionConfigExt;
 use crate::serde::scheduler::PartitionStats;
@@ -32,7 +32,6 @@ use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
 use futures::StreamExt;
 use log::error;
 use std::io::BufWriter;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
@@ -54,7 +53,7 @@ use tonic::transport::{Channel, Endpoint, Error, Server};
 /// let ballista_config = BallistaConfig::default();
 /// let grpc_config = GrpcClientConfig::from(&ballista_config);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct GrpcClientConfig {
     /// Connection timeout in seconds
     pub connect_timeout_seconds: u64,
@@ -64,29 +63,19 @@ pub struct GrpcClientConfig {
     pub tcp_keepalive_seconds: u64,
     /// HTTP/2 keep-alive ping interval in seconds
     pub http2_keepalive_interval_seconds: u64,
-    /// Should client use tls
-    pub use_tls: bool,
-    /// Returns the maximum message size for gRPC clients in bytes.
-    pub max_message_size: usize,
-    /// Number of retries for IO operations.
-    pub io_retries_times: u8,
-    /// Wait time in milliseconds between IO retries.
-    pub io_retry_wait_time_ms: u64,
 }
 
 impl From<&BallistaConfig> for GrpcClientConfig {
     fn from(config: &BallistaConfig) -> Self {
         Self {
-            connect_timeout_seconds: config.grpc_client_connect_timeout_seconds() as u64,
-            timeout_seconds: config.grpc_client_timeout_seconds() as u64,
-            tcp_keepalive_seconds: config.grpc_client_tcp_keepalive_seconds() as u64,
-            http2_keepalive_interval_seconds: config
-                .grpc_client_http2_keepalive_interval_seconds()
+            connect_timeout_seconds: config.default_grpc_client_connect_timeout_seconds()
                 as u64,
-            use_tls: config.client_use_tls(),
-            max_message_size: config.grpc_client_max_message_size(),
-            io_retries_times: config.io_retries_times() as u8,
-            io_retry_wait_time_ms: config.io_retry_wait_time_ms() as u64,
+            timeout_seconds: config.default_grpc_client_timeout_seconds() as u64,
+            tcp_keepalive_seconds: config.default_grpc_client_tcp_keepalive_seconds()
+                as u64,
+            http2_keepalive_interval_seconds: config
+                .default_grpc_client_http2_keepalive_interval_seconds()
+                as u64,
         }
     }
 }
@@ -98,10 +87,6 @@ impl Default for GrpcClientConfig {
             timeout_seconds: 20,
             tcp_keepalive_seconds: 3600,
             http2_keepalive_interval_seconds: 300,
-            use_tls: false,
-            max_message_size: 16 * 1024 * 1024,
-            io_retries_times: 3,
-            io_retry_wait_time_ms: 3000,
         }
     }
 }
@@ -168,80 +153,46 @@ pub fn default_config_producer() -> SessionConfig {
     SessionConfig::new_with_ballista()
 }
 
-/// Stream data to disk in Arrow IPC format.
-///
-/// Batches are read from the async stream and forwarded through a bounded
-/// channel to a `spawn_blocking` task that performs all synchronous file I/O,
-/// keeping the tokio worker thread unblocked.
+/// Stream data to disk in Arrow IPC format
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-    path: &Path,
+    path: &str,
     disk_write_metric: &metrics::Time,
-    channel_capacity: usize,
 ) -> Result<PartitionStats> {
-    let schema = stream.schema();
-    let path_owned = path.to_owned();
-    let write_metric = disk_write_metric.clone();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
-
-    let handle = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
-            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
-            BallistaError::IoError(e)
-        })?);
-
-        let options = IpcWriteOptions::default()
-            .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-
-        let mut writer =
-            StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
-
-        while let Some(batch) = rx.blocking_recv() {
-            let timer = write_metric.timer();
-            writer.write(&batch)?;
-            timer.done();
-        }
-        let timer = write_metric.timer();
-        writer.finish()?;
-        timer.done();
-        Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
-    });
+    let file = BufWriter::new(File::create(path).map_err(|e| {
+        error!("Failed to create partition file at {path}: {e:?}");
+        BallistaError::IoError(e)
+    })?);
 
     let mut num_rows = 0;
     let mut num_batches = 0;
+    let mut num_bytes = 0;
 
-    let stream_err = loop {
-        match stream.next().await {
-            Some(Ok(batch)) => {
-                num_batches += 1;
-                num_rows += batch.num_rows();
-                if tx.send(batch).await.is_err() {
-                    break None;
-                }
-            }
-            Some(Err(e)) => break Some(e),
-            None => break None,
-        }
-    };
-    drop(tx);
+    let options = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
 
-    let write_result = handle
-        .await
-        .map_err(|e| BallistaError::General(format!("Disk writer task failed: {e}")))?;
+    let mut writer =
+        StreamWriter::try_new_with_options(file, stream.schema().as_ref(), options)?;
 
-    if let Some(e) = stream_err {
-        if let Err(write_err) = &write_result {
-            error!("Disk writer also failed: {write_err}");
-        }
-        return Err(e.into());
+    while let Some(result) = stream.next().await {
+        let batch = result?;
+
+        let batch_size_bytes: usize = batch.get_array_memory_size();
+        num_batches += 1;
+        num_rows += batch.num_rows();
+        num_bytes += batch_size_bytes;
+
+        let timer = disk_write_metric.timer();
+        writer.write(&batch)?;
+        timer.done();
     }
-    let num_bytes = write_result?;
-
+    let timer = disk_write_metric.timer();
+    writer.finish()?;
+    timer.done();
     Ok(PartitionStats::new(
         Some(num_rows as u64),
         Some(num_batches),
-        Some(num_bytes),
+        Some(num_bytes as u64),
     ))
 }
 
@@ -254,6 +205,39 @@ pub async fn collect_stream(
         batches.push(batch?);
     }
     Ok(batches)
+}
+
+/// Write stream to disk using the specified shuffle format
+///
+/// This function dispatches to the appropriate writer based on the format:
+/// - ArrowIpc: Uses Arrow IPC streaming format with LZ4 compression
+/// - Vortex: Uses Vortex columnar format (requires 'vortex' feature)
+pub async fn write_stream_to_disk_with_format(
+    stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
+    path: &str,
+    disk_write_metric: &metrics::Time,
+    format: ShuffleFormat,
+) -> Result<PartitionStats> {
+    match format {
+        ShuffleFormat::ArrowIpc => write_stream_to_disk(stream, path, disk_write_metric).await,
+        #[cfg(feature = "vortex")]
+        ShuffleFormat::Vortex => {
+            crate::execution_plans::write_stream_to_disk_vortex(stream, path, disk_write_metric)
+                .await
+        }
+        #[cfg(not(feature = "vortex"))]
+        ShuffleFormat::Vortex => Err(BallistaError::General(
+            "Vortex format is not available. Enable the 'vortex' feature to use Vortex shuffle format.".to_string(),
+        )),
+    }
+}
+
+/// Get the file extension for the given shuffle format
+pub fn shuffle_file_extension(format: ShuffleFormat) -> &'static str {
+    match format {
+        ShuffleFormat::ArrowIpc => "arrow",
+        ShuffleFormat::Vortex => "vortex",
+    }
 }
 
 /// Creates a gRPC client connection with the specified configuration.
@@ -349,14 +333,6 @@ pub fn get_time_before(interval_seconds: u64) -> u64 {
         .as_secs()
 }
 
-/// Current time since UNIX EPOCH. In milliseconds.
-pub fn get_current_time() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX epoch")
-        .as_millis()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,19 +345,19 @@ mod tests {
         // Verify the conversion picks up the right values
         assert_eq!(
             grpc_config.connect_timeout_seconds,
-            ballista_config.grpc_client_connect_timeout_seconds() as u64
+            ballista_config.default_grpc_client_connect_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.timeout_seconds,
-            ballista_config.grpc_client_timeout_seconds() as u64
+            ballista_config.default_grpc_client_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.tcp_keepalive_seconds,
-            ballista_config.grpc_client_tcp_keepalive_seconds() as u64
+            ballista_config.default_grpc_client_tcp_keepalive_seconds() as u64
         );
         assert_eq!(
             grpc_config.http2_keepalive_interval_seconds,
-            ballista_config.grpc_client_http2_keepalive_interval_seconds() as u64
+            ballista_config.default_grpc_client_http2_keepalive_interval_seconds() as u64
         );
     }
 
@@ -392,10 +368,6 @@ mod tests {
             timeout_seconds: 30,
             tcp_keepalive_seconds: 1800,
             http2_keepalive_interval_seconds: 150,
-            use_tls: false,
-            max_message_size: 16 * 1024 * 1024,
-            io_retries_times: 3,
-            io_retry_wait_time_ms: 3000,
         };
         let result = create_grpc_client_endpoint("http://localhost:50051", Some(&config));
         assert!(result.is_ok());

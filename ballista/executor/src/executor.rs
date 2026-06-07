@@ -25,6 +25,7 @@ use crate::metrics::LoggingMetricsCollector;
 use ballista_core::ConfigProducer;
 use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf;
 use ballista_core::serde::protobuf::ExecutorRegistration;
@@ -32,12 +33,167 @@ use ballista_core::serde::scheduler::PartitionId;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use futures::future::AbortHandle;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+/// Categorize a BallistaError into a short string suitable for use as a metric label.
+///
+/// This function is provided for use by custom `ExecutorMetricsCollector` implementations
+/// that may need to categorize errors differently than the default.
+#[allow(dead_code)]
+pub fn categorize_ballista_error(error: &BallistaError) -> String {
+    match error {
+        BallistaError::NotImplemented(_) => "not_implemented".to_string(),
+        BallistaError::General(_) => "general".to_string(),
+        BallistaError::Internal(_) => "internal".to_string(),
+        BallistaError::Configuration(_) => "configuration".to_string(),
+        BallistaError::ArrowError(_) => "arrow".to_string(),
+        BallistaError::DataFusionError(_) => "datafusion".to_string(),
+        BallistaError::SqlError(_) => "sql".to_string(),
+        BallistaError::IoError(_) => "io".to_string(),
+        BallistaError::TonicError(_) => "tonic".to_string(),
+        BallistaError::GrpcError(_) => "grpc".to_string(),
+        BallistaError::GrpcConnectionError(_) => "grpc_connection".to_string(),
+        BallistaError::TokioError(_) => "tokio".to_string(),
+        BallistaError::GrpcActionError(_) => "grpc_action".to_string(),
+        BallistaError::FetchFailed(_, _, _, _) => "fetch_failed".to_string(),
+        BallistaError::Cancelled => "cancelled".to_string(),
+    }
+}
+
+/// Categorize a DataFusionError into a short string suitable for use as a metric label.
+fn categorize_datafusion_error(error: &datafusion::error::DataFusionError) -> String {
+    use datafusion::error::DataFusionError;
+    match error {
+        DataFusionError::ArrowError(_, _) => "arrow".to_string(),
+        DataFusionError::IoError(_) => "io".to_string(),
+        DataFusionError::SQL(_, _) => "sql".to_string(),
+        DataFusionError::NotImplemented(_) => "not_implemented".to_string(),
+        DataFusionError::Internal(_) => "internal".to_string(),
+        DataFusionError::Plan(_) => "plan".to_string(),
+        DataFusionError::Configuration(_) => "configuration".to_string(),
+        DataFusionError::SchemaError(_, _) => "schema".to_string(),
+        DataFusionError::Execution(_) => "execution".to_string(),
+        DataFusionError::ResourcesExhausted(_) => "resources_exhausted".to_string(),
+        DataFusionError::External(_) => "external".to_string(),
+        DataFusionError::Context(_, _) => "context".to_string(),
+        DataFusionError::Substrait(_) => "substrait".to_string(),
+        DataFusionError::Diagnostic(_, _) => "diagnostic".to_string(),
+        DataFusionError::Collection(_) => "collection".to_string(),
+        DataFusionError::ParquetError(_) => "parquet".to_string(),
+        DataFusionError::ObjectStore(_) => "object_store".to_string(),
+        DataFusionError::ExecutionJoin(_) => "execution_join".to_string(),
+        DataFusionError::Shared(_) => "shared".to_string(),
+        // Catch-all for feature-gated variants (e.g., AvroError when avro feature is enabled)
+        #[allow(unreachable_patterns)]
+        _ => "other".to_string(),
+    }
+}
+
+/// Extract shuffle write metrics from the query stage executor's plan metrics.
+///
+/// Returns (bytes_written, rows_written, write_time_ms) if metrics are available.
+fn extract_shuffle_write_metrics(
+    query_stage_exec: &Arc<dyn QueryStageExecutor>,
+) -> Option<(u64, u64, u64)> {
+    let metrics_sets = query_stage_exec.collect_plan_metrics();
+
+    let total_bytes = 0u64;
+    let mut total_rows = 0u64;
+    let mut total_write_time_nanos = 0u64;
+
+    for metrics_set in &metrics_sets {
+        for metric in metrics_set.iter() {
+            let name = metric.value().name();
+            match name {
+                "output_rows" => {
+                    total_rows += metric.value().as_usize() as u64;
+                }
+                "write_time" => {
+                    // write_time is recorded in nanoseconds
+                    total_write_time_nanos += metric.value().as_usize() as u64;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Note: bytes_written is not directly tracked in ShuffleWriteMetrics,
+    // but we can estimate from the output file sizes or use output_rows as proxy.
+    // For now, we'll return 0 for bytes and let the caller decide.
+    // TODO: Add bytes tracking to ShuffleWriterExec if needed.
+
+    if total_rows > 0 || total_write_time_nanos > 0 {
+        let write_time_ms = total_write_time_nanos / 1_000_000;
+        Some((total_bytes, total_rows, write_time_ms))
+    } else {
+        None
+    }
+}
+
+/// Extract shuffle read metrics by walking the execution plan tree and summing
+/// the partition statistics from all ShuffleReaderExec nodes.
+///
+/// Returns (total_bytes, total_rows) if any shuffle readers are found with stats.
+/// Note: Duration is not available from stats; it would need to be tracked during execution.
+fn extract_shuffle_read_metrics(plan: &dyn ExecutionPlan) -> Option<(u64, u64)> {
+    let mut total_bytes = 0u64;
+    let mut total_rows = 0u64;
+    let mut found_any = false;
+
+    // Recursively walk the plan tree
+    extract_shuffle_read_metrics_recursive(
+        plan,
+        &mut total_bytes,
+        &mut total_rows,
+        &mut found_any,
+    );
+
+    if found_any {
+        Some((total_bytes, total_rows))
+    } else {
+        None
+    }
+}
+
+fn extract_shuffle_read_metrics_recursive(
+    plan: &dyn ExecutionPlan,
+    total_bytes: &mut u64,
+    total_rows: &mut u64,
+    found_any: &mut bool,
+) {
+    // Check if this node is a ShuffleReaderExec
+    if let Some(shuffle_reader) = plan.as_any().downcast_ref::<ShuffleReaderExec>() {
+        // Sum up partition stats from all partition locations
+        for partition_locations in &shuffle_reader.partition {
+            for location in partition_locations {
+                if let Some(bytes) = location.partition_stats.num_bytes() {
+                    *total_bytes += bytes;
+                    *found_any = true;
+                }
+                if let Some(rows) = location.partition_stats.num_rows() {
+                    *total_rows += rows;
+                    *found_any = true;
+                }
+            }
+        }
+    }
+
+    // Recurse into children
+    for child in plan.children() {
+        extract_shuffle_read_metrics_recursive(
+            child.as_ref(),
+            total_bytes,
+            total_rows,
+            found_any,
+        );
+    }
+}
 
 /// A future that resolves when all active tasks on an executor have completed.
 ///
@@ -112,7 +268,7 @@ impl Executor {
             Arc::new(BallistaFunctionRegistry::default()),
             Arc::new(LoggingMetricsCollector::default()),
             concurrent_tasks,
-            Arc::new(DefaultExecutionEngine::new()),
+            None,
         )
     }
 
@@ -127,7 +283,7 @@ impl Executor {
         function_registry: Arc<BallistaFunctionRegistry>,
         metrics_collector: Arc<dyn ExecutorMetricsCollector>,
         concurrent_tasks: usize,
-        execution_engine: Arc<dyn ExecutionEngine>,
+        execution_engine: Option<Arc<dyn ExecutionEngine>>,
     ) -> Self {
         Self {
             metadata,
@@ -138,30 +294,8 @@ impl Executor {
             metrics_collector,
             concurrent_tasks,
             abort_handles: Default::default(),
-            execution_engine,
-        }
-    }
-    /// Creates new Executor with default `ExecutionEngine`.
-    /// Default `ExecutionEngine` does not cache client connections.
-    pub fn with_default_execution_engine(
-        metadata: ExecutorRegistration,
-        work_dir: &str,
-        runtime_producer: RuntimeProducer,
-        config_producer: ConfigProducer,
-        function_registry: Arc<BallistaFunctionRegistry>,
-        metrics_collector: Arc<dyn ExecutorMetricsCollector>,
-        concurrent_tasks: usize,
-    ) -> Self {
-        Self {
-            metadata,
-            work_dir: work_dir.to_owned(),
-            function_registry,
-            runtime_producer,
-            config_producer,
-            metrics_collector,
-            concurrent_tasks,
-            abort_handles: Default::default(),
-            execution_engine: Arc::new(DefaultExecutionEngine::new()),
+            execution_engine: execution_engine
+                .unwrap_or_else(|| Arc::new(DefaultExecutionEngine {})),
         }
     }
 }
@@ -190,6 +324,15 @@ impl Executor {
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<protobuf::ShuffleWritePartition>, BallistaError> {
+        let start_time = std::time::Instant::now();
+
+        // Record task start for metrics tracking
+        self.metrics_collector.record_task_started(
+            &partition.job_id,
+            partition.stage_id,
+            partition.partition_id,
+        );
+
         let (task, abort_handle) = futures::future::abortable(
             query_stage_exec.execute_query_stage(partition.partition_id, task_ctx),
         );
@@ -197,18 +340,71 @@ impl Executor {
         self.abort_handles
             .insert((task_id, partition.clone()), abort_handle);
 
-        let partitions = task.await??;
+        let result = task.await;
+        let duration_ms = start_time.elapsed().as_millis() as u64;
 
         self.abort_handles.remove(&(task_id, partition.clone()));
 
-        self.metrics_collector.record_stage(
-            &partition.job_id,
-            partition.stage_id,
-            partition.partition_id,
-            query_stage_exec,
-        );
+        match result {
+            Ok(Ok(partitions)) => {
+                // Extract shuffle write metrics from the plan
+                let shuffle_write_metrics =
+                    extract_shuffle_write_metrics(&query_stage_exec);
+                if let Some((bytes, rows, write_time_ms)) = shuffle_write_metrics {
+                    self.metrics_collector.record_shuffle_write(
+                        &partition.job_id,
+                        partition.stage_id,
+                        partition.partition_id,
+                        bytes,
+                        rows,
+                        write_time_ms,
+                    );
+                }
 
-        Ok(partitions)
+                // Extract shuffle read metrics from ShuffleReaderExec nodes in the plan
+                // Note: Duration is approximated as task duration minus write time since
+                // we don't have fine-grained timing for the read phase
+                let shuffle_read_metrics =
+                    extract_shuffle_read_metrics(query_stage_exec.plan());
+                if let Some((bytes, rows)) = shuffle_read_metrics {
+                    // Approximate read duration: if we have write time, subtract it from total
+                    // Otherwise, use 0 (the bytes/rows are still valuable)
+                    let read_duration_ms = shuffle_write_metrics
+                        .map(|(_, _, write_ms)| duration_ms.saturating_sub(write_ms))
+                        .unwrap_or(0);
+                    self.metrics_collector.record_shuffle_read(
+                        &partition.job_id,
+                        partition.stage_id,
+                        partition.partition_id,
+                        bytes,
+                        rows,
+                        read_duration_ms,
+                    );
+                }
+
+                self.metrics_collector.record_stage(
+                    &partition.job_id,
+                    partition.stage_id,
+                    partition.partition_id,
+                    query_stage_exec,
+                    duration_ms,
+                );
+                Ok(partitions)
+            }
+            Ok(Err(e)) => {
+                self.metrics_collector.record_task_failed(
+                    &partition.job_id,
+                    partition.stage_id,
+                    partition.partition_id,
+                    &categorize_datafusion_error(&e),
+                );
+                Err(BallistaError::from(e))
+            }
+            Err(_aborted) => {
+                // Task was cancelled - don't record as failure, it was intentional
+                Err(BallistaError::Cancelled)
+            }
+        }
     }
 
     /// Cancels a running task by aborting its execution.
@@ -263,7 +459,7 @@ mod test {
 
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        RecordBatchStream, SendableRecordBatchStream,
+        RecordBatchStream, SendableRecordBatchStream, Statistics,
     };
     use datafusion::prelude::SessionContext;
     use futures::Stream;
@@ -366,6 +562,10 @@ mod test {
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
             Ok(Box::pin(NeverendingRecordBatchStream))
         }
+
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+            Ok(Statistics::new_unknown(&self.schema()))
+        }
     }
 
     #[tokio::test]
@@ -390,7 +590,6 @@ mod test {
             grpc_port: 0,
             specification: None,
             host: None,
-            os_info: None,
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();

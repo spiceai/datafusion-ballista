@@ -20,16 +20,13 @@ use std::time::Duration;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
-use ballista_core::serde::protobuf::ExecutorMetric;
-use ballista_core::serde::protobuf::executor_metric::Metric;
 use log::trace;
 
-use crate::cluster::{BoundTask, ClusterState, ExecutorSlot};
+use crate::cluster::{BindingResult, ClusterState, ExecutorSlot};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;
 use crate::state::task_manager::JobInfoCache;
-use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::executor_grpc_client::ExecutorGrpcClient;
 use ballista_core::serde::protobuf::{
     CancelTasksParams, ExecutorHeartbeat, MultiTaskDefinition, RemoveJobDataParams,
@@ -67,8 +64,6 @@ pub struct ExecutorManager {
     clients: ExecutorClients,
     /// Jobs pending cleanup on each executor.
     pending_cleanup_jobs: Arc<DashMap<String, HashSet<String>>>,
-    /// Configuration for gRPC client connections.
-    grpc_client_config: GrpcClientConfig,
 }
 
 impl ExecutorManager {
@@ -77,20 +72,11 @@ impl ExecutorManager {
         cluster_state: Arc<dyn ClusterState>,
         config: Arc<SchedulerConfig>,
     ) -> Self {
-        let grpc_client_config =
-            if let Some(config_producer) = &config.override_config_producer {
-                let session_config = config_producer();
-                let ballista_config = session_config.ballista_config();
-                GrpcClientConfig::from(&ballista_config)
-            } else {
-                GrpcClientConfig::default()
-            };
         Self {
             cluster_state,
             config,
             clients: Default::default(),
             pending_cleanup_jobs: Default::default(),
-            grpc_client_config,
         }
     }
 
@@ -103,19 +89,19 @@ impl ExecutorManager {
 
     /// Binds ready-to-run tasks from active jobs to available executor slots.
     ///
-    /// Returns a list of bound tasks that can be launched on executors.
+    /// Returns a binding result containing bound tasks and shuffle affinity info.
     pub async fn bind_schedulable_tasks(
         &self,
         running_jobs: Arc<HashMap<String, JobInfoCache>>,
-    ) -> Result<Vec<BoundTask>> {
+    ) -> Result<BindingResult> {
         if running_jobs.is_empty() {
             debug!("There's no active jobs for binding tasks");
-            return Ok(vec![]);
+            return Ok(BindingResult::new());
         }
         let alive_executors = self.get_alive_executors();
         if alive_executors.is_empty() {
-            warn!("There are no alive executors to bind tasks");
-            return Ok(vec![]);
+            debug!("There's no alive executors for binding tasks");
+            return Ok(BindingResult::new());
         }
         self.cluster_state
             .bind_schedulable_tasks(
@@ -135,26 +121,45 @@ impl ExecutorManager {
 
     /// Sends RPC requests to executors to cancel the specified running tasks.
     pub async fn cancel_running_tasks(&self, tasks: Vec<RunningTaskInfo>) -> Result<()> {
-        let mut tasks_to_cancel: HashMap<String, Vec<protobuf::RunningTaskInfo>> =
+        let mut tasks_by_executor: HashMap<String, Vec<RunningTaskInfo>> =
             Default::default();
 
         for task_info in tasks {
-            let infos = tasks_to_cancel.entry(task_info.executor_id).or_default();
-            infos.push(protobuf::RunningTaskInfo {
-                task_id: task_info.task_id as u32,
-                job_id: task_info.job_id,
-                stage_id: task_info.stage_id as u32,
-                partition_id: task_info.partition_id as u32,
-            });
+            tasks_by_executor
+                .entry(task_info.executor_id.clone())
+                .or_default()
+                .push(task_info);
+        }
+
+        if let Some(cancel_callback) = &self.config.on_cancel_tasks {
+            for (executor_id, infos) in tasks_by_executor {
+                cancel_callback(&executor_id, infos);
+            }
+            return Ok(());
+        }
+
+        let mut tasks_to_cancel: HashMap<String, Vec<protobuf::RunningTaskInfo>> =
+            Default::default();
+
+        for (executor_id, infos) in tasks_by_executor {
+            tasks_to_cancel.insert(
+                executor_id,
+                infos
+                    .into_iter()
+                    .map(|task_info| protobuf::RunningTaskInfo {
+                        task_id: task_info.task_id as u32,
+                        job_id: task_info.job_id,
+                        stage_id: task_info.stage_id as u32,
+                        partition_id: task_info.partition_id as u32,
+                    })
+                    .collect(),
+            );
         }
 
         let executor_manager = self.clone();
         tokio::spawn(async move {
             for (executor_id, infos) in tasks_to_cancel {
-                if let Ok(mut client) = executor_manager
-                    .get_client(&executor_id, &executor_manager.grpc_client_config)
-                    .await
-                {
+                if let Ok(mut client) = executor_manager.get_client(&executor_id).await {
                     if let Err(e) = client
                         .cancel_tasks(CancelTasksParams { task_infos: infos })
                         .await
@@ -211,9 +216,7 @@ impl ExecutorManager {
             let job_id_clone = job_id.to_owned();
 
             if self.config.is_push_staged_scheduling() {
-                if let Ok(mut client) =
-                    self.get_client(&executor, &self.grpc_client_config).await
-                {
+                if let Ok(mut client) = self.get_client(&executor).await {
                     tokio::spawn(async move {
                         if let Err(err) = client
                             .remove_job_data(RemoveJobDataParams {
@@ -238,35 +241,20 @@ impl ExecutorManager {
         }
     }
 
-    /// Returns a list of all executors, the timestamp of the last recorded hearbeat and metrics received from it
-    pub async fn get_executors_state(
+    /// Returns a list of all executors along with the timestamp of their last recorded heartbeat.
+    pub async fn get_executor_state(
         &self,
-    ) -> Result<Vec<(ExecutorMetadata, Option<Duration>, Vec<ExecutorMetric>)>> {
-        let mut state = vec![];
+    ) -> Result<Vec<(ExecutorMetadata, Option<Duration>)>> {
+        let mut state: Vec<(ExecutorMetadata, Option<Duration>)> = vec![];
         for metadata in self.cluster_state.registered_executor_metadata().await {
-            let heartbeat = self.cluster_state.get_executor_heartbeat(&metadata.id);
-            let duration = heartbeat
-                .as_ref()
+            let duration = self
+                .cluster_state
+                .get_executor_heartbeat(&metadata.id)
                 .map(|hb| hb.timestamp)
                 .map(Duration::from_secs);
-            let mut metrics = heartbeat
-                .as_ref()
-                .map(|hb| hb.metrics.clone())
-                .unwrap_or_default();
-
-            if let Some(hb) = &heartbeat {
-                metrics.push(ExecutorMetric {
-                    metric: Some(Metric::PeakPhysicalMemory(
-                        hb.peak_proc_physical_memory,
-                    )),
-                });
-                metrics.push(ExecutorMetric {
-                    metric: Some(Metric::PeakVirtualMemory(hb.peak_proc_virtual_memory)),
-                });
-            }
-
-            state.push((metadata, duration, metrics));
+            state.push((metadata, duration));
         }
+
         Ok(state)
     }
 
@@ -278,11 +266,6 @@ impl ExecutorManager {
         executor_id: &str,
     ) -> Result<ExecutorMetadata> {
         self.cluster_state.get_executor_metadata(executor_id).await
-    }
-
-    /// Return executor latest hearbeat, or None if not found
-    pub fn get_executor_hearbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
-        self.cluster_state.get_executor_heartbeat(executor_id)
     }
 
     /// Saves executor metadata for pull-based task scheduling.
@@ -332,10 +315,7 @@ impl ExecutorManager {
     /// Sends a stop request to the specified executor.
     pub async fn stop_executor(&self, executor_id: &str, stop_reason: String) {
         let executor_id = executor_id.to_string();
-        match self
-            .get_client(&executor_id, &self.grpc_client_config)
-            .await
-        {
+        match self.get_client(&executor_id).await {
             Ok(mut client) => {
                 tokio::task::spawn(async move {
                     match client
@@ -368,9 +348,7 @@ impl ExecutorManager {
         multi_tasks: Vec<MultiTaskDefinition>,
         scheduler_id: String,
     ) -> Result<()> {
-        let mut client = self
-            .get_client(executor_id, &self.grpc_client_config)
-            .await?;
+        let mut client = self.get_client(executor_id).await?;
         client
             .launch_multi_task(protobuf::LaunchMultiTaskParams {
                 multi_tasks,
@@ -482,11 +460,7 @@ impl ExecutorManager {
             .collect::<Vec<_>>()
     }
 
-    async fn get_client(
-        &self,
-        executor_id: &str,
-        grpc_client_config: &GrpcClientConfig,
-    ) -> Result<ExecutorGrpcClient<Channel>> {
+    async fn get_client(&self, executor_id: &str) -> Result<ExecutorGrpcClient<Channel>> {
         let client = self.clients.get(executor_id).map(|value| value.clone());
 
         if let Some(client) = client {
@@ -497,15 +471,17 @@ impl ExecutorManager {
                 "http://{}:{}",
                 executor_metadata.host, executor_metadata.grpc_port
             );
-            let mut endpoint =
-                create_grpc_client_endpoint(executor_url, Some(grpc_client_config))?;
+            let mut endpoint = create_grpc_client_endpoint(
+                executor_url,
+                Some(&GrpcClientConfig::default()),
+            )?;
 
             if let Some(ref override_fn) =
                 self.config.override_create_grpc_client_endpoint
             {
                 endpoint = override_fn(endpoint).map_err(|e| {
-                    BallistaError::GrpcConnectionError(format!(
-                        "Failed to customize endpoint for executor {executor_id}: {e}"
+                    BallistaError::Internal(format!(
+                        "Error overriding gRPC client endpoint: {e}"
                     ))
                 })?;
             }
@@ -538,5 +514,67 @@ impl ExecutorManager {
     #[cfg(test)]
     async fn test_connectivity(_metadata: &ExecutorMetadata) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::memory::InMemoryClusterState;
+
+    #[tokio::test]
+    async fn cancel_running_tasks_uses_callback() {
+        let captured: Arc<std::sync::Mutex<HashMap<String, Vec<RunningTaskInfo>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let callback_capture = Arc::clone(&captured);
+
+        let config = SchedulerConfig {
+            on_cancel_tasks: Some(Arc::new(move |executor_id, tasks| {
+                callback_capture
+                    .lock()
+                    .expect("callback capture lock")
+                    .insert(executor_id.to_string(), tasks);
+            })),
+            ..SchedulerConfig::default()
+        };
+
+        let manager = ExecutorManager::new(
+            Arc::new(InMemoryClusterState::default()),
+            Arc::new(config),
+        );
+
+        let tasks = vec![
+            RunningTaskInfo {
+                task_id: 1,
+                job_id: "job-1".to_string(),
+                stage_id: 1,
+                partition_id: 0,
+                executor_id: "executor-a".to_string(),
+            },
+            RunningTaskInfo {
+                task_id: 2,
+                job_id: "job-1".to_string(),
+                stage_id: 1,
+                partition_id: 1,
+                executor_id: "executor-a".to_string(),
+            },
+            RunningTaskInfo {
+                task_id: 3,
+                job_id: "job-2".to_string(),
+                stage_id: 2,
+                partition_id: 0,
+                executor_id: "executor-b".to_string(),
+            },
+        ];
+
+        manager
+            .cancel_running_tasks(tasks)
+            .await
+            .expect("cancel should succeed");
+
+        let captured = captured.lock().expect("capture lock");
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured.get("executor-a").map(std::vec::Vec::len), Some(2));
+        assert_eq!(captured.get("executor-b").map(std::vec::Vec::len), Some(1));
     }
 }

@@ -28,17 +28,43 @@ use std::sync::Arc;
 
 static COLLECTOR: OnceCell<Arc<dyn SchedulerMetricsCollector>> = OnceCell::new();
 
-/// SchedulerMetricsCollector implementation based on Prometheus. By default this will track
-/// 7 metrics:
-/// *job_exec_time_seconds* - Histogram of successful job execution time in seconds
-/// *planning_time_ms* - Histogram of job planning time in milliseconds
-/// *failed* - Counter of failed jobs
-/// *job_failed_total* - Counter of failed jobs
-/// *job_cancelled_total* - Counter of cancelled jobs
-/// *job_completed_total* - Counter of completed jobs
-/// *job_submitted_total* - Counter of submitted jobs
-/// *pending_task_queue_size* - Number of pending tasks
+/// SchedulerMetricsCollector implementation based on Prometheus.
+///
+/// # Job lifecycle metrics
+/// - *job_exec_time_seconds* - Histogram of successful job execution time in seconds
+/// - *planning_time_ms* - Histogram of job planning time in milliseconds
+/// - *job_failed_total* - Counter of failed jobs
+/// - *job_cancelled_total* - Counter of cancelled jobs
+/// - *job_completed_total* - Counter of completed jobs
+/// - *job_submitted_total* - Counter of submitted jobs
+/// - *pending_task_queue_size* - Gauge of pending tasks
+/// - *pending_jobs_queue_size* - Gauge of pending jobs
+///
+/// # Stage lifecycle metrics
+/// - *stage_started_total* - Counter of stages started
+/// - *stage_completed_total* - Counter of stages completed
+/// - *stage_failed_total* - Counter of stages failed
+/// - *stage_retry_total* - Counter of stage retries
+/// - *stage_duration_ms* - Histogram of stage execution duration in milliseconds
+///
+/// # Task scheduling metrics
+/// - *task_scheduled_total* - Counter of tasks scheduled
+/// - *task_completed_total* - Counter of tasks completed
+/// - *task_failed_total* - Counter of tasks failed
+/// - *task_retry_total* - Counter of task retries
+/// - *task_scheduling_latency_ms* - Histogram of task scheduling latency
+/// - *task_shuffle_affinity_hit_total* - Counter of shuffle affinity hits
+/// - *task_shuffle_affinity_miss_total* - Counter of shuffle affinity misses
+///
+/// # Executor management metrics
+/// - *active_executor_count* - Gauge of active executors
+/// - *executor_registered_total* - Counter of executor registrations
+/// - *executor_deregistered_total* - Counter of executor deregistrations
+///
+/// # Planning metrics
+/// - *distributed_planning_duration_ms* - Histogram of distributed planning duration
 pub struct PrometheusMetricsCollector {
+    // Job lifecycle
     execution_time: Histogram,
     planning_time: Histogram,
     failed: Counter,
@@ -46,6 +72,31 @@ pub struct PrometheusMetricsCollector {
     completed: Counter,
     submitted: Counter,
     pending_queue_size: Gauge,
+    pending_jobs_queue_size: Gauge,
+
+    // Stage lifecycle
+    stage_started: Counter,
+    stage_completed: Counter,
+    stage_failed: Counter,
+    stage_retry: Counter,
+    stage_duration: Histogram,
+
+    // Task scheduling
+    task_scheduled: Counter,
+    task_completed: Counter,
+    task_failed: Counter,
+    task_retry: Counter,
+    task_scheduling_latency: Histogram,
+    task_shuffle_affinity_hit: Counter,
+    task_shuffle_affinity_miss: Counter,
+
+    // Executor management
+    active_executor_count: Gauge,
+    executor_registered: Counter,
+    executor_deregistered: Counter,
+
+    // Planning
+    distributed_planning_duration: Histogram,
 }
 
 impl PrometheusMetricsCollector {
@@ -116,6 +167,166 @@ impl PrometheusMetricsCollector {
             BallistaError::Internal(format!("Error registering metric: {e:?}"))
         })?;
 
+        let pending_jobs_queue_size = register_gauge_with_registry!(
+            "pending_jobs_queue_size",
+            "Number of pending jobs",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        // Stage lifecycle metrics
+        let stage_started = register_counter_with_registry!(
+            "stage_started_total",
+            "Counter of stages started",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let stage_completed = register_counter_with_registry!(
+            "stage_completed_total",
+            "Counter of stages completed",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let stage_failed = register_counter_with_registry!(
+            "stage_failed_total",
+            "Counter of stages failed",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let stage_retry = register_counter_with_registry!(
+            "stage_retry_total",
+            "Counter of stage retries",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let stage_duration = register_histogram_with_registry!(
+            "stage_duration_ms",
+            "Histogram of stage execution duration in milliseconds",
+            vec![100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 30_000.0, 60_000.0],
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        // Task scheduling metrics
+        let task_scheduled = register_counter_with_registry!(
+            "task_scheduled_total",
+            "Counter of tasks scheduled",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_completed = register_counter_with_registry!(
+            "task_completed_total",
+            "Counter of tasks completed",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_failed = register_counter_with_registry!(
+            "task_failed_total",
+            "Counter of tasks failed",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_retry = register_counter_with_registry!(
+            "task_retry_total",
+            "Counter of task retries",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_scheduling_latency = register_histogram_with_registry!(
+            "task_scheduling_latency_ms",
+            "Histogram of task scheduling latency in milliseconds",
+            vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1_000.0],
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_shuffle_affinity_hit = register_counter_with_registry!(
+            "task_shuffle_affinity_hit_total",
+            "Counter of shuffle affinity hits",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let task_shuffle_affinity_miss = register_counter_with_registry!(
+            "task_shuffle_affinity_miss_total",
+            "Counter of shuffle affinity misses",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        // Executor management metrics
+        let active_executor_count = register_gauge_with_registry!(
+            "active_executor_count",
+            "Number of active executors",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let executor_registered = register_counter_with_registry!(
+            "executor_registered_total",
+            "Counter of executor registrations",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        let executor_deregistered = register_counter_with_registry!(
+            "executor_deregistered_total",
+            "Counter of executor deregistrations",
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
+        // Planning metrics
+        let distributed_planning_duration = register_histogram_with_registry!(
+            "distributed_planning_duration_ms",
+            "Histogram of distributed planning duration in milliseconds",
+            vec![1.0, 5.0, 25.0, 100.0, 500.0, 1_000.0, 5_000.0],
+            registry
+        )
+        .map_err(|e| {
+            BallistaError::Internal(format!("Error registering metric: {e:?}"))
+        })?;
+
         Ok(Self {
             execution_time,
             planning_time,
@@ -124,6 +335,23 @@ impl PrometheusMetricsCollector {
             completed,
             submitted,
             pending_queue_size,
+            pending_jobs_queue_size,
+            stage_started,
+            stage_completed,
+            stage_failed,
+            stage_retry,
+            stage_duration,
+            task_scheduled,
+            task_completed,
+            task_failed,
+            task_retry,
+            task_scheduling_latency,
+            task_shuffle_affinity_hit,
+            task_shuffle_affinity_miss,
+            active_executor_count,
+            executor_registered,
+            executor_deregistered,
+            distributed_planning_duration,
         })
     }
 
@@ -174,5 +402,94 @@ impl SchedulerMetricsCollector for PrometheusMetricsCollector {
         })?;
 
         Ok(Some((buffer, encoder.format_type().to_owned())))
+    }
+
+    // Stage lifecycle
+    fn set_pending_jobs_queue_size(&self, value: u64) {
+        self.pending_jobs_queue_size.set(value as f64);
+    }
+
+    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, _task_count: usize) {
+        self.stage_started.inc();
+    }
+
+    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, duration_ms: u64) {
+        self.stage_completed.inc();
+        self.stage_duration.observe(duration_ms as f64);
+    }
+
+    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, _error_type: &str) {
+        self.stage_failed.inc();
+    }
+
+    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {
+        self.stage_retry.inc();
+    }
+
+    // Task scheduling
+    fn record_task_scheduled(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        latency_ms: u64,
+    ) {
+        self.task_scheduled.inc();
+        self.task_scheduling_latency.observe(latency_ms as f64);
+    }
+
+    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+        self.task_completed.inc();
+    }
+
+    fn record_task_failed(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+        _error_type: &str,
+    ) {
+        self.task_failed.inc();
+    }
+
+    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {
+        self.task_retry.inc();
+    }
+
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+        self.task_shuffle_affinity_hit.inc();
+    }
+
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+        self.task_shuffle_affinity_miss.inc();
+    }
+
+    // Executor management
+    fn set_active_executor_count(&self, count: usize) {
+        self.active_executor_count.set(count as f64);
+    }
+
+    fn record_executor_registered(&self, _executor_id: &str) {
+        self.executor_registered.inc();
+    }
+
+    fn record_executor_deregistered(&self, _executor_id: &str) {
+        self.executor_deregistered.inc();
+    }
+
+    // Planning
+    fn record_planning_duration(&self, _job_id: &str, duration_ms: u64) {
+        self.distributed_planning_duration
+            .observe(duration_ms as f64);
     }
 }

@@ -15,18 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::api::SchedulerErrorResponse;
 use crate::flight_proxy_service::BallistaFlightProxyService;
 
-#[cfg(feature = "rest-api")]
-use crate::api::get_routes;
-use crate::api::route_disabled;
-use crate::cluster::BallistaCluster;
-use crate::config::SchedulerConfig;
-use crate::metrics::default_metrics_collector;
-use crate::scheduler_server::SchedulerServer;
-#[cfg(feature = "keda-scaler")]
-use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::BALLISTA_VERSION;
 use ballista_core::error::BallistaError;
@@ -35,7 +25,6 @@ use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
-use datafusion::DATAFUSION_VERSION;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
@@ -43,6 +32,17 @@ use http::StatusCode;
 use log::info;
 use std::{net::SocketAddr, sync::Arc};
 use tonic::service::RoutesBuilder;
+
+#[cfg(feature = "rest-api")]
+use crate::api::get_routes;
+use crate::cluster::BallistaCluster;
+use crate::config::SchedulerConfig;
+
+use crate::metrics::default_metrics_collector;
+use crate::scheduler_server::SchedulerServer;
+#[cfg(feature = "keda-scaler")]
+use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
+
 /// Creates as initialized scheduler service
 /// without exposing it as a grpc service
 pub async fn create_scheduler<
@@ -69,7 +69,10 @@ pub async fn create_scheduler<
         .unwrap_or_else(|| Arc::new(BallistaPhysicalExtensionCodec::default()));
 
     let codec = BallistaCodec::new(codec_logical, codec_physical);
-    let metrics_collector = default_metrics_collector()?;
+    let metrics_collector = config
+        .override_metrics_collector
+        .clone()
+        .map_or_else(|| default_metrics_collector(), Ok)?;
 
     let mut scheduler_server = SchedulerServer::new(
         config.scheduler_name(),
@@ -130,30 +133,17 @@ pub async fn start_grpc_service<
     tonic_builder.add_service(ExternalScalerServer::new(scheduler.clone()));
 
     let tonic = tonic_builder.routes().into_axum_router();
-
-    // registering default handler for unmatched requests
-    let tonic =
-        tonic.fallback(|| async { SchedulerErrorResponse::new(StatusCode::NOT_FOUND) });
+    let tonic = tonic.fallback(|| async { (StatusCode::NOT_FOUND, "404 - Not Found") });
 
     #[cfg(feature = "rest-api")]
-    let final_route = if config.disable_rest_api {
-        tonic
-            .merge(route_disabled(
-                "REST API has been disabled at startup".to_string(),
-            ))
-            .into_make_service_with_connect_info::<SocketAddr>()
-    } else {
-        let axum = get_routes(Arc::new(scheduler));
-        axum.merge(tonic)
-            .into_make_service_with_connect_info::<SocketAddr>()
-    };
+    let axum = get_routes(Arc::new(scheduler));
+    #[cfg(feature = "rest-api")]
+    let final_route = axum
+        .merge(tonic)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     #[cfg(not(feature = "rest-api"))]
-    let final_route = tonic
-        .merge(route_disabled(
-            "REST API has been disabled at compile time".to_string(),
-        ))
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let final_route = tonic.into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await
@@ -172,9 +162,7 @@ pub async fn start_server(
     address: SocketAddr,
     config: Arc<SchedulerConfig>,
 ) -> ballista_core::error::Result<()> {
-    info!(
-        "Ballista Scheduler v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) listening on {address:?}"
-    );
+    info!("Ballista v{BALLISTA_VERSION} Scheduler listening on {address:?}");
     let scheduler =
         create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config).await?;
 

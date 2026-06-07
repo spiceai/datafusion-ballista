@@ -18,6 +18,8 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+/// Builder API for creating Ballista session contexts with custom object stores.
+pub mod builder;
 /// Extension traits for integrating DataFusion with Ballista distributed execution.
 pub mod extension;
 /// Prelude module providing commonly used imports for Ballista client applications.

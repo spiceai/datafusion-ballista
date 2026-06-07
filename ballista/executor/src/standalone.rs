@@ -31,7 +31,7 @@ use ballista_core::{
     error::Result,
     serde::BallistaCodec,
     serde::protobuf::{ExecutorRegistration, scheduler_grpc_client::SchedulerGrpcClient},
-    serde::scheduler::{ExecutorOperatingSystemSpecification, ExecutorSpecification},
+    serde::scheduler::ExecutorSpecification,
     utils::create_grpc_server,
 };
 use ballista_core::{ConfigProducer, RuntimeProducer};
@@ -105,11 +105,11 @@ pub async fn new_standalone_executor_from_builder(
         // TODO Make it configurable
         grpc_port: 50020,
         specification: Some(
-            ExecutorSpecification::default()
-                .with_task_slots(concurrent_tasks as u32)
-                .into(),
+            ExecutorSpecification {
+                task_slots: concurrent_tasks as u32,
+            }
+            .into(),
         ),
-        os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
     };
 
     let config = config_producer();
@@ -119,7 +119,7 @@ pub async fn new_standalone_executor_from_builder(
 
     info!("work_dir: {work_dir}");
 
-    let executor = Arc::new(Executor::with_default_execution_engine(
+    let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir,
         runtime_producer,
@@ -127,9 +127,10 @@ pub async fn new_standalone_executor_from_builder(
         Arc::new(function_registry),
         Arc::new(LoggingMetricsCollector::default()),
         concurrent_tasks,
+        None,
     ));
 
-    let service = BallistaFlightService::new(work_dir);
+    let service = BallistaFlightService::new();
     let server = FlightServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
@@ -142,7 +143,9 @@ pub async fn new_standalone_executor_from_builder(
             )),
     );
 
-    tokio::spawn(execution_loop::poll_loop(scheduler, executor, codec));
+    tokio::spawn(execution_loop::poll_loop(
+        scheduler, executor, codec, None, None, None,
+    ));
     Ok(())
 }
 

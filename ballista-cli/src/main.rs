@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod logging;
-#[cfg(feature = "tui")]
-mod tui;
+use std::path::Path;
+use std::{env, sync::Arc};
 
 use ballista::{extension::SessionConfigExt, prelude::SessionContextExt};
 use ballista_cli::{
@@ -25,6 +24,7 @@ use ballista_cli::{
 };
 use clap::Parser;
 use datafusion::{
+    common::Result,
     execution::SessionStateBuilder,
     prelude::{SessionConfig, SessionContext},
 };
@@ -32,9 +32,6 @@ use datafusion_cli::{
     object_storage::instrumented::InstrumentedObjectStoreRegistry, print_options::MaxRows,
 };
 use mimalloc::MiMalloc;
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::{env, sync::Arc};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -102,26 +99,12 @@ struct Args {
 
     #[clap(long, help = "Enables console syntax highlighting")]
     color: bool,
-
-    #[cfg(feature = "tui")]
-    #[clap(long, help = "Enables terminal user interface")]
-    tui: bool,
 }
 
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tui_mode = Arc::new(AtomicBool::new(false));
-
-    logging::init_logging(tui_mode.clone())?;
-
+pub async fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
-
-    #[cfg(feature = "tui")]
-    if args.tui {
-        return tui::tui_main(tui_mode.clone())
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
-    }
 
     if !args.quiet {
         println!("Ballista CLI v{BALLISTA_CLI_VERSION}");
@@ -129,7 +112,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref path) = args.data_path {
         let p = Path::new(path);
-        env::set_current_dir(p)?;
+        env::set_current_dir(p).unwrap();
     };
 
     let mut ballista_config =
@@ -194,7 +177,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !rc.is_empty() {
             exec::exec_from_files(rc, &ctx, &print_options).await
         }
-        exec::exec_from_repl(&ctx, &mut print_options, tui_mode.clone()).await;
+        exec::exec_from_repl(&ctx, &mut print_options).await;
     }
 
     Ok(())

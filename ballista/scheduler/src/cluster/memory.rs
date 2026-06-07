@@ -16,8 +16,10 @@
 // under the License.
 
 use crate::cluster::{
-    BoundTask, ClusterState, ExecutorSlot, JobState, JobStateEvent, JobStateEventStream,
-    JobStatus, TaskDistributionPolicy, bind_task_bias, bind_task_round_robin,
+    BindingResult, ClusterState, ExecutorSlot, JobState, JobStateEvent,
+    JobStateEventStream, JobStatus, TaskDistributionPolicy, TopologyNode, bind_task_bias,
+    bind_task_consistent_hash, bind_task_round_robin, get_scan_files,
+    is_skip_consistent_hash,
 };
 use crate::state::execution_graph::ExecutionGraphBox;
 use async_trait::async_trait;
@@ -37,12 +39,14 @@ use crate::scheduler_server::{SessionBuilder, timestamp_millis, timestamp_secs};
 use crate::state::session_manager::create_datafusion_context;
 use crate::state::task_manager::JobInfoCache;
 use ballista_core::serde::protobuf::job_status::Status;
-use log::{error, warn};
+use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
 
+use ballista_core::consistent_hash::node::Node;
+use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use super::{ClusterStateEvent, ClusterStateEventStream};
 
@@ -63,6 +67,44 @@ pub struct InMemoryClusterState {
     cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
 }
 
+impl InMemoryClusterState {
+    /// Get the topology nodes of the cluster for consistent hashing
+    fn get_topology_nodes(
+        &self,
+        guard: &MutexGuard<HashMap<String, AvailableTaskSlots>>,
+        executors: Option<HashSet<String>>,
+    ) -> HashMap<String, TopologyNode> {
+        let mut nodes: HashMap<String, TopologyNode> = HashMap::new();
+        for (executor_id, slots) in guard.iter() {
+            if let Some(executors) = executors.as_ref()
+                && !executors.contains(executor_id)
+            {
+                continue;
+            }
+            if let Some(executor) = self.executors.get(&slots.executor_id) {
+                let node = TopologyNode::new(
+                    &executor.host,
+                    executor.port,
+                    &slots.executor_id,
+                    self.heartbeats
+                        .get(&executor.id)
+                        .map(|heartbeat| heartbeat.timestamp)
+                        .unwrap_or(0),
+                    slots.slots,
+                );
+                if let Some(existing_node) = nodes.get(node.name()) {
+                    if existing_node.last_seen_ts < node.last_seen_ts {
+                        nodes.insert(node.name().to_string(), node);
+                    }
+                } else {
+                    nodes.insert(node.name().to_string(), node);
+                }
+            }
+        }
+        nodes
+    }
+}
+
 #[async_trait]
 impl ClusterState for InMemoryClusterState {
     async fn bind_schedulable_tasks(
@@ -70,7 +112,7 @@ impl ClusterState for InMemoryClusterState {
         distribution: TaskDistributionPolicy,
         active_jobs: Arc<HashMap<String, JobInfoCache>>,
         executors: Option<HashSet<String>>,
-    ) -> Result<Vec<BoundTask>> {
+    ) -> Result<BindingResult> {
         let mut guard = self.task_slots.lock().await;
 
         let available_slots: Vec<&mut AvailableTaskSlots> = guard
@@ -85,19 +127,69 @@ impl ClusterState for InMemoryClusterState {
             })
             .collect();
 
-        let bound_tasks = match distribution {
+        let result = match distribution {
             TaskDistributionPolicy::Bias => {
                 bind_task_bias(available_slots, active_jobs, |_| false).await
             }
             TaskDistributionPolicy::RoundRobin => {
                 bind_task_round_robin(available_slots, active_jobs, |_| false).await
             }
+            TaskDistributionPolicy::ConsistentHash {
+                num_replicas,
+                tolerance,
+            } => {
+                let mut result = bind_task_round_robin(
+                    available_slots,
+                    active_jobs.clone(),
+                    |stage_plan: Arc<dyn ExecutionPlan>| {
+                        if let Ok(scan_files) = get_scan_files(stage_plan) {
+                            // Should be opposite to consistent hash ones.
+                            !is_skip_consistent_hash(&scan_files)
+                        } else {
+                            false
+                        }
+                    },
+                )
+                .await;
+                info!(
+                    "{} tasks bound by round robin policy",
+                    result.bound_tasks.len()
+                );
+                let (consistent_hash_result, ch_topology) = bind_task_consistent_hash(
+                    self.get_topology_nodes(&guard, executors),
+                    num_replicas,
+                    tolerance,
+                    active_jobs,
+                    |_, plan| get_scan_files(plan),
+                )
+                .await?;
+                info!(
+                    "{} tasks bound by consistent hashing policy",
+                    consistent_hash_result.bound_tasks.len()
+                );
+                if !consistent_hash_result.bound_tasks.is_empty() {
+                    result.extend(consistent_hash_result);
+                    // Update the available slots
+                    let ch_topology = ch_topology.unwrap();
+                    for node in ch_topology.nodes() {
+                        if let Some(data) = guard.get_mut(&node.id) {
+                            data.slots = node.available_slots;
+                        } else {
+                            error!("Fail to find executor data for {}", &node.id);
+                        }
+                    }
+                }
+                result
+            }
             TaskDistributionPolicy::Custom(ref policy) => {
-                policy.bind_tasks(available_slots, active_jobs).await?
+                // Custom policies don't support affinity tracking yet
+                BindingResult::from_tasks(
+                    policy.bind_tasks(available_slots, active_jobs).await?,
+                )
             }
         };
 
-        Ok(bound_tasks)
+        Ok(result)
     }
 
     async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
@@ -134,8 +226,6 @@ impl ClusterState for InMemoryClusterState {
             status: Some(ExecutorStatus {
                 status: Some(executor_status::Status::Active(String::default())),
             }),
-            peak_proc_physical_memory: 0,
-            peak_proc_virtual_memory: 0,
         })
         .await?;
 
@@ -192,8 +282,6 @@ impl ClusterState for InMemoryClusterState {
                 .as_secs(),
             metrics: vec![],
             status: None,
-            peak_proc_physical_memory: 0,
-            peak_proc_virtual_memory: 0,
         };
         self.save_executor_heartbeat(heartbeat).await
         // Ok(())
@@ -467,17 +555,6 @@ impl JobState for InMemoryJobState {
             .collect())
     }
 
-    async fn get_all_jobs(&self) -> Result<HashSet<String>> {
-        let mut all_jobs: HashSet<String> = self
-            .queued_jobs
-            .iter()
-            .map(|pair| pair.key().clone())
-            .collect();
-        all_jobs.extend(self.running_jobs.iter().map(|pair| pair.key().clone()));
-        all_jobs.extend(self.completed_jobs.iter().map(|pair| pair.key().clone()));
-        Ok(all_jobs)
-    }
-
     fn accept_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()> {
         self.queued_jobs
             .insert(job_id.to_string(), (job_name.to_string(), queued_at));
@@ -533,9 +610,7 @@ mod test {
     };
     use ballista_core::error::Result;
     use ballista_core::serde::protobuf::JobStatus;
-    use ballista_core::serde::scheduler::{
-        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
-    };
+    use ballista_core::serde::scheduler::{ExecutorMetadata, ExecutorSpecification};
     use ballista_core::utils::{default_config_producer, default_session_builder};
     use datafusion::prelude::SessionConfig;
     use futures::StreamExt;
@@ -656,8 +731,7 @@ mod test {
             host: "".to_string(),
             port: 50055,
             grpc_port: 50050,
-            specification: ExecutorSpecification::default().with_task_slots(2),
-            os_info: ExecutorOperatingSystemSpecification::default(),
+            specification: ExecutorSpecification { task_slots: 2 },
         };
 
         cluster_state

@@ -646,12 +646,7 @@ impl RunningStage {
     /// Update the TaskInfo for task partition
     pub fn update_task_info(&mut self, partition_id: usize, status: TaskStatus) -> bool {
         debug!("Updating TaskInfo for partition {partition_id}");
-        let Some(task_info) = self.task_infos[partition_id].as_ref() else {
-            warn!(
-                "Ignore TaskStatus update for partition {partition_id} because the task was already reset (executor lost)"
-            );
-            return false;
-        };
+        let task_info = self.task_infos[partition_id].as_ref().unwrap();
         let task_id = task_info.task_id;
         if (status.task_id as usize) < task_id {
             warn!(
@@ -687,7 +682,7 @@ impl RunningStage {
         true
     }
 
-    /// update and upsert the task metrics to the stage metrics
+    /// update and combine the task metrics to the stage metrics
     pub fn update_task_metrics(
         &mut self,
         partition: usize,
@@ -711,24 +706,25 @@ impl RunningStage {
             }
             let metrics_values_array = metrics
                 .into_iter()
-                .map(|ms| Self::metrics_set_from_task_metrics(ms, partition))
+                .map(|ms| {
+                    ms.metrics
+                        .into_iter()
+                        .map(|m| m.try_into())
+                        .collect::<Result<Vec<_>>>()
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             combined_metrics
                 .iter_mut()
                 .zip(metrics_values_array)
-                .map(|(existing_metrics, new_partition_metrics)| {
-                    Self::upsert_metrics_set_for_partition(
-                        existing_metrics,
-                        new_partition_metrics,
-                        partition,
-                    )
+                .map(|(first, second)| {
+                    Self::combine_metrics_set(first, second, partition)
                 })
                 .collect()
         } else {
             metrics
                 .into_iter()
-                .map(|ms| Self::metrics_set_from_task_metrics(ms, partition))
+                .map(|ms| ms.try_into())
                 .collect::<Result<Vec<_>>>()?
         };
         self.stage_metrics = Some(new_metrics_set);
@@ -736,36 +732,18 @@ impl RunningStage {
         Ok(())
     }
 
-    /// Converts task metrics into a metrics set for a specific partition
-    fn metrics_set_from_task_metrics(
-        metrics: OperatorMetricsSet,
-        partition: usize,
-    ) -> Result<MetricsSet> {
-        let mut metrics_set = MetricsSet::new();
-        for metric in metrics.metrics {
-            let metric_value: MetricValue = metric.try_into()?;
-            metrics_set.push(Arc::new(Metric::new(metric_value, Some(partition))));
-        }
-        Ok(metrics_set)
-    }
-
-    /// Upserts raw metrics from a completed task into the stage metrics
-    pub fn upsert_metrics_set_for_partition(
-        existing_metrics: &mut MetricsSet,
-        new_partition_metrics: MetricsSet,
+    /// Combines metrics from a completed task into the stage's aggregate metrics.
+    pub fn combine_metrics_set(
+        first: &mut MetricsSet,
+        second: Vec<MetricValue>,
         partition: usize,
     ) -> MetricsSet {
-        let mut updated_metrics = MetricsSet::new();
-        // Task metrics are snapshots, so replace any prior metrics for this partition.
-        for metric in existing_metrics.iter() {
-            if metric.partition() != Some(partition) {
-                updated_metrics.push(metric.clone());
-            }
+        for metric_value in second {
+            // TODO recheck the lable logic
+            let new_metric = Arc::new(Metric::new(metric_value, Some(partition)));
+            first.push(new_metric);
         }
-        for metric in new_partition_metrics.iter() {
-            updated_metrics.push(metric.clone());
-        }
-        updated_metrics
+        first.aggregate_by_name()
     }
 
     /// Returns the number of times the task for the given partition has failed.
@@ -1069,217 +1047,5 @@ impl StageOutput {
         }
 
         partition_locations
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ballista_core::serde::protobuf::{
-        OperatorMetric, SuccessfulTask, TaskStatus, operator_metric, task_status,
-    };
-    use datafusion::physical_plan::empty::EmptyExec;
-    use datafusion::prelude::SessionConfig;
-    use std::collections::HashMap;
-
-    fn make_running_stage(partitions: usize) -> RunningStage {
-        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        RunningStage::new(
-            1,
-            0,
-            plan,
-            partitions,
-            vec![],
-            HashMap::new(),
-            Arc::new(SessionConfig::default()),
-        )
-    }
-
-    fn make_task_status(task_id: u32, partition_id: u32) -> TaskStatus {
-        TaskStatus {
-            task_id,
-            job_id: "test-job".to_string(),
-            stage_id: 1,
-            stage_attempt_num: 0,
-            partition_id,
-            launch_time: 100,
-            start_exec_time: 200,
-            end_exec_time: 300,
-            status: Some(task_status::Status::Successful(SuccessfulTask {
-                executor_id: "executor-1".to_string(),
-                partitions: vec![],
-            })),
-            metrics: vec![],
-        }
-    }
-
-    fn make_operator_metrics_set(
-        output_rows: u64,
-        elapsed_compute_nanos: u64,
-    ) -> OperatorMetricsSet {
-        OperatorMetricsSet {
-            metrics: vec![
-                OperatorMetric {
-                    metric: Some(operator_metric::Metric::OutputRows(output_rows)),
-                },
-                OperatorMetric {
-                    metric: Some(operator_metric::Metric::ElapseTime(
-                        elapsed_compute_nanos,
-                    )),
-                },
-            ],
-        }
-    }
-
-    /// Regression test: `update_task_info` must not panic when the task slot
-    /// is `None` (task was reset after executor heartbeat timeout).
-    #[test]
-    fn test_update_task_info_after_reset_does_not_panic() {
-        let mut stage = make_running_stage(2);
-
-        // Both task slots start as None (not yet scheduled).
-        // Simulates receiving a status update for a task that was already
-        // reset (e.g., executor heartbeat timed out).
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        // Should return false (update rejected), not panic.
-        assert!(!result);
-    }
-
-    /// Verify that a normal update succeeds when the task slot is populated.
-    #[test]
-    fn test_update_task_info_normal_update_succeeds() {
-        let mut stage = make_running_stage(2);
-
-        // Simulate scheduling the task: populate the task slot.
-        stage.task_infos[0] = Some(TaskInfo {
-            task_id: 0,
-            scheduled_time: 50,
-            launch_time: 0,
-            start_exec_time: 0,
-            end_exec_time: 0,
-            finish_time: 0,
-            task_status: task_status::Status::Running(RunningTask {
-                executor_id: "executor-1".to_string(),
-            }),
-        });
-
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        assert!(result);
-        assert!(matches!(
-            stage.task_infos[0].as_ref().unwrap().task_status,
-            task_status::Status::Successful(_)
-        ));
-    }
-
-    /// After reset_tasks sets a slot to None, update_task_info must not panic.
-    #[test]
-    fn test_update_task_info_after_executor_lost() {
-        let mut stage = make_running_stage(2);
-
-        // Populate tasks as running on executor-1.
-        for i in 0..2 {
-            stage.task_infos[i] = Some(TaskInfo {
-                task_id: i,
-                scheduled_time: 50,
-                launch_time: 100,
-                start_exec_time: 200,
-                end_exec_time: 0,
-                finish_time: 0,
-                task_status: task_status::Status::Running(RunningTask {
-                    executor_id: "executor-1".to_string(),
-                }),
-            });
-        }
-
-        // Executor heartbeat times out - tasks are reset.
-        let reset_count = stage.reset_tasks("executor-1");
-        assert_eq!(reset_count, 2);
-        assert!(stage.task_infos[0].is_none());
-        assert!(stage.task_infos[1].is_none());
-
-        // Executor sends a late status update for partition 0.
-        let status = make_task_status(0, 0);
-        let result = stage.update_task_info(0, status);
-
-        // Should gracefully reject the update, not panic.
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_update_task_metrics_keeps_raw_partition_snapshots() {
-        let mut stage = make_running_stage(3);
-
-        stage
-            .update_task_metrics(0, vec![make_operator_metrics_set(100, 10)])
-            .unwrap();
-
-        let metrics = stage.stage_metrics.as_ref().unwrap();
-        assert_eq!(metrics.len(), 1);
-
-        let operator_metrics = &metrics[0];
-        assert_eq!(operator_metrics.iter().count(), 2);
-        assert!(
-            operator_metrics
-                .iter()
-                .all(|metric| metric.partition() == Some(0))
-        );
-
-        let aggregated = operator_metrics.aggregate_by_name();
-        assert_eq!(aggregated.output_rows(), Some(100));
-        assert_eq!(aggregated.elapsed_compute().unwrap(), 10);
-
-        stage
-            .update_task_metrics(1, vec![make_operator_metrics_set(200, 20)])
-            .unwrap();
-        stage
-            .update_task_metrics(2, vec![make_operator_metrics_set(300, 30)])
-            .unwrap();
-
-        let metrics = stage.stage_metrics.as_ref().unwrap();
-        let operator_metrics = &metrics[0];
-        assert_eq!(operator_metrics.iter().count(), 6);
-
-        let partitions = operator_metrics
-            .iter()
-            .filter(|metric| matches!(metric.value(), MetricValue::OutputRows(_)))
-            .map(|metric| metric.partition())
-            .collect::<Vec<_>>();
-        assert_eq!(partitions, vec![Some(0), Some(1), Some(2)]);
-
-        let aggregated = operator_metrics.aggregate_by_name();
-        assert_eq!(aggregated.output_rows(), Some(600));
-        assert_eq!(aggregated.elapsed_compute().unwrap(), 60);
-
-        stage
-            .update_task_metrics(1, vec![make_operator_metrics_set(250, 25)])
-            .unwrap();
-
-        let metrics = stage.stage_metrics.as_ref().unwrap();
-        let operator_metrics = &metrics[0];
-        assert_eq!(operator_metrics.iter().count(), 6);
-
-        let mut output_rows = operator_metrics
-            .iter()
-            .filter_map(|metric| match metric.value() {
-                MetricValue::OutputRows(value) => {
-                    Some((metric.partition(), value.value()))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        output_rows.sort_by_key(|(partition, _)| *partition);
-        assert_eq!(
-            output_rows,
-            vec![(Some(0), 100), (Some(1), 250), (Some(2), 300)]
-        );
-
-        let aggregated = operator_metrics.aggregate_by_name();
-        assert_eq!(aggregated.output_rows(), Some(650));
-        assert_eq!(aggregated.elapsed_compute().unwrap(), 65);
     }
 }

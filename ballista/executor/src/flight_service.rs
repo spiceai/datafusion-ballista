@@ -17,18 +17,20 @@
 
 //! Implementation of the Apache Arrow Flight protocol that wraps an executor.
 
-use ballista_core::execution_plans::create_shuffle_path;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
 use std::convert::TryFrom;
 use std::fs::File;
+use std::path::Path;
 use std::pin::Pin;
 use tokio_util::io::ReaderStream;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::global_shuffle_manager;
 use ballista_core::execution_plans::sort_shuffle::{
-    ShuffleIndex, get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
+    get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
 };
 use ballista_core::serde::decode_protobuf;
 use ballista_core::serde::scheduler::Action as BallistaAction;
@@ -58,14 +60,18 @@ use tonic::{Request, Response, Status, Streaming};
 /// It supports both decoded streaming via `do_get` and optimized block transfer
 /// via the `IO_BLOCK_TRANSPORT` action.
 #[derive(Clone)]
-pub struct BallistaFlightService {
-    work_dir: String,
-}
+pub struct BallistaFlightService {}
 
 impl BallistaFlightService {
     /// Creates a new BallistaFlightService instance.
-    pub fn new(work_dir: String) -> Self {
-        Self { work_dir }
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for BallistaFlightService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,33 +102,67 @@ impl FlightService for BallistaFlightService {
 
         match &action {
             BallistaAction::FetchPartition {
-                job_id,
-                stage_id,
-                partition_id,
-                file_id,
-                is_sort_shuffle,
-                ..
+                path, partition_id, ..
             } => {
-                let path = create_shuffle_path(
-                    &self.work_dir,
-                    job_id,
-                    *stage_id,
-                    *partition_id,
-                    *file_id,
-                    *is_sort_shuffle,
-                )
-                .map_err(|e| {
-                    Status::internal(format!("I/O error, can't create shuffle path: {e}"))
-                })?;
-                debug!("FetchPartition reading partition {partition_id} from {path:?}");
+                // Check if this is an in-memory partition
+                if let Some(key) = path.strip_prefix("memory://") {
+                    // Fetch from in-memory shuffle manager
+                    let shuffle_manager = global_shuffle_manager();
+                    let data = shuffle_manager.get_partition(key).map_err(|e| {
+                        Status::not_found(format!(
+                            "In-memory partition not found: {key}: {e}"
+                        ))
+                    })?;
+
+                    debug!(
+                        "FetchPartition serving in-memory partition: {} ({} batches, {} rows, format: {:?})",
+                        key, data.num_batches, data.num_rows, data.format
+                    );
+
+                    let (tx, rx) = channel(2);
+                    let schema = data.schema.clone();
+
+                    // Convert to batches (handles both Arrow and Vortex formats)
+                    let batches = data.to_batches().map_err(|e| {
+                        Status::internal(format!(
+                            "Failed to convert in-memory partition to batches: {e}"
+                        ))
+                    })?;
+
+                    // Stream the batches from memory
+                    task::spawn(async move {
+                        for batch in batches {
+                            if tx.send(Ok(batch)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                        .map_err(|e| from_arrow_err(&e))?;
+                    let flight_data_stream = FlightDataEncoderBuilder::new()
+                        .with_schema(schema)
+                        .with_options(write_options)
+                        .build(ReceiverStream::new(rx))
+                        .map_err(|err| Status::from_error(Box::new(err)));
+
+                    return Ok(Response::new(
+                        Box::pin(flight_data_stream) as Self::DoGetStream
+                    ));
+                }
 
                 // Check if this is a sort-based shuffle output
-                if is_sort_shuffle_output(&path) {
-                    debug!("Detected sort-based shuffle format for {path:?}");
-                    let index_path = get_index_path(path.as_path());
-                    let stream =
-                        stream_sort_shuffle_partition(&path, &index_path, *partition_id)
-                            .map_err(|e| from_ballista_err(&e))?;
+                let data_path = Path::new(path);
+                if is_sort_shuffle_output(data_path) {
+                    debug!("Detected sort-based shuffle format for {path}");
+                    let index_path = get_index_path(data_path);
+                    let stream = stream_sort_shuffle_partition(
+                        data_path,
+                        &index_path,
+                        *partition_id,
+                    )
+                    .map_err(|e| from_ballista_err(&e))?;
 
                     let schema = stream.schema();
                     // Map DataFusionError to FlightError
@@ -143,29 +183,30 @@ impl FlightService for BallistaFlightService {
                     ));
                 }
 
-                // Standard hash-based shuffle - read the entire file
-                let file = File::open(&path)
-                    .map_err(|e| {
-                        BallistaError::General(format!(
-                            "Failed to open partition file at {path:?}: {e:?}"
-                        ))
-                    })
-                    .map_err(|e| from_ballista_err(&e))?;
-                let file = BufReader::new(file);
-                // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
-                let reader = unsafe {
-                    StreamReader::try_new(file, None)
-                        .map_err(|e| from_arrow_err(&e))?
-                        .with_skip_validation(cfg!(feature = "arrow-ipc-optimizations"))
-                };
+                // Handle disk-based partition
+                // Detect shuffle format based on file extension
+                let is_vortex = Path::new(path)
+                    .extension()
+                    .map(|ext| ext == "vortex")
+                    .unwrap_or(false);
 
-                let (tx, rx) = channel(2);
-                let schema = reader.schema();
-                task::spawn_blocking(move || {
-                    if let Err(e) = read_partition(reader, tx) {
-                        log::warn!("error streaming shuffle partition: {e}");
+                let format = if is_vortex { "vortex" } else { "arrow-ipc" };
+                debug!("FetchPartition reading {path} (format: {format})");
+
+                let (schema, rx) = if is_vortex {
+                    #[cfg(feature = "vortex")]
+                    {
+                        read_vortex_partition(path)?
                     }
-                });
+                    #[cfg(not(feature = "vortex"))]
+                    {
+                        return Err(Status::unimplemented(
+                            "Vortex format is not available. Enable the 'vortex' feature.",
+                        ));
+                    }
+                } else {
+                    read_arrow_ipc_partition(path)?
+                };
 
                 let write_options: IpcWriteOptions = IpcWriteOptions::default()
                     .try_with_compression(Some(CompressionType::LZ4_FRAME))
@@ -259,42 +300,104 @@ impl FlightService for BallistaFlightService {
                     decode_protobuf(&action.body).map_err(|e| from_ballista_err(&e))?;
 
                 match &action {
-                    BallistaAction::FetchPartition {
-                        job_id,
-                        stage_id,
-                        partition_id,
-                        file_id,
-                        is_sort_shuffle,
-                        ..
-                    } => {
-                        let path = create_shuffle_path(
-                            &self.work_dir,
-                            job_id,
-                            *stage_id,
-                            *partition_id,
-                            *file_id,
-                            *is_sort_shuffle,
-                        )
-                        .map_err(|e| {
-                            Status::internal(format!(
-                                "I/O error, can't create shuffle path: {e}"
-                            ))
+                    BallistaAction::FetchPartition { path, .. } => {
+                        debug!("FetchPartition reading {path}");
+
+                        // Check if this is an in-memory partition
+                        // For in-memory partitions, we need to serialize to IPC format first
+                        if let Some(key) = path.strip_prefix("memory://") {
+                            let shuffle_manager = global_shuffle_manager();
+                            let data =
+                                shuffle_manager.get_partition(key).map_err(|e| {
+                                    Status::not_found(format!(
+                                        "In-memory partition not found: {key}: {e}"
+                                    ))
+                                })?;
+
+                            debug!(
+                                "FetchPartition serving in-memory partition via block transfer: {} ({} batches, format: {:?})",
+                                key, data.num_batches, data.format
+                            );
+
+                            // Convert to batches (handles both Arrow and Vortex formats)
+                            let batches = data.to_batches().map_err(|e| {
+                                Status::internal(format!(
+                                    "Failed to convert in-memory partition to batches: {e}"
+                                ))
+                            })?;
+
+                            // Serialize batches to IPC format in memory
+                            let mut buffer = Vec::new();
+                            {
+                                use datafusion::arrow::ipc::writer::StreamWriter;
+                                let mut writer = StreamWriter::try_new_with_options(
+                                    &mut buffer,
+                                    &data.schema,
+                                    IpcWriteOptions::default()
+                                        .try_with_compression(Some(
+                                            CompressionType::LZ4_FRAME,
+                                        ))
+                                        .map_err(|e| from_arrow_err(&e))?,
+                                )
+                                .map_err(|e| from_arrow_err(&e))?;
+
+                                for batch in &batches {
+                                    writer
+                                        .write(batch)
+                                        .map_err(|e| from_arrow_err(&e))?;
+                                }
+                                writer.finish().map_err(|e| from_arrow_err(&e))?;
+                            }
+
+                            let bytes = bytes::Bytes::from(buffer);
+                            let result_stream = futures::stream::once(async move {
+                                Ok(arrow_flight::Result { body: bytes })
+                            });
+
+                            return Ok(Response::new(
+                                Box::pin(result_stream) as Self::DoActionStream
+                            ));
+                        }
+
+                        let data_path = Path::new(path);
+
+                        // Block transport doesn't support sort-based shuffle because it
+                        // transfers the entire file, which contains all partitions.
+                        // Use flight transport (do_get) for sort-based shuffle.
+                        if is_sort_shuffle_output(data_path) {
+                            return Err(Status::unimplemented(
+                                "IO_BLOCK_TRANSPORT does not support sort-based shuffle. \
+                                 Set ballista.shuffle.remote_read_prefer_flight=true to use \
+                                 flight transport instead.",
+                            ));
+                        }
+
+                        // Handle disk-based partition
+                        let file = tokio::fs::File::open(&path).await.map_err(|e| {
+                            Status::internal(format!("Failed to open file: {e}"))
                         })?;
 
-                        debug!("FetchPartition reading {path:?}");
+                        debug!(
+                            "streaming file: {} with size: {}",
+                            path,
+                            file.metadata().await?.len()
+                        );
+                        let reader = tokio::io::BufReader::with_capacity(
+                            BLOCK_BUFFER_CAPACITY,
+                            file,
+                        );
+                        let file_stream =
+                            ReaderStream::with_capacity(reader, BLOCK_BUFFER_CAPACITY);
 
-                        let stream = if is_sort_shuffle_output(&path) {
-                            // Sort-shuffle: stream the leading schema-header
-                            // bytes followed by the requested partition's
-                            // byte range. The receiver (BlockDataStream) walks
-                            // the resulting concatenated IPC streams.
-                            stream_sort_shuffle_block(&path, *partition_id).await?
-                        } else {
-                            // Hash-shuffle: file contains exactly one partition.
-                            stream_whole_file(&path).await?
-                        };
+                        let flight_data_stream = file_stream.map(|result| {
+                            result
+                                .map(|bytes| arrow_flight::Result { body: bytes })
+                                .map_err(|e| Status::internal(format!("I/O error: {e}")))
+                        });
 
-                        Ok(Response::new(stream))
+                        Ok(Response::new(
+                            Box::pin(flight_data_stream) as Self::DoActionStream
+                        ))
                     }
                 }
             }
@@ -334,77 +437,157 @@ impl FlightService for BallistaFlightService {
     }
 }
 
-async fn stream_whole_file(
-    path: &std::path::Path,
-) -> Result<<BallistaFlightService as FlightService>::DoActionStream, Status> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to open file: {e}")))?;
-    debug!(
-        "streaming file: {:?} with size: {}",
-        path,
-        file.metadata().await?.len()
-    );
-    let file_stream = ReaderStream::with_capacity(file, BLOCK_BUFFER_CAPACITY);
-    Ok(Box::pin(file_stream.map(|result| {
-        result
-            .map(|bytes| arrow_flight::Result { body: bytes })
-            .map_err(|e| Status::internal(format!("I/O error: {e}")))
-    })))
+/// Read an Arrow IPC partition file and return the schema and a receiver for record batches
+fn read_arrow_ipc_partition(
+    path: &str,
+) -> Result<
+    (
+        SchemaRef,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, FlightError>>,
+    ),
+    Status,
+> {
+    let file = File::open(path)
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to open partition file at {path}: {e:?}"
+            ))
+        })
+        .map_err(|e| from_ballista_err(&e))?;
+    let file = BufReader::new(file);
+    let reader = StreamReader::try_new(file, None).map_err(|e| from_arrow_err(&e))?;
+
+    let (tx, rx) = channel(2);
+    let schema = reader.schema();
+    task::spawn_blocking(move || {
+        if let Err(e) = read_arrow_ipc_batches(reader, tx) {
+            log::warn!("error streaming Arrow IPC shuffle partition: {e}");
+        }
+    });
+
+    Ok((schema, rx))
 }
 
-async fn stream_sort_shuffle_block(
-    data_path: &std::path::Path,
-    partition_id: usize,
-) -> Result<<BallistaFlightService as FlightService>::DoActionStream, Status> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+/// Read Vortex partition file and return the schema and a receiver for record batches
+#[cfg(feature = "vortex")]
+fn read_vortex_partition(
+    path: &str,
+) -> Result<
+    (
+        SchemaRef,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, FlightError>>,
+    ),
+    Status,
+> {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use vortex_array::ArrayRef;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::iter::ArrayIterator;
+    use vortex_ipc::iterator::SyncIPCReader;
 
-    let index_path = get_index_path(data_path);
-    let index =
-        ShuffleIndex::read_from_file(&index_path).map_err(|e| from_ballista_err(&e))?;
+    let file = File::open(path)
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "Failed to open Vortex partition file at {path}: {e:?}"
+            ))
+        })
+        .map_err(|e| from_ballista_err(&e))?;
 
-    if partition_id >= index.partition_count() {
-        return Err(Status::out_of_range(format!(
-            "partition_id {partition_id} not found in index (max: {})",
-            index.partition_count()
-        )));
+    let mut buf_reader = BufReader::new(file);
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut buf_reader, &mut data).map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to read Vortex file at {path}: {e:?}"
+        )))
+    })?;
+
+    // Create default session with all canonical encodings
+    let session = &*LEGACY_SESSION;
+
+    // Read IPC data
+    let cursor = Cursor::new(data);
+    let reader = SyncIPCReader::try_new(cursor, session).map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to create Vortex IPC reader at {path}: {e:?}"
+        )))
+    })?;
+
+    // Get schema from IPC header via ArrayIterator::dtype() method
+    // This is stored in the Vortex IPC format header, not inferred from data
+    let dtype = reader.dtype().clone();
+    let arrow_schema = dtype.to_arrow_schema().map_err(|e| {
+        from_ballista_err(&BallistaError::General(format!(
+            "Failed to convert Vortex DType to Arrow schema: {e:?}"
+        )))
+    })?;
+    let schema = Arc::new(arrow_schema);
+
+    let arrays: Vec<ArrayRef> = reader
+        .map(|r| {
+            r.map_err(|e| {
+                from_ballista_err(&BallistaError::General(format!(
+                    "Failed to read Vortex array: {e:?}"
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (tx, rx) = channel(2);
+    task::spawn_blocking(move || {
+        if let Err(e) = read_vortex_batches(arrays, tx) {
+            log::warn!("error streaming Vortex shuffle partition: {e}");
+        }
+    });
+
+    Ok((schema, rx))
+}
+
+/// Read Vortex arrays and send them as record batches
+#[cfg(feature = "vortex")]
+#[allow(deprecated)]
+fn read_vortex_batches(
+    arrays: Vec<vortex_array::ArrayRef>,
+    tx: Sender<Result<RecordBatch, FlightError>>,
+) -> Result<(), FlightError> {
+    use vortex_array::arrow::IntoArrowArray;
+
+    if tx.is_closed() {
+        return Err(FlightError::Tonic(Box::new(Status::internal(
+            "Can't send a batch, channel is closed",
+        ))));
     }
 
-    // The leading [0, header_end) bytes hold the schema-header IPC stream.
-    // We always prepend it to the partition's byte range so the receiver
-    // recovers the schema even when the partition is empty.
-    let header_end = index.header_end_offset() as u64;
-    let (start, end) = index.get_partition_range(partition_id);
-    let (start, end) = (start as u64, end as u64);
+    for array in arrays {
+        let arrow_array = array
+            .into_arrow_preferred()
+            .map_err(|e| FlightError::Arrow(ArrowError::ExternalError(Box::new(e))))?;
 
-    // One open + dup gives us two independent file cursors over the same
-    // inode: one reads the header from offset 0, the other seeks to the
-    // partition. `chain` and `take` consume their readers by value, so two
-    // cursors are unavoidable here.
-    let header_file = tokio::fs::File::open(data_path)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to open file: {e}")))?;
-    let mut partition_file = header_file
-        .try_clone()
-        .await
-        .map_err(|e| Status::internal(format!("dup file handle: {e}")))?;
-    partition_file
-        .seek(std::io::SeekFrom::Start(start))
-        .await
-        .map_err(|e| Status::internal(format!("seek partition: {e}")))?;
+        let struct_array = arrow_array
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StructArray>()
+            .ok_or_else(|| {
+                FlightError::Arrow(ArrowError::InvalidArgumentError(
+                    "Expected StructArray from Vortex".to_string(),
+                ))
+            })?;
 
-    let combined = header_file
-        .take(header_end)
-        .chain(partition_file.take(end - start));
-    let file_stream = ReaderStream::with_capacity(combined, BLOCK_BUFFER_CAPACITY);
-    Ok(Box::pin(file_stream.map(|result| {
-        result
-            .map(|bytes| arrow_flight::Result { body: bytes })
-            .map_err(|e| Status::internal(format!("I/O error: {e}")))
-    })))
+        let batch = RecordBatch::from(struct_array);
+
+        tx.blocking_send(Ok(batch)).map_err(|err| {
+            if let SendError(Err(err)) = err {
+                err
+            } else {
+                FlightError::Tonic(Box::new(Status::internal(format!(
+                    "Can't send a batch, something went wrong: {err:?}"
+                ))))
+            }
+        })?;
+    }
+    Ok(())
 }
 
-fn read_partition<T>(
+fn read_arrow_ipc_batches<T>(
     reader: StreamReader<std::io::BufReader<T>>,
     tx: Sender<Result<RecordBatch, FlightError>>,
 ) -> Result<(), FlightError>

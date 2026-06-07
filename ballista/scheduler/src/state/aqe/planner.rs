@@ -17,22 +17,22 @@
 use crate::state::aqe::adapter::BallistaAdapter;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::optimizer_rule::{
-    CoalescePartitionsRule, DistributedExchangeRule, PropagateEmptyExecRule,
-    WarnOnDuplicateExecRule,
+    DistributedExchangeRule, EliminateCooperativeExecRule, EliminateEmptyExchangeRule,
+    PropagateEmptyExecRule, WarnOnDuplicateExecRule,
 };
 
 use crate::state::execution_stage::StageOutput;
-use ballista_core::execution_plans::ShuffleWriter;
+use ballista_core::execution_plans::ShuffleWriterExec;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::scheduler::PartitionLocation;
 use datafusion::common;
 use datafusion::common::{HashMap, exec_err};
 use datafusion::execution::{SessionState, SessionStateBuilder};
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::SessionConfig;
-use log::debug;
+use log::{debug, warn};
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -61,6 +61,9 @@ pub struct AdaptivePlanner {
     plan: Arc<dyn ExecutionPlan>,
     /// caches current runnable stages
     runnable_stage_cache: HashMap<usize, Arc<dyn ExecutionPlan>>,
+    /// Optimizer max passes before it gives up
+    // to be configured from a configuration
+    max_passes: usize,
     /// job name
     job_name: String,
 
@@ -78,21 +81,22 @@ impl Debug for AdaptivePlanner {
 impl AdaptivePlanner {
     /// Creates a new `AdaptivePlanner` with the specified physical optimizer rules.
     ///
-    /// # Arguments:
-    ///
-    /// * `session_config` - The session configuration for the job.
+    /// # Arguments
     /// * `plan` - The physical execution plan for the job.
-    /// * `job_name` - The name of the job.
+    /// * `session_config` - The session configuration for the job.
     /// * `physical_optimizer_rules` - A list of physical optimizer rules to apply.
+    /// * `job_name` - The name of the job.
     ///
     /// # Returns
     /// A new instance of `AdaptivePlanner` or an error if the initialization fails.
     pub fn try_new_with_optimizers(
-        session_config: &SessionConfig,
         plan: Arc<dyn ExecutionPlan>,
-        job_name: String,
+        session_config: &SessionConfig,
         physical_optimizer_rules: Vec<PhysicalOptimizerRuleRef>,
+        job_name: String,
     ) -> common::Result<Self> {
+        let max_passes = session_config.adaptive_query_planner_max_passes();
+
         let session_state =
             Self::create_session_state(session_config, physical_optimizer_rules);
         let planner = DefaultPhysicalPlanner::default();
@@ -104,6 +108,7 @@ impl AdaptivePlanner {
             physical_planner: planner.into(),
             plan,
             runnable_stage_cache: HashMap::new(),
+            max_passes,
             job_name,
             runnable_stage_output: HashMap::new(),
         })
@@ -111,7 +116,6 @@ impl AdaptivePlanner {
     /// Creates a new `AdaptivePlanner` with default physical optimizer rules.
     ///
     /// # Arguments
-    ///
     /// * `session_config` - The session configuration for the job.
     /// * `plan` - The physical execution plan for the job.
     /// * `job_name` - The name of the job.
@@ -124,10 +128,10 @@ impl AdaptivePlanner {
         job_name: String,
     ) -> common::Result<Self> {
         Self::try_new_with_optimizers(
-            session_config,
             plan,
-            job_name,
+            session_config,
             Self::default_optimizers(),
+            job_name,
         )
     }
     /// Cancels a stage by its ID.
@@ -245,11 +249,24 @@ impl AdaptivePlanner {
             displayable(plan.as_ref()).indent(false)
         );
 
-        plan = self.physical_planner.optimize_physical_plan(
-            plan.clone(),
-            &self.session_state,
-            |_, _| {},
-        )?;
+        for pass in 0..self.max_passes {
+            plan = self.physical_planner.optimize_physical_plan(
+                plan.clone(),
+                &self.session_state,
+                |_, _| {},
+            )?;
+
+            if DistributedExchangeRule::default().plan_invalid(plan.clone())? {
+                if pass >= self.max_passes - 1 {
+                    warn!("plan needs another distributed optimizer pass");
+                    exec_err!("plan needs another distributed optimizer pass")?
+                }
+                debug!("plan does not look correct correct");
+            } else {
+                debug!("plan looks correct correct");
+                break;
+            }
+        }
 
         debug!(
             "Distributed physical plan (after optimization):\n{}\n",
@@ -294,23 +311,13 @@ impl AdaptivePlanner {
                 Ok((None, stages_to_cancel))
             }
             Some(stages) => {
-                let config = self.session_state.config().options();
                 let (stage_ids, shuffle_writers) = stages
                     .into_iter()
                     .map(|plan| {
-                        // Run the coalesce rule per-stage: the root of `plan` is
-                        // the stage's wrapper exchange, so the rule's walker sees
-                        // only this stage's input exchanges as the alignment
-                        // group. This avoids cross-stage gluing and stale state
-                        // that would arise if the rule walked the entire residual
-                        // plan in `default_optimizers()`.
-                        let plan = CoalescePartitionsRule.optimize(plan, config)?;
-                        BallistaAdapter::adapt_to_ballista(
-                            plan,
-                            self.job_name.as_str(),
-                            config,
-                        )
-                        .map(|w| (w.plan.stage_id(), w))
+                        // TODO: we need to find input stages for given stage
+                        //       thus result should change
+                        BallistaAdapter::adapt_to_ballista(plan, self.job_name.as_str())
+                            .map(|w| (w.plan.stage_id(), w))
                     })
                     .collect::<common::Result<(HashSet<_>, Vec<_>)>>()?;
 
@@ -429,18 +436,23 @@ impl AdaptivePlanner {
     /// # Returns
     /// A vector of default physical optimizer rules.
     fn default_optimizers() -> Vec<PhysicalOptimizerRuleRef> {
-        let mut physical_optimizers = PhysicalOptimizer::new().rules;
-        physical_optimizers.push(Arc::new(PropagateEmptyExecRule::default()));
-        // `DistributedExchangeRule` should be the last plan mutator rule in the chain
-        physical_optimizers.push(Arc::new(DistributedExchangeRule::default()));
-        // we should remove it at the later stage this is just temporary
-        // to detect possible duplicate execs.
-        // rule does not mutate plan hance it can go after `DistributedExchangeRule`
-        physical_optimizers.push(Arc::new(WarnOnDuplicateExecRule::default()));
+        let mut physical_optimizers: Vec<PhysicalOptimizerRuleRef> = vec![
+            // TODO: do we keep it here or make it last
+            Arc::new(DistributedExchangeRule::default()),
+            Arc::new(EliminateEmptyExchangeRule::default()),
+        ];
 
-        // `CoalescePartitionsRule` is invoked per-stage in `actionable_stages()`
-        // rather than registered here, so each invocation sees only one stage's
-        // plan and forms an alignment group scoped to that stage's inputs.
+        let default_optimizers = PhysicalOptimizer::new();
+        physical_optimizers.extend(default_optimizers.rules.iter().cloned());
+        physical_optimizers.push(Arc::new(PropagateEmptyExecRule::default()));
+        // this rule is not required anymore
+        // physical_optimizers.push(Arc::new(EliminateRoundRobbinRule::default()));
+        physical_optimizers.push(Arc::new(EliminateCooperativeExecRule::default()));
+        // we should remove it at the later stage
+        // this is just temporary to detect possible duplicate
+        // execs
+        physical_optimizers.push(Arc::new(WarnOnDuplicateExecRule::default()));
+        // physical_optimizers.push(Arc::new(DistributedExchangeRule::default()));
 
         physical_optimizers
     }
@@ -514,7 +526,7 @@ impl AdaptivePlanner {
 
 /// Wraps stage plan with addition of references to previous stages
 pub(crate) struct AdaptiveStageInfo {
-    pub(crate) plan: Arc<dyn ShuffleWriter>,
+    pub(crate) plan: Arc<ShuffleWriterExec>,
     #[allow(dead_code)] // TODO: still not sure if this is needed
     pub(crate) inputs: Vec<usize>,
 }

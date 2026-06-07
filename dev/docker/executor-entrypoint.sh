@@ -19,6 +19,4 @@
 
 set -e
 
-mkdir -p /work
-
 /root/ballista-executor "$@"

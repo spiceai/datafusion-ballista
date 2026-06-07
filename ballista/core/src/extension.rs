@@ -16,13 +16,11 @@
 // under the License.
 
 use crate::config::{
-    BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES, BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE,
-    BALLISTA_CLIENT_USE_TLS, BALLISTA_COALESCE_ENABLED,
-    BALLISTA_COALESCE_MERGED_PARTITION_FACTOR, BALLISTA_COALESCE_SMALL_PARTITION_FACTOR,
-    BALLISTA_COALESCE_TARGET_PARTITION_BYTES, BALLISTA_JOB_NAME,
-    BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
-    BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
-    BallistaConfig,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME, BALLISTA_SHUFFLE_FORMAT,
+    BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
+    BALLISTA_SHUFFLE_READER_MAX_REQUESTS, BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT,
+    BALLISTA_SHUFFLE_STORAGE_TYPE, BALLISTA_SHUFFLE_STORAGE_URL,
+    BALLISTA_STANDALONE_PARALLELISM, BallistaConfig, ShuffleFormat,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -181,17 +179,6 @@ pub trait SessionConfigExt {
     /// This option to be used to configure standalone session context
     fn with_ballista_standalone_parallelism(self, parallelism: usize) -> Self;
 
-    /// Returns the byte-size threshold below which a hash join's smaller side
-    /// is promoted to `CollectLeft` and lowered via the broadcast pattern in
-    /// the distributed planner. `0` disables promotion.
-    fn ballista_broadcast_join_threshold_bytes(&self) -> usize;
-
-    /// Sets the byte-size threshold below which a hash join's smaller side
-    /// is promoted to `CollectLeft` and lowered via the broadcast pattern in
-    /// the distributed planner. Setting `0` disables promotion.
-    fn with_ballista_broadcast_join_threshold_bytes(self, threshold_bytes: usize)
-    -> Self;
-
     /// retrieves grpc client max message size
     fn ballista_grpc_client_max_message_size(&self) -> usize;
 
@@ -219,8 +206,24 @@ pub trait SessionConfigExt {
         prefer_flight: bool,
     ) -> Self;
 
+    /// Returns whether in-memory shuffle mode is enabled.
+    fn ballista_shuffle_memory_mode(&self) -> bool;
+
+    /// Sets whether to use in-memory shuffle mode.
+    fn with_ballista_shuffle_memory_mode(self, memory_mode: bool) -> Self;
+
+    /// Returns whether this is the final output stage.
+    /// Final stages always write to disk regardless of memory_mode setting.
+    fn ballista_is_final_stage(&self) -> bool;
+
+    /// Sets whether this is the final output stage.
+    fn with_ballista_is_final_stage(self, is_final: bool) -> Self;
+
     /// Is adaptive query planner enabled
     fn ballista_adaptive_query_planner_enabled(&self) -> bool;
+
+    /// Number of times that the adaptive optimizer will attempt to optimize the plan
+    fn adaptive_query_planner_max_passes(&self) -> usize;
 
     /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
@@ -245,28 +248,57 @@ pub trait SessionConfigExt {
     /// Get whether to use TLS for executor connections
     fn ballista_use_tls(&self) -> bool;
 
-    /// Is short shuffle used
-    fn ballista_sort_shuffle_enabled(&self) -> bool;
+    /// Returns the shuffle storage type (local, s3, azure).
+    fn ballista_shuffle_storage_type(&self) -> String;
 
-    /// Returns whether the AQE coalesce-shuffle-partitions rule is enabled.
-    fn ballista_coalesce_enabled(&self) -> bool;
-    /// Sets whether the AQE coalesce-shuffle-partitions rule is enabled.
-    fn with_ballista_coalesce_enabled(self, enabled: bool) -> Self;
+    /// Sets the shuffle storage type.
+    fn with_ballista_shuffle_storage_type(self, storage_type: &str) -> Self;
 
-    /// Returns the target post-coalesce partition byte size in bytes.
-    fn ballista_coalesce_target_partition_bytes(&self) -> u64;
-    /// Sets the target post-coalesce partition byte size in bytes.
-    fn with_ballista_coalesce_target_partition_bytes(self, bytes: u64) -> Self;
+    /// Returns the shuffle storage base URL/path if configured.
+    fn ballista_shuffle_storage_url(&self) -> Option<String>;
 
-    /// Returns the small-partition merge factor (Spark legacy).
-    fn ballista_coalesce_small_partition_factor(&self) -> f64;
-    /// Sets the small-partition merge factor (Spark legacy).
-    fn with_ballista_coalesce_small_partition_factor(self, factor: f64) -> Self;
+    /// Sets the shuffle storage base URL/path.
+    fn with_ballista_shuffle_storage_url(self, url: &str) -> Self;
 
-    /// Returns the merged-partition early-flush factor (Spark legacy).
-    fn ballista_coalesce_merged_partition_factor(&self) -> f64;
-    /// Sets the merged-partition early-flush factor (Spark legacy).
-    fn with_ballista_coalesce_merged_partition_factor(self, factor: f64) -> Self;
+    /// Get the shuffle format (ArrowIpc or Vortex)
+    ///
+    /// Note: Vortex format requires the 'vortex' feature to be enabled.
+    fn ballista_shuffle_format(&self) -> ShuffleFormat;
+
+    /// Set the shuffle format for intermediate shuffle data
+    ///
+    /// Available formats:
+    /// - `ShuffleFormat::ArrowIpc` (default) - Standard Arrow IPC format
+    /// - `ShuffleFormat::Vortex` - Vortex columnar format (requires 'vortex' feature)
+    fn with_ballista_shuffle_format(self, format: ShuffleFormat) -> Self;
+
+    /// Set a callback for recording shuffle read metrics (local vs remote).
+    ///
+    /// This callback will be invoked by the shuffle reader during execution
+    /// to record detailed metrics about local and remote shuffle reads.
+    fn with_ballista_shuffle_read_metrics_callback(
+        self,
+        callback: Arc<dyn ShuffleReadMetricsCallback>,
+    ) -> Self;
+
+    /// Get the shuffle read metrics callback if one has been set.
+    fn ballista_shuffle_read_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ShuffleReadMetricsCallback>>;
+
+    /// Set a callback for recording result fetch metrics.
+    ///
+    /// This callback will be invoked by `DistributedQueryExec` when fetching
+    /// final query results from executors.
+    fn with_ballista_result_fetch_metrics_callback(
+        self,
+        callback: Arc<dyn ResultFetchMetricsCallback>,
+    ) -> Self;
+
+    /// Get the result fetch metrics callback if one has been set.
+    fn ballista_result_fetch_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ResultFetchMetricsCallback>>;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -426,8 +458,10 @@ impl SessionConfigExt for SessionConfig {
         self.options()
             .extensions
             .get::<BallistaConfig>()
-            .map(|c| c.grpc_client_max_message_size())
-            .unwrap_or_else(|| BallistaConfig::default().grpc_client_max_message_size())
+            .map(|c| c.default_grpc_client_max_message_size())
+            .unwrap_or_else(|| {
+                BallistaConfig::default().default_grpc_client_max_message_size()
+            })
     }
 
     fn with_ballista_job_name(self, job_name: &str) -> Self {
@@ -441,10 +475,10 @@ impl SessionConfigExt for SessionConfig {
 
     fn with_ballista_grpc_client_max_message_size(self, max_size: usize) -> Self {
         if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_usize(BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE, max_size)
+            self.set_usize(BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, max_size)
         } else {
             self.with_option_extension(BallistaConfig::default())
-                .set_usize(BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE, max_size)
+                .set_usize(BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, max_size)
         }
     }
 
@@ -457,26 +491,6 @@ impl SessionConfigExt for SessionConfig {
         }
     }
 
-    fn ballista_broadcast_join_threshold_bytes(&self) -> usize {
-        self.options()
-            .extensions
-            .get::<BallistaConfig>()
-            .map(|c| c.broadcast_join_threshold_bytes())
-            .unwrap_or_else(|| BallistaConfig::default().broadcast_join_threshold_bytes())
-    }
-
-    fn with_ballista_broadcast_join_threshold_bytes(
-        self,
-        threshold_bytes: usize,
-    ) -> Self {
-        if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_usize(BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES, threshold_bytes)
-        } else {
-            self.with_option_extension(BallistaConfig::default())
-                .set_usize(BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES, threshold_bytes)
-        }
-    }
-
     fn ballista_shuffle_reader_maximum_concurrent_requests(&self) -> usize {
         self.options()
             .extensions
@@ -485,14 +499,6 @@ impl SessionConfigExt for SessionConfig {
             .unwrap_or_else(|| {
                 BallistaConfig::default().shuffle_reader_maximum_concurrent_requests()
             })
-    }
-
-    fn ballista_sort_shuffle_enabled(&self) -> bool {
-        self.options()
-            .extensions
-            .get::<BallistaConfig>()
-            .map(|c| c.shuffle_sort_based_enabled())
-            .unwrap_or_else(|| BallistaConfig::default().shuffle_sort_based_enabled())
     }
 
     fn with_ballista_shuffle_reader_maximum_concurrent_requests(
@@ -551,12 +557,60 @@ impl SessionConfigExt for SessionConfig {
         }
     }
 
+    fn ballista_shuffle_memory_mode(&self) -> bool {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.shuffle_memory_mode())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_memory_mode())
+    }
+
+    fn with_ballista_shuffle_memory_mode(self, memory_mode: bool) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_bool(BALLISTA_SHUFFLE_MEMORY_MODE, memory_mode)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_bool(BALLISTA_SHUFFLE_MEMORY_MODE, memory_mode)
+        }
+    }
+
+    fn ballista_is_final_stage(&self) -> bool {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.is_final_stage())
+            .unwrap_or(false)
+    }
+
+    fn with_ballista_is_final_stage(self, is_final: bool) -> Self {
+        // is_final_stage is an internal flag, not a user-configurable setting,
+        // so we modify the BallistaConfig directly instead of using set_bool
+        let ballista_config = self
+            .options()
+            .extensions
+            .get::<BallistaConfig>()
+            .cloned()
+            .unwrap_or_default()
+            .with_is_final_stage(is_final);
+        self.with_option_extension(ballista_config)
+    }
+
     fn ballista_adaptive_query_planner_enabled(&self) -> bool {
         self.options()
             .extensions
             .get::<BallistaConfig>()
             .map(|c| c.adaptive_query_planner_enabled())
             .unwrap_or_else(|| BallistaConfig::default().adaptive_query_planner_enabled())
+    }
+
+    fn adaptive_query_planner_max_passes(&self) -> usize {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.adaptive_query_planner_max_passes())
+            .unwrap_or_else(|| {
+                BallistaConfig::default().adaptive_query_planner_max_passes()
+            })
     }
 
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
@@ -588,99 +642,93 @@ impl SessionConfigExt for SessionConfig {
     }
 
     fn with_ballista_use_tls(self, use_tls: bool) -> Self {
-        if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_bool(BALLISTA_CLIENT_USE_TLS, use_tls)
-        } else {
-            self.with_option_extension(BallistaConfig::default())
-                .set_bool(BALLISTA_CLIENT_USE_TLS, use_tls)
-        }
+        self.with_extension(Arc::new(BallistaUseTls(use_tls)))
     }
 
     fn ballista_use_tls(&self) -> bool {
+        self.get_extension::<BallistaUseTls>()
+            .map(|ext| ext.0)
+            .unwrap_or(false)
+    }
+
+    fn ballista_shuffle_storage_type(&self) -> String {
         self.options()
             .extensions
             .get::<BallistaConfig>()
-            .map(|c| c.client_use_tls())
-            .unwrap_or_else(|| BallistaConfig::default().client_use_tls())
+            .map(|c| c.shuffle_storage_type())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_storage_type())
     }
 
-    fn ballista_coalesce_enabled(&self) -> bool {
-        self.options()
-            .extensions
-            .get::<BallistaConfig>()
-            .map(|c| c.coalesce_enabled())
-            .unwrap_or_else(|| BallistaConfig::default().coalesce_enabled())
-    }
-
-    fn with_ballista_coalesce_enabled(self, enabled: bool) -> Self {
+    fn with_ballista_shuffle_storage_type(self, storage_type: &str) -> Self {
         if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_bool(BALLISTA_COALESCE_ENABLED, enabled)
+            self.set_str(BALLISTA_SHUFFLE_STORAGE_TYPE, storage_type)
         } else {
             self.with_option_extension(BallistaConfig::default())
-                .set_bool(BALLISTA_COALESCE_ENABLED, enabled)
+                .set_str(BALLISTA_SHUFFLE_STORAGE_TYPE, storage_type)
         }
     }
 
-    fn ballista_coalesce_target_partition_bytes(&self) -> u64 {
+    fn ballista_shuffle_storage_url(&self) -> Option<String> {
         self.options()
             .extensions
             .get::<BallistaConfig>()
-            .map(|c| c.coalesce_target_partition_bytes())
-            .unwrap_or_else(|| {
-                BallistaConfig::default().coalesce_target_partition_bytes()
-            })
+            .and_then(|c| c.shuffle_storage_url())
     }
 
-    fn with_ballista_coalesce_target_partition_bytes(self, bytes: u64) -> Self {
+    fn with_ballista_shuffle_storage_url(self, url: &str) -> Self {
         if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_usize(BALLISTA_COALESCE_TARGET_PARTITION_BYTES, bytes as usize)
+            self.set_str(BALLISTA_SHUFFLE_STORAGE_URL, url)
         } else {
             self.with_option_extension(BallistaConfig::default())
-                .set_usize(BALLISTA_COALESCE_TARGET_PARTITION_BYTES, bytes as usize)
+                .set_str(BALLISTA_SHUFFLE_STORAGE_URL, url)
         }
     }
 
-    fn ballista_coalesce_small_partition_factor(&self) -> f64 {
+    fn ballista_shuffle_format(&self) -> ShuffleFormat {
         self.options()
             .extensions
             .get::<BallistaConfig>()
-            .map(|c| c.coalesce_small_partition_factor())
-            .unwrap_or_else(|| {
-                BallistaConfig::default().coalesce_small_partition_factor()
-            })
+            .map(|c| c.shuffle_format())
+            .unwrap_or_else(|| BallistaConfig::default().shuffle_format())
     }
 
-    // f64 setter — uses set_str because SessionConfig has no set_f64 in this
-    // workspace; the stored string is round-tripped via f64::to_string() /
-    // f64::from_str(), mirroring the `with_ballista_job_name` set_str pattern.
-    fn with_ballista_coalesce_small_partition_factor(self, factor: f64) -> Self {
-        let s = factor.to_string();
+    fn with_ballista_shuffle_format(self, format: ShuffleFormat) -> Self {
         if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_str(BALLISTA_COALESCE_SMALL_PARTITION_FACTOR, &s)
+            self.set_str(BALLISTA_SHUFFLE_FORMAT, &format.to_string())
         } else {
             self.with_option_extension(BallistaConfig::default())
-                .set_str(BALLISTA_COALESCE_SMALL_PARTITION_FACTOR, &s)
+                .set_str(BALLISTA_SHUFFLE_FORMAT, &format.to_string())
         }
     }
 
-    fn ballista_coalesce_merged_partition_factor(&self) -> f64 {
-        self.options()
-            .extensions
-            .get::<BallistaConfig>()
-            .map(|c| c.coalesce_merged_partition_factor())
-            .unwrap_or_else(|| {
-                BallistaConfig::default().coalesce_merged_partition_factor()
-            })
+    fn with_ballista_shuffle_read_metrics_callback(
+        self,
+        callback: Arc<dyn ShuffleReadMetricsCallback>,
+    ) -> Self {
+        let extension = ShuffleReadMetricsCallbackExtension::new(callback);
+        self.with_extension(Arc::new(extension))
     }
 
-    fn with_ballista_coalesce_merged_partition_factor(self, factor: f64) -> Self {
-        let s = factor.to_string();
-        if self.options().extensions.get::<BallistaConfig>().is_some() {
-            self.set_str(BALLISTA_COALESCE_MERGED_PARTITION_FACTOR, &s)
-        } else {
-            self.with_option_extension(BallistaConfig::default())
-                .set_str(BALLISTA_COALESCE_MERGED_PARTITION_FACTOR, &s)
-        }
+    fn ballista_shuffle_read_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ShuffleReadMetricsCallback>> {
+        self.get_extension::<ShuffleReadMetricsCallbackExtension>()
+            .map(|ext| ext.callback())
+    }
+
+    fn with_ballista_result_fetch_metrics_callback(
+        self,
+        callback: Arc<dyn ResultFetchMetricsCallback>,
+    ) -> Self {
+        let extension = ResultFetchMetricsCallbackExtension::new(callback);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_result_fetch_metrics_callback(
+        &self,
+    ) -> Option<Arc<dyn ResultFetchMetricsCallback>> {
+        self.get_extension::<ResultFetchMetricsCallbackExtension>()
+            .map(|ext| ext.callback())
     }
 }
 
@@ -773,15 +821,6 @@ impl SessionConfigHelperExt for SessionConfig {
                 "datafusion.optimizer.hash_join_single_partition_threshold_rows",
                 0,
             )
-            //
-            // DataFusion's hash join has no spill support, so each parallel
-            // task on an executor must hold the full build side in memory.
-            // Default to sort-merge join, which spills, until DataFusion gains
-            // a spilling hash join. Users can opt back in with
-            // `SET datafusion.optimizer.prefer_hash_join = true`.
-            //
-            // See https://github.com/apache/datafusion-ballista/issues/1648
-            .set_bool("datafusion.optimizer.prefer_hash_join", false)
     }
 }
 
@@ -891,6 +930,137 @@ impl BallistaConfigGrpcEndpoint {
     }
 }
 
+/// Wrapper for cluster-wide TLS configuration
+#[derive(Clone, Copy)]
+pub struct BallistaUseTls(pub bool);
+
+/// Callback trait for recording shuffle read metrics from the shuffle reader.
+///
+/// This trait is designed to be passed via session config extension to the
+/// shuffle reader, allowing external systems (like Spice) to capture detailed
+/// shuffle read locality metrics without creating circular dependencies.
+pub trait ShuffleReadMetricsCallback: Send + Sync {
+    /// Record a local shuffle read operation.
+    ///
+    /// Called when the shuffle reader successfully reads data from a local file
+    /// (i.e., the partition was produced by this executor).
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The stage that is reading the shuffle data
+    /// * `partition` - The partition being read
+    /// * `source_executor_id` - The executor that produced the shuffle data (same as current executor for local reads)
+    /// * `bytes` - Number of bytes read
+    /// * `rows` - Number of rows read
+    /// * `duration_ms` - Time taken to read the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_local_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+
+    /// Record a remote shuffle read operation.
+    ///
+    /// Called when the shuffle reader fetches data from a remote executor
+    /// via Arrow Flight.
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The stage that is reading the shuffle data
+    /// * `partition` - The partition being read
+    /// * `source_executor_id` - The executor that produced the shuffle data
+    /// * `bytes` - Number of bytes read
+    /// * `rows` - Number of rows read
+    /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_remote_read(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+}
+
+/// Session config extension wrapper for the shuffle read metrics callback.
+#[derive(Clone)]
+pub struct ShuffleReadMetricsCallbackExtension {
+    callback: Arc<dyn ShuffleReadMetricsCallback>,
+}
+
+impl ShuffleReadMetricsCallbackExtension {
+    /// Create a new extension wrapping the provided callback.
+    pub fn new(callback: Arc<dyn ShuffleReadMetricsCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Get the callback.
+    pub fn callback(&self) -> Arc<dyn ShuffleReadMetricsCallback> {
+        Arc::clone(&self.callback)
+    }
+}
+
+/// Callback trait for recording result fetch metrics from distributed query execution.
+///
+/// This trait is designed to be passed via session config extension to the
+/// `DistributedQueryExec`, allowing external systems (like Spice) to capture detailed
+/// metrics about fetching final query results from executors.
+///
+/// Note: Result fetching is always "remote" from the client's perspective since
+/// the client (scheduler in Spice's case) always fetches from executors over the network.
+pub trait ResultFetchMetricsCallback: Send + Sync {
+    /// Record a result fetch operation from an executor.
+    ///
+    /// Called when the client successfully fetches final query result data from an executor.
+    ///
+    /// # Arguments
+    /// * `job_id` - The job identifier
+    /// * `stage_id` - The final stage that produced the results
+    /// * `partition` - The partition being fetched
+    /// * `source_executor_id` - The executor that produced the result data
+    /// * `bytes` - Number of bytes fetched
+    /// * `rows` - Number of rows fetched
+    /// * `duration_ms` - Time taken to fetch the partition
+    #[allow(clippy::too_many_arguments)]
+    fn record_result_fetch(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        partition: usize,
+        source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    );
+}
+
+/// Session config extension wrapper for the result fetch metrics callback.
+#[derive(Clone)]
+pub struct ResultFetchMetricsCallbackExtension {
+    callback: Arc<dyn ResultFetchMetricsCallback>,
+}
+
+impl ResultFetchMetricsCallbackExtension {
+    /// Create a new extension wrapping the provided callback.
+    pub fn new(callback: Arc<dyn ResultFetchMetricsCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Get the callback.
+    pub fn callback(&self) -> Arc<dyn ResultFetchMetricsCallback> {
+        Arc::clone(&self.callback)
+    }
+}
+
 #[derive(Debug)]
 struct BallistaCacheFactory;
 
@@ -997,7 +1167,7 @@ mod test {
     };
 
     use crate::{
-        config::BALLISTA_JOB_NAME,
+        config::{BALLISTA_JOB_NAME, BallistaConfig},
         extension::{SessionConfigExt, SessionConfigHelperExt, SessionStateExt},
     };
 
@@ -1032,6 +1202,85 @@ mod test {
                 .iter()
                 .any(|p| p.key == "datafusion.catalog.information_schema")
         )
+    }
+
+    #[test]
+    fn test_is_final_stage_config() {
+        // Default should be false
+        let config = SessionConfig::new_with_ballista();
+        assert!(!config.ballista_is_final_stage());
+
+        // Set to true
+        let config = config.with_ballista_is_final_stage(true);
+        assert!(config.ballista_is_final_stage());
+
+        // Set back to false
+        let config = config.with_ballista_is_final_stage(false);
+        assert!(!config.ballista_is_final_stage());
+    }
+
+    #[test]
+    fn test_shuffle_memory_mode_config() {
+        // Default should be false (disk-based)
+        let config = SessionConfig::new_with_ballista();
+        assert!(!config.ballista_shuffle_memory_mode());
+
+        // Enable memory mode
+        let config = config.with_ballista_shuffle_memory_mode(true);
+        assert!(config.ballista_shuffle_memory_mode());
+
+        // Disable memory mode
+        let config = config.with_ballista_shuffle_memory_mode(false);
+        assert!(!config.ballista_shuffle_memory_mode());
+    }
+
+    #[test]
+    fn test_shuffle_format_config() {
+        use crate::config::ShuffleFormat;
+
+        // Default should be ArrowIpc
+        let config = SessionConfig::new_with_ballista();
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::ArrowIpc);
+
+        // Set to Vortex
+        let config = config.with_ballista_shuffle_format(ShuffleFormat::Vortex);
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::Vortex);
+
+        // Set back to ArrowIpc
+        let config = config.with_ballista_shuffle_format(ShuffleFormat::ArrowIpc);
+        assert_eq!(config.ballista_shuffle_format(), ShuffleFormat::ArrowIpc);
+    }
+
+    #[test]
+    fn test_is_final_stage_internal_setting() {
+        // Test that is_final_stage is properly stored in BallistaConfig
+        let config =
+            SessionConfig::new_with_ballista().with_ballista_is_final_stage(true);
+
+        // Verify via the getter
+        assert!(config.ballista_is_final_stage());
+
+        // Verify the internal BallistaConfig has the setting
+        let ballista_config = config
+            .options()
+            .extensions
+            .get::<BallistaConfig>()
+            .expect("BallistaConfig should exist");
+        assert!(ballista_config.is_final_stage());
+    }
+
+    #[test]
+    fn test_config_without_ballista_extension() {
+        // Test that methods work even without explicit ballista extension
+        let config = SessionConfig::new();
+
+        // Should return defaults
+        assert!(!config.ballista_is_final_stage());
+        assert!(!config.ballista_shuffle_memory_mode());
+
+        // Should be able to set values (which adds the extension)
+        let config = config.with_ballista_is_final_stage(true);
+        assert!(config.ballista_is_final_stage());
     }
 
     #[test]

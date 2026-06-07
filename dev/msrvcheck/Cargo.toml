@@ -17,8 +17,8 @@
 
 # MSRV checker for upstream DataFusion
 [package]
-name = "msrvcheck"
 edition = "2024"
+name = "msrvcheck"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

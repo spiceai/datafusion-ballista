@@ -16,31 +16,33 @@
 # under the License.
 
 [package]
-name = "ballista"
-description = "Ballista Distributed Compute"
-license = "Apache-2.0"
-version = "53.0.0"
-homepage = "https://datafusion.apache.org/ballista/"
-repository = "https://github.com/apache/datafusion-ballista"
-readme = "README.md"
 authors = ["Apache DataFusion <dev@datafusion.apache.org>"]
+description = "Ballista Distributed Compute"
 edition = { workspace = true }
+homepage = "https://datafusion.apache.org/ballista/"
+license = "Apache-2.0"
+name = "ballista"
+readme = "README.md"
+repository = "https://github.com/apache/datafusion-ballista"
 rust-version = { workspace = true }
+version = "52.0.0"
 
 [dependencies]
 async-trait = { workspace = true }
-ballista-core = { path = "../core", version = "53.0.0" }
-ballista-executor = { path = "../executor", version = "53.0.0", optional = true }
-ballista-scheduler = { path = "../scheduler", version = "53.0.0", optional = true }
+ballista-core = { path = "../core", version = "52.0.0" }
+ballista-executor = { path = "../executor", version = "52.0.0", optional = true }
+ballista-scheduler = { path = "../scheduler", version = "52.0.0", optional = true }
 datafusion = { workspace = true }
 log = { workspace = true }
+object_store = { workspace = true }
 
 tokio = { workspace = true }
+tonic = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-ballista-executor = { path = "../executor", version = "53.0.0" }
-ballista-scheduler = { path = "../scheduler", version = "53.0.0" }
+ballista-executor = { path = "../executor", version = "52.0.0" }
+ballista-scheduler = { path = "../scheduler", version = "52.0.0" }
 ctor = { workspace = true }
 datafusion-proto = { workspace = true }
 env_logger = { workspace = true }
@@ -51,6 +53,4 @@ tonic = { workspace = true }
 [features]
 default = ["standalone"]
 standalone = ["ballista-executor", "ballista-scheduler"]
-# tests which need change of RUST_MIN_STACK in order for 
-# tests to run. 
 test_extended_stack = []

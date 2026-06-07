@@ -27,12 +27,31 @@
 
 use crate::SessionBuilder;
 use crate::cluster::DistributionPolicy;
+use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::extension::EndpointOverrideFn;
 use ballista_core::{ConfigProducer, config::TaskSchedulingPolicy};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use std::fmt::Display;
 use std::sync::Arc;
+
+/// Callback invoked when new work becomes available for executors.
+///
+/// This is called after:
+/// - A job is submitted and tasks are ready to be scheduled
+/// - Tasks complete and new stages become runnable
+///
+/// This allows external systems to notify executors to poll immediately
+/// rather than waiting for their next poll interval.
+pub type OnWorkAvailableFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Callback invoked when running tasks should be cancelled on an executor.
+///
+/// Arguments are:
+/// - executor_id
+/// - running tasks to cancel on that executor
+pub type OnCancelTasksFn =
+    Arc<dyn Fn(&str, Vec<crate::state::execution_graph::RunningTaskInfo>) + Send + Sync>;
 
 /// Command-line configuration for the scheduler binary.
 #[cfg(feature = "build-binary")]
@@ -48,55 +67,72 @@ pub struct Config {
     )]
     pub advertise_flight_sql_endpoint: Option<String>,
     /// Namespace for the ballista cluster.
-    #[arg(short = 'n', long, default_value_t = String::from("ballista"), help = "Namespace for the ballista cluster that this executor will join.")]
+    #[arg(short = 'n', long, default_value_t = String::from("ballista"), help = "Namespace for the ballista cluster that this executor will join. Default: ballista")]
     pub namespace: String,
     /// Local host name or IP address to bind to.
-    #[arg(long, default_value_t = String::from("0.0.0.0"), help = "Local host name or IP address to bind to.")]
+    #[arg(long, default_value_t = String::from("0.0.0.0"), help = "Local host name or IP address to bind to. Default: 0.0.0.0")]
     pub bind_host: String,
     /// External host name for executors to connect to.
-    #[arg(long, default_value_t = String::from("localhost"), help = "Host name or IP address so that executors can connect to this scheduler.")]
+    #[arg(long, default_value_t = String::from("localhost"), help = "Host name or IP address so that executors can connect to this scheduler. Default: localhost")]
     pub external_host: String,
     /// Port to bind the scheduler gRPC service.
     #[arg(
         short = 'p',
         long,
         default_value_t = 50050,
-        help = "Scheduler bind port."
+        help = "bind port. Default: 50050"
     )]
     pub bind_port: u16,
     /// Task scheduling policy (pull-staged or push-staged).
     #[arg(
         short = 's',
         long,
-        default_value_t = ballista_core::config::TaskSchedulingPolicy::default(),
-        help = "The scheduling policy used by the scheduler. Executor configuration must match with scheduler configured policy."
+        default_value_t = ballista_core::config::TaskSchedulingPolicy::PushStaged,
+        help = "The scheduling policy for the scheduler, possible values: pull-staged, push-staged. Default: pull-staged"
     )]
     pub scheduler_policy: ballista_core::config::TaskSchedulingPolicy,
     /// Event loop buffer size for high throughput systems.
-    #[arg(long, default_value_t = 1000, help = "Event loop buffer size. ")]
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Event loop buffer size. Default: 10000"
+    )]
     pub event_loop_buffer_size: u32,
     /// Interval in seconds for cleaning up finished job data.
     #[arg(
         long,
         default_value_t = 300,
-        help = "Delayed interval for cleaning up finished job data."
+        help = "Delayed interval for cleaning up finished job data. Default: 300"
     )]
     pub finished_job_data_clean_up_interval_seconds: u64,
     /// Interval in seconds for cleaning up finished job state.
     #[arg(
         long,
         default_value_t = 3600,
-        help = "Delayed interval for cleaning up finished job state."
+        help = "Delayed interval for cleaning up finished job state. Default: 3600"
     )]
     pub finished_job_state_clean_up_interval_seconds: u64,
     /// Task distribution policy (bias, round-robin, consistent-hash).
     #[arg(
         long,
-        default_value_t = crate::config::TaskDistribution::default(),
-        help = "The policy of distributing tasks to available executor slots."
+        default_value_t = crate::config::TaskDistribution::Bias,
+        help = "The policy of distributing tasks to available executor slots, possible values: bias, round-robin, consistent-hash. Default: bias"
     )]
     pub task_distribution: crate::config::TaskDistribution,
-
+    /// Replica count per node for consistent hashing.
+    #[arg(
+        long,
+        default_value_t = 31,
+        help = "Replica number of each node for the consistent hashing. Default: 31"
+    )]
+    pub consistent_hash_num_replicas: u32,
+    /// Tolerance for consistent hashing task scheduling.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Tolerance of the consistent hashing policy for task scheduling. Default: 0"
+    )]
+    pub consistent_hash_tolerance: u32,
     /// Directory path for log files.
     #[arg(
         long,
@@ -114,28 +150,28 @@ pub struct Config {
     #[arg(
         long,
         default_value_t = String::from("INFO,datafusion=INFO"),
-        help = "special log level for sub mod. link: https://docs.rs/env_logger/latest/env_logger/#enabling-logging. For example we want whole level is INFO but datafusion mode is DEBUG."
+        help = "special log level for sub mod. link: https://docs.rs/env_logger/latest/env_logger/#enabling-logging. For example we want whole level is INFO but datafusion mode is DEBUG"
     )]
     pub log_level_setting: String,
     /// Log rotation policy (minutely, hourly, daily, never).
     #[arg(
         long,
         default_value_t = ballista_core::config::LogRotationPolicy::Daily,
-        help = "Tracing log rotation policy"
+        help = "Tracing log rotation policy, possible values: minutely, hourly, daily, never. Default: daily"
     )]
     pub log_rotation_policy: ballista_core::config::LogRotationPolicy,
     /// Interval in ms to wait before resubmitting unscheduled jobs.
     #[arg(
         long,
         default_value_t = 0,
-        help = "If job is not able to be scheduled on submission, wait for this interval and resubmit. Default value of 0 indicates that job should not be resubmitted."
+        help = "If job is not able to be scheduled on submission, wait for this interval and resubmit. Default value of 0 indicates that job should not be resubmitted"
     )]
     pub job_resubmit_interval_ms: u64,
     /// Grace period in seconds for executor termination.
     #[arg(
         long,
         default_value_t = 30,
-        help = "Time in seconds an executor should be considered lost after it enters terminating status."
+        help = "Time in seconds an executor should be considered lost after it enters terminating status"
     )]
     pub executor_termination_grace_period: u64,
     /// Expected processing time for scheduler events in microseconds.
@@ -149,52 +185,30 @@ pub struct Config {
     #[arg(
         long,
         default_value_t = 16777216,
-        help = "The maximum size of a decoded message at the grpc server side."
+        help = "The maximum size of a decoded message at the grpc server side. Default: 16MB"
     )]
     pub grpc_server_max_decoding_message_size: u32,
     /// Maximum size of encoded gRPC messages.
     #[arg(
         long,
         default_value_t = 16777216,
-        help = "The maximum size of an encoded message at the grpc server side."
+        help = "The maximum size of an encoded message at the grpc server side. Default: 16MB"
     )]
     pub grpc_server_max_encoding_message_size: u32,
     /// Timeout in seconds before marking an executor as dead.
     #[arg(
         long,
         default_value_t = 180,
-        help = "The executor timeout in seconds. It should be longer than executor's heartbeat intervals. Only after missing two or tree consecutive heartbeats from a executor, the executor is mark to be dead."
+        help = "The executor timeout in seconds. It should be longer than executor's heartbeat intervals. Only after missing two or tree consecutive heartbeats from a executor, the executor is mark to be dead"
     )]
     pub executor_timeout_seconds: u64,
     /// Interval in seconds to check for dead executors.
     #[arg(
         long,
         default_value_t = 15,
-        help = "Interval, in seconds, to check expired or dead executors."
+        help = "The interval to check expired or dead executors"
     )]
     pub expire_dead_executor_interval_seconds: u64,
-    /// Number of failures attempts before task is considered failed
-    #[arg(
-        long,
-        default_value_t = 4,
-        help = "Number of attempts before task is considered failed."
-    )]
-    pub task_max_failures: usize,
-    /// Number of failures attempts before stage is considered failed
-    #[arg(
-        long,
-        default_value_t = 4,
-        help = "Number of attempts before stage is considered failed."
-    )]
-    pub stage_max_failures: usize,
-    #[cfg(feature = "rest-api")]
-    /// Should the rest api be disabled
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Should the REST API be disabled"
-    )]
-    pub disable_rest_api: bool,
 }
 
 /// Configurations for the ballista scheduler of scheduling jobs and tasks
@@ -237,6 +251,7 @@ pub struct SchedulerConfig {
     pub executor_timeout_seconds: u64,
     /// The interval to check expired or dead executors
     pub expire_dead_executor_interval_seconds: u64,
+
     /// [ConfigProducer] override option
     pub override_config_producer: Option<ConfigProducer>,
     /// [SessionBuilder] override option
@@ -247,15 +262,15 @@ pub struct SchedulerConfig {
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// Override function for customizing gRPC client endpoints before they are used
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// [SchedulerMetricsCollector] override option
+    pub override_metrics_collector: Option<Arc<dyn SchedulerMetricsCollector>>,
+    /// Callback invoked when new work becomes available for executors.
+    /// The string argument is a reason/description for debugging purposes.
+    pub on_work_available: Option<OnWorkAvailableFn>,
+    /// Callback invoked when running tasks should be cancelled on an executor.
+    pub on_cancel_tasks: Option<OnCancelTasksFn>,
     /// Whether to use TLS when connecting to executors (for flight proxy)
     pub use_tls: bool,
-    /// Number of failures attempts before task is considered failed
-    pub task_max_failures: usize,
-    /// Number of failures attempts before stage is considered failed
-    pub stage_max_failures: usize,
-    #[cfg(feature = "rest-api")]
-    /// Should the rest api be disabled
-    pub disable_rest_api: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -283,11 +298,10 @@ impl Default for SchedulerConfig {
             override_logical_codec: None,
             override_physical_codec: None,
             override_create_grpc_client_endpoint: None,
+            override_metrics_collector: None,
+            on_work_available: None,
+            on_cancel_tasks: None,
             use_tls: false,
-            task_max_failures: 4,
-            stage_max_failures: 4,
-            #[cfg(feature = "rest-api")]
-            disable_rest_api: false,
         }
     }
 }
@@ -418,6 +432,15 @@ impl SchedulerConfig {
         self
     }
 
+    /// Sets a custom metrics collector.
+    pub fn with_override_metrics_collector(
+        mut self,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+    ) -> Self {
+        self.override_metrics_collector = Some(metrics_collector);
+        self
+    }
+
     /// Sets whether TLS should be used when connecting to executors (for flight proxy).
     pub fn with_use_tls(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
@@ -427,16 +450,20 @@ impl SchedulerConfig {
 
 /// Policy of distributing tasks to available executor slots
 ///
-#[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum TaskDistribution {
     /// Eagerly assign tasks to executor slots. This will assign as many task slots per executor
     /// as are currently available
-    #[default]
     Bias,
     /// Distribute tasks evenly across executors. This will try and iterate through available executors
     /// and assign one task to each executor until all tasks are assigned.
     RoundRobin,
+    /// 1. Firstly, try to bind tasks without scanning source files by `RoundRobin` policy.
+    /// 2. Then for a task for scanning source files, firstly calculate a hash value based on input files.
+    ///    And then bind it with an execute according to consistent hashing policy.
+    /// 3. If needed, work stealing can be enabled based on the tolerance of the consistent hashing.
+    ConsistentHash,
 }
 
 impl Display for TaskDistribution {
@@ -444,6 +471,7 @@ impl Display for TaskDistribution {
         match self {
             TaskDistribution::Bias => f.write_str("bias"),
             TaskDistribution::RoundRobin => f.write_str("round-robin"),
+            TaskDistribution::ConsistentHash => f.write_str("consistent-hash"),
         }
     }
 }
@@ -467,6 +495,16 @@ pub enum TaskDistributionPolicy {
     /// Distribute tasks evenly across executors. This will try and iterate through available executors
     /// and assign one task to each executor until all tasks are assigned.
     RoundRobin,
+    /// 1. Firstly, try to bind tasks without scanning source files by `RoundRobin` policy.
+    /// 2. Then for a task for scanning source files, firstly calculate a hash value based on input files.
+    ///    And then bind it with an execute according to consistent hashing policy.
+    /// 3. If needed, work stealing can be enabled based on the tolerance of the consistent hashing.
+    ConsistentHash {
+        /// Number of virtual nodes per executor on the consistent hash ring.
+        num_replicas: usize,
+        /// Tolerance for work stealing when slots are imbalanced.
+        tolerance: usize,
+    },
     /// User provided task distribution policy
     Custom(Arc<dyn DistributionPolicy>),
 }
@@ -479,6 +517,14 @@ impl TryFrom<Config> for SchedulerConfig {
         let task_distribution = match opt.task_distribution {
             TaskDistribution::Bias => TaskDistributionPolicy::Bias,
             TaskDistribution::RoundRobin => TaskDistributionPolicy::RoundRobin,
+            TaskDistribution::ConsistentHash => {
+                let num_replicas = opt.consistent_hash_num_replicas as usize;
+                let tolerance = opt.consistent_hash_tolerance as usize;
+                TaskDistributionPolicy::ConsistentHash {
+                    num_replicas,
+                    tolerance,
+                }
+            }
         };
 
         let config = SchedulerConfig {
@@ -511,11 +557,10 @@ impl TryFrom<Config> for SchedulerConfig {
             override_physical_codec: None,
             override_session_builder: None,
             override_create_grpc_client_endpoint: None,
+            override_metrics_collector: None,
+            on_work_available: None,
+            on_cancel_tasks: None,
             use_tls: false,
-            task_max_failures: opt.task_max_failures,
-            stage_max_failures: opt.stage_max_failures,
-            #[cfg(feature = "rest-api")]
-            disable_rest_api: opt.disable_rest_api,
         };
 
         Ok(config)

@@ -17,7 +17,9 @@
 
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
-use crate::extension::{BallistaConfigGrpcEndpoint, SessionConfigExt};
+use crate::extension::{
+    BallistaConfigGrpcEndpoint, ResultFetchMetricsCallback, SessionConfigExt,
+};
 use crate::serde::protobuf::get_job_status_result::FlightProxy;
 use crate::serde::protobuf::{
     ExecuteQueryParams, GetJobStatusParams, GetJobStatusResult, KeyValuePair,
@@ -39,7 +41,7 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use datafusion::prelude::SessionConfig;
 use datafusion_proto::logical_plan::{
@@ -47,7 +49,6 @@ use datafusion_proto::logical_plan::{
 };
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, error, info};
-use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -83,8 +84,6 @@ pub struct DistributedQueryExec<T: 'static + AsLogicalPlan> {
     /// - job_execution_time_ms: Time spent executing on the cluster (ended_at - started_at)
     /// - job_scheduling_in_ms: Time job waited in scheduler queue (started_at - queued_at)
     metrics: ExecutionPlanMetricsSet,
-    /// The scheduler job id after the query has been accepted.
-    job_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
@@ -95,9 +94,8 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
         plan: LogicalPlan,
         session_id: String,
     ) -> Self {
-        let properties = Arc::new(Self::compute_properties(
-            plan.schema().as_arrow().clone().into(),
-        ));
+        let properties =
+            Self::compute_properties(plan.schema().as_arrow().clone().into());
         Self {
             scheduler_url,
             config,
@@ -107,7 +105,6 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            job_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -119,9 +116,8 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
         extension_codec: Arc<dyn LogicalExtensionCodec>,
         session_id: String,
     ) -> Self {
-        let properties = Arc::new(Self::compute_properties(
-            plan.schema().as_arrow().clone().into(),
-        ));
+        let properties =
+            Self::compute_properties(plan.schema().as_arrow().clone().into());
         Self {
             scheduler_url,
             config,
@@ -131,22 +127,16 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            job_id: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Returns the scheduler job id after the query has been accepted.
-    pub fn job_id(&self) -> Option<String> {
-        self.job_id.lock().clone()
-    }
-
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
-        PlanProperties::new(
+    fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        )
+        ))
     }
 }
 
@@ -203,11 +193,10 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
             extension_codec: self.extension_codec.clone(),
             plan_repr: self.plan_repr,
             session_id: self.session_id.clone(),
-            properties: Arc::new(Self::compute_properties(
+            properties: Self::compute_properties(
                 self.plan.schema().as_arrow().clone().into(),
-            )),
+            ),
             metrics: ExecutionPlanMetricsSet::new(),
-            job_id: Arc::clone(&self.job_id),
         }))
     }
 
@@ -266,10 +255,9 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                     self.scheduler_url.clone(),
                     self.session_id.clone(),
                     query,
-                    self.config.grpc_client_max_message_size(),
+                    self.config.default_grpc_client_max_message_size(),
                     GrpcClientConfig::from(&self.config),
                     Arc::new(self.metrics.clone()),
-                    Arc::clone(&self.job_id),
                     partition,
                     session_config,
                 )
@@ -294,10 +282,9 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 execute_query_push(
                     self.scheduler_url.clone(),
                     query,
-                    self.config.grpc_client_max_message_size(),
+                    self.config.default_grpc_client_max_message_size(),
                     GrpcClientConfig::from(&self.config),
                     Arc::new(self.metrics.clone()),
-                    Arc::clone(&self.job_id),
                     partition,
                     session_config,
                 )
@@ -320,6 +307,13 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         }
     }
 
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        // This execution plan sends the logical plan to the scheduler without
+        // performing the node by node conversion to a full physical plan.
+        // This implies that we cannot infer the statistics at this stage.
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -336,7 +330,6 @@ async fn execute_query_pull(
     max_message_size: usize,
     grpc_config: GrpcClientConfig,
     metrics: Arc<ExecutionPlanMetricsSet>,
-    job_id_handle: Arc<Mutex<Option<String>>>,
     partition: usize,
     session_config: SessionConfig,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
@@ -344,8 +337,7 @@ async fn execute_query_pull(
     let customize_endpoint =
         session_config.ballista_override_create_grpc_client_endpoint();
     let use_tls = session_config.ballista_use_tls();
-    let io_retries_times = grpc_config.io_retries_times;
-    let io_retry_wait_time_ms = grpc_config.io_retry_wait_time_ms;
+    let result_fetch_callback = session_config.ballista_result_fetch_metrics_callback();
 
     // Capture query submission time for total_query_time_ms
     let query_start_time = std::time::Instant::now();
@@ -395,7 +387,6 @@ async fn execute_query_pull(
     );
 
     let job_id = query_result.job_id;
-    *job_id_handle.lock() = Some(job_id.clone());
     let mut prev_status: Option<job_status::Status> = None;
 
     loop {
@@ -478,6 +469,7 @@ async fn execute_query_pull(
                 // This could be added in a future enhancement by wrapping the stream.
 
                 let streams = partition_location.into_iter().map(move |partition| {
+                    let callback = result_fetch_callback.clone();
                     let f = fetch_partition(
                         partition,
                         max_message_size,
@@ -486,8 +478,7 @@ async fn execute_query_pull(
                         flight_proxy.clone(),
                         customize_endpoint.clone(),
                         use_tls,
-                        io_retries_times,
-                        io_retry_wait_time_ms,
+                        callback,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
@@ -509,7 +500,6 @@ async fn execute_query_push(
     max_message_size: usize,
     grpc_config: GrpcClientConfig,
     metrics: Arc<ExecutionPlanMetricsSet>,
-    job_id_handle: Arc<Mutex<Option<String>>>,
     partition: usize,
     session_config: SessionConfig,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
@@ -517,8 +507,7 @@ async fn execute_query_push(
     let customize_endpoint =
         session_config.ballista_override_create_grpc_client_endpoint();
     let use_tls = session_config.ballista_use_tls();
-    let io_retries_times = grpc_config.io_retries_times;
-    let io_retry_wait_time_ms = grpc_config.io_retry_wait_time_ms;
+    let result_fetch_callback = session_config.ballista_result_fetch_metrics_callback();
 
     // Capture query submission time for total_query_time_ms
     let query_start_time = std::time::Instant::now();
@@ -572,12 +561,6 @@ async fn execute_query_push(
             .as_ref()
             .map(|s| s.job_id.to_owned())
             .unwrap_or("unknown_job_id".to_string()); // should not happen
-        if !job_id.starts_with("unknown_") {
-            let mut shared_job_id = job_id_handle.lock();
-            if shared_job_id.is_none() {
-                *shared_job_id = Some(job_id.clone());
-            }
-        }
         let status = status.and_then(|s| s.status);
         let has_status_change = prev_status != status;
         match status {
@@ -643,6 +626,7 @@ async fn execute_query_push(
                 // This could be added in a future enhancement by wrapping the stream.
 
                 let streams = partition_location.into_iter().map(move |partition| {
+                    let callback = result_fetch_callback.clone();
                     let f = fetch_partition(
                         partition,
                         max_message_size,
@@ -651,8 +635,7 @@ async fn execute_query_push(
                         flight_proxy.clone(),
                         customize_endpoint.clone(),
                         use_tls,
-                        io_retries_times,
-                        io_retry_wait_time_ms,
+                        callback,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
 
@@ -709,6 +692,7 @@ fn get_client_host_port(
         }
     }
 }
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_partition(
     location: PartitionLocation,
@@ -718,9 +702,10 @@ async fn fetch_partition(
     flight_proxy: Option<FlightProxy>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
-    io_retries_times: u8,
-    io_retry_wait_time_ms: u64,
+    metrics_callback: Option<Arc<dyn ResultFetchMetricsCallback>>,
 ) -> Result<SendableRecordBatchStream> {
+    let start_time = std::time::Instant::now();
+
     let metadata = location.executor_meta.ok_or_else(|| {
         DataFusionError::Internal("Received empty executor metadata".to_owned())
     })?;
@@ -728,6 +713,19 @@ async fn fetch_partition(
     let partition_id = location.partition_id.ok_or_else(|| {
         DataFusionError::Internal("Received empty partition id".to_owned())
     })?;
+
+    // Extract stats before consuming location
+    let stats = location.partition_stats.as_ref();
+    #[expect(clippy::cast_sign_loss)]
+    let expected_bytes = stats.map(|s| s.num_bytes as u64).unwrap_or(0);
+    #[expect(clippy::cast_sign_loss)]
+    let expected_rows = stats.map(|s| s.num_rows as u64).unwrap_or(0);
+
+    let job_id = partition_id.job_id.clone();
+    let stage_id = partition_id.stage_id as usize;
+    let partition = partition_id.partition_id as usize;
+    let executor_id = metadata.id.clone();
+
     let host = metadata.host.as_str();
     let port = metadata.port as u16;
 
@@ -740,37 +738,44 @@ async fn fetch_partition(
         max_message_size,
         use_tls,
         customize_endpoint,
-        io_retries_times,
-        io_retry_wait_time_ms,
     )
     .await
     .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-    ballista_client
-        .fetch_partition_proxied(
+
+    let stream = ballista_client
+        .fetch_partition(
             &metadata.id,
             &partition_id.into(),
-            location.file_id,
-            location.is_sort_shuffle,
+            &location.path,
             host,
             port,
             flight_transport,
         )
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Record metrics after successful fetch
+    if let Some(callback) = metrics_callback {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        callback.record_result_fetch(
+            &job_id,
+            stage_id,
+            partition,
+            &executor_id,
+            expected_bytes,
+            expected_rows,
+            duration_ms,
+        );
+    }
+
+    Ok(stream)
 }
 
 #[cfg(test)]
 mod test {
-    use crate::config::BallistaConfig;
-    use crate::execution_plans::distributed_query::{
-        DistributedQueryExec, get_client_host_port,
-    };
+    use crate::execution_plans::distributed_query::get_client_host_port;
     use crate::serde::protobuf::ExecutorMetadata;
     use crate::serde::protobuf::get_job_status_result::FlightProxy;
-    use datafusion::logical_expr::LogicalPlan;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion_proto::protobuf::LogicalPlanNode;
-    use std::sync::Arc;
 
     #[test]
     fn test_client_host_port() {
@@ -784,7 +789,6 @@ mod test {
             port: 12345,
             grpc_port: 1,
             specification: None,
-            os_info: None,
         };
 
         // no flight proxy -> client should fetch results from executor
@@ -825,24 +829,5 @@ mod test {
             .unwrap(),
             ("proxy".to_string(), 1234_u16)
         );
-    }
-
-    #[test]
-    fn test_create_distributed_query_exec_with_job_id() {
-        let exec = Arc::new(DistributedQueryExec::<LogicalPlanNode>::new(
-            "http://scheduler:50050".to_string(),
-            BallistaConfig::default(),
-            LogicalPlan::default(),
-            "session".to_string(),
-        ));
-        *exec.job_id.lock() = Some("job-123".to_string());
-
-        let new_exec = exec.clone().with_new_children(vec![]).unwrap();
-        let new_exec = new_exec
-            .as_any()
-            .downcast_ref::<DistributedQueryExec<LogicalPlanNode>>()
-            .unwrap();
-
-        assert_eq!(new_exec.job_id().as_deref(), Some("job-123"));
     }
 }

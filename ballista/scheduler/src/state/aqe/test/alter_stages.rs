@@ -21,21 +21,21 @@ use crate::state::aqe::test::{
     mock_batch, mock_context, mock_partitions_with_statistics_no_data,
 };
 use ballista_core::serde::scheduler::{
-    ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
-    PartitionId, PartitionLocation, PartitionStats,
+    ExecutorMetadata, ExecutorSpecification, PartitionId, PartitionLocation,
+    PartitionStats,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, DataFusionError, JoinType, Statistics};
+use datafusion::common::{ColumnStatistics, DataFusionError, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::joins::{CrossJoinExec, HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::CrossJoinExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::test::exec::StatisticsExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use std::any::Any;
 use std::collections::HashSet;
@@ -60,7 +60,7 @@ async fn should_propagate_empty_stage() -> datafusion::error::Result<()> {
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ r"
-    SortShuffleWriterExec: partitioning=Hash([c@0], 2)
+    ShuffleWriterExec: partitioning: Hash([c@0], 2)
       AggregateExec: mode=Partial, gby=[c@2 as c], aggr=[min(t.a), max(t.b)]
         DataSourceExec: partitions=1, partition_sizes=[1]
     ");
@@ -86,24 +86,27 @@ async fn should_propagate_empty_stage() -> datafusion::error::Result<()> {
 #[tokio::test]
 async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<()> {
     //
-    // [stage 1] --------------------------------------------------------------------------------------------------
-    // AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=
+    // [stage 2] --------------------------------------------------------------------------------------------------
+    // AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=
     //   ProjectionExec: expr=[c0@0 as c0, count(Int64(1))@1 as count(*)]
     //     AggregateExec: mode=FinalPartitioned, gby=[c0@0 as c0], aggr=[count(Int64(1))]
-    //       RepartitionExec: partitioning=Hash([c0@0], 2), input_partitions=2  <- deferred, resolved after stage 0
-    //         AggregateExec: mode=Partial, gby=[c0@0 as c0], aggr=[count(Int64(1))]
-    //           ProjectionExec: expr=[min(t.a)@1 as c0]
-    //             AggregateExec: mode=FinalPartitioned, gby=[c@0 as c], aggr=[min(t.a)]
+    //       CoalesceBatchesExec: target_batch_size=8192
+    // [stage 1] --------------------------------------------------------------------------------------------------
+    //         ExchangeExec: partitioning=Hash([c0@0], 2), plan_id=1, stage_id=None, stage_resolved=false
+    //           AggregateExec: mode=Partial, gby=[c0@0 as c0], aggr=[count(Int64(1))]
+    //             ProjectionExec: expr=[min(t.a)@1 as c0]
+    //               AggregateExec: mode=FinalPartitioned, gby=[c@0 as c], aggr=[min(t.a)]
+    //                 CoalesceBatchesExec: target_batch_size=8192
     // [stage 0] --------------------------------------------------------------------------------------------------
-    //               ExchangeExec: partitioning=Hash([c@0], 2), plan_id=0, stage_id=None, stage_resolved=false
-    //                 AggregateExec: mode=Partial, gby=[c@1 as c], aggr=[min(t.a)]
-    //                   DataSourceExec: partitions=1, partition_sizes=[1]
+    //                    ExchangeExec: partitioning=Hash([c@0], 2), plan_id=0, stage_id=None, stage_resolved=false
+    //                      AggregateExec: mode=Partial, gby=[c@1 as c], aggr=[min(t.a)]
+    //                        DataSourceExec: partitions=1, partition_sizes=[1]
     // ------------------------------------------------------------------------------------------------------------
     //
     // test scenario:
     //
     // - stage 0 will produce empty shuffle files (no data)
-    // - this should trigger plan re-write, and the outer repartition is removed entirely
+    // - this should trigger plan re-write, and stage 1 should be totally removed
     // - result plan will produce empty output
 
     let ctx = mock_context();
@@ -118,10 +121,10 @@ async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<
         AdaptivePlanner::try_new(ctx.state().config(), plan, "test_job".to_string())?;
 
     assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=pending, stage_resolved=false
+    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending
       ProjectionExec: expr=[c0@0 as c0, count(Int64(1))@1 as count(*)]
         AggregateExec: mode=FinalPartitioned, gby=[c0@0 as c0], aggr=[count(Int64(1))]
-          RepartitionExec: partitioning=Hash([c0@0], 2), input_partitions=2
+          ExchangeExec: partitioning=Hash([c0@0], 2), plan_id=1, stage_id=pending, stage_resolved=false
             AggregateExec: mode=Partial, gby=[c0@0 as c0], aggr=[count(Int64(1))]
               ProjectionExec: expr=[min(t.a)@1 as c0]
                 AggregateExec: mode=FinalPartitioned, gby=[c@0 as c], aggr=[min(t.a)]
@@ -134,7 +137,7 @@ async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ r"
-    SortShuffleWriterExec: partitioning=Hash([c@0], 2)
+    ShuffleWriterExec: partitioning: Hash([c@0], 2)
       AggregateExec: mode=Partial, gby=[c@1 as c], aggr=[min(t.a)]
         FilterExec: a@0 = 42
           DataSourceExec: partitions=1, partition_sizes=[1]
@@ -146,182 +149,68 @@ async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ r"
-    SortShuffleWriterExec: partitioning=Hash([c0@0], 2)
+    ShuffleWriterExec: partitioning: None
       EmptyExec
     ");
     planner.finalise_stage_internal(1, mock_partitions_with_statistics_no_data())?;
 
     let stages = planner.runnable_stages()?;
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=true, plan_id=1, stage_id=2, stage_resolved=false
-      EmptyExec
-    ");
-    assert!(stages.is_some());
+    assert!(stages.is_none());
 
     Ok(())
 }
 
-// This test covers join re-ordering after exchange statistic changed
-//
-// note: I was expecting join type change from `mode=Partitioned` to
-// `mode=CollectLeft` but it did not, to be investigated as a follow
-// up
 #[tokio::test]
-async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
+async fn should_insert_new_stage() -> datafusion::error::Result<()> {
     let ctx = mock_context();
 
-    let join = create_plan_with_hash_join()?;
-
-    assert_plan!(join.as_ref(),  @ r"
-    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-      RepartitionExec: partitioning=Hash([big_col@0], 2), input_partitions=2
-        MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-      RepartitionExec: partitioning=Hash([big_col@0], 2), input_partitions=2
-        MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-    ");
-
+    let join = create_plan_with_scan()?;
     let mut planner =
         AdaptivePlanner::try_new(ctx.state().config(), join, "test_job".to_string())?;
 
     assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-        ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=pending, stage_resolved=false
-          MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-        ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=pending, stage_resolved=false
-          MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-    ");
-
-    let stages = planner.runnable_stages()?.unwrap();
-    assert_eq!(2, stages.len());
-
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-        ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=false
-          MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-        ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=false
-          MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-    ");
-
-    // we finalize stage 1 with smaller number of rows, for test purposes,
-    // this should trigger join re-ordering
-    planner.finalise_stage_internal(0, big_statistics_exchange())?;
-    planner.finalise_stage_internal(1, small_statistics_exchange())?;
-
-    // join ordering changes as build side is bigger than probe side
-    // after exchange statistic updated.
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
-        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
+    AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=pending
+      CrossJoinExec
+        CoalescePartitionsExec
+          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=pending, stage_resolved=false
+            StatisticsExec: col_count=1, row_count=Inexact(262144)
+        CooperativeExec
+          MockPartitionedScan: num_partitions=2, statistics=[Rows=Inexact(1024), Bytes=Inexact(8192), [(Col[0]:)]]
     ");
 
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
 
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=true, plan_id=2, stage_id=2, stage_resolved=false
-      ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
-        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
+    assert_plan!(stages[0].plan.as_ref(),  @ "
+    ShuffleWriterExec: partitioning: Hash([big_col@0], 2)
+      StatisticsExec: col_count=1, row_count=Inexact(262144)
     ");
 
-    planner.finalise_stage_internal(2, small_statistics_exchange())?;
-
+    planner.finalise_stage_internal(0, big_statistics_exchange())?;
     assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=true, plan_id=2, stage_id=2, stage_resolved=true
-      ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
-        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=true
-            CooperativeExec
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
-    ");
-
-    Ok(())
-}
-
-// this test initially handled cross join where new repartition
-// is inserted due to new statistic information.
-// with lazy stage computation this plan is adjusted much earlier
-// hance no late exchange addition.
-//
-// will keep the test,
-#[tokio::test]
-async fn should_support_cross_join() -> datafusion::error::Result<()> {
-    let ctx = mock_context();
-
-    let join = create_plan_with_cross_join()?;
-
-    //
-    // initial plan
-    //
-    assert_plan!(join.as_ref(),  @ r"
-    CrossJoinExec
-      RepartitionExec: partitioning=Hash([big_col@0], 2), input_partitions=2
-        StatisticsExec: col_count=1, row_count=Exact(262144)
-      MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(1024), Bytes=Exact(8192), [(Col[0]:)]]
-    ");
-
-    let mut planner =
-        AdaptivePlanner::try_new(ctx.state().config(), join, "test_job".to_string())?;
-
-    //
-    // plan after AQE, note the join has already been re-ordered
-    //
-
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=pending, stage_resolved=false
+    AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=pending
       ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
         CrossJoinExec
           CoalescePartitionsExec
-            ExchangeExec: partitioning=None, plan_id=0, stage_id=pending, stage_resolved=false
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(1024), Bytes=Exact(8192), [(Col[0]:)]]
-          CooperativeExec
-            StatisticsExec: col_count=1, row_count=Exact(262144)
+            ExchangeExec: partitioning=None, plan_id=2, stage_id=pending, stage_resolved=false
+              CooperativeExec
+                MockPartitionedScan: num_partitions=2, statistics=[Rows=Inexact(1024), Bytes=Inexact(8192), [(Col[0]:)]]
+          ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=true
+            CooperativeExec
+              StatisticsExec: col_count=1, row_count=Inexact(262144)
     ");
-
-    //
-    // first stage to be resolve is build side of the join
-    // which should be resolved with "small statistics"
-    //
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
 
     assert_plan!(stages[0].plan.as_ref(),  @ r"
     ShuffleWriterExec: partitioning: None
-      MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(1024), Bytes=Exact(8192), [(Col[0]:)]]
+      CooperativeExec
+        MockPartitionedScan: num_partitions=2, statistics=[Rows=Inexact(1024), Bytes=Inexact(8192), [(Col[0]:)]]
     ");
 
-    planner.finalise_stage_internal(0, small_statistics_exchange())?;
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=1, stage_id=pending, stage_resolved=false
-      ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
-        CrossJoinExec
-          CoalescePartitionsExec
-            ExchangeExec: partitioning=None, plan_id=0, stage_id=0, stage_resolved=true
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(1024), Bytes=Exact(8192), [(Col[0]:)]]
-          CooperativeExec
-            StatisticsExec: col_count=1, row_count=Exact(262144)
-    ");
-
-    //
-    // next stage is final stage
-    //
+    planner.finalise_stage_internal(1, small_statistics_exchange())?;
+    let stages = planner.runnable_stages()?.unwrap();
+    assert_eq!(1, stages.len());
 
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
@@ -332,24 +221,10 @@ async fn should_support_cross_join() -> datafusion::error::Result<()> {
         CrossJoinExec
           CoalescePartitionsExec
             ShuffleReaderExec: partitioning: UnknownPartitioning(2)
-          CooperativeExec
-            StatisticsExec: col_count=1, row_count=Exact(262144)
+          ShuffleReaderExec: partitioning: Hash([big_col@0], 2)
     ");
 
-    planner.finalise_stage_internal(1, big_statistics_exchange())?;
-
-    assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=true, plan_id=1, stage_id=1, stage_resolved=true
-      ProjectionExec: expr=[big_col@1 as big_col, big_col@0 as big_col]
-        CrossJoinExec
-          CoalescePartitionsExec
-            ExchangeExec: partitioning=None, plan_id=0, stage_id=0, stage_resolved=true
-              MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(1024), Bytes=Exact(8192), [(Col[0]:)]]
-          CooperativeExec
-            StatisticsExec: col_count=1, row_count=Exact(262144)
-    ");
-
-    // should be no more runnable stages after final stage has been finalized
+    planner.finalise_stage_internal(2, small_statistics_exchange())?;
     let stages = planner.runnable_stages()?;
     assert!(stages.is_none());
 
@@ -388,7 +263,7 @@ async fn should_cancel_the_stage() -> datafusion::error::Result<()> {
     assert_eq!(0, cancellable.len());
 
     assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
+    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending
       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)], projection=[a@1, b@2, c@3]
         ExchangeExec: partitioning=Hash([a@0], 2), plan_id=0, stage_id=0, stage_resolved=false
           FilterExec: b@1 = 42, projection=[a@0]
@@ -400,7 +275,7 @@ async fn should_cancel_the_stage() -> datafusion::error::Result<()> {
     planner.finalise_stage_internal(0, mock_partitions_with_statistics_no_data())?;
 
     assert_plan!(planner.current_plan(),  @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
+    AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending
       EmptyExec
     ");
 
@@ -422,17 +297,7 @@ fn small_scan(num_partitions: usize) -> Arc<dyn ExecutionPlan> {
     Arc::new(MockPartitionedScan::new(schema, num_partitions, statistics))
 }
 
-fn big_scan(num_partitions: usize) -> Arc<dyn ExecutionPlan> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "big_col",
-        DataType::Int32,
-        false,
-    )]));
-    let statistics = big_statistics();
-    Arc::new(MockPartitionedScan::new(schema, num_partitions, statistics))
-}
-
-fn create_plan_with_cross_join() -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+fn create_plan_with_scan() -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let (big, _) = create_big_and_small_statistic_scan();
 
     let small_scan = small_scan(2);
@@ -448,48 +313,6 @@ fn create_plan_with_cross_join() -> Result<Arc<dyn ExecutionPlan>, DataFusionErr
     )?);
     let join =
         Arc::new(CrossJoinExec::new(exchange_big, small_scan)) as Arc<dyn ExecutionPlan>;
-    Ok(join)
-}
-
-fn create_plan_with_hash_join() -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let big_scan0 = big_scan(2);
-    let big_scan1 = big_scan(2);
-
-    let column_big = Arc::new(Column::new_with_schema(
-        "big_col",
-        &Schema::new(vec![Field::new("big_col", DataType::Int32, false)]),
-    )?);
-
-    let big_exchange0 = Arc::new(RepartitionExec::try_new(
-        big_scan0,
-        Partitioning::Hash(vec![column_big.clone()], 2),
-    )?);
-
-    let big_exchange1 = Arc::new(RepartitionExec::try_new(
-        big_scan1,
-        Partitioning::Hash(vec![column_big], 2),
-    )?);
-
-    let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
-        Arc::new(Column::new("big_col", 0)),
-        Arc::new(Column::new("big_col", 0)),
-    )];
-
-    let join = Arc::new(
-        HashJoinExec::try_new(
-            big_exchange0,
-            big_exchange1,
-            on,
-            None, // No filter (WHERE clause)
-            &JoinType::Inner,
-            None,
-            PartitionMode::Partitioned, // Or PartitionMode::CollectLeft for small joins
-            datafusion::common::NullEquality::NullEqualsNothing,
-            false,
-        )
-        .unwrap(),
-    ) as Arc<dyn ExecutionPlan>;
-
     Ok(join)
 }
 
@@ -524,17 +347,15 @@ fn small_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
             host: "".to_string(),
             port: 0,
             grpc_port: 0,
-            specification: ExecutorSpecification::default().with_task_slots(0),
-            os_info: ExecutorOperatingSystemSpecification::default(),
+            specification: ExecutorSpecification { task_slots: 0 },
         },
+        path: "".to_string(),
         // next few properties are needed
         partition_stats: PartitionStats::new(
             Some(threshold_num_rows as u64 / 128),
             None,
             Some(threshold_byte_size as u64 / 128),
         ),
-        file_id: None,
-        is_sort_shuffle: false,
     };
     vec![vec![location]]
 }
@@ -556,18 +377,15 @@ fn big_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
             host: "".to_string(),
             port: 0,
             grpc_port: 0,
-            specification: ExecutorSpecification::default().with_task_slots(0),
-            os_info: ExecutorOperatingSystemSpecification::default(),
+            specification: ExecutorSpecification { task_slots: 0 },
         },
-
+        path: "".to_string(),
         // next few properties are needed
         partition_stats: PartitionStats::new(
             Some(threshold_num_rows as u64 * 2),
             None,
             Some(threshold_byte_size as u64 * 2),
         ),
-        file_id: None,
-        is_sort_shuffle: false,
     };
     vec![vec![location]]
 }
@@ -576,8 +394,8 @@ fn big_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
 fn small_statistics() -> Statistics {
     let (threshold_num_rows, threshold_byte_size) = get_thresholds();
     Statistics {
-        num_rows: Precision::Exact(threshold_num_rows / 128),
-        total_byte_size: Precision::Exact(threshold_byte_size / 128),
+        num_rows: Precision::Inexact(threshold_num_rows / 128),
+        total_byte_size: Precision::Inexact(threshold_byte_size / 128),
         column_statistics: vec![ColumnStatistics::new_unknown()],
     }
 }
@@ -586,8 +404,8 @@ fn small_statistics() -> Statistics {
 fn big_statistics() -> Statistics {
     let (threshold_num_rows, threshold_byte_size) = get_thresholds();
     Statistics {
-        num_rows: Precision::Exact(threshold_num_rows * 2),
-        total_byte_size: Precision::Exact(threshold_byte_size * 2),
+        num_rows: Precision::Inexact(threshold_num_rows * 2),
+        total_byte_size: Precision::Inexact(threshold_byte_size * 2),
         column_statistics: vec![ColumnStatistics::new_unknown()],
     }
 }

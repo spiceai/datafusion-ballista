@@ -23,6 +23,7 @@ use ballista_core::error::Result;
 use ballista_core::event_loop::{EventLoop, EventSender};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
+use tokio::sync::broadcast;
 
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::LogicalPlan;
@@ -57,6 +58,8 @@ pub mod event;
 #[cfg(feature = "keda-scaler")]
 mod external_scaler;
 mod grpc;
+/// Job state event notifications for subscribers.
+pub mod job_state_event;
 pub(crate) mod query_stage_scheduler;
 
 /// Function type for building DataFusion session states from configuration.
@@ -85,9 +88,20 @@ pub struct SchedulerServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     query_stage_scheduler: Arc<QueryStageScheduler<T, U>>,
     /// Scheduler configuration.
     config: Arc<SchedulerConfig>,
+    /// Broadcast sender for job state change notifications.
+    ///
+    /// Subscribers can receive notifications when jobs change state by calling
+    /// `subscribe_job_updates()`.
+    job_state_sender: broadcast::Sender<job_state_event::JobStateEvent>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {
+    /// Default capacity for the job state broadcast channel.
+    ///
+    /// This determines how many job state events can be buffered before
+    /// slow receivers start lagging behind.
+    const JOB_STATE_CHANNEL_CAPACITY: usize = 256;
+
     /// Creates a new `SchedulerServer` with the given configuration.
     pub fn new(
         scheduler_name: String,
@@ -101,11 +115,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             codec,
             scheduler_name.clone(),
             config.clone(),
+            metrics_collector.clone(),
         ));
+        let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
             state.clone(),
             metrics_collector,
             config.clone(),
+            job_state_sender.clone(),
         ));
         let query_stage_event_loop = EventLoop::new(
             "query_stage".to_owned(),
@@ -121,6 +138,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             #[cfg(feature = "rest-api")]
             query_stage_scheduler,
             config,
+            job_state_sender,
         }
     }
 
@@ -139,12 +157,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             codec,
             scheduler_name.clone(),
             config.clone(),
+            metrics_collector.clone(),
             task_launcher,
         ));
+        let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
             state.clone(),
             metrics_collector,
             config.clone(),
+            job_state_sender.clone(),
         ));
         let query_stage_event_loop = EventLoop::new(
             "query_stage".to_owned(),
@@ -160,6 +181,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             #[cfg(feature = "rest-api")]
             query_stage_scheduler,
             config,
+            job_state_sender,
         }
     }
 
@@ -168,6 +190,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.init().await?;
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
+        self.start_pending_tasks_metrics_loop();
 
         Ok(())
     }
@@ -181,6 +204,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     pub fn running_job_number(&self) -> usize {
         self.state.task_manager.running_job_number()
     }
+
+    /// Subscribes to job state change notifications.
+    ///
+    /// Returns a receiver that will receive [`JobStateEvent`] notifications
+    /// whenever a job changes state. This allows consumers to be notified
+    /// of job state changes without polling.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut receiver = scheduler.subscribe_job_updates();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = receiver.recv().await {
+    ///         println!("Job {} changed to state: {}", event.job_id, event.state);
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// If the receiver falls behind and the channel buffer fills up,
+    /// older messages will be dropped and the receiver will receive
+    /// a `RecvError::Lagged` error on the next `recv()` call.
+    ///
+    /// [`JobStateEvent`]: job_state_event::JobStateEvent
+    pub fn subscribe_job_updates(
+        &self,
+    ) -> broadcast::Receiver<job_state_event::JobStateEvent> {
+        self.job_state_sender.subscribe()
+    }
+
     #[cfg(feature = "rest-api")]
     pub(crate) fn metrics_collector(&self) -> &dyn SchedulerMetricsCollector {
         self.query_stage_scheduler.metrics_collector()
@@ -315,6 +369,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     Self::remove_executor(
                         state.executor_manager.clone(),
                         sender_clone,
+                        state.metrics_collector.clone(),
                         &executor_id,
                         Some(stop_reason.clone()),
                         0,
@@ -338,9 +393,34 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         Ok(())
     }
 
+    /// Spawns a background task that periodically updates the pending tasks metric.
+    ///
+    /// This metric requires iterating over all active jobs and acquiring read locks,
+    /// which can cause lock contention if done in the main event loop. Running it
+    /// periodically in a background task provides observability without impacting
+    /// scheduler performance.
+    fn start_pending_tasks_metrics_loop(&self) {
+        let state = self.state.clone();
+        tokio::task::spawn(async move {
+            // Update every 5 seconds - frequent enough for observability,
+            // infrequent enough to avoid lock contention
+            const UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+            loop {
+                let pending_tasks = state.task_manager.total_pending_tasks().await;
+                state
+                    .metrics_collector
+                    .set_pending_tasks_queue_size(pending_tasks as u64);
+
+                tokio::time::sleep(UPDATE_INTERVAL).await;
+            }
+        });
+    }
+
     pub(crate) fn remove_executor(
         executor_manager: ExecutorManager,
         event_sender: EventSender<QueryStageSchedulerEvent>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         executor_id: &str,
         reason: Option<String>,
         wait_secs: u64,
@@ -359,6 +439,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                 error!("error removing executor {executor_id}: {e:?}");
             }
 
+            // Record executor deregistration metric
+            metrics_collector.record_executor_deregistered(&executor_id);
+
+            // Update active executor count
+            let count = executor_manager.get_alive_executors().len();
+            metrics_collector.set_active_executor_count(count);
+
             if let Err(e) = event_sender
                 .post_event(QueryStageSchedulerEvent::ExecutorLost(executor_id, reason))
                 .await
@@ -369,8 +456,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     }
 
     async fn do_register_executor(&self, metadata: ExecutorMetadata) -> Result<()> {
+        let executor_id = metadata.id.clone();
         let executor_data = ExecutorData {
-            executor_id: metadata.id.clone(),
+            executor_id: executor_id.clone(),
             total_task_slots: metadata.specification.task_slots,
             available_task_slots: metadata.specification.task_slots,
         };
@@ -380,6 +468,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             .executor_manager
             .register_executor(metadata, executor_data)
             .await?;
+
+        // Record executor registration metric
+        self.state
+            .metrics_collector
+            .record_executor_registered(&executor_id);
+
+        // Update active executor count
+        let count = self.state.executor_manager.get_alive_executors().len();
+        self.state
+            .metrics_collector
+            .set_active_executor_count(count);
 
         // If we are using push-based scheduling then reserve this executors slots and send
         // them for scheduling tasks.
@@ -434,8 +533,7 @@ mod test {
         failed_task, job_status, task_status,
     };
     use ballista_core::serde::scheduler::{
-        ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
-        ExecutorSpecification,
+        ExecutorData, ExecutorMetadata, ExecutorSpecification,
     };
 
     use crate::scheduler_server::{SchedulerServer, timestamp_millis};
@@ -506,11 +604,10 @@ mod test {
                 for partition_id in 0..num_partitions {
                     partitions.push(ShuffleWritePartition {
                         partition_id: partition_id as u64,
+                        path: "some/path".to_string(),
                         num_batches: 1,
                         num_rows: 1,
                         num_bytes: 1,
-                        file_id: None,
-                        is_sort_shuffle: false,
                     })
                 }
 
@@ -551,6 +648,7 @@ mod test {
         assert_eq!(final_graph.output_locations().len(), 4);
 
         for output_location in final_graph.output_locations() {
+            assert_eq!(output_location.path, "some/path".to_owned());
             assert_eq!(output_location.executor_meta.host, "localhost1".to_owned())
         }
 
@@ -959,9 +1057,7 @@ mod test {
                     host: "localhost1".to_string(),
                     port: 8080,
                     grpc_port: 9090,
-                    specification: ExecutorSpecification::default()
-                        .with_task_slots(task_slots),
-                    os_info: ExecutorOperatingSystemSpecification::default(),
+                    specification: ExecutorSpecification { task_slots },
                 },
                 ExecutorData {
                     executor_id: "executor-1".to_owned(),
@@ -975,9 +1071,9 @@ mod test {
                     host: "localhost2".to_string(),
                     port: 8080,
                     grpc_port: 9090,
-                    specification: ExecutorSpecification::default()
-                        .with_task_slots(num_partitions as u32 - task_slots),
-                    os_info: ExecutorOperatingSystemSpecification::default(),
+                    specification: ExecutorSpecification {
+                        task_slots: num_partitions as u32 - task_slots,
+                    },
                 },
                 ExecutorData {
                     executor_id: "executor-2".to_owned(),

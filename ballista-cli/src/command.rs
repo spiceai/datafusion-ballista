@@ -19,9 +19,6 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-#[cfg(feature = "tui")]
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use datafusion::arrow::array::{ArrayRef, StringArray};
@@ -46,8 +43,6 @@ pub enum Command {
     SearchFunctions(String),
     QuietMode(Option<bool>),
     OutputFormat(Option<String>),
-    #[cfg(feature = "tui")]
-    OpenTui,
 }
 
 pub enum OutputFormat {
@@ -59,7 +54,6 @@ impl Command {
         &self,
         ctx: &SessionContext,
         print_options: &mut PrintOptions,
-        #[allow(unused_variables)] tui_mode: Arc<AtomicBool>,
     ) -> Result<()> {
         let now = Instant::now();
         let max_rows = match print_options.maxrows {
@@ -135,29 +129,11 @@ impl Command {
                 "Unexpected change output format, this should be handled outside"
                     .to_string(),
             )),
-            #[cfg(feature = "tui")]
-            Self::OpenTui => {
-                /// RAII guard to reset tui mode back to false when exiting the TUI mode.
-                struct TuiModeGuard(Arc<AtomicBool>);
-                impl Drop for TuiModeGuard {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
-                }
-                let _tui_mode_guard = TuiModeGuard(tui_mode.clone());
-
-                match crate::tui::tui_main(tui_mode.clone()).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(DataFusionError::Internal(format!(
-                        "Error opening TUI: {e}",
-                    ))),
-                }
-            }
         }
     }
 
     fn get_name_and_description(&self) -> (&'static str, &'static str) {
-        match *self {
+        match self {
             Self::Quit => ("\\q", "quit ballista-cli"),
             Self::ListTables => ("\\d", "list tables"),
             Self::DescribeTable(_) => ("\\d name", "describe table"),
@@ -168,13 +144,11 @@ impl Command {
             Self::OutputFormat(_) => {
                 ("\\pset [NAME [VALUE]]", "set table output option\n(format)")
             }
-            #[cfg(feature = "tui")]
-            Self::OpenTui => ("\\tui", "open tui"),
         }
     }
 }
 
-const ALL_COMMANDS: &[Command] = &[
+const ALL_COMMANDS: [Command; 8] = [
     Command::ListTables,
     Command::DescribeTable(String::new()),
     Command::Quit,
@@ -183,8 +157,6 @@ const ALL_COMMANDS: &[Command] = &[
     Command::SearchFunctions(String::new()),
     Command::QuietMode(None),
     Command::OutputFormat(None),
-    #[cfg(feature = "tui")]
-    Command::OpenTui,
 ];
 
 fn all_commands_info() -> RecordBatch {
@@ -193,7 +165,7 @@ fn all_commands_info() -> RecordBatch {
         Field::new("Description", DataType::Utf8, false),
     ]));
     let (names, description): (Vec<&str>, Vec<&str>) = ALL_COMMANDS
-        .iter()
+        .into_iter()
         .map(|c| c.get_name_and_description())
         .unzip();
     RecordBatch::try_new(
@@ -233,8 +205,6 @@ impl FromStr for Command {
                 Self::OutputFormat(Some(subcommand.to_string()))
             }
             ("pset", None) => Self::OutputFormat(None),
-            #[cfg(feature = "tui")]
-            ("tui", None) => Self::OpenTui,
             _ => return Err(()),
         })
     }

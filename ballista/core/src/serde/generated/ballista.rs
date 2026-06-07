@@ -79,7 +79,13 @@ pub struct SortShuffleWriterExecNode {
     pub output_partitioning: ::core::option::Option<
         ::datafusion_proto::protobuf::PhysicalHashRepartition,
     >,
-    /// Target batch size in rows when materializing buffered shuffle data.
+    /// Configuration for sort shuffle
+    #[prost(uint64, tag = "5")]
+    pub buffer_size: u64,
+    #[prost(uint64, tag = "6")]
+    pub memory_limit: u64,
+    #[prost(double, tag = "7")]
+    pub spill_threshold: f64,
     #[prost(uint64, tag = "8")]
     pub batch_size: u64,
 }
@@ -91,13 +97,6 @@ pub struct UnresolvedShuffleExecNode {
     pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
     #[prost(message, optional, tag = "5")]
     pub partitioning: ::core::option::Option<::datafusion_proto::protobuf::Partitioning>,
-    #[prost(bool, tag = "6")]
-    pub broadcast: bool,
-    #[prost(uint32, tag = "7")]
-    pub upstream_partition_count: u32,
-    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
-    #[prost(message, optional, tag = "8")]
-    pub coalesce: ::core::option::Option<CoalescePlan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShuffleReaderExecNode {
@@ -110,37 +109,12 @@ pub struct ShuffleReaderExecNode {
     pub stage_id: u32,
     #[prost(message, optional, tag = "4")]
     pub partitioning: ::core::option::Option<::datafusion_proto::protobuf::Partitioning>,
-    #[prost(bool, tag = "5")]
-    pub broadcast: bool,
-    #[prost(uint32, tag = "6")]
-    pub upstream_partition_count: u32,
-    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
-    #[prost(message, optional, tag = "7")]
-    pub coalesce: ::core::option::Option<CoalescePlan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShuffleReaderPartition {
     /// each partition of a shuffle read can read data from multiple locations
     #[prost(message, repeated, tag = "1")]
     pub location: ::prost::alloc::vec::Vec<PartitionLocation>,
-}
-/// CoalescePartitionsRule output: groups upstream partitions into coalesced output partitions.
-/// Empty when no coalesce is applied (the optional field on the parent message is absent).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CoalescePlan {
-    /// Original number of upstream partitions (M) before coalescing. Required for EXPLAIN's "K of M" rendering.
-    #[prost(uint32, tag = "1")]
-    pub upstream_partition_count: u32,
-    /// Coalesced output groups. Length is K (the post-coalesce partition count).
-    #[prost(message, repeated, tag = "2")]
-    pub groups: ::prost::alloc::vec::Vec<PartitionGroup>,
-}
-/// One coalesced output partition's source list: a set of upstream partition indices in \[0, upstream_partition_count).
-/// Default algorithm produces only contiguous indices, but proto allows arbitrary index sets for future strategies.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PartitionGroup {
-    #[prost(uint32, repeated, tag = "1")]
-    pub upstream_indices: ::prost::alloc::vec::Vec<u32>,
 }
 /// /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Ballista Scheduling
@@ -377,14 +351,12 @@ pub struct FetchPartition {
     pub stage_id: u32,
     #[prost(uint32, tag = "3")]
     pub partition_id: u32,
+    #[prost(string, tag = "4")]
+    pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub host: ::prost::alloc::string::String,
     #[prost(uint32, tag = "6")]
     pub port: u32,
-    #[prost(uint64, optional, tag = "7")]
-    pub file_id: ::core::option::Option<u64>,
-    #[prost(bool, tag = "8")]
-    pub is_sort_shuffle: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionLocation {
@@ -398,10 +370,8 @@ pub struct PartitionLocation {
     pub executor_meta: ::core::option::Option<ExecutorMetadata>,
     #[prost(message, optional, tag = "4")]
     pub partition_stats: ::core::option::Option<PartitionStats>,
-    #[prost(uint64, optional, tag = "6")]
-    pub file_id: ::core::option::Option<u64>,
-    #[prost(bool, tag = "7")]
-    pub is_sort_shuffle: bool,
+    #[prost(string, tag = "5")]
+    pub path: ::prost::alloc::string::String,
 }
 /// Unique identifier for a materialized partition of data
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -545,8 +515,6 @@ pub struct ExecutorMetadata {
     pub grpc_port: u32,
     #[prost(message, optional, tag = "5")]
     pub specification: ::core::option::Option<ExecutorSpecification>,
-    #[prost(message, optional, tag = "6")]
-    pub os_info: ::core::option::Option<ExecutorOperatingSystemSpecification>,
 }
 /// Used for scheduler-executor
 /// communication
@@ -562,8 +530,6 @@ pub struct ExecutorRegistration {
     pub grpc_port: u32,
     #[prost(message, optional, tag = "5")]
     pub specification: ::core::option::Option<ExecutorSpecification>,
-    #[prost(message, optional, tag = "6")]
-    pub os_info: ::core::option::Option<ExecutorOperatingSystemSpecification>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutorHeartbeat {
@@ -576,15 +542,11 @@ pub struct ExecutorHeartbeat {
     pub metrics: ::prost::alloc::vec::Vec<ExecutorMetric>,
     #[prost(message, optional, tag = "4")]
     pub status: ::core::option::Option<ExecutorStatus>,
-    #[prost(uint64, tag = "5")]
-    pub peak_proc_physical_memory: u64,
-    #[prost(uint64, tag = "6")]
-    pub peak_proc_virtual_memory: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutorMetric {
     /// TODO add more metrics
-    #[prost(oneof = "executor_metric::Metric", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "executor_metric::Metric", tags = "1")]
     pub metric: ::core::option::Option<executor_metric::Metric>,
 }
 /// Nested message and enum types in `ExecutorMetric`.
@@ -594,18 +556,6 @@ pub mod executor_metric {
     pub enum Metric {
         #[prost(uint64, tag = "1")]
         AvailableMemory(u64),
-        #[prost(uint64, tag = "2")]
-        TotalMemory(u64),
-        #[prost(uint64, tag = "3")]
-        UsedMemory(u64),
-        #[prost(uint64, tag = "4")]
-        ProcPhysicalMemory(u64),
-        #[prost(uint64, tag = "5")]
-        ProcVirtualMemory(u64),
-        #[prost(uint64, tag = "6")]
-        PeakPhysicalMemory(u64),
-        #[prost(uint64, tag = "7")]
-        PeakVirtualMemory(u64),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -634,37 +584,18 @@ pub struct ExecutorSpecification {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutorResource {
+    /// TODO add more resources
     #[prost(oneof = "executor_resource::Resource", tags = "1")]
     pub resource: ::core::option::Option<executor_resource::Resource>,
 }
 /// Nested message and enum types in `ExecutorResource`.
 pub mod executor_resource {
+    /// TODO add more resources
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Resource {
         #[prost(uint32, tag = "1")]
         TaskSlots(u32),
     }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ExecutorOperatingSystemSpecification {
-    #[prost(string, tag = "1")]
-    pub system_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub kernel_ver: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub os_ver: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub os_ver_long: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "5")]
-    pub physical_cores: u32,
-    #[prost(uint32, tag = "6")]
-    pub num_disks: u32,
-    #[prost(uint64, tag = "7")]
-    pub total_disk_space: u64,
-    #[prost(uint64, tag = "8")]
-    pub total_available_disk_space: u64,
-    #[prost(uint64, tag = "9")]
-    pub open_files_limit: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AvailableTaskSlots {
@@ -756,20 +687,18 @@ pub struct ExecutorLost {}
 pub struct ResultLost {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskKilled {}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShuffleWritePartition {
     #[prost(uint64, tag = "1")]
     pub partition_id: u64,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
     pub num_batches: u64,
     #[prost(uint64, tag = "4")]
     pub num_rows: u64,
     #[prost(uint64, tag = "5")]
     pub num_bytes: u64,
-    #[prost(uint64, optional, tag = "6")]
-    pub file_id: ::core::option::Option<u64>,
-    #[prost(bool, tag = "7")]
-    pub is_sort_shuffle: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskStatus {
@@ -1045,36 +974,6 @@ pub struct GetJobStatusParams {
     #[prost(string, tag = "1")]
     pub job_id: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetJobMetricsParams {
-    #[prost(string, tag = "1")]
-    pub job_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct JobStageMetrics {
-    #[prost(uint32, tag = "1")]
-    pub stage_id: u32,
-    #[prost(uint32, tag = "2")]
-    pub partitions: u32,
-    #[prost(message, repeated, tag = "3")]
-    pub operators: ::prost::alloc::vec::Vec<OperatorWithMetrics>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct OperatorWithMetrics {
-    #[prost(uint32, tag = "1")]
-    pub depth: u32,
-    #[prost(string, tag = "2")]
-    pub operator_type: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub operator_desc: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "4")]
-    pub metrics: ::prost::alloc::vec::Vec<OperatorMetric>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GetJobMetricsResult {
-    #[prost(message, repeated, tag = "1")]
-    pub stages: ::prost::alloc::vec::Vec<JobStageMetrics>,
-}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessfulJob {
     #[prost(message, repeated, tag = "1")]
@@ -1229,6 +1128,92 @@ pub struct RunningTaskInfo {
     pub stage_id: u32,
     #[prost(uint32, tag = "4")]
     pub partition_id: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCatalogParams {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetCatalogResult {
+    #[prost(message, repeated, tag = "1")]
+    pub catalogs: ::prost::alloc::vec::Vec<CatalogInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CatalogInfo {
+    #[prost(string, tag = "1")]
+    pub catalog_name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub schemas: ::prost::alloc::vec::Vec<SchemaInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SchemaInfo {
+    #[prost(string, tag = "1")]
+    pub schema_name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub tables: ::prost::alloc::vec::Vec<TableInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TableInfo {
+    #[prost(string, tag = "1")]
+    pub table_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemoteTableProviderNode {
+    #[prost(string, tag = "1")]
+    pub catalog_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub schema_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub table_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetRemoteFunctionsParams {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetRemoteFunctionsResult {
+    #[prost(message, repeated, tag = "1")]
+    pub udfs: ::prost::alloc::vec::Vec<ScalarUdfInfo>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarUdfInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub documentation: ::core::option::Option<ScalarUdfDocumentation>,
+    #[prost(message, repeated, tag = "3")]
+    pub signatures: ::prost::alloc::vec::Vec<ScalarUdfTypeSignature>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarUdfTypeSignature {
+    #[prost(message, repeated, tag = "1")]
+    pub arity: ::prost::alloc::vec::Vec<::datafusion_proto_common::ArrowType>,
+    #[prost(message, optional, tag = "2")]
+    pub return_type: ::core::option::Option<::datafusion_proto_common::ArrowType>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarUdfDocumentation {
+    #[prost(string, tag = "1")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub syntax_example: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub sql_example: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub arguments: ::prost::alloc::vec::Vec<ScalarUdfDocumentationArgument>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScalarUdfDocumentationArgument {
+    #[prost(string, tag = "1")]
+    pub argument: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub description: ::prost::alloc::string::String,
 }
 /// Generated client implementations.
 pub mod scheduler_grpc_client {
@@ -1568,32 +1553,6 @@ pub mod scheduler_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        pub async fn get_job_metrics(
-            &mut self,
-            request: impl tonic::IntoRequest<super::GetJobMetricsParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::GetJobMetricsResult>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ballista.protobuf.SchedulerGrpc/GetJobMetrics",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("ballista.protobuf.SchedulerGrpc", "GetJobMetrics"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Used by Executor to tell Scheduler it is stopped.
         pub async fn executor_stopped(
             &mut self,
@@ -1668,6 +1627,63 @@ pub mod scheduler_grpc_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("ballista.protobuf.SchedulerGrpc", "CleanJobData"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Get catalog metadata for a session
+        pub async fn get_catalog(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCatalogParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetCatalogResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/GetCatalog",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ballista.protobuf.SchedulerGrpc", "GetCatalog"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Get catalog metadata for a session
+        pub async fn get_remote_functions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetRemoteFunctionsParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetRemoteFunctionsResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/GetRemoteFunctions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ballista.protobuf.SchedulerGrpc",
+                        "GetRemoteFunctions",
+                    ),
                 );
             self.inner.unary(req, path, codec).await
         }
@@ -1752,13 +1768,6 @@ pub mod scheduler_grpc_server {
             tonic::Response<super::GetJobStatusResult>,
             tonic::Status,
         >;
-        async fn get_job_metrics(
-            &self,
-            request: tonic::Request<super::GetJobMetricsParams>,
-        ) -> std::result::Result<
-            tonic::Response<super::GetJobMetricsResult>,
-            tonic::Status,
-        >;
         /// Used by Executor to tell Scheduler it is stopped.
         async fn executor_stopped(
             &self,
@@ -1776,6 +1785,22 @@ pub mod scheduler_grpc_server {
             request: tonic::Request<super::CleanJobDataParams>,
         ) -> std::result::Result<
             tonic::Response<super::CleanJobDataResult>,
+            tonic::Status,
+        >;
+        /// Get catalog metadata for a session
+        async fn get_catalog(
+            &self,
+            request: tonic::Request<super::GetCatalogParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetCatalogResult>,
+            tonic::Status,
+        >;
+        /// Get catalog metadata for a session
+        async fn get_remote_functions(
+            &self,
+            request: tonic::Request<super::GetRemoteFunctionsParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetRemoteFunctionsResult>,
             tonic::Status,
         >;
     }
@@ -2269,51 +2294,6 @@ pub mod scheduler_grpc_server {
                     };
                     Box::pin(fut)
                 }
-                "/ballista.protobuf.SchedulerGrpc/GetJobMetrics" => {
-                    #[allow(non_camel_case_types)]
-                    struct GetJobMetricsSvc<T: SchedulerGrpc>(pub Arc<T>);
-                    impl<
-                        T: SchedulerGrpc,
-                    > tonic::server::UnaryService<super::GetJobMetricsParams>
-                    for GetJobMetricsSvc<T> {
-                        type Response = super::GetJobMetricsResult;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::GetJobMetricsParams>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SchedulerGrpc>::get_job_metrics(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = GetJobMetricsSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/ballista.protobuf.SchedulerGrpc/ExecutorStopped" => {
                     #[allow(non_camel_case_types)]
                     struct ExecutorStoppedSvc<T: SchedulerGrpc>(pub Arc<T>);
@@ -2435,6 +2415,97 @@ pub mod scheduler_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CleanJobDataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ballista.protobuf.SchedulerGrpc/GetCatalog" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCatalogSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::GetCatalogParams>
+                    for GetCatalogSvc<T> {
+                        type Response = super::GetCatalogResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCatalogParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::get_catalog(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCatalogSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ballista.protobuf.SchedulerGrpc/GetRemoteFunctions" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetRemoteFunctionsSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::GetRemoteFunctionsParams>
+                    for GetRemoteFunctionsSvc<T> {
+                        type Response = super::GetRemoteFunctionsResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetRemoteFunctionsParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::get_remote_functions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetRemoteFunctionsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
