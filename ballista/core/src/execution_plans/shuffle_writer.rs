@@ -590,7 +590,7 @@ impl ShuffleWriterExec {
         match output_partitioning {
             None => {
                 // No repartitioning — stream batches directly to a multipart upload
-                let (mut writer, full_url) = storage
+                let (writer, full_url) = storage
                     .start_multipart_write(
                         job_id,
                         stage_id,
@@ -601,33 +601,43 @@ impl ShuffleWriterExec {
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let mut num_rows: u64 = 0;
-                let mut num_batches: u64 = 0;
-                let mut num_bytes: u64 = 0;
-
-                // For Vortex, buffer arrays and serialize all at end
-                #[cfg(feature = "vortex")]
-                let mut vortex_buffer: Vec<vortex_array::ArrayRef> = Vec::new();
-
-                while let Some(result) = stream.next().await {
-                    let batch = result?;
-                    write_metrics.input_rows.add(batch.num_rows());
-                    write_metrics.output_rows.add(batch.num_rows());
-                    num_rows += batch.num_rows() as u64;
-                    num_batches += 1;
-
-                    let timer = write_metrics.write_time.timer();
-
-                    match shuffle_format {
-                        ShuffleFormat::ArrowIpc => {
-                            // Serialize each batch to IPC bytes and stream to upload
-                            let buf =
-                                serialize_batch_to_ipc_bytes(&batch, schema.as_ref())?;
-                            num_bytes += buf.len() as u64;
-                            writer.put(bytes::Bytes::from(buf));
+                let (num_rows, num_batches, num_bytes) = match shuffle_format {
+                    ShuffleFormat::ArrowIpc => {
+                        // Single StreamWriter for the whole partition so the EOS
+                        // marker is emitted once at the end; the per-batch path
+                        // emitted one EOS per batch and the reader stopped at the
+                        // first marker.
+                        let mut uploader = StreamingMultipartIpcUploader::try_new(
+                            schema.as_ref(),
+                            writer,
+                            full_url.clone(),
+                        )?;
+                        while let Some(result) = stream.next().await {
+                            let batch = result?;
+                            write_metrics.input_rows.add(batch.num_rows());
+                            write_metrics.output_rows.add(batch.num_rows());
+                            let timer = write_metrics.write_time.timer();
+                            uploader.write_batch(&batch)?;
+                            timer.done();
                         }
-                        #[cfg(feature = "vortex")]
-                        ShuffleFormat::Vortex => {
+                        let timer = write_metrics.write_time.timer();
+                        let (_url, batches, rows, bytes) = uploader.finish().await?;
+                        timer.done();
+                        (rows, batches, bytes)
+                    }
+                    #[cfg(feature = "vortex")]
+                    ShuffleFormat::Vortex => {
+                        let mut writer = writer;
+                        let mut vortex_buffer: Vec<vortex_array::ArrayRef> = Vec::new();
+                        let mut num_rows: u64 = 0;
+                        let mut num_batches: u64 = 0;
+                        while let Some(result) = stream.next().await {
+                            let batch = result?;
+                            write_metrics.input_rows.add(batch.num_rows());
+                            write_metrics.output_rows.add(batch.num_rows());
+                            num_rows += batch.num_rows() as u64;
+                            num_batches += 1;
+                            let timer = write_metrics.write_time.timer();
                             use vortex_array::arrow::FromArrowArray;
                             let vortex_array =
                                 vortex_array::ArrayRef::from_arrow(&batch, false)
@@ -635,34 +645,31 @@ impl ShuffleWriterExec {
                                         DataFusionError::External(Box::new(e))
                                     })?;
                             vortex_buffer.push(vortex_array);
+                            timer.done();
                         }
-                        // Non-vortex build: already returned error above
-                        #[cfg(not(feature = "vortex"))]
-                        _ => unreachable!(),
+                        let mut num_bytes: u64 = 0;
+                        if !vortex_buffer.is_empty() {
+                            let timer = write_metrics.write_time.timer();
+                            let buf = serialize_vortex_arrays_to_bytes(vortex_buffer)?;
+                            num_bytes = buf.len() as u64;
+                            writer.put(bytes::Bytes::from(buf));
+                            timer.done();
+                        }
+                        let timer = write_metrics.write_time.timer();
+                        writer.finish().await.map_err(|e| {
+                            DataFusionError::External(Box::new(BallistaError::General(
+                                format!(
+                                    "Failed to complete multipart upload to {}: {:?}",
+                                    full_url, e
+                                ),
+                            )))
+                        })?;
+                        timer.done();
+                        (num_rows, num_batches, num_bytes)
                     }
-
-                    timer.done();
-                }
-
-                // For Vortex, serialize all buffered arrays and write to the upload
-                #[cfg(feature = "vortex")]
-                if shuffle_format == ShuffleFormat::Vortex && !vortex_buffer.is_empty() {
-                    let timer = write_metrics.write_time.timer();
-                    let buf = serialize_vortex_arrays_to_bytes(vortex_buffer)?;
-                    num_bytes = buf.len() as u64;
-                    writer.put(bytes::Bytes::from(buf));
-                    timer.done();
-                }
-
-                // Finalize the multipart upload
-                let timer = write_metrics.write_time.timer();
-                writer.finish().await.map_err(|e| {
-                    DataFusionError::External(Box::new(BallistaError::General(format!(
-                        "Failed to complete multipart upload to {}: {:?}",
-                        full_url, e
-                    ))))
-                })?;
-                timer.done();
+                    #[cfg(not(feature = "vortex"))]
+                    _ => unreachable!(),
+                };
 
                 let stats = PartitionStats::new(
                     Some(num_rows),
@@ -753,15 +760,14 @@ impl ShuffleWriterExec {
         write_metrics: &ShuffleWriteMetrics,
         file_ext: &str,
     ) -> Result<Vec<ShuffleWritePartition>> {
-        struct ObjectStoreWriteTracker {
-            writer: object_store::WriteMultipart,
-            full_url: String,
-            num_batches: u64,
-            num_rows: u64,
-            num_bytes: u64,
-        }
-
-        let mut writers: Vec<Option<ObjectStoreWriteTracker>> =
+        // One StreamingMultipartIpcUploader per output partition — emits the IPC
+        // header on construction, appends each batch as it arrives, and writes
+        // the EOS marker exactly once at finish(). Previously this path used
+        // `serialize_batch_to_ipc_bytes` per batch (one complete stream per batch,
+        // each with its own EOS marker) and concatenated them; the reader's
+        // StreamReader stopped at the first marker so any multi-batch partition
+        // came back as `Unexpected EOS`.
+        let mut writers: Vec<Option<StreamingMultipartIpcUploader>> =
             (0..num_output_partitions).map(|_| None).collect();
 
         let mut partitioner = BatchPartitioner::try_new(
@@ -771,98 +777,70 @@ impl ShuffleWriterExec {
             1,
         )?;
 
-        // Collect serialized IPC bytes per partition in the synchronous
-        // partition callback, then write them to the multipart writers
-        // after each input batch.
-        // (output_partition, ipc_bytes, num_rows)
-        let mut pending_writes: Vec<Vec<(usize, Vec<u8>, u64)>> = Vec::new();
-
+        // The BatchPartitioner callback is synchronous — collect repartitioned
+        // batches into a Vec and process (lazy multipart-start + write) on the
+        // async side after each input batch.
         while let Some(result) = stream.next().await {
             let input_batch = result?;
             write_metrics.input_rows.add(input_batch.num_rows());
 
-            let mut batch_pending: Vec<(usize, Vec<u8>, u64)> = Vec::new();
-            let schema_ref = schema.clone();
-
+            let mut batch_pending: Vec<(usize, RecordBatch)> = Vec::new();
             partitioner.partition(input_batch, |output_partition, output_batch| {
-                let timer = write_metrics.write_time.timer();
-                let batch_rows = output_batch.num_rows() as u64;
-
-                let buf =
-                    serialize_batch_to_ipc_bytes(&output_batch, schema_ref.as_ref())?;
-
-                batch_pending.push((output_partition, buf, batch_rows));
-                write_metrics.output_rows.add(batch_rows as usize);
-                timer.done();
+                let rows = output_batch.num_rows();
+                write_metrics.output_rows.add(rows);
+                batch_pending.push((output_partition, output_batch));
                 Ok(())
             })?;
 
-            pending_writes.push(batch_pending);
-
-            // Process pending writes — start multipart uploads lazily
-            for batch_writes in pending_writes.drain(..) {
-                for (output_partition, buf, rows) in batch_writes {
-                    let buf_len = buf.len() as u64;
-
-                    match &mut writers[output_partition] {
-                        Some(tracker) => {
-                            tracker.num_batches += 1;
-                            tracker.num_rows += rows;
-                            tracker.num_bytes += buf_len;
-                            tracker.writer.put(bytes::Bytes::from(buf));
-                        }
-                        None => {
-                            let (writer, full_url) = storage
-                                .start_multipart_write(
-                                    job_id,
-                                    stage_id,
-                                    output_partition,
-                                    input_partition,
-                                    file_ext,
-                                )
-                                .await
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                            let mut tracker = ObjectStoreWriteTracker {
-                                writer,
-                                full_url,
-                                num_batches: 1,
-                                num_rows: rows,
-                                num_bytes: buf_len,
-                            };
-                            tracker.writer.put(bytes::Bytes::from(buf));
-                            writers[output_partition] = Some(tracker);
-                        }
+            for (output_partition, output_batch) in batch_pending {
+                let timer = write_metrics.write_time.timer();
+                let uploader = match &mut writers[output_partition] {
+                    Some(u) => u,
+                    None => {
+                        let (multipart_writer, full_url) = storage
+                            .start_multipart_write(
+                                job_id,
+                                stage_id,
+                                output_partition,
+                                input_partition,
+                                file_ext,
+                            )
+                            .await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        let uploader = StreamingMultipartIpcUploader::try_new(
+                            schema.as_ref(),
+                            multipart_writer,
+                            full_url,
+                        )?;
+                        writers[output_partition] = Some(uploader);
+                        writers[output_partition].as_mut().expect("just inserted")
                     }
-                }
+                };
+                uploader.write_batch(&output_batch)?;
+                timer.done();
             }
         }
 
         // Finalize all multipart uploads
         let mut part_locs = Vec::new();
-
         for (output_partition, writer_opt) in writers.into_iter().enumerate() {
-            if let Some(tracker) = writer_opt {
+            if let Some(uploader) = writer_opt {
                 let timer = write_metrics.write_time.timer();
-                tracker.writer.finish().await.map_err(|e| {
-                    DataFusionError::External(Box::new(BallistaError::General(format!(
-                        "Failed to complete multipart upload to {}: {:?}",
-                        tracker.full_url, e
-                    ))))
-                })?;
+                let (full_url, num_batches, num_rows, num_bytes) =
+                    uploader.finish().await?;
                 timer.done();
 
                 debug!(
                     "Finished writing shuffle partition {} (Arrow IPC) to object store. Batches: {}, Bytes: {}.",
-                    output_partition, tracker.num_batches, tracker.num_bytes
+                    output_partition, num_batches, num_bytes
                 );
 
                 part_locs.push(ShuffleWritePartition {
                     partition_id: output_partition as u64,
-                    path: tracker.full_url,
-                    num_batches: tracker.num_batches,
-                    num_rows: tracker.num_rows,
-                    num_bytes: tracker.num_bytes,
+                    path: full_url,
+                    num_batches,
+                    num_rows,
+                    num_bytes,
                 });
             }
         }
@@ -1374,21 +1352,105 @@ fn result_schema() -> SchemaRef {
     ]))
 }
 
-/// Serialize a single record batch to Arrow IPC bytes with LZ4 compression.
-fn serialize_batch_to_ipc_bytes(batch: &RecordBatch, schema: &Schema) -> Result<Vec<u8>> {
-    let options = IpcWriteOptions::default()
-        .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-    let mut buf = Vec::new();
-    {
-        let mut ipc_writer = StreamWriter::try_new_with_options(
-            std::io::Cursor::new(&mut buf),
+/// Builds an [`IpcWriteOptions`] with LZ4_FRAME compression for shuffle writes.
+fn ipc_write_options() -> Result<IpcWriteOptions> {
+    Ok(IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::LZ4_FRAME))?)
+}
+
+/// Maintains a single Arrow IPC `StreamWriter` whose lifetime spans every batch
+/// written to one shuffle output partition, and drains its bytes into a
+/// `WriteMultipart` upload as they accumulate.
+///
+/// The previous implementation called `serialize_batch_to_ipc_bytes` per batch
+/// — each call wrote a complete IPC stream **with** an EOS marker via
+/// `StreamWriter::finish()` — and concatenated the streams into one S3 object.
+/// `StreamReader` on the reader side stops at the first EOS, so any partition
+/// holding more than one batch came back truncated (or as `Unexpected EOS`).
+///
+/// This wrapper writes the schema header once on construction, appends each
+/// batch's bytes to the multipart upload after `StreamWriter::write`, and emits
+/// the EOS marker exactly once at the end via [`Self::finish`].
+struct StreamingMultipartIpcUploader {
+    stream_writer: StreamWriter<std::io::Cursor<Vec<u8>>>,
+    multipart_writer: object_store::WriteMultipart,
+    full_url: String,
+    num_batches: u64,
+    num_rows: u64,
+    num_bytes: u64,
+}
+
+impl StreamingMultipartIpcUploader {
+    fn try_new(
+        schema: &Schema,
+        multipart_writer: object_store::WriteMultipart,
+        full_url: String,
+    ) -> Result<Self> {
+        let options = ipc_write_options()?;
+        let stream_writer = StreamWriter::try_new_with_options(
+            std::io::Cursor::new(Vec::new()),
             schema,
             options,
         )?;
-        ipc_writer.write(batch)?;
-        ipc_writer.finish()?;
+        let mut uploader = Self {
+            stream_writer,
+            multipart_writer,
+            full_url,
+            num_batches: 0,
+            num_rows: 0,
+            num_bytes: 0,
+        };
+        // Flush the schema header bytes that `try_new_with_options` already wrote
+        // so they land in the multipart upload before any batch bytes.
+        uploader.drain_buffer();
+        Ok(uploader)
     }
-    Ok(buf)
+
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let rows = batch.num_rows() as u64;
+        self.stream_writer.write(batch)?;
+        self.drain_buffer();
+        self.num_batches += 1;
+        self.num_rows += rows;
+        Ok(())
+    }
+
+    /// Move whatever bytes the `StreamWriter` has emitted since the last drain
+    /// from its internal cursor into the multipart upload and reset the cursor.
+    ///
+    /// Replaces the cursor's buffer with a fresh `Vec` sized at the previous
+    /// capacity rather than `Vec::new()` so the writer can reuse the allocation
+    /// between drains on shuffle-heavy workloads.
+    fn drain_buffer(&mut self) {
+        let cursor = self.stream_writer.get_mut();
+        let buf = cursor.get_mut();
+        let capacity = buf.capacity();
+        let bytes = std::mem::replace(buf, Vec::with_capacity(capacity));
+        cursor.set_position(0);
+        if !bytes.is_empty() {
+            self.num_bytes += bytes.len() as u64;
+            self.multipart_writer.put(bytes::Bytes::from(bytes));
+        }
+    }
+
+    /// Emit the final EOS marker, push any remaining bytes, and complete the
+    /// multipart upload. Returns `(full_url, num_batches, num_rows, num_bytes)`.
+    async fn finish(mut self) -> Result<(String, u64, u64, u64)> {
+        self.stream_writer.finish()?;
+        self.drain_buffer();
+        self.multipart_writer.finish().await.map_err(|e| {
+            DataFusionError::External(Box::new(BallistaError::General(format!(
+                "Failed to complete multipart upload to {}: {:?}",
+                self.full_url, e
+            ))))
+        })?;
+        Ok((
+            self.full_url,
+            self.num_batches,
+            self.num_rows,
+            self.num_bytes,
+        ))
+    }
 }
 
 /// Serialize buffered Vortex arrays to IPC bytes.
@@ -1545,5 +1607,103 @@ mod tests {
             Arc::new(MemorySourceConfig::try_new(&partitions, schema, None)?);
 
         Ok(Arc::new(DataSourceExec::new(memory_data_source)))
+    }
+
+    /// End-to-end regression test for [`StreamingMultipartIpcUploader`]:
+    /// writes multiple Arrow batches to the in-memory object store via the
+    /// streaming multipart path and reads them back, asserting all batches
+    /// survive without `Unexpected EOS`. Before the per-partition StreamWriter
+    /// refactor, every batch was serialised as a standalone IPC stream with its
+    /// own EOS marker and the reader stopped at the first one.
+    #[tokio::test]
+    async fn streaming_multipart_ipc_uploader_round_trips_multiple_batches() -> Result<()>
+    {
+        use crate::shuffle_storage::{ObjectStoreShuffleStorage, ShuffleStorage};
+        use datafusion::arrow::ipc::reader::StreamReader;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStore, ObjectStoreExt};
+
+        // Hand-build an `ObjectStoreShuffleStorage` over an in-memory store so the
+        // test exercises the multipart write path without needing S3.
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = ObjectStoreShuffleStorage::new_for_test(
+            Arc::clone(&inner),
+            "s3://test-bucket/shuffle/prefix".to_string(),
+            "shuffle/prefix".to_string(),
+            ShuffleStorageType::S3,
+        );
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let write_time =
+            metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::UInt32, false)]));
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                let values: Vec<u32> = (0..3).map(|j| i * 10 + j).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(datafusion::arrow::array::UInt32Array::from(
+                        values,
+                    ))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        let (multipart_writer, full_url) = storage
+            .start_multipart_write("job_a", 1, 0, 0, "arrow")
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let mut uploader = StreamingMultipartIpcUploader::try_new(
+            schema.as_ref(),
+            multipart_writer,
+            full_url.clone(),
+        )?;
+        for batch in &batches {
+            let timer = write_time.timer();
+            uploader.write_batch(batch)?;
+            timer.done();
+        }
+        let (returned_url, num_batches, num_rows, num_bytes) = uploader.finish().await?;
+        assert_eq!(returned_url, full_url);
+        assert_eq!(num_batches, batches.len() as u64);
+        assert_eq!(num_rows, total_rows as u64);
+        assert!(num_bytes > 0, "uploader should have written some bytes");
+
+        // Read the object straight back from the underlying in-memory store and
+        // decode with a standard Arrow `StreamReader` — this is what the
+        // shuffle reader does for object-store partitions.
+        let key = object_store::path::Path::from("shuffle/prefix/job_a/1/0/data.arrow");
+        let bytes = inner
+            .get(&key)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .bytes()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let reader = StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None)?;
+
+        let read_batches: Vec<RecordBatch> = reader
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "unexpected error reading shuffle stream back: {e}"
+                ))
+            })?;
+
+        assert_eq!(
+            read_batches.len(),
+            batches.len(),
+            "every batch should round-trip through one Arrow IPC stream"
+        );
+        let read_rows: usize = read_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(read_rows, total_rows);
+
+        Ok(())
     }
 }
