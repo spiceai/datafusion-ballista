@@ -34,6 +34,7 @@ use log::{debug, error};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectPath;
+use object_store::prefix::PrefixStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
 use std::fmt::{Debug, Display};
 use std::fs::File;
@@ -386,9 +387,42 @@ impl ShuffleStorage for LocalShuffleStorage {
 /// Object store based shuffle storage implementation (for S3 and Azure).
 #[derive(Debug)]
 pub struct ObjectStoreShuffleStorage {
+    /// Either the raw bucket/container store (when `base_url` has no path) or a
+    /// [`PrefixStore`] wrapping it (when `base_url` includes a path like
+    /// `s3://bucket/shuffle/prefix`). All keys passed to `self.store` are
+    /// job-relative — `PrefixStore` reattaches the URL path prefix transparently.
     store: Arc<dyn ObjectStore>,
     base_url: String,
+    /// Path portion of `base_url`, normalised without leading/trailing slashes
+    /// (e.g. "shuffle/prefix" for `s3://bucket/shuffle/prefix`). Empty when the
+    /// URL has no path. Used only by [`Self::extract_object_path`] to strip the
+    /// prefix from caller-supplied full URLs before handing the key to the
+    /// already-prefixed `self.store`.
+    path_prefix: String,
     storage_type: ShuffleStorageType,
+}
+
+/// Extracts the path component of an object-store URL as a normalised key prefix.
+/// Returns "" if the URL has no path (e.g. `s3://bucket`) or fails to parse.
+fn extract_path_prefix(base_url: &str) -> String {
+    Url::parse(base_url)
+        .ok()
+        .map(|u| u.path().trim_matches('/').to_string())
+        .unwrap_or_default()
+}
+
+/// Wraps `store` in a [`PrefixStore`] when `prefix` is non-empty so every
+/// subsequent operation runs in the prefix's namespace; returns the store
+/// unchanged otherwise.
+fn apply_path_prefix<S>(store: S, prefix: &str) -> Arc<dyn ObjectStore>
+where
+    S: ObjectStore + 'static,
+{
+    if prefix.is_empty() {
+        Arc::new(store)
+    } else {
+        Arc::new(PrefixStore::new(store, prefix.to_string()))
+    }
 }
 
 impl ObjectStoreShuffleStorage {
@@ -429,10 +463,13 @@ impl ObjectStoreShuffleStorage {
             .base_url
             .clone()
             .unwrap_or_else(|| format!("s3://{}", bucket));
+        let path_prefix = extract_path_prefix(&base_url);
+        let store = apply_path_prefix(store, &path_prefix);
 
         Ok(Self {
-            store: Arc::new(store),
+            store,
             base_url,
+            path_prefix,
             storage_type: ShuffleStorageType::S3,
         })
     }
@@ -484,10 +521,13 @@ impl ObjectStoreShuffleStorage {
         let base_url = config.base_url.clone().unwrap_or_else(|| {
             format!("abfs://{}@{}.dfs.core.windows.net", container, account)
         });
+        let path_prefix = extract_path_prefix(&base_url);
+        let store = apply_path_prefix(store, &path_prefix);
 
         Ok(Self {
-            store: Arc::new(store),
+            store,
             base_url,
+            path_prefix,
             storage_type: ShuffleStorageType::Azure,
         })
     }
@@ -503,12 +543,39 @@ impl ObjectStoreShuffleStorage {
         }
     }
 
+    /// Constructs an `ObjectStoreShuffleStorage` for tests that need to inject an
+    /// in-memory or other custom `ObjectStore` instead of building an S3 / Azure
+    /// client. Applies the same `PrefixStore` wrapping as the production
+    /// constructors so the test setup matches behaviour.
+    #[doc(hidden)]
+    pub fn new_for_test(
+        inner_store: Arc<dyn ObjectStore>,
+        base_url: String,
+        path_prefix: String,
+        storage_type: ShuffleStorageType,
+    ) -> Self {
+        let store = if path_prefix.is_empty() {
+            inner_store
+        } else {
+            Arc::new(PrefixStore::new(inner_store, path_prefix.clone()))
+        };
+        Self {
+            store,
+            base_url,
+            path_prefix,
+            storage_type,
+        }
+    }
+
     /// Returns a reference to the underlying object store.
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }
 
-    /// Constructs the full URL for a shuffle partition.
+    /// Constructs the full URL for a shuffle partition along with the job-relative
+    /// object-store key. The returned `ObjectPath` is relative to the storage's
+    /// `path_prefix` — `self.store` is already a [`PrefixStore`] when a prefix is set,
+    /// so it reattaches the prefix transparently.
     pub fn make_full_url(
         &self,
         job_id: &str,
@@ -617,7 +684,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
 
         let num_bytes = buffer.len();
 
-        // Upload to object store
+        // Upload via the (possibly prefix-wrapped) store with the job-relative key.
         let object_path = ObjectPath::from(relative_path);
         let payload = PutPayload::from(Bytes::from(buffer));
 
@@ -670,7 +737,8 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
     async fn delete_job_data(&self, job_id: &str) -> Result<()> {
         let prefix = ObjectPath::from(job_id.to_string());
 
-        // List all objects with the job_id prefix
+        // List all objects with the job_id prefix (relative to the storage's path_prefix —
+        // PrefixStore reattaches the URL path prefix on every operation).
         let mut list_stream = self.store.list(Some(&prefix));
         let mut objects_to_delete = Vec::new();
 
@@ -715,15 +783,25 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
 }
 
 impl ObjectStoreShuffleStorage {
+    /// Resolves a caller-supplied URL or path to a key relative to the storage's
+    /// `path_prefix`. `self.store` is already prefix-wrapped, so handing it the
+    /// full URL path would double-prefix — strip `self.path_prefix` first.
     fn extract_object_path(&self, path: &str) -> Result<ObjectPath> {
-        // Parse the URL and extract the path component
-        if let Ok(url) = Url::parse(path) {
-            let path_str = url.path().trim_start_matches('/');
-            Ok(ObjectPath::from(path_str))
+        let raw = match Url::parse(path) {
+            Ok(url) => url.path().trim_start_matches('/').to_string(),
+            // Not a URL — treat as an already-relative key.
+            Err(_) => return Ok(ObjectPath::from(path)),
+        };
+        let relative = if self.path_prefix.is_empty() {
+            raw.as_str()
         } else {
-            // If it's not a valid URL, assume it's already a relative path
-            Ok(ObjectPath::from(path))
-        }
+            raw.strip_prefix(&self.path_prefix)
+                .map(|rest| rest.trim_start_matches('/'))
+                // Fall back to the raw key if it doesn't start with our prefix —
+                // happens in tests that hand-construct URLs against unrelated stores.
+                .unwrap_or(raw.as_str())
+        };
+        Ok(ObjectPath::from(relative))
     }
 }
 
@@ -947,5 +1025,109 @@ mod tests {
         let result =
             ShuffleStorageConfig::from_type_and_url(ShuffleStorageType::S3, "not-a-url");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_path_prefix() {
+        assert_eq!(extract_path_prefix("s3://bucket"), "");
+        assert_eq!(extract_path_prefix("s3://bucket/"), "");
+        assert_eq!(extract_path_prefix("s3://bucket/shuffle"), "shuffle");
+        assert_eq!(
+            extract_path_prefix("s3://bucket/shuffle/prefix"),
+            "shuffle/prefix"
+        );
+        assert_eq!(
+            extract_path_prefix("s3://bucket/shuffle/prefix/"),
+            "shuffle/prefix"
+        );
+        assert_eq!(
+            extract_path_prefix("abfs://container@account.dfs.core.windows.net/shuffle"),
+            "shuffle"
+        );
+        assert_eq!(extract_path_prefix("not-a-url"), "");
+    }
+
+    /// Builds an `ObjectStoreShuffleStorage` over the supplied [`InMemory`] store
+    /// with the same `PrefixStore`-based wiring `new_s3` / `new_azure` apply in
+    /// production. Returns the inner store so tests can directly inspect the
+    /// final object key (the wrapped store would strip the prefix on listing).
+    fn build_storage_for_test(
+        base_url: &str,
+    ) -> (ObjectStoreShuffleStorage, Arc<dyn ObjectStore>) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path_prefix = extract_path_prefix(base_url);
+        let store: Arc<dyn ObjectStore> = if path_prefix.is_empty() {
+            Arc::clone(&inner)
+        } else {
+            Arc::new(PrefixStore::new(Arc::clone(&inner), path_prefix.clone()))
+        };
+        let storage = ObjectStoreShuffleStorage {
+            store,
+            base_url: base_url.to_string(),
+            path_prefix,
+            storage_type: ShuffleStorageType::S3,
+        };
+        (storage, inner)
+    }
+
+    /// `make_full_url` reports a full URL for downstream consumers but hands the
+    /// store a job-relative key — `PrefixStore` reattaches the URL path prefix.
+    #[test]
+    fn test_make_full_url_returns_relative_object_path() {
+        let (storage, _inner) = build_storage_for_test("s3://my-bucket/shuffle/prefix");
+
+        let (full_url, object_path) = storage.make_full_url("job_a", 1, 40, 40, "arrow");
+        assert_eq!(
+            full_url,
+            "s3://my-bucket/shuffle/prefix/job_a/1/40/data.arrow"
+        );
+        assert_eq!(object_path.as_ref(), "job_a/1/40/data.arrow");
+    }
+
+    #[test]
+    fn test_make_full_url_no_prefix_round_trip() {
+        let (storage, _inner) = build_storage_for_test("s3://my-bucket");
+
+        let (full_url, object_path) = storage.make_full_url("job_a", 1, 0, 0, "arrow");
+        assert_eq!(full_url, "s3://my-bucket/job_a/1/0/data.arrow");
+        assert_eq!(object_path.as_ref(), "job_a/1/0/data.arrow");
+    }
+
+    /// Regression test for the writer-side prefix bug: an end-to-end write must
+    /// land under the URL path prefix in the underlying bucket. Before the fix,
+    /// the object landed at `job_a/1/0/data.arrow` while the reader looked under
+    /// `shuffle/prefix/job_a/1/0/data.arrow` and got NotFound.
+    #[tokio::test]
+    async fn test_object_store_round_trip_with_prefix() {
+        let (storage, inner) = build_storage_for_test("s3://my-bucket/shuffle/prefix");
+
+        let (batch, schema) = create_test_batch();
+        let metrics = ExecutionPlanMetricsSet::new();
+        let time_metric =
+            metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
+
+        let (full_url, _stats) = storage
+            .write_shuffle_data("job_a", 1, 0, 0, vec![batch], schema, &time_metric)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_url,
+            "s3://my-bucket/shuffle/prefix/job_a/1/0/data.arrow"
+        );
+
+        // The actual S3 key in the underlying bucket must include the URL path prefix.
+        let inner_keys: Vec<String> = inner
+            .list(None)
+            .filter_map(|r| async move { r.ok().map(|m| m.location.to_string()) })
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(inner_keys, vec!["shuffle/prefix/job_a/1/0/data.arrow"]);
+
+        let read_batches = storage.read_shuffle_data(&full_url).await.unwrap();
+        assert_eq!(read_batches.len(), 1);
+        assert_eq!(read_batches[0].num_rows(), 3);
+
+        storage.delete_job_data("job_a").await.unwrap();
+        assert!(storage.read_shuffle_data(&full_url).await.is_err());
     }
 }

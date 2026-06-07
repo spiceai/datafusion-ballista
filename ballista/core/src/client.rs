@@ -126,6 +126,20 @@ impl BallistaClient {
         port: u16,
         flight_transport: bool,
     ) -> BResult<SendableRecordBatchStream> {
+        // When the writer-side stored this partition in object store (s3 / abfs / az / gs),
+        // skip the gRPC FetchPartition path entirely — the executor's handler only knows
+        // local paths and `memory://` and would `tokio::fs::File::open("s3://...")`, failing
+        // with `No such file or directory`. Read straight from object store instead.
+        if crate::execution_plans::shuffle_reader::path_is_object_store(path) {
+            return crate::execution_plans::shuffle_reader::fetch_object_store_partition_stream(
+                path,
+                executor_id,
+                partition_id.stage_id,
+                partition_id.partition_id,
+            )
+            .await;
+        }
+
         let action = Action::FetchPartition {
             job_id: partition_id.job_id.clone(),
             stage_id: partition_id.stage_id,

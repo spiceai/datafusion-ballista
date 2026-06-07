@@ -990,6 +990,85 @@ async fn fetch_partition_object_store_with_runtime(
     Ok(Box::pin(stream))
 }
 
+/// Streams a shuffle / result partition directly from object store. Used by the
+/// driver-side final-stage fetch in `distributed_query` (via
+/// [`crate::client::BallistaClient::fetch_partition`]), which has no
+/// `RuntimeEnv` on hand and only knows the path and identifiers, so this helper
+/// takes plain args and builds the client from the environment (same
+/// credentials the writer side reads).
+///
+/// Streams the response body so partitions are decoded incrementally rather than
+/// buffered in memory.
+pub(crate) async fn fetch_object_store_partition_stream(
+    path: &str,
+    executor_id: &str,
+    stage_id: usize,
+    partition_id: usize,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    use object_store::path::Path as ObjectPath;
+
+    debug!("Fetching shuffle partition from object store: {path}");
+
+    let url = Url::parse(path).map_err(|e| {
+        BallistaError::General(format!(
+            "Failed to parse object store URL '{path}': {e:?}"
+        ))
+    })?;
+
+    let store = build_shuffle_object_store(&url).map_err(|e| {
+        BallistaError::FetchFailed(
+            executor_id.to_owned(),
+            stage_id,
+            partition_id,
+            format!("Failed to build object store client for '{path}': {e:?}"),
+        )
+    })?;
+
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    debug!("Reading object from path: {object_path:?}");
+
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        BallistaError::FetchFailed(
+            executor_id.to_owned(),
+            stage_id,
+            partition_id,
+            format!("Failed to read object from {path}: {e:?}"),
+        )
+    })?;
+
+    let byte_stream = get_result.into_stream();
+    let stream = ObjectStoreShuffleStream::try_new(byte_stream, path.to_owned()).await?;
+
+    Ok(Box::pin(stream))
+}
+
+/// Builds an S3 object store client for a shuffle URL. Credentials come from
+/// the environment (same as the writer in practice). Non-S3 schemes return an
+/// error — Azure shuffle is on the same architectural footing but its writer-
+/// side path doesn't go through this code today; rather than add a divergent
+/// reader, we leave it to the registry-based follow-up to handle both.
+fn build_shuffle_object_store(
+    url: &Url,
+) -> result::Result<Arc<dyn ObjectStore>, BallistaError> {
+    let scheme = url.scheme();
+    match scheme {
+        "s3" => {
+            let bucket = url.host_str().ok_or_else(|| {
+                BallistaError::General(format!("No bucket in S3 URL: {url}"))
+            })?;
+            let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let store = builder.build().map_err(|e| {
+                BallistaError::General(format!("Failed to create S3 client: {e:?}"))
+            })?;
+            Ok(Arc::new(store))
+        }
+        _ => Err(BallistaError::General(format!(
+            "Unsupported object store scheme for shuffle reader: {scheme}. Only 's3' is supported."
+        ))),
+    }
+}
+
 /// Maximum length of message with schema definition for object store streaming.
 const OBJECT_STORE_MAX_SCHEMA_BUFFER_SIZE: usize = 8_388_608;
 
@@ -1166,6 +1245,22 @@ impl RecordBatchStream for ObjectStoreShuffleStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+/// Returns true when the given path is an object-store URL the streaming shuffle
+/// reader can handle. Exposed so non-shuffle-reader callers (e.g. the driver-side
+/// final-stage fetch via [`crate::client::BallistaClient::fetch_partition`]) can
+/// route around the gRPC `FetchPartition` path, which only understands local files
+/// and `memory://`.
+///
+/// Scoped to `s3://` to match [`build_shuffle_object_store`]: the writer-side
+/// `ObjectStoreShuffleStorage::new_azure` exists but is not wired through the
+/// registry-based credential path yet, so `abfs://` / `az://` / `gs://` URLs would
+/// be routed away from gRPC and then fail in `build_shuffle_object_store`.
+/// Broaden this alongside `build_shuffle_object_store` once those backends are
+/// supported.
+pub(crate) fn path_is_object_store(path: &str) -> bool {
+    path.starts_with("s3://")
 }
 
 /// Check if the location is an object store path (S3 or Azure).
@@ -2222,5 +2317,35 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// `build_shuffle_object_store` must accept an S3 URL that includes a path
+    /// component (the shuffle key) — earlier versions of the reader funneled
+    /// the full URL through `ObjectStoreUrl::parse`, which rejected anything
+    /// beyond scheme+authority and failed with
+    /// "ObjectStoreUrl must only contain scheme and authority".
+    #[test]
+    fn test_build_shuffle_object_store_accepts_s3_with_path() {
+        let url = Url::parse("s3://my-bucket/shuffle/job-id/1/4i1vaNv/1/0/data-35.arrow")
+            .unwrap();
+
+        build_shuffle_object_store(&url)
+            .expect("a fully-qualified S3 shuffle URL must build a client");
+    }
+
+    #[test]
+    fn test_build_shuffle_object_store_rejects_non_s3_schemes() {
+        for url in [
+            "file:///tmp/shuffle/data.arrow",
+            "abfs://container@account.dfs.core.windows.net/data.arrow",
+            "az://container/data.arrow",
+            "gs://bucket/data.arrow",
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            assert!(
+                build_shuffle_object_store(&parsed).is_err(),
+                "expected {url} to be rejected — only s3 is supported on the reader today"
+            );
+        }
     }
 }
