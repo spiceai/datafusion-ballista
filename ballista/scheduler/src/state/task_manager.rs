@@ -409,8 +409,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Get the execution graph of of a job. First look in the active cache.
     /// If no one found, then in the Active/Completed jobs.
-    #[cfg(feature = "rest-api")]
-    pub(crate) async fn get_job_execution_graph(
+    ///
+    /// Exposed as `pub` so embedded callers (e.g., Spice's distributed
+    /// task_history writer) can walk per-stage and per-task state directly
+    /// without going through a gRPC method.
+    pub async fn get_job_execution_graph(
         &self,
         job_id: &str,
     ) -> Result<Option<ExecutionGraphBox>> {

@@ -1658,6 +1658,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                 let task_attempt = stage.task_failure_numbers[partition_id];
                 let task_info = TaskInfo {
                     task_id,
+                    executor_id: executor_id.to_owned(),
                     scheduled_time: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -1742,6 +1743,7 @@ impl Debug for StaticExecutionGraph {
 pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
     TaskInfo {
         task_id,
+        executor_id: executor_id.clone(),
         scheduled_time: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
