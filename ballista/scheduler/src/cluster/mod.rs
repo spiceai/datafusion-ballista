@@ -811,11 +811,8 @@ pub(crate) fn get_scan_files(
 ) -> std::result::Result<Vec<Vec<Vec<PartitionedFile>>>, DataFusionError> {
     let mut collector: Vec<Vec<Vec<PartitionedFile>>> = vec![];
     plan.apply(&mut |plan: &Arc<dyn ExecutionPlan>| {
-        let plan_any = plan.as_any();
-
-        if let Some(config) = plan_any
-            .downcast_ref::<DataSourceExec>()
-            .and_then(|c| c.data_source().as_any().downcast_ref::<FileScanConfig>())
+        if let Some(config) = plan.downcast_ref::<DataSourceExec>()
+            .and_then(|c| c.data_source().downcast_ref::<FileScanConfig>())
         {
             collector.push(
                 config
@@ -1219,10 +1216,11 @@ mod test {
                 },
                 partition_values: vec![],
                 range: None,
-                extensions: None,
+                extensions: Default::default(),
                 statistics: None,
                 ordering: None,
                 metadata_size_hint: None,
+                table_reference: None,
             }]);
         }
         vec![scan_files]

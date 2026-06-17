@@ -21,7 +21,6 @@
 //! per input partition, along with an index file mapping partition IDs to
 //! byte offsets.
 
-use std::any::Any;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufWriter;
@@ -231,7 +230,7 @@ impl SortShuffleWriterExec {
                 exprs,
                 num_output_partitions,
                 metrics.repart_time.clone(),
-            );
+            )?;
 
             // Process input stream
             while let Some(result) = stream.next().await {
@@ -485,10 +484,6 @@ impl ExecutionPlan for SortShuffleWriterExec {
         "SortShuffleWriterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.plan.schema()
     }
@@ -595,7 +590,10 @@ impl ExecutionPlan for SortShuffleWriterExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
         self.plan.partition_statistics(partition)
     }
 }

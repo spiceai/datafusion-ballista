@@ -315,7 +315,7 @@ fn statistical_join_selection_subrule(
     collect_threshold_num_rows: usize,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let transformed =
-        if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
             match hash_join.partition_mode() {
                 PartitionMode::Auto => try_collect_left(
                     hash_join,
@@ -346,7 +346,7 @@ fn statistical_join_selection_subrule(
                     }
                 }
             }
-        } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
+        } else if let Some(cross_join) = plan.downcast_ref::<CrossJoinExec>() {
             let left = cross_join.left();
             let right = cross_join.right();
             if right.properties().output_partitioning().partition_count() > 1 {
@@ -356,7 +356,7 @@ fn statistical_join_selection_subrule(
             } else {
                 None
             }
-        } else if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+        } else if let Some(nl_join) = plan.downcast_ref::<NestedLoopJoinExec>() {
             let left = nl_join.left();
             let right = nl_join.right();
             // next few lines are different from original datafusion rule
@@ -407,7 +407,7 @@ fn hash_join_convert_symmetric_subrule(
     config_options: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // Check if the current plan node is a HashJoinExec.
-    if let Some(hash_join) = input.as_any().downcast_ref::<HashJoinExec>() {
+    if let Some(hash_join) = input.downcast_ref::<HashJoinExec>() {
         let left_unbounded = hash_join.left.boundedness().is_unbounded();
         let left_incremental = matches!(
             hash_join.left.pipeline_behavior(),
@@ -547,7 +547,7 @@ pub fn hash_join_swap_subrule(
     mut input: Arc<dyn ExecutionPlan>,
     _config_options: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if let Some(hash_join) = input.as_any().downcast_ref::<HashJoinExec>()
+    if let Some(hash_join) = input.downcast_ref::<HashJoinExec>()
         && hash_join.left.boundedness().is_unbounded()
         && !hash_join.right.boundedness().is_unbounded()
         && matches!(

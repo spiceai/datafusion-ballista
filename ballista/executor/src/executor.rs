@@ -168,7 +168,7 @@ fn extract_shuffle_read_metrics_recursive(
     found_any: &mut bool,
 ) {
     // Check if this node is a ShuffleReaderExec
-    if let Some(shuffle_reader) = plan.as_any().downcast_ref::<ShuffleReaderExec>() {
+    if let Some(shuffle_reader) = plan.downcast_ref::<ShuffleReaderExec>() {
         // Sum up partition stats from all partition locations
         for partition_locations in &shuffle_reader.partition {
             for location in partition_locations {
@@ -463,7 +463,6 @@ mod test {
     };
     use datafusion::prelude::SessionContext;
     use futures::Stream;
-    use std::any::Any;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -532,10 +531,6 @@ mod test {
             "NeverendingOperator"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::new(Schema::empty())
         }
@@ -563,8 +558,11 @@ mod test {
             Ok(Box::pin(NeverendingRecordBatchStream))
         }
 
-        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-            Ok(Statistics::new_unknown(&self.schema()))
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> Result<Arc<Statistics>> {
+            Ok(Arc::new(Statistics::new_unknown(&self.schema())))
         }
     }
 

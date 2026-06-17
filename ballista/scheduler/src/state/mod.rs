@@ -489,7 +489,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
         plan.apply(&mut |plan: &LogicalPlan| {
             if let LogicalPlan::TableScan(scan) = plan {
                 let provider = source_as_provider(&scan.source)?;
-                if let Some(table) = provider.as_any().downcast_ref::<ListingTable>() {
+                if let Some(table) = provider.downcast_ref::<ListingTable>() {
                     let local_paths: Vec<&ListingTableUrl> = table
                         .table_paths()
                         .iter()
@@ -549,9 +549,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                     Arc::new(EmptyExec::new(node.schema()));
                 Ok(Transformed::yes(empty))
             } else if let (Some(explain), Some(explain_distributed_plan)) = (
-                node.as_any()
-                    .downcast_ref::<datafusion::physical_plan::explain::ExplainExec>(),
-                &explain_distributed_plan,
+                node.downcast_ref::<datafusion::physical_plan::explain::ExplainExec>(), &explain_distributed_plan,
             ) {
                 let plans = explain.stringified_plans();
                 let (logical_txt, physical_txt) =

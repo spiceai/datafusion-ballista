@@ -24,7 +24,6 @@ use datafusion::logical_expr::{
     ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
     TypeSignature, Volatility,
 };
-use std::any::Any;
 use std::hash::Hash;
 
 /// A stub provider to encapsulate a function that exists in the scheduler's registry,
@@ -95,10 +94,6 @@ impl RemoteScalarUDF {
 }
 
 impl ScalarUDFImpl for RemoteScalarUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.meta.name.as_str()
     }

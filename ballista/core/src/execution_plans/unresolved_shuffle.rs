@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -92,10 +91,6 @@ impl ExecutionPlan for UnresolvedShuffleExec {
         "UnresolvedShuffleExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -132,9 +127,12 @@ impl ExecutionPlan for UnresolvedShuffleExec {
         ))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
         // The full statistics are computed in the `ShuffleReaderExec` node
         // that replaces this one once the previous stage is completed.
-        Ok(Statistics::new_unknown(&self.schema()))
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 }

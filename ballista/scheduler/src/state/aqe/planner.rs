@@ -170,8 +170,8 @@ impl AdaptivePlanner {
             .as_ref()
             .map(|stage| {
                 (
-                    stage.as_any().downcast_ref::<ExchangeExec>(),
-                    stage.as_any().downcast_ref::<AdaptiveDatafusionExec>(),
+                    stage.downcast_ref::<ExchangeExec>(),
+                    stage.downcast_ref::<AdaptiveDatafusionExec>(),
                 )
             }) {
             Some((Some(stage), None)) => {
@@ -345,7 +345,7 @@ impl AdaptivePlanner {
         if !runnable_stages.is_empty() {
             let mut runnable = Vec::new();
             for exec in runnable_stages.into_iter() {
-                match exec.as_any().downcast_ref::<ExchangeExec>() {
+                match exec.downcast_ref::<ExchangeExec>() {
                     Some(exchange) if exchange.inactive_stage => continue,
                     Some(exchange) if exchange.stage_id().is_none() => {
                         exchange.set_stage_id(self.stage_id_generator);
@@ -369,7 +369,7 @@ impl AdaptivePlanner {
 
             Ok(Some(runnable))
         } else if let Some(root) =
-            self.plan.as_any().downcast_ref::<AdaptiveDatafusionExec>()
+            self.plan.downcast_ref::<AdaptiveDatafusionExec>()
         {
             // shuffle writer has finished
             // there is no more runnable stages
@@ -412,8 +412,7 @@ impl AdaptivePlanner {
         runnable_stages
             .into_iter()
             .map(|exec| {
-                exec.as_any()
-                    .downcast_ref::<ExchangeExec>()
+                exec.downcast_ref::<ExchangeExec>()
                     .ok_or_else(|| {
                         datafusion::common::DataFusionError::Plan(
                             "ExchangeExec expected".into(),
@@ -485,7 +484,7 @@ impl AdaptivePlanner {
         node: &Arc<dyn ExecutionPlan>,
         runnable_stages: &mut Vec<Arc<dyn ExecutionPlan>>,
     ) -> bool {
-        if let Some(exchange) = node.as_any().downcast_ref::<ExchangeExec>()
+        if let Some(exchange) = node.downcast_ref::<ExchangeExec>()
             && exchange.shuffle_created()
         {
             // we found exchange which has partitions resolved or this stage is not
@@ -493,7 +492,7 @@ impl AdaptivePlanner {
             // all runnable children has been run
 
             false
-        } else if let Some(exchange) = node.as_any().downcast_ref::<ExchangeExec>()
+        } else if let Some(exchange) = node.downcast_ref::<ExchangeExec>()
             && !exchange.shuffle_created()
         {
             // we found exchange which has not been resolved (run)
