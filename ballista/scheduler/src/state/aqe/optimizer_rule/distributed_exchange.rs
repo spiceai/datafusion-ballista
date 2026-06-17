@@ -45,11 +45,9 @@ impl DistributedExchangeRule {
         execution_plan: Arc<dyn ExecutionPlan>,
     ) -> datafusion::error::Result<Transformed<Arc<dyn ExecutionPlan>>> {
         if let Some(coalesce) = execution_plan
-            .as_any()
             .downcast_ref::<CoalescePartitionsExec>()
             && coalesce
                 .input()
-                .as_any()
                 .downcast_ref::<ExchangeExec>()
                 .is_none()
         {
@@ -63,11 +61,9 @@ impl DistributedExchangeRule {
                 execution_plan.with_new_children(vec![Arc::new(exchange_exec)])?,
             ))
         } else if let Some(sort_preserving_merge) = execution_plan
-            .as_any()
             .downcast_ref::<SortPreservingMergeExec>(
         ) && sort_preserving_merge
             .input()
-            .as_any()
             .downcast_ref::<ExchangeExec>()
             .is_none()
         {
@@ -81,7 +77,7 @@ impl DistributedExchangeRule {
                 execution_plan.with_new_children(vec![Arc::new(exchange_exec)])?,
             ))
         } else if let Some(repartition) =
-            execution_plan.as_any().downcast_ref::<RepartitionExec>()
+            execution_plan.downcast_ref::<RepartitionExec>()
         {
             match repartition.partitioning() {
                 execution_plan::Partitioning::Hash(_, _) => {
@@ -116,7 +112,6 @@ impl PhysicalOptimizerRule for DistributedExchangeRule {
 
         if result
             .data
-            .as_any()
             .downcast_ref::<AdaptiveDatafusionExec>()
             .is_some()
         {

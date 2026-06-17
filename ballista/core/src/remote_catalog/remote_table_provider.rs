@@ -22,7 +22,6 @@ use datafusion::common::{Result, exec_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use std::any::Any;
 use std::sync::Arc;
 
 /// A stub provider to encapsulate a table that exists in the scheduler's catalog, to allow
@@ -69,10 +68,6 @@ impl RemoteTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for RemoteTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

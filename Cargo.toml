@@ -31,12 +31,12 @@ arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
 clap = { version = "4.5", features = ["derive", "cargo"] }
 configure_me = { version = "0.4.0" }
 configure_me_codegen = { version = "0.4.4" }
-datafusion = "53"
-datafusion-cli = "53"
-datafusion-proto = "53"
-datafusion-proto-common = "53"
-datafusion-spark = "53"
-datafusion-substrait = "53"
+datafusion = "54"
+datafusion-cli = "54"
+datafusion-proto = "54"
+datafusion-proto-common = "54"
+datafusion-spark = "54"
+datafusion-substrait = "54"
 insta = "1.47"
 object_store = { version = "0.13", features = ["aws", "azure"] }
 bytes = "1.5"

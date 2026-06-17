@@ -49,7 +49,6 @@ use datafusion_proto::logical_plan::{
 };
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, error, info};
-use std::any::Any;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -164,10 +163,6 @@ impl<T: 'static + AsLogicalPlan> DisplayAs for DistributedQueryExec<T> {
 impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
     fn name(&self) -> &str {
         "DistributedQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -307,11 +302,14 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         }
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
         // This execution plan sends the logical plan to the scheduler without
         // performing the node by node conversion to a full physical plan.
         // This implies that we cannot infer the statistics at this stage.
-        Ok(Statistics::new_unknown(&self.schema()))
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

@@ -141,7 +141,6 @@ impl DefaultDistributedPlanner {
         }
 
         if let Some(_coalesce) = execution_plan
-            .as_any()
             .downcast_ref::<CoalescePartitionsExec>()
         {
             let input = children[0].clone();
@@ -161,7 +160,6 @@ impl DefaultDistributedPlanner {
                 stages,
             ))
         } else if let Some(_sort_preserving_merge) = execution_plan
-            .as_any()
             .downcast_ref::<SortPreservingMergeExec>(
         ) {
             let shuffle_writer = create_shuffle_writer_with_config(
@@ -178,7 +176,7 @@ impl DefaultDistributedPlanner {
                 stages,
             ))
         } else if let Some(repart) =
-            execution_plan.as_any().downcast_ref::<RepartitionExec>()
+            execution_plan.downcast_ref::<RepartitionExec>()
         {
             match repart.properties().output_partitioning() {
                 Partitioning::Hash(_, _) => {
@@ -235,7 +233,7 @@ pub fn find_unresolved_shuffles(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<UnresolvedShuffleExec>> {
     if let Some(unresolved_shuffle) =
-        plan.as_any().downcast_ref::<UnresolvedShuffleExec>()
+        plan.downcast_ref::<UnresolvedShuffleExec>()
     {
         Ok(vec![unresolved_shuffle.clone()])
     } else {
@@ -260,7 +258,7 @@ pub fn remove_unresolved_shuffles(
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
         if let Some(unresolved_shuffle) =
-            child.as_any().downcast_ref::<UnresolvedShuffleExec>()
+            child.downcast_ref::<UnresolvedShuffleExec>()
         {
             let mut relevant_locations = vec![];
             let p = partition_locations
@@ -320,7 +318,7 @@ pub fn rollback_resolved_shuffles(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
-        if let Some(shuffle_reader) = child.as_any().downcast_ref::<ShuffleReaderExec>() {
+        if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
             let stage_id = shuffle_reader.stage_id;
 
             let unresolved_shuffle = Arc::new(UnresolvedShuffleExec::new(
@@ -410,11 +408,13 @@ mod test {
 
     macro_rules! downcast_exec {
         ($exec: expr, $ty: ty) => {
-            $exec.as_any().downcast_ref::<$ty>().expect(&format!(
-                "Downcast to {} failed. Got {:?}",
-                stringify!($ty),
-                $exec
-            ))
+            ($exec.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<$ty>()
+                .expect(&format!(
+                    "Downcast to {} failed. Got {:?}",
+                    stringify!($ty),
+                    $exec
+                ))
         };
     }
 
@@ -752,7 +752,7 @@ order by
         assert_eq!(2, partitioning.partition_count());
         let partition_col = match partitioning {
             Partitioning::Hash(exprs, 2) => match exprs.as_slice() {
-                [col] => col.as_any().downcast_ref::<Column>(),
+                [col] => col.downcast_ref::<Column>(),
                 _ => None,
             },
             _ => None,
@@ -766,7 +766,7 @@ order by
         let window = downcast_exec!(filter.children()[0], BoundedWindowAggExec);
         let partition_by = window.partition_keys();
         let partition_by = match partition_by[..] {
-            [ref col] => col.as_any().downcast_ref::<Column>(),
+            [ref col] => col.downcast_ref::<Column>(),
             _ => None,
         };
         assert_eq!(Some(&Column::new("l_shipmode", 1)), partition_by);
@@ -783,7 +783,7 @@ order by
                 );
                 assert_eq!(
                     Some(&Column::new("l_shipmode", 1)),
-                    expr1.expr.as_any().downcast_ref()
+                    expr1.expr.downcast_ref()
                 );
                 assert_eq!(
                     SortOptions {
@@ -794,7 +794,7 @@ order by
                 );
                 assert_eq!(
                     Some(&Column::new("l_shipdate", 0)),
-                    expr2.expr.as_any().downcast_ref()
+                    expr2.expr.downcast_ref()
                 );
             }
             _ => panic!("invalid sort {sort:?}"),

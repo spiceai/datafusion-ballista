@@ -19,7 +19,6 @@ use async_trait::async_trait;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::stats::Precision;
 use datafusion::physical_plan::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
@@ -137,10 +136,6 @@ impl ExecutionPlan for ShuffleReaderExec {
         "ShuffleReaderExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -241,7 +236,10 @@ impl ExecutionPlan for ShuffleReaderExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
         if let Some(idx) = partition {
             let partition_count = self.properties().partitioning.partition_count();
             if idx >= partition_count {
@@ -258,7 +256,7 @@ impl ExecutionPlan for ShuffleReaderExec {
                 "shuffle reader at stage: {} and partition {} returned statistics: {:?}",
                 self.stage_id, idx, stat_for_partition
             );
-            stat_for_partition
+            stat_for_partition.map(Arc::new)
         } else {
             let stats_for_partitions = stats_for_partitions(
                 self.schema.fields().len(),
@@ -271,7 +269,7 @@ impl ExecutionPlan for ShuffleReaderExec {
                 "shuffle reader at stage: {} returned statistics for all partitions: {:?}",
                 self.stage_id, stats_for_partitions
             );
-            Ok(stats_for_partitions)
+            Ok(Arc::new(stats_for_partitions))
         }
     }
 }

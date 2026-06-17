@@ -1836,14 +1836,14 @@ impl ExecutionPlanVisitor for ExecutionStageBuilder {
         plan: &dyn ExecutionPlan,
     ) -> std::result::Result<bool, Self::Error> {
         // Handle both ShuffleWriterExec and SortShuffleWriterExec
-        if let Some(shuffle_write) = plan.as_any().downcast_ref::<ShuffleWriterExec>() {
+        if let Some(shuffle_write) = plan.downcast_ref::<ShuffleWriterExec>() {
             self.current_stage_id = shuffle_write.stage_id();
         } else if let Some(shuffle_write) =
-            plan.as_any().downcast_ref::<SortShuffleWriterExec>()
+            plan.downcast_ref::<SortShuffleWriterExec>()
         {
             self.current_stage_id = shuffle_write.stage_id();
         } else if let Some(unresolved_shuffle) =
-            plan.as_any().downcast_ref::<UnresolvedShuffleExec>()
+            plan.downcast_ref::<UnresolvedShuffleExec>()
         {
             if let Some(output_links) =
                 self.output_links.get_mut(&unresolved_shuffle.stage_id)
@@ -1917,7 +1917,7 @@ impl TaskDescription {
     pub fn get_output_partition_number(&self) -> usize {
         // Try ShuffleWriterExec first
         if let Some(shuffle_writer) =
-            self.plan.as_any().downcast_ref::<ShuffleWriterExec>()
+            self.plan.downcast_ref::<ShuffleWriterExec>()
         {
             return shuffle_writer
                 .shuffle_output_partitioning()
@@ -1926,7 +1926,7 @@ impl TaskDescription {
         }
         // Try SortShuffleWriterExec
         if let Some(shuffle_writer) =
-            self.plan.as_any().downcast_ref::<SortShuffleWriterExec>()
+            self.plan.downcast_ref::<SortShuffleWriterExec>()
         {
             return shuffle_writer
                 .shuffle_output_partitioning()
