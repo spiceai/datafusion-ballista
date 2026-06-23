@@ -90,6 +90,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         {
             trace!("Received poll_work request for {metadata:?}");
             let executor_id = metadata.id.clone();
+            // DIAG: time the poll_work handler. poll_work doubles as the executor
+            // liveness refresh (save_executor_metadata -> save_executor_heartbeat);
+            // if this handler is slow under load the scheduler stamps stale
+            // heartbeats and expire_dead_executors wrongly evicts live executors.
+            let __diag_h0 = std::time::Instant::now();
+            let __diag_ntask = task_status.len();
 
             // It's not necessary.
             // It's only for the scheduler to have a picture of the whole executor cluster.
@@ -113,6 +119,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 }
             }
 
+            let __diag_uts = std::time::Instant::now();
             self.update_task_status(&executor_id, task_status)
                 .await
                 .map_err(|e| {
@@ -123,6 +130,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     error!("{msg}");
                     Status::internal(msg)
                 })?;
+            let __diag_uts_ms = __diag_uts.elapsed().as_millis() as u64;
 
             let mut available_slots = [AvailableTaskSlots {
                 executor_id: executor_id.clone(),
@@ -209,6 +217,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .into_iter()
                 .map(|job_id| CleanJobDataParams { job_id })
                 .collect();
+            let __diag_h_ms = __diag_h0.elapsed().as_millis() as u64;
+            if __diag_h_ms > 1000 || __diag_uts_ms > 1000 {
+                tracing::warn!(
+                    target: "diag_pw_sched",
+                    executor_id = %executor_id,
+                    handler_ms = __diag_h_ms,
+                    update_task_status_ms = __diag_uts_ms,
+                    task_status_n = __diag_ntask,
+                    ntasks_returned = tasks.len(),
+                    "DIAG poll_work handler SLOW"
+                );
+            }
             Ok(Response::new(PollWorkResult {
                 tasks,
                 jobs_to_clean,

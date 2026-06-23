@@ -363,7 +363,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                         )
                     };
 
-                    warn!("{stop_reason}");
+                    // DIAG: how stale was the last heartbeat? poll_work stamps the
+                    // heartbeat on the scheduler; staleness >> executor_timeout means
+                    // poll_work stopped being processed for this (live) executor.
+                    let __diag_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let __diag_stale = __diag_now.saturating_sub(expired.timestamp);
+                    warn!(
+                        target: "diag_expire",
+                        "{stop_reason} (DIAG last_heartbeat={}s ago, timeout={}s)",
+                        __diag_stale, state.config.executor_timeout_seconds
+                    );
 
                     // If executor is expired, remove it immediately
                     Self::remove_executor(

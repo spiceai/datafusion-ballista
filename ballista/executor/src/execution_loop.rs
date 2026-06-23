@@ -134,6 +134,8 @@ where
         ..ExponentialBackoff::default()
     };
 
+    // DIAG: track inter-poll gap (wall time between consecutive poll_work round-trips).
+    let mut __diag_last_poll: Option<std::time::Instant> = None;
     loop {
         // Wait for a free task slot before requesting new work, but cap the wait
         // so a fully-busy executor still polls the scheduler periodically.
@@ -158,14 +160,34 @@ where
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;
 
+        // DIAG: time the poll_work round-trip + report gap since the previous poll.
+        // poll_work doubles as the liveness refresh; if rtt_ms or gap_ms approaches
+        // the scheduler's executor_timeout (30s), the scheduler is processing this
+        // executor's polls too slowly and will wrongly expire it.
+        let __diag_gap_ms = __diag_last_poll.map_or(0, |t| t.elapsed().as_millis() as u64);
+        let __diag_free = available_task_slots.available_permits() as u32;
+        let __diag_ntask = task_status.len();
+        let __diag_rtt = std::time::Instant::now();
         let poll_work_result: Result<tonic::Response<PollWorkResult>, tonic::Status> =
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_slots: available_task_slots.available_permits() as u32,
+                    num_free_slots: __diag_free,
                     task_status,
                 })
                 .await;
+        let __diag_rtt_ms = __diag_rtt.elapsed().as_millis() as u64;
+        __diag_last_poll = Some(std::time::Instant::now());
+        tracing::warn!(
+            target: "diag_pw",
+            executor_id = %executor.metadata.id,
+            rtt_ms = __diag_rtt_ms,
+            gap_ms = __diag_gap_ms,
+            free_slots = __diag_free,
+            task_status_n = __diag_ntask,
+            ok = poll_work_result.is_ok(),
+            "DIAG poll_work"
+        );
 
         *report_ready;
 
