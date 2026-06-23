@@ -328,18 +328,16 @@ filter_expr={}",
             exec.input_partition_count()
         )
     } else if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
-        let config = if let Some(config) =
-            exec.data_source().downcast_ref::<FileScanConfig>()
-        {
-            get_file_scan(config)
-        } else if let Some(_config) = exec
-            .data_source()
-            .downcast_ref::<MemorySourceConfig>()
-        {
-            "Memory".to_string()
-        } else {
-            "Unknown".to_string()
-        };
+        let config =
+            if let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() {
+                get_file_scan(config)
+            } else if let Some(_config) =
+                exec.data_source().downcast_ref::<MemorySourceConfig>()
+            {
+                "Memory".to_string()
+            } else {
+                "Unknown".to_string()
+            };
 
         let parts = exec.properties().output_partitioning().partition_count();
 

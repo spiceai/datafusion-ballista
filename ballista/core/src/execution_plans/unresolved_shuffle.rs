@@ -127,10 +127,7 @@ impl ExecutionPlan for UnresolvedShuffleExec {
         ))
     }
 
-    fn partition_statistics(
-        &self,
-        _partition: Option<usize>,
-    ) -> Result<Arc<Statistics>> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         // The full statistics are computed in the `ShuffleReaderExec` node
         // that replaces this one once the previous stage is completed.
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))

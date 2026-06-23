@@ -291,10 +291,7 @@ impl ExecutionPlan for ExchangeExec {
         ))
     }
 
-    fn partition_statistics(
-        &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<Statistics>> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let schema = self.input.schema();
         match self.shuffle_partitions.lock().deref() {
             //

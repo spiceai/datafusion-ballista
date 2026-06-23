@@ -302,10 +302,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
         }
     }
 
-    fn partition_statistics(
-        &self,
-        _partition: Option<usize>,
-    ) -> Result<Arc<Statistics>> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         // This execution plan sends the logical plan to the scheduler without
         // performing the node by node conversion to a full physical plan.
         // This implies that we cannot infer the statistics at this stage.
