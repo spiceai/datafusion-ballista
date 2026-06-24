@@ -457,20 +457,19 @@ fn read_arrow_ipc_partition(
     ),
     Status,
 > {
-    let file = File::open(path)
-        .map_err(|e| {
-            // Missing file == empty partition (writer skips 0-row partitions).
-            // Report NotFound so the client treats it as an empty partition.
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Status::not_found(format!(
-                    "partition file not found (empty partition) at {path}: {e}"
-                ))
-            } else {
-                from_ballista_err(&BallistaError::General(format!(
-                    "Failed to open partition file at {path}: {e:?}"
-                )))
-            }
-        })?;
+    let file = File::open(path).map_err(|e| {
+        // Missing file == empty partition (writer skips 0-row partitions).
+        // Report NotFound so the client treats it as an empty partition.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Status::not_found(format!(
+                "partition file not found (empty partition) at {path}: {e}"
+            ))
+        } else {
+            from_ballista_err(&BallistaError::General(format!(
+                "Failed to open partition file at {path}: {e:?}"
+            )))
+        }
+    })?;
     let file = BufReader::new(file);
     let reader = StreamReader::try_new(file, None).map_err(|e| from_arrow_err(&e))?;
 
