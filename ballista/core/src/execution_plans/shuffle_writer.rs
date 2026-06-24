@@ -1308,10 +1308,7 @@ impl ExecutionPlan for ShuffleWriterExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
-        &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<Statistics>> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.plan.partition_statistics(partition)
     }
 }
@@ -1543,9 +1540,8 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        let total_rows: u64 = (0..num_written_partitions)
-            .map(|i| num_rows.value(i))
-            .sum();
+        let total_rows: u64 =
+            (0..num_written_partitions).map(|i| num_rows.value(i)).sum();
         assert_eq!(8, total_rows);
 
         Ok(())
@@ -1589,9 +1585,8 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        let total_rows: u64 = (0..num_written_partitions)
-            .map(|i| num_rows.value(i))
-            .sum();
+        let total_rows: u64 =
+            (0..num_written_partitions).map(|i| num_rows.value(i)).sum();
         assert_eq!(4, total_rows);
 
         Ok(())

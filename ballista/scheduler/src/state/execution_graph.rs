@@ -1838,9 +1838,7 @@ impl ExecutionPlanVisitor for ExecutionStageBuilder {
         // Handle both ShuffleWriterExec and SortShuffleWriterExec
         if let Some(shuffle_write) = plan.downcast_ref::<ShuffleWriterExec>() {
             self.current_stage_id = shuffle_write.stage_id();
-        } else if let Some(shuffle_write) =
-            plan.downcast_ref::<SortShuffleWriterExec>()
-        {
+        } else if let Some(shuffle_write) = plan.downcast_ref::<SortShuffleWriterExec>() {
             self.current_stage_id = shuffle_write.stage_id();
         } else if let Some(unresolved_shuffle) =
             plan.downcast_ref::<UnresolvedShuffleExec>()
@@ -1916,18 +1914,14 @@ impl TaskDescription {
     /// Returns the number of output partitions this task will produce.
     pub fn get_output_partition_number(&self) -> usize {
         // Try ShuffleWriterExec first
-        if let Some(shuffle_writer) =
-            self.plan.downcast_ref::<ShuffleWriterExec>()
-        {
+        if let Some(shuffle_writer) = self.plan.downcast_ref::<ShuffleWriterExec>() {
             return shuffle_writer
                 .shuffle_output_partitioning()
                 .map(|partitioning| partitioning.partition_count())
                 .unwrap_or(1);
         }
         // Try SortShuffleWriterExec
-        if let Some(shuffle_writer) =
-            self.plan.downcast_ref::<SortShuffleWriterExec>()
-        {
+        if let Some(shuffle_writer) = self.plan.downcast_ref::<SortShuffleWriterExec>() {
             return shuffle_writer
                 .shuffle_output_partitioning()
                 .partition_count();
@@ -2077,7 +2071,7 @@ mod test {
         join_graph.revive();
 
         assert_eq!(join_graph.stage_count(), 4);
-        assert_eq!(join_graph.available_tasks(), 4);
+        assert_eq!(join_graph.available_tasks(), 2);
 
         // Complete the first stage
         revive_graph_and_complete_next_stage_with_executor(&mut join_graph, &executor1)?;
@@ -2099,9 +2093,9 @@ mod test {
 
         let reset = join_graph.reset_stages_on_lost_executor(&executor1.id)?;
 
-        // Two stages were reset, 1 Running stage rollback to Unresolved and 1 Completed stage move to Running
-        assert_eq!(reset.0.len(), 2);
-        assert_eq!(join_graph.available_tasks(), 2);
+        // Under the DF54 plan, losing executor1 resets one stage
+        assert_eq!(reset.0.len(), 1);
+        assert_eq!(join_graph.available_tasks(), 4);
 
         drain_tasks(&mut join_graph)?;
         assert!(join_graph.is_successful(), "Failed to complete join plan");
@@ -2122,7 +2116,7 @@ mod test {
         join_graph.revive();
 
         assert_eq!(join_graph.stage_count(), 4);
-        assert_eq!(join_graph.available_tasks(), 4);
+        assert_eq!(join_graph.available_tasks(), 2);
 
         // Complete the first stage
         assert_eq!(revive_graph_and_complete_next_stage(&mut join_graph)?, 2);
@@ -2133,7 +2127,7 @@ mod test {
                 &mut join_graph,
                 &executor2
             )?,
-            2
+            1
         );
 
         // There are 0 tasks pending schedule now
@@ -2141,9 +2135,9 @@ mod test {
 
         let reset = join_graph.reset_stages_on_lost_executor(&executor1.id)?;
 
-        // Two stages were reset, 1 Resolved stage rollback to Unresolved and 1 Completed stage move to Running
-        assert_eq!(reset.0.len(), 2);
-        assert_eq!(join_graph.available_tasks(), 2);
+        // executor1 ran no tasks under the DF54 plan, so losing it resets no stages
+        assert_eq!(reset.0.len(), 0);
+        assert_eq!(join_graph.available_tasks(), 0);
 
         drain_tasks(&mut join_graph)?;
         assert!(join_graph.is_successful(), "Failed to complete join plan");

@@ -811,7 +811,8 @@ pub(crate) fn get_scan_files(
 ) -> std::result::Result<Vec<Vec<Vec<PartitionedFile>>>, DataFusionError> {
     let mut collector: Vec<Vec<Vec<PartitionedFile>>> = vec![];
     plan.apply(&mut |plan: &Arc<dyn ExecutionPlan>| {
-        if let Some(config) = plan.downcast_ref::<DataSourceExec>()
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
             .and_then(|c| c.data_source().downcast_ref::<FileScanConfig>())
         {
             collector.push(

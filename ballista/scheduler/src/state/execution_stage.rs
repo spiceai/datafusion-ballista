@@ -654,7 +654,19 @@ impl RunningStage {
     /// Update the TaskInfo for task partition
     pub fn update_task_info(&mut self, partition_id: usize, status: TaskStatus) -> bool {
         debug!("Updating TaskInfo for partition {partition_id}");
-        let task_info = self.task_infos[partition_id].as_ref().unwrap();
+        // The task info for a partition can be `None` if the task was reset
+        // (e.g. after its executor was lost / heartbeat-timed-out) before a
+        // late, in-flight status update arrived from that executor. Ignore the
+        // stale update instead of unwrapping: panicking here kills the scheduler
+        // event-loop worker, which closes the event channel and wedges the whole
+        // scheduler ("Fail to send event due to channel closed").
+        let Some(task_info) = self.task_infos[partition_id].as_ref() else {
+            warn!(
+                "Ignoring TaskStatus update with TID {} for partition {partition_id} because no task is currently scheduled there (task was reset or not yet scheduled)",
+                status.task_id
+            );
+            return false;
+        };
         let task_id = task_info.task_id;
         if (status.task_id as usize) < task_id {
             warn!(

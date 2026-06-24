@@ -96,8 +96,7 @@ impl BallistaAdapter {
                 )?),
                 inputs: adapter.inputs,
             })
-        } else if let Some(root) = plan.downcast_ref::<AdaptiveDatafusionExec>()
-        {
+        } else if let Some(root) = plan.downcast_ref::<AdaptiveDatafusionExec>() {
             let mut adapter = BallistaAdapter::default();
             let plan = root
                 .input()

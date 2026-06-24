@@ -368,9 +368,7 @@ impl AdaptivePlanner {
             }
 
             Ok(Some(runnable))
-        } else if let Some(root) =
-            self.plan.downcast_ref::<AdaptiveDatafusionExec>()
-        {
+        } else if let Some(root) = self.plan.downcast_ref::<AdaptiveDatafusionExec>() {
             // shuffle writer has finished
             // there is no more runnable stages
             if root.shuffle_created() {
