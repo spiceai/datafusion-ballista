@@ -687,6 +687,17 @@ impl PartitionReader for PartitionReaderEnum {
     }
 }
 
+/// A shuffle partition with no rows is never written to disk — the writer creates
+/// partition files lazily, only when a partition actually receives a batch. A fetch
+/// for such a partition finds no file; that is an empty partition, not a failure.
+/// Represent it as a zero-batch stream so the reducer reads no rows for it.
+fn empty_partition_stream() -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        futures::stream::empty::<datafusion::error::Result<RecordBatch>>(),
+    ))
+}
+
 async fn fetch_partition_remote(
     location: &PartitionLocation,
     max_message_size: usize,
@@ -784,6 +795,13 @@ async fn fetch_partition_local(
                 e.to_string(),
             )
         });
+    }
+
+    // A 0-row partition is never written to disk (the writer creates partition
+    // files lazily), so a missing file here means an empty partition, not a
+    // failure. Return an empty stream rather than failing the whole stage.
+    if !data_path.exists() {
+        return Ok(empty_partition_stream());
     }
 
     // Standard hash-based shuffle - read the file directly
