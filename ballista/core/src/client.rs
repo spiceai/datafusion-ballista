@@ -65,6 +65,21 @@ pub struct BallistaClient {
 const IO_RETRIES_TIMES: u8 = 3;
 const IO_RETRY_WAIT_TIME_MS: u64 = 3000;
 
+/// A shuffle partition with no rows is never written to disk — the writer creates
+/// partition files lazily, only when a partition actually receives a batch (see
+/// `ShuffleWriterExec`). A fetch for such a partition therefore returns
+/// `Code::NotFound` from the server (or a missing local file). That is not a fetch
+/// failure: the partition is simply empty. Represent it as an empty record-batch
+/// stream so the reducer reads zero rows for it instead of failing the whole stage.
+fn empty_partition_stream() -> SendableRecordBatchStream {
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    Box::pin(RecordBatchStreamAdapter::new(
+        Arc::new(Schema::empty()),
+        futures::stream::empty::<Result<RecordBatch>>(),
+    ))
+}
+
 impl BallistaClient {
     /// Create a new BallistaClient to connect to the executor listening on the specified
     /// host and port
@@ -216,6 +231,12 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
+                    // A missing shuffle partition file means the partition was empty
+                    // (the writer skips 0-row partitions), not a fetch failure. The
+                    // server reports this as NotFound — return an empty stream.
+                    if err.code() == Code::NotFound {
+                        return Ok(empty_partition_stream());
+                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
                     // This means IO related error will retry.
                     if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {
@@ -296,6 +317,12 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
+                    // A missing shuffle partition file means the partition was empty
+                    // (the writer skips 0-row partitions), not a fetch failure. The
+                    // server reports this as NotFound — return an empty stream.
+                    if err.code() == Code::NotFound {
+                        return Ok(empty_partition_stream());
+                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
                     // This means IO related error will retry.
                     if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {

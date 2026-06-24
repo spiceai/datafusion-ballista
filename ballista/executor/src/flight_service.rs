@@ -374,7 +374,17 @@ impl FlightService for BallistaFlightService {
 
                         // Handle disk-based partition
                         let file = tokio::fs::File::open(&path).await.map_err(|e| {
-                            Status::internal(format!("Failed to open file: {e}"))
+                            // A 0-row partition is never written to disk (the writer
+                            // creates partition files lazily), so a missing file means
+                            // an empty partition, not a failure. Report NotFound so the
+                            // client treats it as an empty partition.
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                Status::not_found(format!(
+                                    "partition file not found (empty partition): {e}"
+                                ))
+                            } else {
+                                Status::internal(format!("Failed to open file: {e}"))
+                            }
                         })?;
 
                         debug!(
@@ -449,11 +459,18 @@ fn read_arrow_ipc_partition(
 > {
     let file = File::open(path)
         .map_err(|e| {
-            BallistaError::General(format!(
-                "Failed to open partition file at {path}: {e:?}"
-            ))
-        })
-        .map_err(|e| from_ballista_err(&e))?;
+            // Missing file == empty partition (writer skips 0-row partitions).
+            // Report NotFound so the client treats it as an empty partition.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Status::not_found(format!(
+                    "partition file not found (empty partition) at {path}: {e}"
+                ))
+            } else {
+                from_ballista_err(&BallistaError::General(format!(
+                    "Failed to open partition file at {path}: {e:?}"
+                )))
+            }
+        })?;
     let file = BufReader::new(file);
     let reader = StreamReader::try_new(file, None).map_err(|e| from_arrow_err(&e))?;
 
