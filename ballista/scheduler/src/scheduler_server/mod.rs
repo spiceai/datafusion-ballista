@@ -271,7 +271,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         Ok(())
     }
 
-    /// Submits a job to executor returning job_id
+    /// Submits a job to executor returning a generated job_id
     pub async fn submit_job(
         &self,
         job_name: &str,
@@ -279,8 +279,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         plan: &LogicalPlan,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<String> {
-        log::debug!("Received submit request for job {job_name}");
         let job_id = self.state.task_manager.generate_job_id();
+        self.submit_job_with_id(&job_id, job_name, ctx, plan, subscriber)
+            .await
+    }
+
+    /// Submits a job using a caller-provided `job_id` so the job has a stable
+    /// identity that survives across schedulers (used for recovery).
+    pub async fn submit_job_with_id(
+        &self,
+        job_id: &str,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: &LogicalPlan,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<String> {
+        log::debug!("Received submit request for job {job_name} ({job_id})");
         self.query_stage_event_loop
             .get_sender()?
             .post_event(QueryStageSchedulerEvent::JobQueued {
@@ -293,7 +307,26 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             })
             .await?;
 
-        Ok(job_id)
+        Ok(job_id.to_owned())
+    }
+
+    /// Resumes driving a job whose execution graph was persisted to shared
+    /// state by a scheduler that is no longer available. Acquires ownership
+    /// and re-enters the scheduling loop. Returns `false` if the job could not
+    /// be acquired.
+    pub async fn recover_job(&self, job_id: &str) -> Result<bool> {
+        if !self.state.task_manager.recover_job(job_id).await? {
+            return Ok(false);
+        }
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::JobSubmitted {
+                job_id: job_id.to_owned(),
+                queued_at: timestamp_millis(),
+                submitted_at: timestamp_millis(),
+            })
+            .await?;
+        Ok(true)
     }
 
     /// It just send task status update event to the channel,
