@@ -684,6 +684,35 @@ impl PartitionReader for PartitionReaderEnum {
     }
 }
 
+/// A shuffle partition with no rows is never written to disk — the writer creates
+/// partition files lazily, only when a partition actually receives a batch. A fetch
+/// for such a partition finds no file; that is an empty partition, not a failure.
+/// Represent it as a zero-batch stream so the reducer reads no rows for it.
+fn empty_partition_stream() -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        futures::stream::empty::<datafusion::error::Result<RecordBatch>>(),
+    ))
+}
+
+/// Whether a *missing* shuffle partition file should be treated as an empty
+/// partition rather than a fetch failure.
+///
+/// The writer creates partition files lazily (only when a partition receives a
+/// batch), so a 0-row partition legitimately has no file. But a missing file for a
+/// partition that should have rows means lost/corrupted data and must FAIL so the
+/// stage can be resubmitted — never silently dropped. We only treat a missing file
+/// as empty when:
+/// - the partition is disk-backed (not `memory://` and not object-store — those have
+///   their own existence semantics; a miss there can mean genuinely lost data), and
+/// - its stats report zero rows, or stats are unknown (the writer recorded none).
+fn missing_disk_partition_is_empty(location: &PartitionLocation) -> bool {
+    let disk_backed =
+        !check_is_memory_location(location) && !path_is_object_store(&location.path);
+    let no_rows = matches!(location.partition_stats.num_rows, None | Some(0));
+    disk_backed && no_rows
+}
+
 async fn fetch_partition_remote(
     location: &PartitionLocation,
     max_message_size: usize,
@@ -716,7 +745,7 @@ async fn fetch_partition_remote(
         other => other,
     })?;
 
-    ballista_client
+    match ballista_client
         .fetch_partition(
             &metadata.id,
             partition_id,
@@ -726,6 +755,30 @@ async fn fetch_partition_remote(
             flight_transport,
         )
         .await
+    {
+        Ok(stream) => Ok(stream),
+        // A missing disk partition file comes back as a NotFound status. If the
+        // partition is an expected-empty disk partition, treat it as empty; otherwise
+        // a missing file means lost data and must fail so the stage is resubmitted.
+        Err(BallistaError::GrpcError(status))
+            if status.code() == tonic::Code::NotFound =>
+        {
+            if missing_disk_partition_is_empty(location) {
+                Ok(empty_partition_stream())
+            } else {
+                Err(BallistaError::FetchFailed(
+                    metadata.id.clone(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    format!(
+                        "remote partition file missing but stats report {:?} rows",
+                        location.partition_stats.num_rows
+                    ),
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn fetch_partition_local(
@@ -781,6 +834,25 @@ async fn fetch_partition_local(
                 e.to_string(),
             )
         });
+    }
+
+    // The writer creates partition files lazily, so a missing file for an
+    // expected-empty disk partition means an empty partition, not a failure. A
+    // missing file for a partition that should have rows means lost data and must
+    // fail so the stage is resubmitted (never silently drop rows).
+    if !data_path.exists() {
+        if missing_disk_partition_is_empty(location) {
+            return Ok(empty_partition_stream());
+        }
+        return Err(BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            format!(
+                "partition file missing at {path} but stats report {:?} rows",
+                location.partition_stats.num_rows
+            ),
+        ));
     }
 
     // Standard hash-based shuffle - read the file directly
@@ -1482,6 +1554,71 @@ mod tests {
     use crate::execution_plans::ShuffleWriterExec;
     use crate::serde::scheduler::{ExecutorMetadata, ExecutorSpecification, PartitionId};
     use crate::utils;
+
+    /// A `PartitionLocation` pointing at a disk path that does not exist, with the
+    /// given row-count stats. Used to exercise the missing-file handling.
+    fn missing_disk_file_location(num_rows: Option<u64>) -> PartitionLocation {
+        PartitionLocation {
+            map_partition_id: 0,
+            partition_id: PartitionId {
+                job_id: "job".to_string(),
+                stage_id: 1,
+                partition_id: 0,
+            },
+            executor_meta: ExecutorMetadata {
+                id: "executor_1".to_string(),
+                host: "executor_1".to_string(),
+                port: 7070,
+                grpc_port: 8080,
+                specification: ExecutorSpecification { task_slots: 1 },
+            },
+            partition_stats: PartitionStats {
+                num_rows,
+                num_batches: None,
+                num_bytes: None,
+            },
+            path: "/nonexistent/shuffle/partition/data-0.arrow".to_string(),
+        }
+    }
+
+    /// A 0-row (or unknown-stats) partition is never written to disk by the writer,
+    /// so a missing file is an empty partition and must read as zero batches.
+    #[tokio::test]
+    async fn missing_local_partition_file_is_empty_when_stats_zero_or_unknown() {
+        for num_rows in [Some(0u64), None] {
+            let location = missing_disk_file_location(num_rows);
+            let stream = match fetch_partition_local(&location).await {
+                Ok(s) => s,
+                Err(e) => {
+                    panic!(
+                        "missing 0-row partition should be an empty stream, got: {e:?}"
+                    )
+                }
+            };
+            let batches = datafusion::physical_plan::common::collect(stream)
+                .await
+                .unwrap();
+            assert!(
+                batches.is_empty(),
+                "expected zero batches for empty partition (num_rows={num_rows:?}), got {}",
+                batches.len()
+            );
+        }
+    }
+
+    /// A missing file for a partition whose stats report rows means lost/corrupted
+    /// data — it must fail (so the stage is resubmitted), never silently drop rows.
+    #[tokio::test]
+    async fn missing_local_partition_file_fails_when_stats_nonzero() {
+        let location = missing_disk_file_location(Some(5));
+        match fetch_partition_local(&location).await {
+            Ok(_) => panic!("missing non-empty partition file must fail"),
+            Err(e) => assert!(
+                matches!(e, BallistaError::FetchFailed(..)),
+                "expected FetchFailed, got {e:?}"
+            ),
+        }
+    }
     use datafusion::arrow::array::{Int32Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::ipc::writer::StreamWriter;
