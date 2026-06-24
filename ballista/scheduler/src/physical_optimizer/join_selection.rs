@@ -314,66 +314,65 @@ fn statistical_join_selection_subrule(
     collect_threshold_byte_size: usize,
     collect_threshold_num_rows: usize,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let transformed =
-        if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
-            match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(
-                    hash_join,
-                    false,
-                    collect_threshold_byte_size,
-                    collect_threshold_num_rows,
-                )?
+    let transformed = if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
+        match hash_join.partition_mode() {
+            PartitionMode::Auto => try_collect_left(
+                hash_join,
+                false,
+                collect_threshold_byte_size,
+                collect_threshold_num_rows,
+            )?
+            .map_or_else(
+                || partitioned_hash_join(hash_join).map(Some),
+                |v| Ok(Some(v)),
+            )?,
+            PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
                 .map_or_else(
                     || partitioned_hash_join(hash_join).map(Some),
                     |v| Ok(Some(v)),
                 )?,
-                PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
-                    .map_or_else(
-                        || partitioned_hash_join(hash_join).map(Some),
-                        |v| Ok(Some(v)),
-                    )?,
-                PartitionMode::Partitioned => {
-                    let left = hash_join.left();
-                    let right = hash_join.right();
-                    if hash_join.join_type().supports_swap()
-                        && should_swap_join_order(&**left, &**right)?
-                    {
-                        hash_join
-                            .swap_inputs(PartitionMode::Partitioned)
-                            .map(Some)?
-                    } else {
-                        None
-                    }
+            PartitionMode::Partitioned => {
+                let left = hash_join.left();
+                let right = hash_join.right();
+                if hash_join.join_type().supports_swap()
+                    && should_swap_join_order(&**left, &**right)?
+                {
+                    hash_join
+                        .swap_inputs(PartitionMode::Partitioned)
+                        .map(Some)?
+                } else {
+                    None
                 }
             }
-        } else if let Some(cross_join) = plan.downcast_ref::<CrossJoinExec>() {
-            let left = cross_join.left();
-            let right = cross_join.right();
-            if right.properties().output_partitioning().partition_count() > 1 {
-                None
-            } else if should_swap_join_order(&**left, &**right)? {
-                cross_join.swap_inputs().map(Some)?
-            } else {
-                None
-            }
-        } else if let Some(nl_join) = plan.downcast_ref::<NestedLoopJoinExec>() {
-            let left = nl_join.left();
-            let right = nl_join.right();
-            // next few lines are different from original datafusion rule
-            // partition count of right side has to be equal one to be
-            // able to swap inputs
-            if right.properties().output_partitioning().partition_count() > 1 {
-                None
-            } else if nl_join.join_type().supports_swap()
-                && should_swap_join_order(&**left, &**right)?
-            {
-                nl_join.swap_inputs().map(Some)?
-            } else {
-                None
-            }
+        }
+    } else if let Some(cross_join) = plan.downcast_ref::<CrossJoinExec>() {
+        let left = cross_join.left();
+        let right = cross_join.right();
+        if right.properties().output_partitioning().partition_count() > 1 {
+            None
+        } else if should_swap_join_order(&**left, &**right)? {
+            cross_join.swap_inputs().map(Some)?
         } else {
             None
-        };
+        }
+    } else if let Some(nl_join) = plan.downcast_ref::<NestedLoopJoinExec>() {
+        let left = nl_join.left();
+        let right = nl_join.right();
+        // next few lines are different from original datafusion rule
+        // partition count of right side has to be equal one to be
+        // able to swap inputs
+        if right.properties().output_partitioning().partition_count() > 1 {
+            None
+        } else if nl_join.join_type().supports_swap()
+            && should_swap_join_order(&**left, &**right)?
+        {
+            nl_join.swap_inputs().map(Some)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(if let Some(transformed) = transformed {
         Transformed::yes(transformed)

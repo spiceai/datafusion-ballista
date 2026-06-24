@@ -98,25 +98,13 @@ fn build_exec_plan_diagram(
         "FilterExec"
     } else if plan.downcast_ref::<ShuffleWriterExec>().is_some() {
         "ShuffleWriterExec"
-    } else if plan
-        .downcast_ref::<SortShuffleWriterExec>()
-        .is_some()
-    {
+    } else if plan.downcast_ref::<SortShuffleWriterExec>().is_some() {
         "SortShuffleWriterExec"
-    } else if plan
-        .downcast_ref::<UnresolvedShuffleExec>()
-        .is_some()
-    {
+    } else if plan.downcast_ref::<UnresolvedShuffleExec>().is_some() {
         "UnresolvedShuffleExec"
-    } else if plan
-        .downcast_ref::<CoalesceBatchesExec>()
-        .is_some()
-    {
+    } else if plan.downcast_ref::<CoalesceBatchesExec>().is_some() {
         "CoalesceBatchesExec"
-    } else if plan
-        .downcast_ref::<CoalescePartitionsExec>()
-        .is_some()
-    {
+    } else if plan.downcast_ref::<CoalescePartitionsExec>().is_some() {
         "CoalescePartitionsExec"
     } else {
         warn!("Unknown: {plan:?}");

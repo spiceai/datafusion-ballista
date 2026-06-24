@@ -37,9 +37,7 @@ impl EliminateRoundRobbinRule {
     fn transform(
         execution_plan: Arc<dyn ExecutionPlan>,
     ) -> datafusion::error::Result<Transformed<Arc<dyn ExecutionPlan>>> {
-        if let Some(repartition) =
-            execution_plan.downcast_ref::<RepartitionExec>()
-        {
+        if let Some(repartition) = execution_plan.downcast_ref::<RepartitionExec>() {
             match repartition.partitioning() {
                 execution_plan::Partitioning::RoundRobinBatch(_) => {
                     Ok(Transformed::yes(repartition.input().clone()))
@@ -84,13 +82,8 @@ impl EliminateCooperativeExecRule {
     fn transform(
         execution_plan: Arc<dyn ExecutionPlan>,
     ) -> datafusion::error::Result<Transformed<Arc<dyn ExecutionPlan>>> {
-        if let Some(coalesce) = execution_plan.downcast_ref::<CooperativeExec>()
-        {
-            if coalesce
-                .input()
-                .downcast_ref::<CooperativeExec>()
-                .is_some()
-            {
+        if let Some(coalesce) = execution_plan.downcast_ref::<CooperativeExec>() {
+            if coalesce.input().downcast_ref::<CooperativeExec>().is_some() {
                 Ok(Transformed::yes(coalesce.input().clone()))
             } else {
                 Ok(Transformed::no(execution_plan))

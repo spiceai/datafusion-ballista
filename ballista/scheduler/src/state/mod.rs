@@ -549,7 +549,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                     Arc::new(EmptyExec::new(node.schema()));
                 Ok(Transformed::yes(empty))
             } else if let (Some(explain), Some(explain_distributed_plan)) = (
-                node.downcast_ref::<datafusion::physical_plan::explain::ExplainExec>(), &explain_distributed_plan,
+                node.downcast_ref::<datafusion::physical_plan::explain::ExplainExec>(),
+                &explain_distributed_plan,
             ) {
                 let plans = explain.stringified_plans();
                 let (logical_txt, physical_txt) =

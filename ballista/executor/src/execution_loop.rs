@@ -66,6 +66,13 @@ use tonic::codegen::{Body, Bytes, StdError};
 /// Number of consecutive failures before reducing log level from WARN to DEBUG.
 const QUIET_AFTER_FAILURES: u32 = 5;
 
+/// Maximum time the poll loop will wait for a free task slot before polling the
+/// scheduler anyway. `poll_work` doubles as the executor's heartbeat under
+/// pull-based scheduling, so a fully-busy executor must keep polling (reporting
+/// zero free slots) or the scheduler times it out and resets its tasks. Kept
+/// well below the scheduler's executor timeout.
+const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Main polling loop for executor task execution.
 ///
 /// This function polls the scheduler for new tasks to execute and runs them,
@@ -128,10 +135,25 @@ where
     };
 
     loop {
-        // Wait for task slots to be available before asking for new work
-        let permit = available_task_slots.acquire().await.unwrap();
-        // Make the slot available again
-        drop(permit);
+        // Wait for a free task slot before requesting new work, but cap the wait
+        // so a fully-busy executor still polls the scheduler periodically.
+        // `poll_work` is the executor's ONLY heartbeat under pull-based scheduling
+        // (the scheduler records a heartbeat on every poll). If every slot is held
+        // by a task running longer than the scheduler's `executor_timeout`,
+        // blocking here indefinitely stops heartbeats and the scheduler wrongly
+        // marks this healthy-but-busy executor dead and resets its in-flight
+        // tasks. On timeout we poll anyway below with `num_free_slots: 0`
+        // (heartbeat only), so liveness no longer depends on slot availability.
+        match tokio::time::timeout(
+            HEARTBEAT_POLL_INTERVAL,
+            available_task_slots.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => drop(permit), // a slot is free; request work below
+            Ok(Err(_)) => break Ok(()),     // semaphore closed (executor shutting down)
+            Err(_) => {} // no free slot within the interval; poll anyway to stay alive
+        }
 
         let task_status: Vec<TaskStatus> =
             sample_tasks_status(&mut task_status_receiver).await;

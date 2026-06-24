@@ -140,9 +140,7 @@ impl DefaultDistributedPlanner {
             stages.append(&mut child_stages);
         }
 
-        if let Some(_coalesce) = execution_plan
-            .downcast_ref::<CoalescePartitionsExec>()
-        {
+        if let Some(_coalesce) = execution_plan.downcast_ref::<CoalescePartitionsExec>() {
             let input = children[0].clone();
             let input = self.optimizer_enforce_sorting.optimize(input, config)?;
             let shuffle_writer = create_shuffle_writer_with_config(
@@ -159,9 +157,9 @@ impl DefaultDistributedPlanner {
                 with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
                 stages,
             ))
-        } else if let Some(_sort_preserving_merge) = execution_plan
-            .downcast_ref::<SortPreservingMergeExec>(
-        ) {
+        } else if let Some(_sort_preserving_merge) =
+            execution_plan.downcast_ref::<SortPreservingMergeExec>()
+        {
             let shuffle_writer = create_shuffle_writer_with_config(
                 job_id,
                 self.next_stage_id(),
@@ -175,9 +173,7 @@ impl DefaultDistributedPlanner {
                 with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
                 stages,
             ))
-        } else if let Some(repart) =
-            execution_plan.downcast_ref::<RepartitionExec>()
-        {
+        } else if let Some(repart) = execution_plan.downcast_ref::<RepartitionExec>() {
             match repart.properties().output_partitioning() {
                 Partitioning::Hash(_, _) => {
                     let input = children[0].clone();
@@ -232,9 +228,7 @@ fn create_unresolved_shuffle(
 pub fn find_unresolved_shuffles(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<UnresolvedShuffleExec>> {
-    if let Some(unresolved_shuffle) =
-        plan.downcast_ref::<UnresolvedShuffleExec>()
-    {
+    if let Some(unresolved_shuffle) = plan.downcast_ref::<UnresolvedShuffleExec>() {
         Ok(vec![unresolved_shuffle.clone()])
     } else {
         Ok(plan
@@ -257,9 +251,7 @@ pub fn remove_unresolved_shuffles(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
-        if let Some(unresolved_shuffle) =
-            child.downcast_ref::<UnresolvedShuffleExec>()
-        {
+        if let Some(unresolved_shuffle) = child.downcast_ref::<UnresolvedShuffleExec>() {
             let mut relevant_locations = vec![];
             let p = partition_locations
                 .get(&unresolved_shuffle.stage_id)

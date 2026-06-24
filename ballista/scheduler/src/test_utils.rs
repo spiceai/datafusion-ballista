@@ -80,7 +80,6 @@ pub struct ExplodingTableProvider;
 
 #[async_trait]
 impl TableProvider for ExplodingTableProvider {
-
     fn schema(&self) -> SchemaRef {
         Arc::new(Schema::empty())
     }
