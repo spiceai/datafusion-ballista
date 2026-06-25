@@ -145,7 +145,7 @@ pub struct TaskStatusUpdateResult {
 ///
 /// If a stage has `output_links` is empty then it is the final stage in this query, and it should
 /// publish its outputs to the `ExecutionGraph`s `output_locations` representing the final query results.
-pub trait ExecutionGraph: Debug {
+pub trait ExecutionGraph: Debug + std::any::Any {
     /// Returns the job ID for this execution graph.
     fn job_id(&self) -> &str;
 
@@ -274,9 +274,6 @@ pub trait ExecutionGraph: Debug {
 
     /// Clones execution graph
     fn cloned(&self) -> ExecutionGraphBox;
-
-    /// Returns this graph as `&dyn Any` to allow downcasting to a concrete implementation.
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Type alias for a boxed [ExecutionGraph] trait object.
@@ -290,8 +287,7 @@ pub fn execution_graph_to_bytes<T: AsLogicalPlan, U: AsExecutionPlan>(
     graph: &dyn ExecutionGraph,
     codec: &BallistaCodec<T, U>,
 ) -> Result<Vec<u8>> {
-    let graph = graph
-        .as_any()
+    let graph = (graph as &dyn std::any::Any)
         .downcast_ref::<StaticExecutionGraph>()
         .ok_or_else(|| {
             BallistaError::Internal(
@@ -1436,10 +1432,6 @@ impl StaticExecutionGraph {
 impl ExecutionGraph for StaticExecutionGraph {
     fn cloned(&self) -> ExecutionGraphBox {
         Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn job_id(&self) -> &str {
