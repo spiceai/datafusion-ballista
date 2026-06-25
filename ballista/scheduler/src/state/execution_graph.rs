@@ -43,15 +43,20 @@ use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, PartitionId, PartitionLocation, PartitionStats,
 };
+use ballista_core::serde::{BallistaCodec, protobuf};
+use datafusion::prelude::SessionContext;
+use datafusion_proto::logical_plan::AsLogicalPlan;
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use prost::Message;
 
 use crate::display::print_stage_metrics;
 use crate::planner::DistributedPlanner;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::timestamp_millis;
-use crate::state::execution_stage::RunningStage;
 pub(crate) use crate::state::execution_stage::{
     ExecutionStage, ResolvedStage, StageOutput, TaskInfo, UnresolvedStage,
 };
+use crate::state::execution_stage::{FailedStage, RunningStage, SuccessfulStage};
 use crate::state::task_manager::UpdatedStages;
 
 /// Information about stage lifecycle changes during a task status update.
@@ -140,7 +145,7 @@ pub struct TaskStatusUpdateResult {
 ///
 /// If a stage has `output_links` is empty then it is the final stage in this query, and it should
 /// publish its outputs to the `ExecutionGraph`s `output_locations` representing the final query results.
-pub trait ExecutionGraph: Debug {
+pub trait ExecutionGraph: Debug + std::any::Any {
     /// Returns the job ID for this execution graph.
     fn job_id(&self) -> &str;
 
@@ -273,6 +278,213 @@ pub trait ExecutionGraph: Debug {
 
 /// Type alias for a boxed [ExecutionGraph] trait object.
 pub type ExecutionGraphBox = Box<dyn ExecutionGraph + Send + Sync>;
+
+/// Serialize an [ExecutionGraph] to its protobuf byte representation.
+///
+/// Only [StaticExecutionGraph] is supported; persisting an adaptive graph
+/// returns an error.
+pub fn execution_graph_to_bytes<T: AsLogicalPlan, U: AsExecutionPlan>(
+    graph: &dyn ExecutionGraph,
+    codec: &BallistaCodec<T, U>,
+) -> Result<Vec<u8>> {
+    let graph = (graph as &dyn std::any::Any)
+        .downcast_ref::<StaticExecutionGraph>()
+        .ok_or_else(|| {
+            BallistaError::Internal(
+                "adaptive execution graph persistence is not supported".into(),
+            )
+        })?;
+
+    let proto = encode_execution_graph(graph, codec)?;
+    Ok(proto.encode_to_vec())
+}
+
+/// Deserialize an [ExecutionGraph] from its protobuf byte representation.
+///
+/// The decoded graph is always a [StaticExecutionGraph].
+pub fn execution_graph_from_bytes<T: AsLogicalPlan, U: AsExecutionPlan>(
+    bytes: &[u8],
+    codec: &BallistaCodec<T, U>,
+    session_ctx: &SessionContext,
+) -> Result<ExecutionGraphBox> {
+    let proto = protobuf::ExecutionGraph::decode(bytes).map_err(|e| {
+        BallistaError::Internal(format!("Failed to decode ExecutionGraph: {e}"))
+    })?;
+    let graph = decode_execution_graph(proto, codec, session_ctx)?;
+    Ok(Box::new(graph))
+}
+
+fn encode_execution_graph<T: AsLogicalPlan, U: AsExecutionPlan>(
+    graph: &StaticExecutionGraph,
+    codec: &BallistaCodec<T, U>,
+) -> Result<protobuf::ExecutionGraph> {
+    use ballista_core::serde::protobuf::execution_graph_stage::StageType;
+
+    // Sort by stage_id so the serialized bytes are deterministic across
+    // schedulers/processes (HashMap iteration order is not stable). Stable bytes
+    // keep object-store versioning/checksums meaningful and minimize churn.
+    let mut stage_entries: Vec<_> = graph.stages.iter().collect();
+    stage_entries.sort_by_key(|(stage_id, _)| **stage_id);
+    let stages = stage_entries
+        .into_iter()
+        .map(|(_, stage)| {
+            let stage_type = match stage {
+                ExecutionStage::UnResolved(stage) => StageType::UnresolvedStage(
+                    UnresolvedStage::encode(stage.clone(), codec)?,
+                ),
+                ExecutionStage::Resolved(stage) => {
+                    StageType::ResolvedStage(ResolvedStage::encode(stage.clone(), codec)?)
+                }
+                ExecutionStage::Running(stage) => StageType::ResolvedStage(
+                    ResolvedStage::encode(stage.to_resolved(), codec)?,
+                ),
+                ExecutionStage::Successful(stage) => StageType::SuccessfulStage(
+                    SuccessfulStage::encode(stage.clone(), codec)?,
+                ),
+                ExecutionStage::Failed(stage) => {
+                    StageType::FailedStage(FailedStage::encode(stage.clone(), codec)?)
+                }
+            };
+            Ok(protobuf::ExecutionGraphStage {
+                stage_type: Some(stage_type),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let output_locations: Vec<protobuf::PartitionLocation> = graph
+        .output_locations
+        .iter()
+        .cloned()
+        .map(|loc| loc.try_into())
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut failed_attempt_entries: Vec<_> = graph.failed_stage_attempts.iter().collect();
+    failed_attempt_entries.sort_by_key(|(stage_id, _)| **stage_id);
+    let failed_attempts: Vec<protobuf::StageAttempts> = failed_attempt_entries
+        .into_iter()
+        .map(|(stage_id, attempts)| {
+            // Sort attempt numbers too (HashSet order is not stable).
+            let mut stage_attempt_num: Vec<u32> =
+                attempts.iter().map(|num| *num as u32).collect();
+            stage_attempt_num.sort_unstable();
+            protobuf::StageAttempts {
+                stage_id: *stage_id as u32,
+                stage_attempt_num,
+            }
+        })
+        .collect();
+
+    Ok(protobuf::ExecutionGraph {
+        job_id: graph.job_id.clone(),
+        job_name: graph.job_name.clone(),
+        session_id: graph.session_id.clone(),
+        status: Some(graph.status.clone()),
+        queued_at: graph.queued_at,
+        start_time: graph.start_time,
+        end_time: graph.end_time,
+        stages,
+        output_partitions: 0,
+        output_locations,
+        scheduler_id: graph.scheduler_id.clone().unwrap_or_default(),
+        task_id_gen: graph.task_id_gen as u32,
+        failed_attempts,
+    })
+}
+
+fn decode_execution_graph<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
+    proto: protobuf::ExecutionGraph,
+    codec: &BallistaCodec<T, U>,
+    session_ctx: &SessionContext,
+) -> Result<StaticExecutionGraph> {
+    use ballista_core::serde::protobuf::execution_graph_stage::StageType;
+
+    let session_config = Arc::new(session_ctx.copied_config());
+
+    let mut stages: HashMap<usize, ExecutionStage> = HashMap::new();
+    for graph_stage in proto.stages {
+        let stage_type = graph_stage
+            .stage_type
+            .ok_or_else(|| BallistaError::Internal("Unexpected empty stage".into()))?;
+
+        let (stage_id, execution_stage) = match stage_type {
+            StageType::UnresolvedStage(stage) => {
+                let stage = UnresolvedStage::decode(
+                    stage,
+                    codec,
+                    session_ctx,
+                    session_config.clone(),
+                )?;
+                (stage.stage_id, ExecutionStage::UnResolved(stage))
+            }
+            StageType::ResolvedStage(stage) => {
+                let stage = ResolvedStage::decode(
+                    stage,
+                    codec,
+                    session_ctx,
+                    session_config.clone(),
+                )?;
+                (stage.stage_id, ExecutionStage::Resolved(stage))
+            }
+            StageType::SuccessfulStage(stage) => {
+                let stage = SuccessfulStage::decode(
+                    stage,
+                    codec,
+                    session_ctx,
+                    session_config.clone(),
+                )?;
+                (stage.stage_id, ExecutionStage::Successful(stage))
+            }
+            StageType::FailedStage(stage) => {
+                let stage = FailedStage::decode(stage, codec, session_ctx)?;
+                (stage.stage_id, ExecutionStage::Failed(stage))
+            }
+        };
+
+        stages.insert(stage_id, execution_stage);
+    }
+
+    let output_locations: Vec<PartitionLocation> = proto
+        .output_locations
+        .into_iter()
+        .map(|loc| loc.try_into())
+        .collect::<Result<Vec<_>>>()?;
+
+    let failed_stage_attempts = proto
+        .failed_attempts
+        .into_iter()
+        .map(|attempt| {
+            (
+                attempt.stage_id as usize,
+                HashSet::from_iter(
+                    attempt
+                        .stage_attempt_num
+                        .into_iter()
+                        .map(|num| num as usize),
+                ),
+            )
+        })
+        .collect();
+
+    Ok(StaticExecutionGraph {
+        scheduler_id: (!proto.scheduler_id.is_empty()).then_some(proto.scheduler_id),
+        job_id: proto.job_id,
+        job_name: proto.job_name,
+        session_id: proto.session_id,
+        status: proto.status.ok_or_else(|| {
+            BallistaError::Internal(
+                "Invalid Execution Graph: missing job status".to_owned(),
+            )
+        })?,
+        queued_at: proto.queued_at,
+        start_time: proto.start_time,
+        end_time: proto.end_time,
+        stages,
+        output_locations,
+        task_id_gen: proto.task_id_gen as usize,
+        failed_stage_attempts,
+        session_config,
+    })
+}
 
 /// [ExecutionGraph] implementation which generates
 /// all stages on job submission time
@@ -1970,7 +2182,9 @@ mod test {
     };
 
     use super::StaticExecutionGraph;
-    use crate::state::execution_graph::ExecutionGraph;
+    use crate::state::execution_graph::{
+        ExecutionGraph, execution_graph_from_bytes, execution_graph_to_bytes,
+    };
     use crate::test_utils::{
         mock_completed_task, mock_executor, mock_failed_task,
         revive_graph_and_complete_next_stage,
@@ -1978,6 +2192,48 @@ mod test {
         test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
         test_union_all_plan, test_union_plan,
     };
+    use ballista_core::serde::BallistaCodec;
+    use datafusion::prelude::SessionContext;
+
+    #[tokio::test]
+    async fn test_execution_graph_proto_round_trip() -> Result<()> {
+        let graph = test_join_plan(4).await;
+        let codec = BallistaCodec::default();
+
+        let expected_stage_ids: HashSet<usize> = graph.stages().keys().copied().collect();
+        let expected_variants: HashSet<(usize, String)> = graph
+            .stages()
+            .iter()
+            .map(|(id, stage)| (*id, stage.variant_name().to_string()))
+            .collect();
+
+        let bytes = execution_graph_to_bytes(&graph, &codec)?;
+
+        let ctx = SessionContext::new();
+        let decoded = execution_graph_from_bytes(&bytes, &codec, &ctx)?;
+
+        assert_eq!(decoded.job_id(), graph.job_id());
+        assert_eq!(decoded.job_name(), graph.job_name());
+        assert_eq!(decoded.session_id(), graph.session_id());
+        assert_eq!(decoded.stage_count(), graph.stage_count());
+        assert_eq!(
+            decoded.output_locations().len(),
+            graph.output_locations().len()
+        );
+
+        let decoded_stage_ids: HashSet<usize> =
+            decoded.stages().keys().copied().collect();
+        assert_eq!(decoded_stage_ids, expected_stage_ids);
+
+        let decoded_variants: HashSet<(usize, String)> = decoded
+            .stages()
+            .iter()
+            .map(|(id, stage)| (*id, stage.variant_name().to_string()))
+            .collect();
+        assert_eq!(decoded_variants, expected_variants);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_drain_tasks() -> Result<()> {

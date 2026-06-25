@@ -358,6 +358,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         Ok(())
     }
 
+    /// Acquires ownership of a job from the persistent state and adds its
+    /// execution graph back to the active cache so it can be driven locally.
+    ///
+    /// Returns `false` if the job could not be acquired (already owned by a
+    /// live scheduler, terminal, or absent).
+    pub(crate) async fn recover_job(&self, job_id: &str) -> Result<bool> {
+        let Some(mut graph) = self.state.try_acquire_job(job_id).await? else {
+            return Ok(false);
+        };
+        graph.revive();
+        self.active_job_cache
+            .insert(job_id.to_owned(), JobInfoCache::new(graph));
+        Ok(true)
+    }
+
     /// Returns a snapshot of currently running jobs from the cache.
     pub fn get_running_job_cache(&self) -> Arc<HashMap<String, JobInfoCache>> {
         let ret = self
