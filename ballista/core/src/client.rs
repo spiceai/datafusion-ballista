@@ -216,6 +216,14 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
+                    // Preserve NotFound (e.g. a missing shuffle partition file) as a
+                    // typed gRPC status so the shuffle reader can decide whether it
+                    // means an empty partition (disk-backed, 0 rows) or genuinely lost
+                    // data (retry/fail). Don't blanket-map it to an empty stream here.
+                    if err.code() == Code::NotFound {
+                        return BallistaError::GrpcError(Box::new(result.unwrap_err()))
+                            .into();
+                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
                     // This means IO related error will retry.
                     if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {
@@ -296,6 +304,14 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
+                    // Preserve NotFound (e.g. a missing shuffle partition file) as a
+                    // typed gRPC status so the shuffle reader can decide whether it
+                    // means an empty partition (disk-backed, 0 rows) or genuinely lost
+                    // data (retry/fail). Don't blanket-map it to an empty stream here.
+                    if err.code() == Code::NotFound {
+                        return BallistaError::GrpcError(Box::new(result.unwrap_err()))
+                            .into();
+                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
                     // This means IO related error will retry.
                     if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {
