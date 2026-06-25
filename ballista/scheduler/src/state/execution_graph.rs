@@ -320,10 +320,14 @@ fn encode_execution_graph<T: AsLogicalPlan, U: AsExecutionPlan>(
 ) -> Result<protobuf::ExecutionGraph> {
     use ballista_core::serde::protobuf::execution_graph_stage::StageType;
 
-    let stages = graph
-        .stages
-        .values()
-        .map(|stage| {
+    // Sort by stage_id so the serialized bytes are deterministic across
+    // schedulers/processes (HashMap iteration order is not stable). Stable bytes
+    // keep object-store versioning/checksums meaningful and minimize churn.
+    let mut stage_entries: Vec<_> = graph.stages.iter().collect();
+    stage_entries.sort_by_key(|(stage_id, _)| **stage_id);
+    let stages = stage_entries
+        .into_iter()
+        .map(|(_, stage)| {
             let stage_type = match stage {
                 ExecutionStage::UnResolved(stage) => StageType::UnresolvedStage(
                     UnresolvedStage::encode(stage.clone(), codec)?,
@@ -354,12 +358,19 @@ fn encode_execution_graph<T: AsLogicalPlan, U: AsExecutionPlan>(
         .map(|loc| loc.try_into())
         .collect::<Result<Vec<_>>>()?;
 
-    let failed_attempts: Vec<protobuf::StageAttempts> = graph
-        .failed_stage_attempts
-        .iter()
-        .map(|(stage_id, attempts)| protobuf::StageAttempts {
-            stage_id: *stage_id as u32,
-            stage_attempt_num: attempts.iter().map(|num| *num as u32).collect(),
+    let mut failed_attempt_entries: Vec<_> = graph.failed_stage_attempts.iter().collect();
+    failed_attempt_entries.sort_by_key(|(stage_id, _)| **stage_id);
+    let failed_attempts: Vec<protobuf::StageAttempts> = failed_attempt_entries
+        .into_iter()
+        .map(|(stage_id, attempts)| {
+            // Sort attempt numbers too (HashSet order is not stable).
+            let mut stage_attempt_num: Vec<u32> =
+                attempts.iter().map(|num| *num as u32).collect();
+            stage_attempt_num.sort_unstable();
+            protobuf::StageAttempts {
+                stage_id: *stage_id as u32,
+                stage_attempt_num,
+            }
         })
         .collect();
 

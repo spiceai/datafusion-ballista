@@ -1048,12 +1048,37 @@ impl SuccessfulStage {
     ) -> Result<SuccessfulStage> {
         let plan = decode_plan(&stage.plan, codec, session_ctx)?;
         let inputs = decode_inputs(stage.inputs)?;
-        assert_eq!(
-            stage.task_infos.len(),
-            stage.partitions as usize,
-            "protobuf::SuccessfulStage task_infos len not equal to partitions."
-        );
-        let task_infos = stage.task_infos.into_iter().map(decode_taskinfo).collect();
+        // Reconstruct by `partition_id` (rather than trusting the on-the-wire
+        // order) and validate against `partitions`, returning an error instead
+        // of panicking on corrupt or version-skewed persisted state.
+        let stage_id = stage.stage_id;
+        let partitions = stage.partitions as usize;
+        let mut slots: Vec<Option<TaskInfo>> = vec![None; partitions];
+        for info in stage.task_infos {
+            let partition_id = info.partition_id as usize;
+            if partition_id >= partitions {
+                return Err(BallistaError::Internal(format!(
+                    "protobuf::SuccessfulStage {stage_id} task_info partition_id {partition_id} out of range (partitions={partitions})"
+                )));
+            }
+            if slots[partition_id].is_some() {
+                return Err(BallistaError::Internal(format!(
+                    "protobuf::SuccessfulStage {stage_id} has duplicate task_info for partition {partition_id}"
+                )));
+            }
+            slots[partition_id] = Some(decode_taskinfo(info)?);
+        }
+        let task_infos = slots
+            .into_iter()
+            .enumerate()
+            .map(|(partition, info)| {
+                info.ok_or_else(|| {
+                    BallistaError::Internal(format!(
+                        "protobuf::SuccessfulStage {stage_id} is missing task_info for partition {partition}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let stage_metrics = stage
             .stage_metrics
             .into_iter()
@@ -1156,10 +1181,17 @@ impl FailedStage {
     ) -> Result<FailedStage> {
         let plan = decode_plan(&stage.plan, codec, session_ctx)?;
 
-        let mut task_infos: Vec<Option<TaskInfo>> = vec![None; stage.partitions as usize];
+        let stage_id = stage.stage_id;
+        let partitions = stage.partitions as usize;
+        let mut task_infos: Vec<Option<TaskInfo>> = vec![None; partitions];
         for info in stage.task_infos {
             let partition_id = info.partition_id as usize;
-            task_infos[partition_id] = Some(decode_taskinfo(info));
+            if partition_id >= partitions {
+                return Err(BallistaError::Internal(format!(
+                    "protobuf::FailedStage {stage_id} task_info partition_id {partition_id} out of range (partitions={partitions})"
+                )));
+            }
+            task_infos[partition_id] = Some(decode_taskinfo(info)?);
         }
 
         let stage_metrics = if stage.stage_metrics.is_empty() {
@@ -1392,7 +1424,10 @@ fn encode_inputs(
     Ok(inputs)
 }
 
-fn decode_taskinfo(task_info: protobuf::TaskInfo) -> TaskInfo {
+fn decode_taskinfo(task_info: protobuf::TaskInfo) -> Result<TaskInfo> {
+    // These protobufs are persisted (object store) and may come from an older
+    // version or be corrupt; return an error rather than panicking so a single
+    // bad graph cannot crash the scheduler during recovery.
     let task_info_status = match task_info.status {
         Some(task_info::Status::Running(running)) => {
             task_status::Status::Running(running)
@@ -1401,17 +1436,19 @@ fn decode_taskinfo(task_info: protobuf::TaskInfo) -> TaskInfo {
         Some(task_info::Status::Successful(success)) => {
             task_status::Status::Successful(success)
         }
-        _ => panic!(
-            "protobuf::TaskInfo status for task {} should not be none",
-            task_info.task_id
-        ),
+        None => {
+            return Err(BallistaError::Internal(format!(
+                "protobuf::TaskInfo status for task {} is missing; cannot decode persisted graph",
+                task_info.task_id
+            )));
+        }
     };
     let executor_id = match &task_info_status {
         task_status::Status::Running(running) => running.executor_id.clone(),
         task_status::Status::Successful(success) => success.executor_id.clone(),
         task_status::Status::Failed(_) => String::new(),
     };
-    TaskInfo {
+    Ok(TaskInfo {
         task_id: task_info.task_id as usize,
         executor_id,
         scheduled_time: task_info.scheduled_time as u128,
@@ -1420,7 +1457,7 @@ fn decode_taskinfo(task_info: protobuf::TaskInfo) -> TaskInfo {
         end_exec_time: task_info.end_exec_time as u128,
         finish_time: task_info.finish_time as u128,
         task_status: task_info_status,
-    }
+    })
 }
 
 fn encode_taskinfo(task_info: TaskInfo, partition_id: usize) -> protobuf::TaskInfo {

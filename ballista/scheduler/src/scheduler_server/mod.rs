@@ -318,6 +318,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         if !self.state.task_manager.recover_job(job_id).await? {
             return Ok(false);
         }
+        // Mirror the normal submission path, which broadcasts `running` before
+        // emitting `JobSubmitted`, so `subscribe_job_updates()` observers see the
+        // transition for recovered jobs too. (Best-effort: no subscribers is fine.)
+        let _ = self
+            .job_state_sender
+            .send(job_state_event::JobStateEvent::running(job_id));
         self.query_stage_event_loop
             .get_sender()?
             .post_event(QueryStageSchedulerEvent::JobSubmitted {
