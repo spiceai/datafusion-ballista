@@ -69,7 +69,7 @@ use itertools::Itertools;
 use log::{debug, error, trace};
 use rand::prelude::SliceRandom;
 use rand::rng;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// ShuffleReaderExec reads partitions that have already been materialized by a ShuffleWriterExec
@@ -713,6 +713,63 @@ fn missing_disk_partition_is_empty(location: &PartitionLocation) -> bool {
     disk_backed && no_rows
 }
 
+/// Process-global pool of shuffle-fetch clients, keyed by peer `(host, port, use_tls)`.
+///
+/// A distributed shuffle has every reducer partition fetch from every map peer, so a
+/// single query issues thousands of partition fetches. Opening a fresh
+/// [`BallistaClient`] (a new gRPC connection + TLS handshake) per fetch — as the
+/// original code did — produces a connection storm: tens of thousands of concurrent
+/// TLS handshakes that, under CPU load, run slow enough that clients abort
+/// mid-handshake and the peer reports `connection reset by peer`, failing the fetch
+/// and the query.
+///
+/// [`BallistaClient`] is `Clone` and wraps a tonic `Channel`, which multiplexes
+/// concurrent requests over a single HTTP/2 connection. Caching one client per peer
+/// and cloning it per fetch collapses the storm to one connection per peer (bounded
+/// by the small number of executors) — which is exactly what the long-standing TODO
+/// in [`fetch_partition_remote`] asked for.
+static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<
+    Mutex<HashMap<(String, u16, bool), BallistaClient>>,
+> = std::sync::OnceLock::new();
+
+fn remote_shuffle_clients() -> &'static Mutex<HashMap<(String, u16, bool), BallistaClient>>
+{
+    REMOTE_SHUFFLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return a cloned, connected [`BallistaClient`] for `host:port`, reusing a pooled
+/// connection when one exists and connecting (then caching) on a miss. The clone is
+/// cheap and shares the pooled connection's multiplexed tonic `Channel`.
+async fn cached_remote_client(
+    host: &str,
+    port: u16,
+    max_message_size: usize,
+    use_tls: bool,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+) -> result::Result<BallistaClient, BallistaError> {
+    let key = (host.to_string(), port, use_tls);
+    let mut pool = remote_shuffle_clients().lock().await;
+    if let Some(client) = pool.get(&key) {
+        return Ok(client.clone());
+    }
+    // Cache miss: connect once (holding the lock briefly so concurrent first-time
+    // fetches to the same peer don't each open a connection) and cache for reuse.
+    let client =
+        BallistaClient::try_new(host, port, max_message_size, use_tls, customize_endpoint)
+            .await?;
+    pool.insert(key, client.clone());
+    Ok(client)
+}
+
+/// Drop the pooled client for `host:port` so the next fetch reconnects. Called when a
+/// fetch fails, since the cached connection may be broken (e.g. the peer restarted).
+async fn evict_remote_client(host: &str, port: u16, use_tls: bool) {
+    remote_shuffle_clients()
+        .lock()
+        .await
+        .remove(&(host.to_string(), port, use_tls));
+}
+
 async fn fetch_partition_remote(
     location: &PartitionLocation,
     max_message_size: usize,
@@ -722,28 +779,24 @@ async fn fetch_partition_remote(
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
-    // TODO for shuffle client connections, we should avoid creating new connections again and again.
-    // And we should also avoid to keep alive too many connections for long time.
     let host = metadata.host.as_str();
     let port = metadata.port;
-    let mut ballista_client = BallistaClient::try_new(
-        host,
-        port,
-        max_message_size,
-        use_tls,
-        customize_endpoint,
-    )
-    .await
-    .map_err(|error| match error {
-        // map grpc connection error to partition fetch error.
-        BallistaError::GrpcConnectionError(msg) => BallistaError::FetchFailed(
-            metadata.id.clone(),
-            partition_id.stage_id,
-            partition_id.partition_id,
-            msg,
-        ),
-        other => other,
-    })?;
+    // Reuse one pooled connection per peer instead of dialing a new one per fetch
+    // (see `cached_remote_client`); this avoids the connection storm that caused
+    // `connection reset by peer` failures during large distributed shuffles.
+    let mut ballista_client =
+        cached_remote_client(host, port, max_message_size, use_tls, customize_endpoint)
+            .await
+            .map_err(|error| match error {
+                // map grpc connection error to partition fetch error.
+                BallistaError::GrpcConnectionError(msg) => BallistaError::FetchFailed(
+                    metadata.id.clone(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    msg,
+                ),
+                other => other,
+            })?;
 
     match ballista_client
         .fetch_partition(
@@ -760,6 +813,8 @@ async fn fetch_partition_remote(
         // A missing disk partition file comes back as a NotFound status. If the
         // partition is an expected-empty disk partition, treat it as empty; otherwise
         // a missing file means lost data and must fail so the stage is resubmitted.
+        // NotFound is a data-level signal, not a broken connection — keep the pooled
+        // client.
         Err(BallistaError::GrpcError(status))
             if status.code() == tonic::Code::NotFound =>
         {
@@ -777,7 +832,12 @@ async fn fetch_partition_remote(
                 ))
             }
         }
-        Err(e) => Err(e),
+        // Any other failure may indicate the pooled connection is broken; evict it so
+        // the next fetch to this peer reconnects rather than reusing a dead channel.
+        Err(e) => {
+            evict_remote_client(host, port, use_tls).await;
+            Err(e)
+        }
     }
 }
 
