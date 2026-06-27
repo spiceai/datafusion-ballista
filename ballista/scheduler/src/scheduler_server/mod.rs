@@ -190,6 +190,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.init().await?;
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
+        self.reconcile_running_jobs()?;
         self.start_pending_tasks_metrics_loop();
 
         Ok(())
@@ -427,6 +428,58 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     state.config.expire_dead_executor_interval_seconds,
                 ))
                 .await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Periodic reconciliation safety-net for pull-based (PullStaged) scheduling.
+    ///
+    /// Stage revival is event-driven: when a stage completes the scheduler posts
+    /// `JobUpdated`, whose handler calls [`TaskManager::update_job`] →
+    /// `ExecutionGraph::revive()` to resolve the now-runnable downstream stages so the
+    /// next `PollWork` can bind them. Unlike push-based scheduling (which periodically
+    /// posts `ReviveOffers`), pull-based scheduling has no periodic offer/revive sweep,
+    /// so a single lost or raced revival wedges the job forever: it stays `Running`
+    /// with no available tasks, executors poll and get nothing, and the scheduler
+    /// itself stays healthy (heartbeats fine). Observed on a SF10 distributed TPC-H
+    /// query whose correlated-subquery DAG completed its branch stages but never
+    /// resolved the dependent stages.
+    ///
+    /// Periodically re-run `update_job` on every running job. `revive()` is idempotent
+    /// on a correctly-resolved graph (yields no new tasks), so this is a no-op in the
+    /// common case; a job that gains newly-available tasks here was stuck, and the next
+    /// `PollWork` will pick the tasks up.
+    fn reconcile_running_jobs(&self) -> Result<()> {
+        const RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS: u64 = 10;
+        let state = self.state.clone();
+        tokio::task::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(
+                    RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS,
+                ))
+                .await;
+                let job_ids: Vec<String> = state
+                    .task_manager
+                    .get_running_job_cache()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for job_id in job_ids {
+                    match state.task_manager.update_job(&job_id).await {
+                        Ok(new_tasks) if new_tasks > 0 => {
+                            warn!(
+                                "RECONCILE_SWEEP job {job_id} was stuck: revival produced {new_tasks} newly-available task(s)"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(
+                                "reconcile_running_jobs: update_job({job_id}) failed: {e:?}"
+                            );
+                        }
+                    }
+                }
             }
         });
         Ok(())
