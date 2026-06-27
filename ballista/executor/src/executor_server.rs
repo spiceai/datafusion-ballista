@@ -480,9 +480,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> Heartbeater<T, U>
         let heartbeat_complete = shutdown_noti.shutdown_complete_tx.clone();
         tokio::spawn(async move {
             info!("Starting heartbeater to send heartbeat the scheduler periodically");
+            // TEMP INSTRUMENTATION (cluster q11 heartbeat-timeout/flap diagnosis): split the
+            // cause of a missed heartbeat into (a) gap_since_last_ms >> interval -> the
+            // heartbeat TASK was starved (the executor runtime couldn't schedule it:
+            // blocking call, log backpressure, memory stall) vs (b) call_ms high -> the
+            // executor->scheduler gRPC round-trip itself is slow (network or scheduler-side
+            // handler). Logs every beat that looks anomalous, plus a periodic baseline.
+            // REVERT before the final PR.
+            let interval_ms = u128::from(executor_heartbeat_interval_seconds) * 1000;
+            let mut last_beat = std::time::Instant::now();
+            let mut beat_n: u64 = 0;
             // As long as the shutdown notification has not been received
             while !heartbeat_shutdown.is_shutdown() {
+                let hb_start = std::time::Instant::now();
+                let gap_ms = hb_start.duration_since(last_beat).as_millis();
+                last_beat = hb_start;
+                beat_n += 1;
                 executor_server.heartbeat().await;
+                let call_ms = hb_start.elapsed().as_millis();
+                // gap should be ~= interval + previous call; large excess => scheduling delay
+                if gap_ms > interval_ms + 3000 || call_ms > 1000 || beat_n % 20 == 0 {
+                    warn!(
+                        "HEARTBEAT_DIAG beat={beat_n} gap_since_last_ms={gap_ms} interval_ms={interval_ms} call_ms={call_ms}"
+                    );
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(executor_heartbeat_interval_seconds)) => {},
                     _ = heartbeat_shutdown.recv() => {

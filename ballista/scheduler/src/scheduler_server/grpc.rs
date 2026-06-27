@@ -256,6 +256,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         &self,
         request: Request<HeartBeatParams>,
     ) -> Result<Response<HeartBeatResult>, Status> {
+        // TEMP INSTRUMENTATION (cluster heartbeat-flap diagnosis): time the handler. A high
+        // handler_ms points at scheduler-side slowness (likely executor_manager state-lock
+        // contention with task management), distinguishing it from network round-trip time.
+        // REVERT before the final PR.
+        let hb_handler_start = std::time::Instant::now();
         let remote_addr = extract_connect_info(&request);
         let HeartBeatParams {
             executor_id,
@@ -315,6 +320,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 error!("{msg}");
                 Status::internal(msg)
             })?;
+        let handler_ms = hb_handler_start.elapsed().as_millis();
+        if handler_ms > 500 {
+            warn!("SCHED_HB_DIAG handler_ms={handler_ms}");
+        }
         Ok(Response::new(HeartBeatResult { reregister: false }))
     }
 
