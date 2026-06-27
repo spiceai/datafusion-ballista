@@ -570,13 +570,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub async fn update_job(&self, job_id: &str) -> Result<usize> {
         debug!("Update active job {job_id}");
         if let Some(graph) = self.get_active_execution_graph(job_id) {
-            // Mutate and snapshot under the lock, then persist without holding it.
-            // Persistence performs blocking object-store I/O; holding the
-            // execution-graph write lock across it would stall concurrent
-            // executor task-status updates, dropping completion reports and
-            // wedging the job. The snapshot is taken under the lock so it is
-            // consistent; a slightly stale persisted state is corrected by the
-            // next update.
+            // Mutate and snapshot under the lock; the snapshot is consistent.
             let (new_tasks, snapshot) = {
                 let mut graph = graph.write().await;
                 let curr_available_tasks = graph.available_tasks();
@@ -585,9 +579,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 (new_tasks, graph.cloned())
             };
 
-            info!("Saving job with status {:?}", snapshot.status());
-
-            self.state.save_job(job_id, &snapshot).await?;
+            // Persist off the scheduling path. update_job runs on the
+            // QueryStageScheduler event loop, which also delivers executor task
+            // status updates over a bounded channel. Persistence performs
+            // blocking, multi-round-trip object-store I/O; awaiting it here
+            // stalls the loop, backs the channel up, and drops task-completion
+            // events during high-fan-in stage-completion bursts, leaving a
+            // finished stage unrecorded and wedging the job. Hand the snapshot
+            // to a background task so event processing is never blocked on I/O.
+            // A momentarily stale persisted state is corrected by the next
+            // update and by the periodic reconciliation save.
+            let state = Arc::clone(&self.state);
+            let job_id_owned = job_id.to_owned();
+            tokio::spawn(async move {
+                debug!("Persisting job {job_id_owned} with status {:?}", snapshot.status());
+                if let Err(e) = state.save_job(&job_id_owned, &snapshot).await {
+                    error!("Background persistence for job {job_id_owned} failed: {e}");
+                }
+            });
 
             Ok(new_tasks)
         } else {
