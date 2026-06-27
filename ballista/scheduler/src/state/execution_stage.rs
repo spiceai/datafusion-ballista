@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::config::ConfigOptions;
@@ -218,6 +218,11 @@ pub struct SuccessfulStage {
     pub stage_metrics: Vec<MetricsSet>,
     /// [SessionConfig] used for this stage
     pub session_config: Arc<SessionConfig>,
+    /// Encoded form of `plan`, computed lazily on first serialization and
+    /// reused on subsequent ones. A successful stage's plan is immutable, so
+    /// re-encoding it on every graph save is pure overhead; the shared
+    /// [`OnceLock`] survives clones, letting later saves skip the work.
+    pub encoded_plan: Arc<OnceLock<Vec<u8>>>,
 }
 
 /// If a stage fails, it will be with an error message
@@ -648,6 +653,7 @@ impl RunningStage {
             task_infos,
             stage_metrics,
             session_config: self.session_config.clone(),
+            encoded_plan: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1095,6 +1101,7 @@ impl SuccessfulStage {
             task_infos,
             stage_metrics,
             session_config,
+            encoded_plan: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1103,7 +1110,14 @@ impl SuccessfulStage {
         codec: &BallistaCodec<T, U>,
     ) -> Result<protobuf::SuccessfulStage> {
         let stage_id = stage.stage_id;
-        let plan = encode_plan(stage.plan, codec)?;
+        let plan = match stage.encoded_plan.get() {
+            Some(bytes) => bytes.clone(),
+            None => {
+                let bytes = encode_plan(stage.plan.clone(), codec)?;
+                let _ = stage.encoded_plan.set(bytes.clone());
+                bytes
+            }
+        };
         let inputs = encode_inputs(stage.inputs)?;
         let task_infos = stage
             .task_infos
