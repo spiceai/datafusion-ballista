@@ -570,17 +570,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub async fn update_job(&self, job_id: &str) -> Result<usize> {
         debug!("Update active job {job_id}");
         if let Some(graph) = self.get_active_execution_graph(job_id) {
-            let mut graph = graph.write().await;
+            // Mutate and snapshot under the lock, then persist without holding it.
+            // Persistence performs blocking object-store I/O; holding the
+            // execution-graph write lock across it would stall concurrent
+            // executor task-status updates, dropping completion reports and
+            // wedging the job. The snapshot is taken under the lock so it is
+            // consistent; a slightly stale persisted state is corrected by the
+            // next update.
+            let (new_tasks, snapshot) = {
+                let mut graph = graph.write().await;
+                let curr_available_tasks = graph.available_tasks();
+                graph.revive();
+                let new_tasks = graph.available_tasks() - curr_available_tasks;
+                (new_tasks, graph.cloned())
+            };
 
-            let curr_available_tasks = graph.available_tasks();
+            info!("Saving job with status {:?}", snapshot.status());
 
-            graph.revive();
-
-            info!("Saving job with status {:?}", graph.status());
-
-            self.state.save_job(job_id, &graph).await?;
-
-            let new_tasks = graph.available_tasks() - curr_available_tasks;
+            self.state.save_job(job_id, &snapshot).await?;
 
             Ok(new_tasks)
         } else {
