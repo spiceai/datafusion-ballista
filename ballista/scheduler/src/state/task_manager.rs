@@ -579,24 +579,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 (new_tasks, graph.cloned())
             };
 
-            // Persist off the scheduling path. update_job runs on the
-            // QueryStageScheduler event loop, which also delivers executor task
-            // status updates over a bounded channel. Persistence performs
-            // blocking, multi-round-trip object-store I/O; awaiting it here
-            // stalls the loop, backs the channel up, and drops task-completion
-            // events during high-fan-in stage-completion bursts, leaving a
-            // finished stage unrecorded and wedging the job. Hand the snapshot
-            // to a background task so event processing is never blocked on I/O.
-            // A momentarily stale persisted state is corrected by the next
-            // update and by the periodic reconciliation save.
-            let state = Arc::clone(&self.state);
-            let job_id_owned = job_id.to_owned();
-            tokio::spawn(async move {
-                debug!("Persisting job {job_id_owned} with status {:?}", snapshot.status());
-                if let Err(e) = state.save_job(&job_id_owned, &snapshot).await {
-                    error!("Background persistence for job {job_id_owned} failed: {e}");
-                }
-            });
+            // Persist the snapshot outside the graph lock so concurrent executor
+            // task-status updates are not blocked by the object-store I/O. The
+            // save is awaited rather than spawned so persisted job status only
+            // ever advances: a stale intermediate snapshot must not land after
+            // the terminal save and revert a finished job back to "running",
+            // which would leave clients polling a completed job forever.
+            info!("Saving job with status {:?}", snapshot.status());
+
+            self.state.save_job(job_id, &snapshot).await?;
 
             Ok(new_tasks)
         } else {
