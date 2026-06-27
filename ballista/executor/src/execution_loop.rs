@@ -134,6 +134,14 @@ where
         ..ExponentialBackoff::default()
     };
 
+    // Task statuses are drained from the channel and handed to poll_work; if that
+    // call fails the batch would otherwise be lost. A dropped completion leaves
+    // its stage unfinished on the scheduler, its downstream stages never resolve,
+    // and the job wedges. Carry undelivered statuses here and re-send them until a
+    // poll_work succeeds. The scheduler tolerates a completion reported more than
+    // once, so at-least-once delivery is safe.
+    let mut pending_status: Vec<TaskStatus> = Vec::new();
+
     loop {
         // Wait for a free task slot before requesting new work, but cap the wait
         // so a fully-busy executor still polls the scheduler periodically.
@@ -155,15 +163,15 @@ where
             Err(_) => {} // no free slot within the interval; poll anyway to stay alive
         }
 
-        let task_status: Vec<TaskStatus> =
-            sample_tasks_status(&mut task_status_receiver).await;
+        let mut task_status: Vec<TaskStatus> = std::mem::take(&mut pending_status);
+        task_status.extend(sample_tasks_status(&mut task_status_receiver).await);
 
         let poll_work_result: Result<tonic::Response<PollWorkResult>, tonic::Status> =
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
                     num_free_slots: available_task_slots.available_permits() as u32,
-                    task_status,
+                    task_status: task_status.clone(),
                 })
                 .await;
 
@@ -272,6 +280,10 @@ where
                 }
             }
             Err(error) => {
+                // Preserve this poll's statuses so the next attempt re-delivers
+                // them rather than losing the completions.
+                pending_status = task_status;
+
                 warn!(
                     "Executor poll work loop failed. If this continues to happen the Scheduler might be marked as dead. Error: {error}"
                 );
