@@ -337,6 +337,7 @@ impl ShuffleWriterExec {
         let file_ext = utils::shuffle_file_extension(shuffle_format);
 
         async move {
+            log::info!("EXEC_DIAG shuffle-write begin job={job_id} stage={stage_id} input_part={input_partition}");
             let now = Instant::now();
             let mut stream = plan.execute(input_partition, context)?;
 

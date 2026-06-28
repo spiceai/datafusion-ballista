@@ -167,6 +167,7 @@ impl ExecutionPlan for ShuffleReaderExec {
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
         debug!("ShuffleReaderExec::execute({task_id})");
+        log::info!("EXEC_DIAG shuffle-read execute task={task_id} part={partition}");
 
         let config = context.session_config();
 

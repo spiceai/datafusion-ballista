@@ -142,7 +142,23 @@ where
     // once, so at-least-once delivery is safe.
     let mut pending_status: Vec<TaskStatus> = Vec::new();
 
+    // TEMPORARY diagnostic for the silent SF100 executor freeze: periodically log
+    // poll-loop liveness and slot occupancy. On a freeze this shows whether the
+    // loop is still alive and whether all task slots are held by stuck tasks.
+    let diag_total_slots = available_task_slots.available_permits();
+    let mut diag_iter: u64 = 0;
+    let mut diag_last = std::time::Instant::now();
+
     loop {
+        diag_iter += 1;
+        if diag_last.elapsed() >= Duration::from_secs(10) {
+            info!(
+                "EXEC_DIAG iter={diag_iter} free_slots={}/{diag_total_slots} pending_status={}",
+                available_task_slots.available_permits(),
+                pending_status.len()
+            );
+            diag_last = std::time::Instant::now();
+        }
         // Wait for a free task slot before requesting new work, but cap the wait
         // so a fully-busy executor still polls the scheduler periodically.
         // `poll_work` is the executor's ONLY heartbeat under pull-based scheduling
@@ -197,6 +213,14 @@ where
                     jobs_to_clean,
                 } = result.into_inner();
                 active_job = !tasks.is_empty();
+
+                if !tasks.is_empty() {
+                    info!(
+                        "EXEC_DIAG poll_work assigned {} task(s) jobs_to_clean={}",
+                        tasks.len(),
+                        jobs_to_clean.len()
+                    );
+                }
 
                 // Clean up any state related to the listed jobs
                 for cleanup in jobs_to_clean {
@@ -404,6 +428,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
+        info!("EXEC_DIAG started-on-runner TID {task_id} {job_id}/{stage_id}/{partition_id}");
         let part = PartitionId {
             job_id: job_id.clone(),
             stage_id: stage_id as usize,
