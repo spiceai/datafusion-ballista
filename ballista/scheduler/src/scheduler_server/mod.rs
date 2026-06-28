@@ -469,8 +469,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     .collect();
                 for job_id in job_ids {
                     // Recover a lost or raced stage revival: re-resolve runnable stages
-                    // so the next PollWork can bind them.
-                    match state.task_manager.update_job(&job_id).await {
+                    // so the next PollWork can bind them. Revive only — never persist
+                    // from the sweep, or a stale "running" snapshot could race the
+                    // terminal save and overwrite a concurrently-finalized job's graph.
+                    match state.task_manager.revive_job(&job_id).await {
                         Ok(new_tasks) if new_tasks > 0 => {
                             warn!(
                                 "RECONCILE_SWEEP job {job_id} was stuck: revival produced {new_tasks} newly-available task(s)"
@@ -479,7 +481,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                         Ok(_) => {}
                         Err(e) => {
                             debug!(
-                                "reconcile_running_jobs: update_job({job_id}) failed: {e:?}"
+                                "reconcile_running_jobs: revive_job({job_id}) failed: {e:?}"
                             );
                             continue;
                         }
