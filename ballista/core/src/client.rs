@@ -47,7 +47,7 @@ use datafusion::error::Result;
 use crate::extension::BallistaConfigGrpcEndpoint;
 use crate::serde::protobuf;
 
-use crate::utils::create_grpc_client_endpoint;
+use crate::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
@@ -80,7 +80,20 @@ impl BallistaClient {
         let addr = format!("{scheme}://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
 
-        let mut endpoint = create_grpc_client_endpoint(addr.clone(), None)
+        // This connection is pooled and reused per peer for shuffle fetches, so a
+        // dead or stalled peer must be detected: without it the fetch RPC hangs
+        // forever and every subsequent fetch to that peer stalls behind it. Enable
+        // HTTP/2 keepalive (driven by the transport task, independent of any blocked
+        // request future) so a broken connection is closed and the fetch fails,
+        // letting the caller evict the pooled client and retry. The request timeout
+        // is kept large because partition transfers stream at the consumer's pace.
+        let grpc_config = GrpcClientConfig {
+            connect_timeout_seconds: 20,
+            timeout_seconds: 3600,
+            tcp_keepalive_seconds: 3600,
+            http2_keepalive_interval_seconds: 60,
+        };
+        let mut endpoint = create_grpc_client_endpoint(addr.clone(), Some(&grpc_config))
             .map_err(|e| {
                 BallistaError::GrpcConnectionError(format!(
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
