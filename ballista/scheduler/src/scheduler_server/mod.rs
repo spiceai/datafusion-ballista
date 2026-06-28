@@ -435,21 +435,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
     /// Periodic reconciliation safety-net for pull-based (PullStaged) scheduling.
     ///
-    /// Stage revival is event-driven: when a stage completes the scheduler posts
-    /// `JobUpdated`, whose handler calls [`TaskManager::update_job`] →
-    /// `ExecutionGraph::revive()` to resolve the now-runnable downstream stages so the
-    /// next `PollWork` can bind them. Unlike push-based scheduling (which periodically
-    /// posts `ReviveOffers`), pull-based scheduling has no periodic offer/revive sweep,
-    /// so a single lost or raced revival wedges the job forever: it stays `Running`
-    /// with no available tasks, executors poll and get nothing, and the scheduler
-    /// itself stays healthy (heartbeats fine). Observed on a SF10 distributed TPC-H
-    /// query whose correlated-subquery DAG completed its branch stages but never
-    /// resolved the dependent stages.
+    /// Stage revival is event-driven: a completing stage posts `JobUpdated`, whose
+    /// handler calls `TaskManager::update_job` → `ExecutionGraph::revive()` to resolve
+    /// now-runnable downstream stages for the next `PollWork`. Pull-based scheduling has
+    /// no periodic revive sweep (unlike push-based `ReviveOffers`), so a single lost or
+    /// raced revival wedges the job forever — it stays `Running` with no available tasks
+    /// while the scheduler itself stays healthy.
     ///
-    /// Periodically re-run `update_job` on every running job. `revive()` is idempotent
-    /// on a correctly-resolved graph (yields no new tasks), so this is a no-op in the
-    /// common case; a job that gains newly-available tasks here was stuck, and the next
-    /// `PollWork` will pick the tasks up.
+    /// Periodically re-running `update_job` on each running job recovers this: `revive()`
+    /// is idempotent (a no-op on a correctly-resolved graph), and a job that gains tasks
+    /// here was stuck, so the next `PollWork` binds them.
     fn reconcile_running_jobs(&self) -> Result<()> {
         use ballista_core::serde::protobuf::job_status;
         const RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS: u64 = 10;

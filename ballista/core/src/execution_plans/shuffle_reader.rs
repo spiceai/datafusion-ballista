@@ -715,25 +715,16 @@ fn missing_disk_partition_is_empty(location: &PartitionLocation) -> bool {
 
 /// Process-global pool of shuffle-fetch clients, keyed by peer `(host, port, use_tls)`.
 ///
-/// A distributed shuffle has every reducer partition fetch from every map peer, so a
-/// single query issues thousands of partition fetches. Opening a fresh
-/// [`BallistaClient`] (a new gRPC connection + TLS handshake) per fetch — as the
-/// original code did — produces a connection storm: tens of thousands of concurrent
-/// TLS handshakes that, under CPU load, run slow enough that clients abort
-/// mid-handshake and the peer reports `connection reset by peer`, failing the fetch
-/// and the query.
-///
-/// [`BallistaClient`] is `Clone` and wraps a tonic `Channel`, which multiplexes
-/// concurrent requests over a single HTTP/2 connection. Caching one client per peer
-/// and cloning it per fetch collapses the storm to one connection per peer (bounded
-/// by the small number of executors) — which is exactly what the long-standing TODO
-/// in [`fetch_partition_remote`] asked for.
-static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<
-    Mutex<HashMap<(String, u16, bool), BallistaClient>>,
-> = std::sync::OnceLock::new();
+/// A distributed shuffle issues thousands of fetches; opening a fresh client (new gRPC
+/// connection + TLS handshake) per fetch storms the peer with handshakes that reset
+/// under load. Clients clone a shared multiplexed HTTP/2 `Channel`, so caching one
+/// per peer collapses the storm to a single connection per peer.
+type RemoteShuffleClients = Mutex<HashMap<(String, u16, bool), BallistaClient>>;
 
-fn remote_shuffle_clients() -> &'static Mutex<HashMap<(String, u16, bool), BallistaClient>>
-{
+static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<RemoteShuffleClients> =
+    std::sync::OnceLock::new();
+
+fn remote_shuffle_clients() -> &'static RemoteShuffleClients {
     REMOTE_SHUFFLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -754,9 +745,14 @@ async fn cached_remote_client(
     }
     // Cache miss: connect once (holding the lock briefly so concurrent first-time
     // fetches to the same peer don't each open a connection) and cache for reuse.
-    let client =
-        BallistaClient::try_new(host, port, max_message_size, use_tls, customize_endpoint)
-            .await?;
+    let client = BallistaClient::try_new(
+        host,
+        port,
+        max_message_size,
+        use_tls,
+        customize_endpoint,
+    )
+    .await?;
     pool.insert(key, client.clone());
     Ok(client)
 }
