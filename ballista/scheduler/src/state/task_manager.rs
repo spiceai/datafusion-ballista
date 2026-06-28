@@ -602,7 +602,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             // ever advances within this serial path.
             if let Some(snapshot) = snapshot {
                 info!("Saving job with status {:?}", snapshot.status());
-                self.state.save_job(job_id, &snapshot).await?;
+                // Bound the persist so a stalled object-store operation cannot hang
+                // the scheduler event loop (which awaits this) indefinitely. The
+                // intermediate state persisted here is best-effort, so on timeout or
+                // error we log and continue; the next update or the reconciliation
+                // sweep re-persists it. Without this bound a single stuck object-store
+                // request freezes the entire scheduler.
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.state.save_job(job_id, &snapshot),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("save_job for {job_id} failed: {e}"),
+                    Err(_) => warn!(
+                        "save_job for {job_id} timed out after 10s; skipping this persist (next update/sweep retries)"
+                    ),
+                }
             }
 
             Ok(new_tasks)
