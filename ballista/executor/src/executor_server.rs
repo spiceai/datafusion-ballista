@@ -376,6 +376,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             .create_query_stage_exec(
                 job_id.clone(),
                 stage_id,
+                partition_id,
                 plan,
                 &self.executor.work_dir,
             )

@@ -821,6 +821,16 @@ impl SessionConfigHelperExt for SessionConfig {
                 "datafusion.optimizer.hash_join_single_partition_threshold_rows",
                 0,
             )
+            // Uncorrelated scalar subqueries plan as a physical ScalarSubqueryExec
+            // whose expression only decodes inside that exec, so stage splitting
+            // cannot decode the stage plan (TPC-H q11/q15/q22). Disabling this
+            // rewrites them to joins, which Ballista distributes correctly.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1909
+            .set_bool(
+                "datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery",
+                false,
+            )
     }
 }
 
