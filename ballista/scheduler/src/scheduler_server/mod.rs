@@ -443,7 +443,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     /// while the scheduler itself stays healthy.
     ///
     /// Periodically re-running `update_job` on each running job recovers this: `revive()`
-    /// is idempotent (a no-op on a correctly-resolved graph), and a job that gains tasks
+    /// is idempotent and cheap (a no-op on a correctly-resolved graph), and a job that gains tasks
     /// here was stuck, so the next `PollWork` binds them.
     fn reconcile_running_jobs(&self) -> Result<()> {
         use ballista_core::serde::protobuf::job_status;
