@@ -739,12 +739,14 @@ async fn cached_remote_client(
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
 ) -> result::Result<BallistaClient, BallistaError> {
     let key = (host.to_string(), port, use_tls);
-    let mut pool = remote_shuffle_clients().lock().await;
-    if let Some(client) = pool.get(&key) {
+    // Fast path: a pooled client clones cheaply. The lock is not held across the
+    // connect below, so a slow handshake to one peer cannot block fetches to others.
+    if let Some(client) = remote_shuffle_clients().lock().await.get(&key) {
         return Ok(client.clone());
     }
-    // Cache miss: connect once (holding the lock briefly so concurrent first-time
-    // fetches to the same peer don't each open a connection) and cache for reuse.
+    // Cache miss: connect without holding the lock. Concurrent first-time fetches
+    // to the same peer may each connect briefly; the first to re-acquire the lock
+    // wins and the rest reuse its client, dropping their redundant connection.
     let client = BallistaClient::try_new(
         host,
         port,
@@ -753,8 +755,8 @@ async fn cached_remote_client(
         customize_endpoint,
     )
     .await?;
-    pool.insert(key, client.clone());
-    Ok(client)
+    let mut pool = remote_shuffle_clients().lock().await;
+    Ok(pool.entry(key).or_insert(client).clone())
 }
 
 /// Drop the pooled client for `host:port` so the next fetch reconnects. Called when a

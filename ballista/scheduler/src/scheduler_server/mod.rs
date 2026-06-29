@@ -493,7 +493,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     };
                     let graph = graph.read().await;
                     if graph.is_successful() {
+                        // The graph is successful here, so its status is normally
+                        // `Successful`; fall back to `Running` then to now.
                         let queued_at = match &graph.status().status {
+                            Some(job_status::Status::Successful(successful)) => {
+                                successful.queued_at
+                            }
                             Some(job_status::Status::Running(running)) => {
                                 running.queued_at
                             }
