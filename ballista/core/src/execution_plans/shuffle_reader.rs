@@ -713,13 +713,21 @@ fn missing_disk_partition_is_empty(location: &PartitionLocation) -> bool {
     disk_backed && no_rows
 }
 
-/// Process-global pool of shuffle-fetch clients, keyed by peer `(host, port, use_tls)`.
+/// Identifies a pooled shuffle-fetch client by peer address and transport.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PeerKey {
+    host: String,
+    port: u16,
+    use_tls: bool,
+}
+
+/// Process-global pool of shuffle-fetch clients, keyed by peer.
 ///
 /// A distributed shuffle issues thousands of fetches; opening a fresh client (new gRPC
 /// connection + TLS handshake) per fetch storms the peer with handshakes that reset
 /// under load. Clients clone a shared multiplexed HTTP/2 `Channel`, so caching one
 /// per peer collapses the storm to a single connection per peer.
-type RemoteShuffleClients = Mutex<HashMap<(String, u16, bool), BallistaClient>>;
+type RemoteShuffleClients = Mutex<HashMap<PeerKey, BallistaClient>>;
 
 static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<RemoteShuffleClients> =
     std::sync::OnceLock::new();
@@ -738,7 +746,11 @@ async fn cached_remote_client(
     use_tls: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
 ) -> result::Result<BallistaClient, BallistaError> {
-    let key = (host.to_string(), port, use_tls);
+    let key = PeerKey {
+        host: host.to_string(),
+        port,
+        use_tls,
+    };
     // Fast path: a pooled client clones cheaply. The lock is not held across the
     // connect below, so a slow handshake to one peer cannot block fetches to others.
     if let Some(client) = remote_shuffle_clients().lock().await.get(&key) {
@@ -762,10 +774,11 @@ async fn cached_remote_client(
 /// Drop the pooled client for `host:port` so the next fetch reconnects. Called when a
 /// fetch fails, since the cached connection may be broken (e.g. the peer restarted).
 async fn evict_remote_client(host: &str, port: u16, use_tls: bool) {
-    remote_shuffle_clients()
-        .lock()
-        .await
-        .remove(&(host.to_string(), port, use_tls));
+    remote_shuffle_clients().lock().await.remove(&PeerKey {
+        host: host.to_string(),
+        port,
+        use_tls,
+    });
 }
 
 async fn fetch_partition_remote(
