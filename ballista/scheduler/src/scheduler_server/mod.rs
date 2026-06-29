@@ -442,7 +442,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     /// raced revival wedges the job forever — it stays `Running` with no available tasks
     /// while the scheduler itself stays healthy.
     ///
-    /// Periodically re-running `update_job` on each running job recovers this: `revive()`
+    /// Periodically re-running `revive_job` on each running job recovers this: `revive()`
     /// is idempotent and cheap (a no-op on a correctly-resolved graph), and a job that gains tasks
     /// here was stuck, so the next `PollWork` binds them.
     fn reconcile_running_jobs(&self) -> Result<()> {

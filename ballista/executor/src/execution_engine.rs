@@ -76,6 +76,8 @@ fn restrict_scan_to_partition(
     if partition_id >= config.file_groups.len() {
         return None;
     }
+    // Empty (not dropped) for the other partitions so the source's partition count is
+    // preserved and `execute(partition_id)` still maps to its own group.
     let file_groups: Vec<FileGroup> = config
         .file_groups
         .iter()
