@@ -190,6 +190,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.init().await?;
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
+        self.reconcile_running_jobs()?;
         self.start_pending_tasks_metrics_loop();
 
         Ok(())
@@ -427,6 +428,108 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     state.config.expire_dead_executor_interval_seconds,
                 ))
                 .await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Periodic reconciliation safety-net for pull-based (PullStaged) scheduling.
+    ///
+    /// Stage revival is event-driven: a completing stage posts `JobUpdated`, whose
+    /// handler calls `TaskManager::update_job` → `ExecutionGraph::revive()` to resolve
+    /// now-runnable downstream stages for the next `PollWork`. Pull-based scheduling has
+    /// no periodic revive sweep (unlike push-based `ReviveOffers`), so a single lost or
+    /// raced revival wedges the job forever — it stays `Running` with no available tasks
+    /// while the scheduler itself stays healthy.
+    ///
+    /// Periodically re-running `revive_job` on each running job recovers this: `revive()`
+    /// is idempotent and cheap (a no-op on a correctly-resolved graph), and a job that gains tasks
+    /// here was stuck, so the next `PollWork` binds them.
+    fn reconcile_running_jobs(&self) -> Result<()> {
+        use ballista_core::serde::protobuf::job_status;
+        const RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS: u64 = 10;
+        let state = self.state.clone();
+        let event_sender = self.query_stage_event_loop.get_sender()?;
+        tokio::task::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(
+                    RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS,
+                ))
+                .await;
+                let job_ids: Vec<String> = state
+                    .task_manager
+                    .get_running_job_cache()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for job_id in job_ids {
+                    // Recover a lost or raced stage revival: re-resolve runnable stages
+                    // so the next PollWork can bind them. Revive only — never persist
+                    // from the sweep, or a stale "running" snapshot could race the
+                    // terminal save and overwrite a concurrently-finalized job's graph.
+                    match state.task_manager.revive_job(&job_id).await {
+                        Ok(new_tasks) if new_tasks > 0 => {
+                            warn!(
+                                "RECONCILE_SWEEP job {job_id} was stuck: revival produced {new_tasks} newly-available task(s)"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(
+                                "reconcile_running_jobs: revive_job({job_id}) failed: {e:?}"
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Stage revival and job completion are independent event-driven
+                    // paths; the revival above does not cover completion. A job whose
+                    // graph is fully successful but is still in the active cache never
+                    // had its JobFinished processed, so re-emit it to finalize the job.
+                    let Some(graph) =
+                        state.task_manager.get_active_execution_graph(&job_id)
+                    else {
+                        continue;
+                    };
+                    let graph = graph.read().await;
+                    if graph.is_successful() {
+                        // The graph is successful here, so its status is normally
+                        // `Successful`; fall back to `Running` then to now.
+                        let queued_at = match &graph.status().status {
+                            Some(job_status::Status::Successful(successful)) => {
+                                successful.queued_at
+                            }
+                            Some(job_status::Status::Running(running)) => {
+                                running.queued_at
+                            }
+                            _ => timestamp_millis(),
+                        };
+                        drop(graph);
+                        warn!(
+                            "RECONCILE_SWEEP job {job_id} is complete but unfinalized; emitting JobFinished"
+                        );
+                        if let Err(e) = event_sender
+                            .post_event(QueryStageSchedulerEvent::JobFinished {
+                                job_id: job_id.clone(),
+                                queued_at,
+                                completed_at: timestamp_millis(),
+                            })
+                            .await
+                        {
+                            error!(
+                                "reconcile_running_jobs: posting JobFinished for {job_id} failed: {e:?}"
+                            );
+                        }
+                    } else if graph.available_tasks() == 0
+                        && graph.running_tasks().is_empty()
+                    {
+                        warn!(
+                            "RECONCILE_SWEEP job {job_id} is not advancing: available_tasks=0, running_tasks=0, completed_stages={}, running_stages={:?}",
+                            graph.completed_stages(),
+                            graph.running_stages(),
+                        );
+                    }
+                }
             }
         });
         Ok(())

@@ -566,21 +566,44 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             .await
     }
 
-    /// Updates the job state and returns the number of new available tasks.
+    /// Revive runnable stages and persist the job, returning the number of newly
+    /// available tasks. Used on the event-driven update path, where the persisted
+    /// status must track progress so clients can observe completion.
     pub async fn update_job(&self, job_id: &str) -> Result<usize> {
+        self.revive_job_inner(job_id, true).await
+    }
+
+    /// Revive runnable stages WITHOUT persisting. Used by the reconciliation
+    /// sweep, which runs in its own task concurrently with the event loop:
+    /// persisting here would race the terminal save and could overwrite a
+    /// finished job's graph blob with a stale "running" snapshot, leaving
+    /// clients polling a completed job forever. Persistence is left to the
+    /// serial event-driven update and terminal (succeed/fail) save paths.
+    pub async fn revive_job(&self, job_id: &str) -> Result<usize> {
+        self.revive_job_inner(job_id, false).await
+    }
+
+    async fn revive_job_inner(&self, job_id: &str, persist: bool) -> Result<usize> {
         debug!("Update active job {job_id}");
         if let Some(graph) = self.get_active_execution_graph(job_id) {
-            let mut graph = graph.write().await;
+            // Mutate and snapshot under the lock; the snapshot is consistent.
+            let (new_tasks, snapshot) = {
+                let mut graph = graph.write().await;
+                let curr_available_tasks = graph.available_tasks();
+                graph.revive();
+                let new_tasks = graph.available_tasks() - curr_available_tasks;
+                let snapshot = if persist { Some(graph.cloned()) } else { None };
+                (new_tasks, snapshot)
+            };
 
-            let curr_available_tasks = graph.available_tasks();
-
-            graph.revive();
-
-            info!("Saving job with status {:?}", graph.status());
-
-            self.state.save_job(job_id, &graph).await?;
-
-            let new_tasks = graph.available_tasks() - curr_available_tasks;
+            // Persist the snapshot outside the graph lock so concurrent executor
+            // task-status updates are not blocked by the object-store I/O. The
+            // save is awaited rather than spawned so persisted job status only
+            // ever advances within this serial path.
+            if let Some(snapshot) = snapshot {
+                info!("Saving job with status {:?}", snapshot.status());
+                self.state.save_job(job_id, &snapshot).await?;
+            }
 
             Ok(new_tasks)
         } else {

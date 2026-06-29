@@ -26,10 +26,16 @@ use ballista_core::execution_plans::ShuffleWriterExec;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfig, FileScanConfigBuilder,
+};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
+use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -48,9 +54,61 @@ pub trait ExecutionEngine: Sync + Send {
         &self,
         job_id: String,
         stage_id: usize,
+        partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
     ) -> Result<Arc<dyn QueryStageExecutor>>;
+}
+
+/// Restrict a file-backed `DataSourceExec` to the file group for `partition_id`,
+/// emptying the others (partition count preserved). Ballista runs one partition
+/// per task on its own plan instance, so without this the task's lone stream
+/// drains the scan's shared work-queue and reads the whole table. Returns `None`
+/// for non-file scans or a `partition_id` outside the source's file groups.
+/// See apache/datafusion-ballista#1907.
+fn restrict_scan_to_partition(
+    plan: &Arc<dyn ExecutionPlan>,
+    partition_id: usize,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let exec = plan.downcast_ref::<DataSourceExec>()?;
+    let source: &dyn Any = exec.data_source().as_ref();
+    let config = source.downcast_ref::<FileScanConfig>()?;
+    if partition_id >= config.file_groups.len() {
+        return None;
+    }
+    // Empty (not dropped) for the other partitions so the source's partition count is
+    // preserved and `execute(partition_id)` still maps to its own group.
+    let file_groups: Vec<FileGroup> = config
+        .file_groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| {
+            if i == partition_id {
+                group.clone()
+            } else {
+                FileGroup::new(vec![])
+            }
+        })
+        .collect();
+    let config = FileScanConfigBuilder::from(config.clone())
+        .with_file_groups(file_groups)
+        .build();
+    Some(DataSourceExec::from_data_source(config))
+}
+
+/// Restrict every file scan in `plan` to `partition_id`'s file group.
+fn restrict_scans(
+    plan: Arc<dyn ExecutionPlan>,
+    partition_id: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    Ok(plan
+        .transform_down(|node| {
+            Ok(match restrict_scan_to_partition(&node, partition_id) {
+                Some(rewritten) => Transformed::yes(rewritten),
+                None => Transformed::no(node),
+            })
+        })?
+        .data)
 }
 
 /// Executor for a single query stage in a distributed query.
@@ -92,17 +150,19 @@ impl ExecutionEngine for DefaultExecutionEngine {
         &self,
         job_id: String,
         stage_id: usize,
+        partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
         // the query plan created by the scheduler always starts with a shuffle writer
         // (either ShuffleWriterExec or SortShuffleWriterExec)
         if let Some(shuffle_writer) = plan.downcast_ref::<ShuffleWriterExec>() {
-            // recreate the shuffle writer with the correct working directory
+            // recreate the shuffle writer with the correct working directory,
+            // restricting any file scan to this task's partition
             let exec = ShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
-                plan.children()[0].clone(),
+                restrict_scans(plan.children()[0].clone(), partition_id)?,
                 work_dir.to_string(),
                 shuffle_writer.shuffle_output_partitioning().cloned(),
             )?;
@@ -112,11 +172,12 @@ impl ExecutionEngine for DefaultExecutionEngine {
         } else if let Some(sort_shuffle_writer) =
             plan.downcast_ref::<SortShuffleWriterExec>()
         {
-            // recreate the sort shuffle writer with the correct working directory
+            // recreate the sort shuffle writer with the correct working directory,
+            // restricting any file scan to this task's partition
             let exec = SortShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
-                plan.children()[0].clone(),
+                restrict_scans(plan.children()[0].clone(), partition_id)?,
                 work_dir.to_string(),
                 sort_shuffle_writer.shuffle_output_partitioning().clone(),
                 sort_shuffle_writer.config().clone(),
@@ -229,5 +290,59 @@ impl QueryStageExecutor for DefaultQueryStageExec {
             ShuffleWriterVariant::Hash(writer) => writer,
             ShuffleWriterVariant::Sort(writer) => writer,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::physical_plan::ParquetSource;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    /// Build a `DataSourceExec` over `n` file groups, one file each.
+    fn scan_with_file_groups(n: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let source = Arc::new(ParquetSource::new(schema));
+        let mut builder =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source);
+        for i in 0..n {
+            builder =
+                builder.with_file_group(FileGroup::new(vec![PartitionedFile::new(
+                    format!("file{i}.parquet"),
+                    100,
+                )]));
+        }
+        DataSourceExec::from_data_source(builder.build())
+    }
+
+    /// Number of files in each file group of a `DataSourceExec`.
+    fn group_file_counts(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+        let exec = plan.downcast_ref::<DataSourceExec>().unwrap();
+        let source: &dyn Any = exec.data_source().as_ref();
+        let config = source.downcast_ref::<FileScanConfig>().unwrap();
+        config.file_groups.iter().map(|g| g.len()).collect()
+    }
+
+    #[test]
+    fn restrict_scan_keeps_only_its_own_group() {
+        let plan = scan_with_file_groups(4);
+        let restricted = restrict_scan_to_partition(&plan, 2).expect("scan rewritten");
+        assert_eq!(group_file_counts(&restricted), vec![0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn restrict_scan_partition_out_of_range_is_left_untouched() {
+        let plan = scan_with_file_groups(3);
+        assert!(restrict_scan_to_partition(&plan, 3).is_none());
+    }
+
+    #[test]
+    fn restrict_scan_ignores_non_file_scans() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        assert!(restrict_scan_to_partition(&plan, 0).is_none());
     }
 }
