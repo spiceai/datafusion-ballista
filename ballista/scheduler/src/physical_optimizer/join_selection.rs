@@ -239,7 +239,9 @@ pub(crate) fn try_collect_left(
 
     match (left_can_collect, right_can_collect) {
         (true, true) => {
+            // Null-aware anti joins have specific side requirements and must not be swapped.
             if hash_join.join_type().supports_swap()
+                && !hash_join.null_aware
                 && should_swap_join_order(&**left, &**right)?
             {
                 Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
@@ -253,7 +255,7 @@ pub(crate) fn try_collect_left(
                     hash_join.projection.as_ref().map(|v| v.to_vec()),
                     PartitionMode::CollectLeft,
                     hash_join.null_equality(),
-                    false,
+                    hash_join.null_aware,
                 )?)))
             }
         }
@@ -266,10 +268,11 @@ pub(crate) fn try_collect_left(
             hash_join.projection.as_ref().map(|v| v.to_vec()),
             PartitionMode::CollectLeft,
             hash_join.null_equality(),
-            false,
+            hash_join.null_aware,
         )?))),
         (false, true) => {
-            if hash_join.join_type().supports_swap() {
+            // Null-aware anti joins have specific side requirements and must not be swapped.
+            if hash_join.join_type().supports_swap() && !hash_join.null_aware {
                 hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
             } else {
                 Ok(None)
@@ -279,20 +282,32 @@ pub(crate) fn try_collect_left(
     }
 }
 
-/// Creates a partitioned hash join execution plan, swapping inputs if beneficial.
+/// Creates a hash join execution plan for a join that can't be collected on one side.
 ///
-/// Checks if the join order should be swapped based on the join type and input statistics.
-/// If swapping is optimal and supported, creates a swapped partitioned hash join; otherwise,
-/// creates a standard partitioned hash join.
+/// If the join order should be swapped (per join type and input statistics), returns a
+/// swapped partitioned hash join. Otherwise builds the join in `Partitioned` mode, except
+/// null-aware anti joins, which are built in `CollectLeft` mode for correct NULL semantics.
 pub(crate) fn partitioned_hash_join(
     hash_join: &HashJoinExec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
-    if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
+    // Null-aware anti joins have specific side requirements and must not be swapped.
+    if hash_join.join_type().supports_swap()
+        && !hash_join.null_aware
+        && should_swap_join_order(&**left, &**right)?
     {
         hash_join.swap_inputs(PartitionMode::Partitioned)
     } else {
+        // Null-aware anti joins must use CollectLeft mode: they track probe-side state
+        // (probe_side_non_empty, probe_side_has_null) per-partition but need global
+        // knowledge for correct null handling. Partitioning can hide globally-present
+        // probe rows from a partition, yielding incorrect NULL handling.
+        let partition_mode = if hash_join.null_aware {
+            PartitionMode::CollectLeft
+        } else {
+            PartitionMode::Partitioned
+        };
         Ok(Arc::new(HashJoinExec::try_new(
             Arc::clone(left),
             Arc::clone(right),
@@ -300,9 +315,9 @@ pub(crate) fn partitioned_hash_join(
             hash_join.filter().cloned(),
             hash_join.join_type(),
             hash_join.projection.as_ref().map(|v| v.to_vec()),
-            PartitionMode::Partitioned,
+            partition_mode,
             hash_join.null_equality(),
-            false,
+            hash_join.null_aware,
         )?))
     }
 }
@@ -334,7 +349,11 @@ fn statistical_join_selection_subrule(
             PartitionMode::Partitioned => {
                 let left = hash_join.left();
                 let right = hash_join.right();
-                if hash_join.join_type().supports_swap()
+                if hash_join.null_aware {
+                    // A null-aware anti join must run in CollectLeft mode; correct one
+                    // that reached this arm already partitioned.
+                    Some(partitioned_hash_join(hash_join)?)
+                } else if hash_join.join_type().supports_swap()
                     && should_swap_join_order(&**left, &**right)?
                 {
                     hash_join
@@ -549,6 +568,7 @@ pub fn hash_join_swap_subrule(
     if let Some(hash_join) = input.downcast_ref::<HashJoinExec>()
         && hash_join.left.boundedness().is_unbounded()
         && !hash_join.right.boundedness().is_unbounded()
+        && !hash_join.null_aware
         && matches!(
             *hash_join.join_type(),
             JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti
@@ -700,6 +720,116 @@ mod test {
             displayable(join.as_ref()).one_line().to_string(),
             displayable(optimized_join.as_ref()).one_line().to_string()
         );
+    }
+
+    //
+    // Null-aware anti joins (from `NOT IN`) must never be swapped: the swapped
+    // `RightAnti` type cannot carry `null_aware`, which DataFusion rejects during
+    // distributed stage resolution. Regression test for the distributed q16 stall.
+    //
+    #[tokio::test]
+    async fn test_null_aware_anti_join_not_swapped() {
+        use datafusion::{
+            common::NullEquality,
+            config::ConfigOptions,
+            physical_optimizer::PhysicalOptimizerRule,
+            physical_plan::joins::{HashJoinExec, PartitionMode},
+        };
+
+        use crate::physical_optimizer::join_selection::JoinSelection;
+
+        // Build (left) side is large and probe (right) side is small, so
+        // `should_swap_join_order` would normally swap — which for a null-aware
+        // `LeftAnti` would produce an invalid `RightAnti`.
+        let (big, small) = create_big_and_small();
+        let on = vec![(
+            Arc::new(Column::new("big_col", 0)) as _,
+            Arc::new(Column::new("small_col", 0)) as _,
+        )];
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                Arc::clone(&big),
+                Arc::clone(&small),
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true, // null_aware
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = JoinSelection::new()
+            .optimize(Arc::clone(&join), &ConfigOptions::new())
+            .unwrap();
+
+        let hash_join = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("optimized plan should still be a HashJoinExec");
+        assert_eq!(
+            *hash_join.join_type(),
+            JoinType::LeftAnti,
+            "null-aware anti join must not be swapped to RightAnti"
+        );
+        assert!(
+            hash_join.null_aware,
+            "null_aware flag must be preserved through join selection"
+        );
+    }
+
+    //
+    // A null-aware anti join that reaches JoinSelection already in Partitioned mode
+    // must be corrected to CollectLeft; Partitioned mode breaks its NULL semantics.
+    //
+    #[tokio::test]
+    async fn test_null_aware_anti_join_partitioned_forced_to_collect_left() {
+        use datafusion::{
+            common::NullEquality,
+            config::ConfigOptions,
+            physical_optimizer::PhysicalOptimizerRule,
+            physical_plan::joins::{HashJoinExec, PartitionMode},
+        };
+
+        use crate::physical_optimizer::join_selection::JoinSelection;
+
+        let (big, small) = create_big_and_small();
+        let on = vec![(
+            Arc::new(Column::new("big_col", 0)) as _,
+            Arc::new(Column::new("small_col", 0)) as _,
+        )];
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                Arc::clone(&big),
+                Arc::clone(&small),
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                true, // null_aware
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = JoinSelection::new()
+            .optimize(Arc::clone(&join), &ConfigOptions::new())
+            .unwrap();
+
+        let hash_join = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("optimized plan should still be a HashJoinExec");
+        assert_eq!(
+            *hash_join.partition_mode(),
+            PartitionMode::CollectLeft,
+            "null-aware anti join must be corrected to CollectLeft mode"
+        );
+        assert_eq!(*hash_join.join_type(), JoinType::LeftAnti);
+        assert!(hash_join.null_aware, "null_aware flag must be preserved");
     }
 
     fn create_big_and_small() -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
