@@ -117,6 +117,13 @@ impl TaskLauncher for DefaultTaskLauncher {
     }
 }
 
+/// Upper bound on a single job-state persist (object-store meta CAS + graph
+/// blob write). The scheduler event loop awaits these persists, so an
+/// unbounded stall in a single object-store request would freeze the entire
+/// scheduler: it stops scheduling and stops answering `poll_work`, executors
+/// go idle, and the cluster wedges with no error logged.
+const JOB_PERSIST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Manages task scheduling and execution for the Ballista scheduler.
 ///
 /// The `TaskManager` is responsible for:
@@ -496,18 +503,46 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         debug!("Moving job {job_id} from Active to Success");
 
         if let Some(graph) = self.get_active_execution_graph(job_id) {
-            {
+            // Snapshot under the lock, persist outside it. Holding the graph lock
+            // across object-store I/O blocks executor task-status updates (which
+            // take the write lock inside the poll_work handlers), so a stalled
+            // persist would wedge every executor's poll loop — and with it the
+            // poll_work-carried heartbeats — taking down the whole cluster.
+            let snapshot = {
                 let graph = graph.read().await;
                 if !graph.is_successful() {
                     error!("Job {job_id} has not finished and cannot be completed");
                     return Ok(());
                 }
-                // Persist the terminal status before removing the job from the active
-                // cache, so a concurrent `get_job_status` can't fall through to a stale
-                // shared-state read while the save is in flight.
-                self.state.save_job(job_id, &graph).await?;
+                graph.cloned()
+            };
+            // Persist the terminal status before removing the job from the active
+            // cache, so a concurrent `get_job_status` can't fall through to a stale
+            // shared-state read while the save is in flight. Bound the persist so a
+            // stalled object-store operation cannot hang the event loop; on
+            // timeout/error keep the job cached — status reads stay correct from
+            // the cache — and leave the shared state to a later persist.
+            match tokio::time::timeout(
+                JOB_PERSIST_TIMEOUT,
+                self.state.save_job(job_id, &snapshot),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    self.remove_active_execution_graph(job_id);
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "terminal save_job for {job_id} failed: {e}; keeping job in the active cache"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "terminal save_job for {job_id} timed out after {}s; keeping job in the active cache",
+                        JOB_PERSIST_TIMEOUT.as_secs()
+                    );
+                }
             }
-            self.remove_active_execution_graph(job_id);
         } else {
             warn!("Fail to find job {job_id} in the cache");
         }
@@ -607,7 +642,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             // ever advances within this serial path.
             if let Some(snapshot) = snapshot {
                 info!("Saving job with status {:?}", snapshot.status());
-                self.state.save_job(job_id, &snapshot).await?;
+                // Bound the persist so a stalled object-store operation cannot hang
+                // the scheduler event loop (which awaits this) indefinitely. The
+                // intermediate state persisted here is best-effort, so on timeout or
+                // error log and continue; the next update or the reconciliation
+                // sweep re-persists it.
+                match tokio::time::timeout(
+                    JOB_PERSIST_TIMEOUT,
+                    self.state.save_job(job_id, &snapshot),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("save_job for {job_id} failed: {e}"),
+                    Err(_) => warn!(
+                        "save_job for {job_id} timed out after {}s; skipping this persist (next update/sweep retries)",
+                        JOB_PERSIST_TIMEOUT.as_secs()
+                    ),
+                }
             }
 
             Ok(new_tasks)
