@@ -548,7 +548,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         failure_reason: String,
     ) -> Result<(Vec<RunningTaskInfo>, usize)> {
         let (tasks_to_cancel, pending_tasks) = if let Some(graph) =
-            self.remove_active_execution_graph(job_id)
+            self.get_active_execution_graph(job_id)
         {
             // Mutate and snapshot under the lock, persist outside it: holding
             // the graph lock across object-store I/O blocks any task still
@@ -569,20 +569,26 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 (running_tasks, pending_tasks, guard.cloned())
             };
 
+            // Persist the terminal status before removing the job from the
+            // active cache (same ordering as succeed_job), so a concurrent
+            // get_job_status can't fall through to a stale shared-state read.
             // Bound the persist so a stalled object-store operation cannot hang
-            // the event loop; on timeout/error the failed status is still served
-            // from this scheduler while it lives, and the next persist or the
-            // reconciliation sweep updates the shared state.
+            // the event loop; on timeout/error keep the job cached — the graph
+            // now carries the failed status, so status reads stay correct.
             match tokio::time::timeout(
                 JOB_PERSIST_TIMEOUT,
                 self.state.save_job(job_id, &snapshot),
             )
             .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("save_job for aborted job {job_id} failed: {e}"),
+                Ok(Ok(())) => {
+                    self.remove_active_execution_graph(job_id);
+                }
+                Ok(Err(e)) => warn!(
+                    "save_job for aborted job {job_id} failed: {e}; keeping job in the active cache"
+                ),
                 Err(_) => warn!(
-                    "save_job for aborted job {job_id} timed out after {}s",
+                    "save_job for aborted job {job_id} timed out after {}s; keeping job in the active cache",
                     JOB_PERSIST_TIMEOUT.as_secs()
                 ),
             }
@@ -783,9 +789,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         )?;
         plan_proto.try_encode(&mut plan_buf)?;
 
+        // Re-check after the guard-free encode: the job may have been removed
+        // (completed/aborted) meanwhile, and a plan must not be returned for a
+        // job that is no longer active.
         #[cfg(not(feature = "disable-stage-plan-cache"))]
-        if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
-            job_info.insert_stage_plan(stage_id, plan_buf.clone());
+        match self.active_job_cache.get_mut(job_id) {
+            Some(mut job_info) => job_info.insert_stage_plan(stage_id, plan_buf.clone()),
+            None => {
+                return Err(BallistaError::General(format!(
+                    "Cannot prepare task definition for job {job_id} which is not in active cache"
+                )));
+            }
+        }
+        #[cfg(feature = "disable-stage-plan-cache")]
+        if !self.active_job_cache.contains_key(job_id) {
+            return Err(BallistaError::General(format!(
+                "Cannot prepare task definition for job {job_id} which is not in active cache"
+            )));
         }
 
         Ok(plan_buf)
