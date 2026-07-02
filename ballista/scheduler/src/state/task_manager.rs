@@ -650,8 +650,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 // Bound the persist so a stalled object-store operation cannot hang
                 // the scheduler event loop (which awaits this) indefinitely. The
                 // intermediate state persisted here is best-effort, so on timeout or
-                // error log and continue; the next update or the reconciliation
-                // sweep re-persists it.
+                // error log and continue; the next event-driven update re-persists
+                // it (the reconciliation sweep deliberately revives WITHOUT
+                // persisting).
                 match tokio::time::timeout(
                     JOB_PERSIST_TIMEOUT,
                     self.state.save_job(job_id, &snapshot),
@@ -661,7 +662,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!("save_job for {job_id} failed: {e}"),
                     Err(_) => warn!(
-                        "save_job for {job_id} timed out after {}s; skipping this persist (next update/sweep retries)",
+                        "save_job for {job_id} timed out after {}s; skipping this persist (the next event-driven update retries)",
                         JOB_PERSIST_TIMEOUT.as_secs()
                     ),
                 }
@@ -753,6 +754,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// shard (task binding in poll_work handlers, status updates) on its OS
     /// worker thread for the encode duration, which under contention can
     /// exhaust the runtime's workers.
+    #[cfg_attr(feature = "disable-stage-plan-cache", expect(unused_variables))]
     fn encoded_stage_plan(
         &self,
         job_id: &str,
