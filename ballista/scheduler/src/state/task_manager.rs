@@ -495,14 +495,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub(crate) async fn succeed_job(&self, job_id: &str) -> Result<()> {
         debug!("Moving job {job_id} from Active to Success");
 
-        if let Some(graph) = self.remove_active_execution_graph(job_id) {
-            let graph = graph.read().await;
-            if graph.is_successful() {
+        if let Some(graph) = self.get_active_execution_graph(job_id) {
+            {
+                let graph = graph.read().await;
+                if !graph.is_successful() {
+                    error!("Job {job_id} has not finished and cannot be completed");
+                    return Ok(());
+                }
+                // Persist the terminal status before removing the job from the active
+                // cache, so a concurrent `get_job_status` can't fall through to a stale
+                // shared-state read while the save is in flight.
                 self.state.save_job(job_id, &graph).await?;
-            } else {
-                error!("Job {job_id} has not finished and cannot be completed");
-                return Ok(());
             }
+            self.remove_active_execution_graph(job_id);
         } else {
             warn!("Fail to find job {job_id} in the cache");
         }
