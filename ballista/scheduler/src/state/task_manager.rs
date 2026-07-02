@@ -42,7 +42,7 @@ use dashmap::DashMap;
 use crate::state::aqe::AdaptiveExecutionGraph;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
-use datafusion_proto::physical_plan::{AsExecutionPlan, PhysicalExtensionCodec};
+use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use log::{debug, error, info, trace, warn};
 use rand::rng;
@@ -174,36 +174,13 @@ impl JobInfoCache {
         }
     }
     #[cfg(not(feature = "disable-stage-plan-cache"))]
-    fn encode_stage_plan<U: AsExecutionPlan>(
-        &mut self,
-        stage_id: usize,
-        plan: &Arc<dyn ExecutionPlan>,
-        codec: &dyn PhysicalExtensionCodec,
-    ) -> Result<Vec<u8>> {
-        if let Some(plan) = self.encoded_stage_plans.get(&stage_id) {
-            Ok(plan.clone())
-        } else {
-            let mut plan_buf: Vec<u8> = vec![];
-            let plan_proto = U::try_from_physical_plan(plan.clone(), codec)?;
-            plan_proto.try_encode(&mut plan_buf)?;
-            self.encoded_stage_plans.insert(stage_id, plan_buf.clone());
-
-            Ok(plan_buf)
-        }
+    fn cached_stage_plan(&self, stage_id: usize) -> Option<Vec<u8>> {
+        self.encoded_stage_plans.get(&stage_id).cloned()
     }
 
-    #[cfg(feature = "disable-stage-plan-cache")]
-    fn encode_stage_plan<U: AsExecutionPlan>(
-        &mut self,
-        _stage_id: usize,
-        plan: &Arc<dyn ExecutionPlan>,
-        codec: &dyn PhysicalExtensionCodec,
-    ) -> Result<Vec<u8>> {
-        let mut plan_buf: Vec<u8> = vec![];
-        let plan_proto = U::try_from_physical_plan(plan.clone(), codec)?;
-        plan_proto.try_encode(&mut plan_buf)?;
-
-        Ok(plan_buf)
+    #[cfg(not(feature = "disable-stage-plan-cache"))]
+    fn insert_stage_plan(&mut self, stage_id: usize, plan: Vec<u8>) {
+        self.encoded_stage_plans.insert(stage_id, plan);
     }
 }
 
@@ -283,25 +260,31 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// hot loop or after every event) as it can cause lock contention with
     /// concurrent task binding operations.
     pub async fn total_pending_tasks(&self) -> usize {
+        // Collect the graph handles first so no DashMap shard guard is held
+        // across an await. A shard guard held while parked on a graph lock
+        // makes every other shard access (task binding in poll_work, job
+        // insert/remove on the event loop) block its OS worker thread; with
+        // enough concurrent pollers that exhausts the runtime's workers, the
+        // timer driver dies with them, and the process freezes permanently.
+        let graphs: Vec<(String, Arc<RwLock<ExecutionGraphBox>>)> = self
+            .active_job_cache
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().execution_graph.clone()))
+            .collect();
+
         let mut total = 0;
-        for entry in self.active_job_cache.iter() {
+        for (job_id, graph) in graphs {
             // Use a timeout to avoid blocking indefinitely if there's lock contention.
             // If we can't acquire the lock within the timeout, skip this job's count
             // rather than blocking the metrics collection.
-            match tokio::time::timeout(
-                Duration::from_millis(100),
-                entry.value().execution_graph.read(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_millis(100), graph.read()).await {
                 Ok(graph) => {
                     total += graph.available_tasks();
                 }
                 Err(_) => {
                     // Lock acquisition timed out, skip this job
                     trace!(
-                        "Skipping pending task count for job {} due to lock contention",
-                        entry.key()
+                        "Skipping pending task count for job {job_id} due to lock contention"
                     );
                 }
             }
@@ -567,20 +550,42 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let (tasks_to_cancel, pending_tasks) = if let Some(graph) =
             self.remove_active_execution_graph(job_id)
         {
-            let mut guard = graph.write().await;
+            // Mutate and snapshot under the lock, persist outside it: holding
+            // the graph lock across object-store I/O blocks any task still
+            // updating this graph for the duration of a stall.
+            let (running_tasks, pending_tasks, snapshot) = {
+                let mut guard = graph.write().await;
 
-            let pending_tasks = guard.available_tasks();
-            let running_tasks = guard.running_tasks();
+                let pending_tasks = guard.available_tasks();
+                let running_tasks = guard.running_tasks();
 
-            info!(
-                "Cancelling {} running tasks for job {}",
-                running_tasks.len(),
-                job_id
-            );
+                info!(
+                    "Cancelling {} running tasks for job {}",
+                    running_tasks.len(),
+                    job_id
+                );
 
-            guard.fail_job(failure_reason);
+                guard.fail_job(failure_reason);
+                (running_tasks, pending_tasks, guard.cloned())
+            };
 
-            self.state.save_job(job_id, &guard).await?;
+            // Bound the persist so a stalled object-store operation cannot hang
+            // the event loop; on timeout/error the failed status is still served
+            // from this scheduler while it lives, and the next persist or the
+            // reconciliation sweep updates the shared state.
+            match tokio::time::timeout(
+                JOB_PERSIST_TIMEOUT,
+                self.state.save_job(job_id, &snapshot),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("save_job for aborted job {job_id} failed: {e}"),
+                Err(_) => warn!(
+                    "save_job for aborted job {job_id} timed out after {}s",
+                    JOB_PERSIST_TIMEOUT.as_secs()
+                ),
+            }
 
             (running_tasks, pending_tasks)
         } else {
@@ -677,14 +682,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         // Collect all the running task need to cancel when there are running stages rolled back.
         let mut running_tasks_to_cancel: Vec<RunningTaskInfo> = vec![];
 
-        {
-            for pairs in self.active_job_cache.iter() {
-                let (_job_id, job_info) = pairs.pair();
-                let mut graph = job_info.execution_graph.write().await;
-                let reset = graph.reset_stages_on_lost_executor(executor_id)?;
-                if !reset.0.is_empty() {
-                    running_tasks_to_cancel.extend(reset.1);
-                }
+        // Collect the graph handles first: awaiting each graph's (unbounded)
+        // write lock while holding the DashMap shard guard blocks every other
+        // task touching that shard on its OS worker thread, which can exhaust
+        // the runtime's workers and freeze the whole scheduler.
+        let graphs: Vec<Arc<RwLock<ExecutionGraphBox>>> = self
+            .active_job_cache
+            .iter()
+            .map(|entry| entry.value().execution_graph.clone())
+            .collect();
+
+        for graph in graphs {
+            let mut graph = graph.write().await;
+            let reset = graph.reset_stages_on_lost_executor(executor_id)?;
+            if !reset.0.is_empty() {
+                running_tasks_to_cancel.extend(reset.1);
             }
         }
 
@@ -715,34 +727,66 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let job_id = task.partition.job_id.clone();
         let stage_id = task.partition.stage_id;
 
-        if let Some(mut job_info) = self.active_job_cache.get_mut(&job_id) {
-            let plan = job_info.encode_stage_plan::<PhysicalPlanNode>(
-                stage_id,
-                &task.plan,
-                self.codec.physical_extension_codec(),
-            )?;
+        let plan = self.encoded_stage_plan(&job_id, stage_id, &task.plan)?;
 
-            let task_definition = TaskDefinition {
-                task_id: task.task_id as u32,
-                task_attempt_num: task.task_attempt as u32,
-                job_id,
-                stage_id: stage_id as u32,
-                stage_attempt_num: task.stage_attempt_num as u32,
-                partition_id: task.partition.partition_id as u32,
-                plan,
-                session_id: task.session_id,
-                launch_time: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-                props: task.session_config.to_key_value_pairs(),
-            };
-            Ok(task_definition)
-        } else {
-            Err(BallistaError::General(format!(
-                "Cannot prepare task definition for job {job_id} which is not in active cache"
-            )))
+        let task_definition = TaskDefinition {
+            task_id: task.task_id as u32,
+            task_attempt_num: task.task_attempt as u32,
+            job_id,
+            stage_id: stage_id as u32,
+            stage_attempt_num: task.stage_attempt_num as u32,
+            partition_id: task.partition.partition_id as u32,
+            plan,
+            session_id: task.session_id,
+            launch_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            props: task.session_config.to_key_value_pairs(),
+        };
+        Ok(task_definition)
+    }
+
+    /// Returns the protobuf-encoded plan for the given stage, using the
+    /// per-job stage-plan cache. The CPU-heavy encode runs WITHOUT holding any
+    /// cache guard: a DashMap write guard blocks every other task touching the
+    /// shard (task binding in poll_work handlers, status updates) on its OS
+    /// worker thread for the encode duration, which under contention can
+    /// exhaust the runtime's workers.
+    fn encoded_stage_plan(
+        &self,
+        job_id: &str,
+        stage_id: usize,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "disable-stage-plan-cache"))]
+        if let Some(cached) = self
+            .active_job_cache
+            .get(job_id)
+            .and_then(|job_info| job_info.cached_stage_plan(stage_id))
+        {
+            return Ok(cached);
         }
+
+        if !self.active_job_cache.contains_key(job_id) {
+            return Err(BallistaError::General(format!(
+                "Cannot prepare task definition for job {job_id} which is not in active cache"
+            )));
+        }
+
+        let mut plan_buf: Vec<u8> = vec![];
+        let plan_proto = PhysicalPlanNode::try_from_physical_plan(
+            plan.clone(),
+            self.codec.physical_extension_codec(),
+        )?;
+        plan_proto.try_encode(&mut plan_buf)?;
+
+        #[cfg(not(feature = "disable-stage-plan-cache"))]
+        if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
+            job_info.insert_stage_plan(stage_id, plan_buf.clone());
+        }
+
+        Ok(plan_buf)
     }
 
     /// Launch the given tasks on the specified executor
@@ -792,12 +836,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 trace!("With task details {tasks:?}");
             }
 
-            if let Some(mut job_info) = self.active_job_cache.get_mut(&job_id) {
-                let plan = job_info.encode_stage_plan::<PhysicalPlanNode>(
-                    stage_id,
-                    &task.plan,
-                    self.codec.physical_extension_codec(),
-                )?;
+            {
+                let plan = self.encoded_stage_plan(&job_id, stage_id, &task.plan)?;
 
                 let launch_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -826,10 +866,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 });
 
                 Ok(multi_tasks)
-            } else {
-                Err(BallistaError::General(format!(
-                    "Cannot prepare multi task definition for job {job_id} which is not in active cache"
-                )))
             }
         } else {
             Err(BallistaError::General(
