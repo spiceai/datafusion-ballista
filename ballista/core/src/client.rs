@@ -22,7 +22,10 @@ use std::sync::Arc;
 
 use std::{
     convert::{TryFrom, TryInto},
+    future::Future,
+    pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use crate::error::{BallistaError, Result as BResult};
@@ -78,6 +81,77 @@ fn is_dead_channel_error(status: &tonic::Status) -> bool {
 }
 const IO_RETRY_WAIT_TIME_MS: u64 = 3000;
 
+/// HTTP/2 flow-control windows for the pooled shuffle-fetch connection. All of
+/// a peer's concurrent DoGet streams multiplex over one pooled connection, and
+/// for server->client data the CLIENT's advertised receive windows govern.
+/// The h2 defaults (64KB stream AND connection) mean every partition transfer
+/// to this executor shares a single 64KB connection window: with ~100
+/// concurrent reducer streams of real (SF100-sized) partitions the window
+/// exhausts instantly and streams starve each other — observed as every
+/// reducer task on the cluster parked mid-fetch indefinitely, pinning all task
+/// slots. Match the flight data plane's windows (16MB/stream, 64MB/connection).
+const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Read-inactivity bound for shuffle data streams. The endpoint's request
+/// timeout only bounds time-to-response-headers, not the streaming body, so a
+/// peer stream that stalls mid-transfer otherwise hangs the reducer task
+/// forever — pinning its task slot until process restart. If no data arrives
+/// for this long while the consumer is actively waiting, fail the stream so
+/// the task fails and can be retried. Generous, because the timer also
+/// accumulates while the consumer itself pauses between polls.
+const STREAM_READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Wraps a record-batch stream and errors out if the underlying stream stays
+/// pending past [`STREAM_READ_INACTIVITY_TIMEOUT`] without yielding anything.
+/// The deadline resets on every yielded item.
+struct InactivityTimeoutStream {
+    inner: SendableRecordBatchStream,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl InactivityTimeoutStream {
+    fn new(inner: SendableRecordBatchStream) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(STREAM_READ_INACTIVITY_TIMEOUT)),
+        }
+    }
+}
+
+impl Stream for InactivityTimeoutStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(item) => {
+                self.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + STREAM_READ_INACTIVITY_TIMEOUT);
+                Poll::Ready(item)
+            }
+            Poll::Pending => match self.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "shuffle stream stalled: no data received for {}s",
+                        STREAM_READ_INACTIVITY_TIMEOUT.as_secs()
+                    )))))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+impl RecordBatchStream for InactivityTimeoutStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
 impl BallistaClient {
     /// Create a new BallistaClient to connect to the executor listening on the specified
     /// host and port
@@ -111,7 +185,9 @@ impl BallistaClient {
                 BallistaError::GrpcConnectionError(format!(
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
                 ))
-            })?;
+            })?
+            .initial_stream_window_size(Some(HTTP2_INITIAL_STREAM_WINDOW_SIZE))
+            .initial_connection_window_size(Some(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE));
 
         if let Some(customize) = customize_endpoint {
             endpoint = customize
@@ -278,7 +354,9 @@ impl BallistaClient {
                             let schema = Arc::new(Schema::try_from(&flight_data)?);
 
                             // all the remaining stream messages should be dictionary and record batches
-                            Ok(Box::pin(FlightDataStream::new(stream, schema)))
+                            Ok(Box::pin(InactivityTimeoutStream::new(Box::pin(
+                                FlightDataStream::new(stream, schema),
+                            ))))
                         }
                         None => Err(BallistaError::GrpcActionError(
                             "Did not receive schema batch from flight server".to_string(),
@@ -375,7 +453,9 @@ impl BallistaClient {
                 })
             });
 
-            return Ok(Box::pin(BlockDataStream::try_new(stream).await?));
+            return Ok(Box::pin(InactivityTimeoutStream::new(Box::pin(
+                BlockDataStream::try_new(stream).await?,
+            ))));
         }
         unreachable!("Did not receive schema batch from flight server");
     }
