@@ -35,7 +35,9 @@ pub use shuffle_manager::{
     global_shuffle_manager,
 };
 pub use shuffle_reader::ShuffleReaderExec;
-pub use shuffle_reader::{stats_for_partition, stats_for_partitions};
+pub use shuffle_reader::{
+    set_shuffle_transport_runtime, stats_for_partition, stats_for_partitions,
+};
 pub use shuffle_writer::ShuffleWriterExec;
 pub use shuffle_writer_trait::ShuffleWriter;
 pub use sort_shuffle::SortShuffleWriterExec;
