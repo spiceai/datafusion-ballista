@@ -512,9 +512,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// fails or times out the job stays cached — the graph already carries the
     /// terminal status, so status reads stay correct — and the shared state is
     /// left to a later persist.
-    async fn persist_terminal_and_evict(&self, job_id: &str, snapshot: &ExecutionGraphBox) {
+    async fn persist_terminal_and_evict(
+        &self,
+        job_id: &str,
+        snapshot: &ExecutionGraphBox,
+    ) {
         if self.try_save_job(job_id, snapshot).await {
             self.remove_active_execution_graph(job_id);
+        } else if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
+            // The cached status is what get_running_job_cache() filters on; a
+            // kept entry must reflect the terminal status or the job keeps
+            // appearing in every task-binding snapshot until restart.
+            job_info.status = snapshot.status().status.clone();
         }
     }
 
