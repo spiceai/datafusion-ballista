@@ -480,6 +480,44 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         Ok(combined_result)
     }
 
+    /// Persist the job state, bounded by [`JOB_PERSIST_TIMEOUT`] so a stalled
+    /// object-store operation cannot hang the scheduler event loop (which
+    /// awaits these persists). Returns whether the persist completed; failures
+    /// and timeouts are logged and the shared state is left to a later persist.
+    async fn try_save_job(&self, job_id: &str, snapshot: &ExecutionGraphBox) -> bool {
+        match tokio::time::timeout(
+            JOB_PERSIST_TIMEOUT,
+            self.state.save_job(job_id, snapshot),
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!("save_job for {job_id} failed: {e}");
+                false
+            }
+            Err(_) => {
+                warn!(
+                    "save_job for {job_id} timed out after {}s",
+                    JOB_PERSIST_TIMEOUT.as_secs()
+                );
+                false
+            }
+        }
+    }
+
+    /// Persist a terminal job status and only then evict the job from the
+    /// active cache, so a concurrent `get_job_status` can't fall through to a
+    /// stale shared-state read while the save is in flight. If the persist
+    /// fails or times out the job stays cached — the graph already carries the
+    /// terminal status, so status reads stay correct — and the shared state is
+    /// left to a later persist.
+    async fn persist_terminal_and_evict(&self, job_id: &str, snapshot: &ExecutionGraphBox) {
+        if self.try_save_job(job_id, snapshot).await {
+            self.remove_active_execution_graph(job_id);
+        }
+    }
+
     /// Mark a job to success. This will create a key under the CompletedJobs keyspace
     /// and remove the job from ActiveJobs
     pub(crate) async fn succeed_job(&self, job_id: &str) -> Result<()> {
@@ -499,33 +537,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 }
                 graph.cloned()
             };
-            // Persist the terminal status before removing the job from the active
-            // cache, so a concurrent `get_job_status` can't fall through to a stale
-            // shared-state read while the save is in flight. Bound the persist so a
-            // stalled object-store operation cannot hang the event loop; on
-            // timeout/error keep the job cached — status reads stay correct from
-            // the cache — and leave the shared state to a later persist.
-            match tokio::time::timeout(
-                JOB_PERSIST_TIMEOUT,
-                self.state.save_job(job_id, &snapshot),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    self.remove_active_execution_graph(job_id);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "terminal save_job for {job_id} failed: {e}; keeping job in the active cache"
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "terminal save_job for {job_id} timed out after {}s; keeping job in the active cache",
-                        JOB_PERSIST_TIMEOUT.as_secs()
-                    );
-                }
-            }
+            self.persist_terminal_and_evict(job_id, &snapshot).await;
         } else {
             warn!("Fail to find job {job_id} in the cache");
         }
@@ -569,29 +581,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 (running_tasks, pending_tasks, guard.cloned())
             };
 
-            // Persist the terminal status before removing the job from the
-            // active cache (same ordering as succeed_job), so a concurrent
-            // get_job_status can't fall through to a stale shared-state read.
-            // Bound the persist so a stalled object-store operation cannot hang
-            // the event loop; on timeout/error keep the job cached — the graph
-            // now carries the failed status, so status reads stay correct.
-            match tokio::time::timeout(
-                JOB_PERSIST_TIMEOUT,
-                self.state.save_job(job_id, &snapshot),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    self.remove_active_execution_graph(job_id);
-                }
-                Ok(Err(e)) => warn!(
-                    "save_job for aborted job {job_id} failed: {e}; keeping job in the active cache"
-                ),
-                Err(_) => warn!(
-                    "save_job for aborted job {job_id} timed out after {}s; keeping job in the active cache",
-                    JOB_PERSIST_TIMEOUT.as_secs()
-                ),
-            }
+            self.persist_terminal_and_evict(job_id, &snapshot).await;
 
             (running_tasks, pending_tasks)
         } else {
@@ -653,25 +643,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             // ever advances within this serial path.
             if let Some(snapshot) = snapshot {
                 info!("Saving job with status {:?}", snapshot.status());
-                // Bound the persist so a stalled object-store operation cannot hang
-                // the scheduler event loop (which awaits this) indefinitely. The
-                // intermediate state persisted here is best-effort, so on timeout or
-                // error log and continue; the next event-driven update re-persists
-                // it (the reconciliation sweep deliberately revives WITHOUT
-                // persisting).
-                match tokio::time::timeout(
-                    JOB_PERSIST_TIMEOUT,
-                    self.state.save_job(job_id, &snapshot),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("save_job for {job_id} failed: {e}"),
-                    Err(_) => warn!(
-                        "save_job for {job_id} timed out after {}s; skipping this persist (the next event-driven update retries)",
-                        JOB_PERSIST_TIMEOUT.as_secs()
-                    ),
-                }
+                // Best-effort intermediate persist: on failure/timeout the next
+                // event-driven update re-persists (the reconciliation sweep
+                // deliberately revives WITHOUT persisting).
+                self.try_save_job(job_id, &snapshot).await;
             }
 
             Ok(new_tasks)
