@@ -480,7 +480,10 @@ async fn sample_tasks_status(
                 break;
             }
             Err(TryRecvError::Disconnected) => {
+                // Without the break this arm spins forever: try_recv keeps
+                // returning Disconnected once all senders are dropped.
                 error!("Task statuses channel disconnected");
+                break;
             }
         }
     }
