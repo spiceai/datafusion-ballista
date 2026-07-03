@@ -63,6 +63,19 @@ pub struct BallistaClient {
 
 //TODO make this configurable
 const IO_RETRIES_TIMES: u8 = 3;
+
+/// True when the status says the pooled channel itself is unusable — tonic
+/// surfaces a failed channel as `Code::Unknown` with a transport-error message
+/// ("Service was not ready: transport error"), meaning the request never
+/// reached the peer. Retrying on the same channel cannot succeed, so fail
+/// fast and let the caller evict the pooled client and reconnect instead of
+/// burning the IO-retry budget on a dead connection.
+fn is_dead_channel_error(status: &tonic::Status) -> bool {
+    status.code() == Code::Unknown && {
+        let msg = status.message();
+        msg.contains("Service was not ready") || msg.contains("transport error")
+    }
+}
 const IO_RETRY_WAIT_TIME_MS: u64 = 3000;
 
 impl BallistaClient {
@@ -238,8 +251,13 @@ impl BallistaClient {
                             .into();
                     }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
-                    // This means IO related error will retry.
-                    if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {
+                    // This means IO related error will retry. A dead pooled
+                    // channel also reports Code::Unknown but can never recover
+                    // by retrying on the same channel; fail fast instead.
+                    if i == IO_RETRIES_TIMES - 1
+                        || err.code() != Code::Unknown
+                        || is_dead_channel_error(err)
+                    {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             result.unwrap_err()
@@ -268,7 +286,10 @@ impl BallistaClient {
                     };
                 }
                 Err(e) => {
-                    if i == IO_RETRIES_TIMES - 1 || e.code() != Code::Unknown {
+                    if i == IO_RETRIES_TIMES - 1
+                        || e.code() != Code::Unknown
+                        || is_dead_channel_error(&e)
+                    {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             e.to_string()
@@ -326,8 +347,13 @@ impl BallistaClient {
                             .into();
                     }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
-                    // This means IO related error will retry.
-                    if i == IO_RETRIES_TIMES - 1 || err.code() != Code::Unknown {
+                    // This means IO related error will retry. A dead pooled
+                    // channel also reports Code::Unknown but can never recover
+                    // by retrying on the same channel; fail fast instead.
+                    if i == IO_RETRIES_TIMES - 1
+                        || err.code() != Code::Unknown
+                        || is_dead_channel_error(err)
+                    {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             result.unwrap_err()
