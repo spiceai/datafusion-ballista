@@ -792,24 +792,46 @@ async fn cached_remote_client(
         // buffer worker are polled there, not on the CPU-saturated pool that
         // is running this fetch (see SHUFFLE_TRANSPORT_RUNTIME).
         Some(handle) => {
-            let host = host.to_string();
-            handle
+            let host_owned = host.to_string();
+            let ep = customize_endpoint.clone();
+            match handle
                 .spawn(async move {
                     BallistaClient::try_new(
-                        &host,
+                        &host_owned,
+                        port,
+                        max_message_size,
+                        use_tls,
+                        ep,
+                    )
+                    .await
+                })
+                .await
+            {
+                Ok(connect_result) => connect_result?,
+                // The registered transport runtime has already shut down (e.g. a
+                // short-lived executor in an embedded test harness outlived the
+                // stale registration — see `set_shuffle_transport_runtime`).
+                // Fall back to connecting on the caller's own runtime instead of
+                // failing the fetch.
+                Err(join_err) if join_err.is_cancelled() => {
+                    log::warn!(
+                        "shuffle transport runtime is no longer available, connecting on the caller's runtime instead"
+                    );
+                    BallistaClient::try_new(
+                        host,
                         port,
                         max_message_size,
                         use_tls,
                         customize_endpoint,
                     )
-                    .await
-                })
-                .await
-                .map_err(|e| {
-                    BallistaError::GrpcConnectionError(format!(
-                        "shuffle client connect task failed: {e}"
-                    ))
-                })??
+                    .await?
+                }
+                Err(join_err) => {
+                    return Err(BallistaError::GrpcConnectionError(format!(
+                        "shuffle client connect task failed: {join_err}"
+                    )));
+                }
+            }
         }
         None => {
             BallistaClient::try_new(
