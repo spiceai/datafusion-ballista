@@ -81,6 +81,7 @@ vortex-ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
 [build-dependencies]
 rustc_version = "0.4.1"

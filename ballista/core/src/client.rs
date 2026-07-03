@@ -108,6 +108,7 @@ const STREAM_READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 struct InactivityTimeoutStream {
     inner: SendableRecordBatchStream,
     deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
 }
 
 impl InactivityTimeoutStream {
@@ -115,6 +116,7 @@ impl InactivityTimeoutStream {
         Self {
             inner,
             deadline: Box::pin(tokio::time::sleep(STREAM_READ_INACTIVITY_TIMEOUT)),
+            timed_out: false,
         }
     }
 }
@@ -126,6 +128,11 @@ impl Stream for InactivityTimeoutStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        // The timeout is terminal: yield the error once, then end the stream,
+        // so a caller that keeps polling doesn't receive the same error forever.
+        if self.timed_out {
+            return Poll::Ready(None);
+        }
         match self.inner.poll_next_unpin(cx) {
             Poll::Ready(item) => {
                 self.deadline
@@ -135,6 +142,7 @@ impl Stream for InactivityTimeoutStream {
             }
             Poll::Pending => match self.deadline.as_mut().poll(cx) {
                 Poll::Ready(()) => {
+                    self.timed_out = true;
                     Poll::Ready(Some(Err(DataFusionError::Execution(format!(
                         "shuffle stream stalled: no data received for {}s",
                         STREAM_READ_INACTIVITY_TIMEOUT.as_secs()
@@ -694,7 +702,12 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use prost::bytes::Bytes;
 
-    use crate::client::BlockDataStream;
+    use crate::client::{
+        BlockDataStream, InactivityTimeoutStream, STREAM_READ_INACTIVITY_TIMEOUT,
+    };
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use std::time::Duration;
 
     fn generate_batches() -> Vec<RecordBatch> {
         let batch0 = RecordBatch::try_from_iter([
@@ -796,5 +809,50 @@ mod tests {
                 .await;
 
         assert_eq!(batches, result.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_timeout_fires_and_is_terminal() {
+        let schema = Arc::new(Schema::empty());
+        let inner =
+            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::pending());
+        let mut stream = InactivityTimeoutStream::new(Box::pin(inner));
+
+        // The paused clock auto-advances to the inactivity deadline while the
+        // inner stream stays pending, so the timeout error is yielded.
+        let item = stream.next().await.expect("timeout should yield an error");
+        let err = item.expect_err("item should be the timeout error");
+        assert!(
+            err.to_string().contains("shuffle stream stalled"),
+            "unexpected error: {err}"
+        );
+
+        // The timeout is terminal: the stream ends instead of repeating the error.
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_deadline_resets_after_yielding_an_item() {
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(schema.clone());
+        let inner = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch)]).chain(futures::stream::pending()),
+        );
+        let mut stream = InactivityTimeoutStream::new(Box::pin(inner));
+
+        // Consume the item just before the original deadline would fire.
+        tokio::time::advance(STREAM_READ_INACTIVITY_TIMEOUT - Duration::from_secs(1))
+            .await;
+        let first = stream.next().await.expect("one batch");
+        assert!(first.is_ok());
+
+        // Past the ORIGINAL deadline: the yielded item must have reset it.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(futures::poll!(stream.next()).is_pending());
+
+        // The reset deadline eventually fires (auto-advance under paused time).
+        let item = stream.next().await.expect("timeout should yield an error");
+        assert!(item.is_err());
     }
 }
