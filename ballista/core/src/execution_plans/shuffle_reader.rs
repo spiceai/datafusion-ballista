@@ -218,9 +218,19 @@ impl ExecutionPlan for ShuffleReaderExec {
             context.runtime_env(),
         );
 
+        // Consume the fetched streams CONCURRENTLY, not sequentially: all of a
+        // peer's streams multiplex over one pooled HTTP/2 connection, and h2
+        // only releases flow-control credit as the application reads. With
+        // sequential consumption every opened-but-parked stream pins up to a
+        // full stream window of unread bytes, and once the parked total reaches
+        // the connection window nothing can send on ANY stream — a permanent,
+        // silent, all-tasks stall (observed at SF100; small scale factors never
+        // reach the threshold). Unordered flattening keeps every open stream
+        // draining so credit always recycles. Shuffle output has no ordering
+        // guarantee, so cross-stream interleaving is safe.
         let input_stream = Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
-            response_receiver.try_flatten(),
+            response_receiver.try_flatten_unordered(None),
         ));
 
         Ok(Box::pin(CoalescedShuffleReaderStream::new(
@@ -732,6 +742,24 @@ type RemoteShuffleClients = Mutex<HashMap<PeerKey, BallistaClient>>;
 static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<RemoteShuffleClients> =
     std::sync::OnceLock::new();
 
+/// Runtime that owns the pooled shuffle channels' transport tasks (the tower
+/// buffer worker and the hyper h2 connection driver are spawned onto whichever
+/// runtime performs the connect). Reducer tasks run on a dedicated, saturated,
+/// down-prioritized CPU runtime; connecting from there parks the connection
+/// driver behind CPU-heavy tasks, so HTTP/2 keepalive PONGs go unprocessed past
+/// the keepalive timeout and hyper aborts the connection — failing every
+/// multiplexed fetch on it at once. The executor registers its I/O runtime here
+/// at startup; unset (e.g. pure-client embedding), connects run on the caller's
+/// runtime as before.
+static SHUFFLE_TRANSPORT_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> =
+    std::sync::OnceLock::new();
+
+/// Register the runtime that pooled shuffle-client transport tasks should run
+/// on. First call wins; subsequent calls are ignored.
+pub fn set_shuffle_transport_runtime(handle: tokio::runtime::Handle) {
+    let _ = SHUFFLE_TRANSPORT_RUNTIME.set(handle);
+}
+
 fn remote_shuffle_clients() -> &'static RemoteShuffleClients {
     REMOTE_SHUFFLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -759,14 +787,63 @@ async fn cached_remote_client(
     // Cache miss: connect without holding the lock. Concurrent first-time fetches
     // to the same peer may each connect briefly; the first to re-acquire the lock
     // wins and the rest reuse its client, dropping their redundant connection.
-    let client = BallistaClient::try_new(
-        host,
-        port,
-        max_message_size,
-        use_tls,
-        customize_endpoint,
-    )
-    .await?;
+    let client = match SHUFFLE_TRANSPORT_RUNTIME.get() {
+        // Connect on the transport runtime so the channel's h2 driver and
+        // buffer worker are polled there, not on the CPU-saturated pool that
+        // is running this fetch (see SHUFFLE_TRANSPORT_RUNTIME).
+        Some(handle) => {
+            let host_owned = host.to_string();
+            let ep = customize_endpoint.clone();
+            match handle
+                .spawn(async move {
+                    BallistaClient::try_new(
+                        &host_owned,
+                        port,
+                        max_message_size,
+                        use_tls,
+                        ep,
+                    )
+                    .await
+                })
+                .await
+            {
+                Ok(connect_result) => connect_result?,
+                // The registered transport runtime has already shut down (e.g. a
+                // short-lived executor in an embedded test harness outlived the
+                // stale registration — see `set_shuffle_transport_runtime`).
+                // Fall back to connecting on the caller's own runtime instead of
+                // failing the fetch.
+                Err(join_err) if join_err.is_cancelled() => {
+                    log::warn!(
+                        "shuffle transport runtime is no longer available, connecting on the caller's runtime instead"
+                    );
+                    BallistaClient::try_new(
+                        host,
+                        port,
+                        max_message_size,
+                        use_tls,
+                        customize_endpoint,
+                    )
+                    .await?
+                }
+                Err(join_err) => {
+                    return Err(BallistaError::GrpcConnectionError(format!(
+                        "shuffle client connect task failed: {join_err}"
+                    )));
+                }
+            }
+        }
+        None => {
+            BallistaClient::try_new(
+                host,
+                port,
+                max_message_size,
+                use_tls,
+                customize_endpoint,
+            )
+            .await?
+        }
+    };
     let mut pool = remote_shuffle_clients().lock().await;
     Ok(pool.entry(key).or_insert(client).clone())
 }
@@ -2108,7 +2185,7 @@ mod tests {
 
         let stream = RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            response_receiver.try_flatten(),
+            response_receiver.try_flatten_unordered(None),
         );
 
         let result = common::collect(Box::pin(stream)).await.unwrap();

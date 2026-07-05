@@ -195,7 +195,14 @@ impl BallistaClient {
                 ))
             })?
             .initial_stream_window_size(Some(HTTP2_INITIAL_STREAM_WINDOW_SIZE))
-            .initial_connection_window_size(Some(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE));
+            .initial_connection_window_size(Some(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE))
+            // Override the default 20s keepalive-ack timeout: PONG processing
+            // happens on the connection driver task, and under heavy load a
+            // delayed poll past the timeout makes hyper abort the connection,
+            // failing every multiplexed fetch at once. 60s tolerates scheduling
+            // delay while dead-path detection (interval + timeout ~2min) stays
+            // well inside the stream-inactivity bound.
+            .keep_alive_timeout(std::time::Duration::from_secs(60));
 
         if let Some(customize) = customize_endpoint {
             endpoint = customize

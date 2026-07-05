@@ -115,6 +115,13 @@ where
         std::sync::mpsc::channel::<TaskStatus>();
     info!("Starting poll work loop with scheduler");
 
+    // poll_loop runs on the executor's I/O runtime; register it so pooled
+    // shuffle-client transport tasks are polled there instead of on the
+    // CPU-saturated dedicated pool the reducer tasks run on.
+    ballista_core::execution_plans::set_shuffle_transport_runtime(
+        tokio::runtime::Handle::current(),
+    );
+
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.task_slots as usize);
 
