@@ -81,18 +81,21 @@ pub const BALLISTA_ADAPTIVE_PLANNER_MAX_PASSES: &str =
 /// Configuration key for enabling sort-based shuffle.
 pub const BALLISTA_SHUFFLE_SORT_BASED_ENABLED: &str =
     "ballista.shuffle.sort_based.enabled";
-/// Configuration key for sort shuffle per-partition buffer size in bytes.
-pub const BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE: &str =
-    "ballista.shuffle.sort_based.buffer_size";
-/// Configuration key for sort shuffle total memory limit in bytes.
-pub const BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT: &str =
-    "ballista.shuffle.sort_based.memory_limit";
-/// Configuration key for sort shuffle spill threshold (0.0-1.0).
-pub const BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD: &str =
-    "ballista.shuffle.sort_based.spill_threshold";
 /// Configuration key for sort shuffle target batch size in rows.
 pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
+/// Per-task buffered-bytes budget for the sort shuffle writer.
+pub const BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES: &str =
+    "ballista.shuffle.sort_based.memory_limit_per_task_bytes";
+/// Deprecated alias for [`BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES`].
+pub const BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT: &str =
+    "ballista.shuffle.sort_based.memory_limit";
+/// Deprecated: ignored by the writer (kept for embedder/config-file compat).
+pub const BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE: &str =
+    "ballista.shuffle.sort_based.buffer_size";
+/// Deprecated: ignored by the writer (kept for embedder/config-file compat).
+pub const BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD: &str =
+    "ballista.shuffle.sort_based.spill_threshold";
 /// Should connection between client, scheduler, and executors use TLS
 pub const BALLISTA_CLIENT_USE_TLS: &str = "ballista.client.use_tls";
 /// Number of retries for IO operations in the Ballista client
@@ -237,28 +240,32 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          Some(3.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_ENABLED.to_string(),
                          "Enable sort-based shuffle which writes consolidated files with index".to_string(),
-                         // Fork keeps this off by default: the Spice sort-shuffle writer
-                         // still accounts memory against the runtime FairSpillPool (unlike
-                         // upstream's per-task budget), and enabling it by default OOMs
-                         // TPC-H SF10 Q18 under the CI executor memory budget.
                          DataType::Boolean,
-                         Some(false.to_string())),
-        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE.to_string(),
-                         "Per-partition buffer size in bytes for sort shuffle".to_string(),
-                         DataType::UInt64,
-                         Some((1024 * 1024).to_string())),
-        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT.to_string(),
-                         "Total memory limit in bytes for sort shuffle buffers".to_string(),
-                         DataType::UInt64,
-                         Some((256 * 1024 * 1024).to_string())),
-        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD.to_string(),
-                         "Spill threshold as decimal fraction (0.0-1.0) of memory limit".to_string(),
-                         DataType::Utf8,
-                         Some("0.8".to_string())),
+                         Some(true.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE.to_string(),
                          "Target batch size in rows for coalescing small batches in sort shuffle".to_string(),
                          DataType::UInt64,
                          Some((8192).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES.to_string(),
+                         "Per-task buffered-bytes budget at which the sort shuffle writer spills its \
+                         in-memory batches to disk. Counted independently of the runtime memory pool, so \
+                         spilling kicks in even when the pool is unbounded. Total worst-case sort shuffle \
+                         memory per executor is approximately concurrent_tasks * this value.".to_string(),
+                         DataType::UInt64,
+                         Some((256 * 1024 * 1024).to_string())),
+        // Deprecated aliases — still accepted so existing spicepods/configs keep working.
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT.to_string(),
+                         "Deprecated alias for ballista.shuffle.sort_based.memory_limit_per_task_bytes".to_string(),
+                         DataType::UInt64,
+                         Some((256 * 1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE.to_string(),
+                         "Deprecated: ignored by the sort shuffle writer".to_string(),
+                         DataType::UInt64,
+                         Some((1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD.to_string(),
+                         "Deprecated: ignored by the sort shuffle writer".to_string(),
+                         DataType::Utf8,
+                         Some("0.8".to_string())),
         ConfigEntry::new(BALLISTA_CLIENT_USE_TLS.to_string(),
                          "Should connection between client, scheduler, and executors use TLS.".to_string(),
                          DataType::Boolean,
@@ -658,24 +665,29 @@ impl BallistaConfig {
         self.get_bool_setting(BALLISTA_SHUFFLE_SORT_BASED_ENABLED)
     }
 
-    /// Returns the per-partition buffer size for sort-based shuffle in bytes.
-    pub fn shuffle_sort_based_buffer_size(&self) -> usize {
-        self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE)
-    }
-
-    /// Returns the total memory limit for sort-based shuffle buffers in bytes.
-    pub fn shuffle_sort_based_memory_limit(&self) -> usize {
-        self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
-    }
-
-    /// Returns the spill threshold for sort-based shuffle (0.0-1.0).
-    pub fn shuffle_sort_based_spill_threshold(&self) -> f64 {
-        self.get_f64_setting(BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD)
-    }
-
     /// Returns the target batch size for sort-based shuffle.
     pub fn shuffle_sort_based_batch_size(&self) -> usize {
         self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE)
+    }
+
+    /// Per-task buffered-bytes budget for the sort shuffle writer.
+    ///
+    /// Prefers the upstream key `memory_limit_per_task_bytes`; falls back to the
+    /// deprecated `memory_limit` alias when the new key was never set.
+    pub fn shuffle_sort_based_memory_limit_per_task_bytes(&self) -> usize {
+        if self
+            .settings
+            .contains_key(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
+        {
+            self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
+        } else if self
+            .settings
+            .contains_key(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
+        {
+            self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
+        } else {
+            self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
+        }
     }
 
     /// should client use TLS to communicate with ballista cluster

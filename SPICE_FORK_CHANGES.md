@@ -221,15 +221,17 @@ Not Spice patches — features the fork never absorbed because it skipped the
   runtime MUST configure a pool when repinning or fetches connect per
   request (the pre-#57 connection-storm regime).
   `ballista.shuffle.remote_read_prefer_flight` still defaults to **true** —
-  the fork's block-IO transport cannot serve sort-based shuffle, so the
-  upstream sort-shuffle test's block-IO cases stay removed.
-- `#1623` sort-shuffle default-on — **not adopted**. Upstream defaults
-  `ballista.shuffle.sort_based.enabled=true` with a per-task memory budget
-  counted independently of the runtime pool. The fork still uses the Spice
-  sort-shuffle writer (pool-coupled accounting), which OOMs TPC-H SF10 Q18
-  under the CI `--memory-pool-size 2GB` / `--concurrent-tasks 4` budget when
-  enabled by default. Keep the Spice default of `false` until the upstream
-  writer/memory model is ported.
+  the fork's block-IO transport cannot serve sort-based shuffle (enabled by
+  default), so the upstream sort-shuffle test's block-IO cases stay removed.
+- `#1623` sort-shuffle default-on — **adopted**, with the upstream per-task
+  memory budget ported into the Spice writer: spill decisions use a private
+  `memory_limit_per_task_bytes` counter (default 256 MiB), and a best-effort
+  `MemoryReservation` on the FairSpillPool so other operators see the RSS.
+  Without that reservation, TPC-H SF10 Q18 OOMs under the CI
+  `--memory-pool-size 2GB` / `--concurrent-tasks 4` budget. The Spice
+  path-based writer (eager `PartitionBuffer`) is retained; only the memory
+  model was aligned. Deprecated config keys `buffer_size` / `spill_threshold`
+  / `memory_limit` remain accepted for wire/embedder compat.
 - `#1911` partition pruning — **adopted** (repair commit; active under
   `disable-stage-plan-cache`, ignored when the stage-plan cache is on)
 - `#1902` preserve user session config overrides — **adopted** (merge)

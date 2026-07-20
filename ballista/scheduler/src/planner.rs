@@ -747,11 +747,11 @@ pub(crate) fn create_shuffle_writer_with_config(
         if let Some(Partitioning::Hash(exprs, partition_count)) = partitioning {
             let sort_config = SortShuffleConfig::new(
                 true,
-                ballista_config.shuffle_sort_based_buffer_size(),
-                ballista_config.shuffle_sort_based_memory_limit(),
-                ballista_config.shuffle_sort_based_spill_threshold(),
                 datafusion::arrow::ipc::CompressionType::LZ4_FRAME,
                 ballista_config.shuffle_sort_based_batch_size(),
+            )
+            .with_memory_limit_per_task_bytes(
+                ballista_config.shuffle_sort_based_memory_limit_per_task_bytes(),
             );
 
             return Ok(Arc::new(SortShuffleWriterExec::try_new(
@@ -782,7 +782,7 @@ mod test {
     use crate::test_utils::datafusion_test_context;
     use ballista_core::JobId;
     use ballista_core::error::BallistaError;
-    use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
+    use ballista_core::execution_plans::{SortShuffleWriterExec, UnresolvedShuffleExec};
     use ballista_core::serde::BallistaCodec;
     use datafusion::arrow::compute::SortOptions;
     use datafusion::execution::TaskContext;
@@ -1137,8 +1137,8 @@ order by
 
         // stage0
         let stage0 = stages[0].clone();
-        let shuffle_write = downcast_exec!(stage0, ShuffleWriterExec);
-        let partitioning = shuffle_write.shuffle_output_partitioning().expect("stage0");
+        let shuffle_write = downcast_exec!(stage0, SortShuffleWriterExec);
+        let partitioning = shuffle_write.shuffle_output_partitioning();
         assert_eq!(2, partitioning.partition_count());
         let partition_col = match partitioning {
             Partitioning::Hash(exprs, 2) => match exprs.as_slice() {

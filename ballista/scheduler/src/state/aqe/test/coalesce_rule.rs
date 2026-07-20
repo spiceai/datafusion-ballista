@@ -417,7 +417,7 @@ async fn shuffle_reader_uses_coalesced_k_when_rule_fires() -> datafusion::error:
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages[0].plan.as_ref(),  @ "
-    ShuffleWriterExec: partitioning: Hash([c@0], 8)
+    SortShuffleWriterExec: partitioning=Hash([c@0], 8)
       AggregateExec: mode=Partial, gby=[c@2 as c], aggr=[min(t.a), max(t.b)]
         DataSourceExec: partitions=1, partition_sizes=[1]
     ");

@@ -220,14 +220,8 @@ fn run_sort_shuffle(
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();
 
-    let config = SortShuffleConfig::new(
-        true,
-        1024 * 1024, // 1MB buffer
-        memory_limit,
-        0.8,
-        CompressionType::LZ4_FRAME,
-        8192,
-    );
+    let config = SortShuffleConfig::new(true, CompressionType::LZ4_FRAME, 8192)
+        .with_memory_limit_per_task_bytes(memory_limit);
 
     let writer = SortShuffleWriterExec::try_new(
         "bench_job".into(),

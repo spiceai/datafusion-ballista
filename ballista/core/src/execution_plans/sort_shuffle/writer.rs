@@ -44,6 +44,7 @@ use datafusion::arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::{
@@ -203,6 +204,17 @@ impl SortShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            // Register against the runtime pool before taking ownership of
+            // `context` in `plan.execute`. Spill decisions use the private
+            // buffered-bytes counter below; the reservation is best-effort
+            // visibility so other operators see this writer's RSS (upstream
+            // Ballista 54 behaviour).
+            let mut reservation = MemoryConsumer::new(format!(
+                "SortShuffleWriter[{input_partition}]"
+            ))
+            .with_can_spill(true)
+            .register(&context.runtime_env().memory_pool);
+
             let mut stream = plan.execute(input_partition, context)?;
             let schema = stream.schema();
 
@@ -234,10 +246,14 @@ impl SortShuffleWriterExec {
                 metrics.repart_time.clone(),
             )?;
 
+            let memory_limit = config.memory_limit_per_task_bytes;
+
             // Process input stream
             while let Some(result) = stream.next().await {
                 let input_batch = result?;
                 metrics.input_rows.add(input_batch.num_rows());
+
+                let before_bytes: usize = buffers.iter().map(|b| b.memory_used()).sum();
 
                 // Partition the batch
                 partitioner.partition(
@@ -248,15 +264,19 @@ impl SortShuffleWriterExec {
                     },
                 )?;
 
-                // Check if we need to spill
-                let total_memory: usize = buffers.iter().map(|b| b.memory_used()).sum();
-                if total_memory > config.spill_memory_threshold() {
+                let after_bytes: usize = buffers.iter().map(|b| b.memory_used()).sum();
+                let growth = after_bytes.saturating_sub(before_bytes);
+                // Best-effort: if the pool is exhausted, spill still proceeds
+                // based on the private counter below.
+                let _ = reservation.try_grow(growth);
+
+                if after_bytes >= memory_limit {
                     let timer = metrics.spill_time.timer();
-                    spill_largest_buffers(
+                    spill_all_buffers(
                         &mut buffers,
                         &mut spill_manager,
+                        &mut reservation,
                         &schema,
-                        config.spill_memory_threshold() / 2,
                         config.batch_size,
                     )?;
                     timer.done();
@@ -281,6 +301,10 @@ impl SortShuffleWriterExec {
                 &config,
             )?;
             timer.done();
+
+            // In-memory buffers are drained by finalize; release the reservation.
+            reservation.free();
+            drop(reservation);
 
             // Update metrics
             metrics.spill_count.add(spill_manager.total_spills());
@@ -326,38 +350,28 @@ impl SortShuffleWriterExec {
     }
 }
 
-/// Spills the largest buffers until total memory is below the target.
-fn spill_largest_buffers(
+/// Spills all non-empty partition buffers, then frees the memory reservation.
+///
+/// Mirrors upstream's spill-all behaviour so peak buffered bytes drop to zero
+/// after each spill event rather than lingering at half the threshold.
+fn spill_all_buffers(
     buffers: &mut [PartitionBuffer],
     spill_manager: &mut SpillManager,
+    reservation: &mut MemoryReservation,
     schema: &SchemaRef,
-    target_memory: usize,
     batch_size: usize,
 ) -> Result<()> {
-    loop {
-        let total_memory: usize = buffers.iter().map(|b| b.memory_used()).sum();
-        if total_memory <= target_memory {
-            break;
+    for buffer in buffers.iter_mut() {
+        if buffer.memory_used() == 0 {
+            continue;
         }
-
-        // Find the largest buffer
-        let largest_idx = buffers
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, b)| b.memory_used())
-            .map(|(i, _)| i);
-
-        match largest_idx {
-            Some(idx) if buffers[idx].memory_used() > 0 => {
-                let partition_id = buffers[idx].partition_id();
-                let batches = buffers[idx].drain_coalesced(batch_size);
-                spill_manager
-                    .spill(partition_id, batches, schema)
-                    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-            }
-            _ => break, // No more buffers to spill
-        }
+        let partition_id = buffer.partition_id();
+        let batches = buffer.drain_coalesced(batch_size);
+        spill_manager
+            .spill(partition_id, batches, schema)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
     }
+    reservation.free();
     Ok(())
 }
 

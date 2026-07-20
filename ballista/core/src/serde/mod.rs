@@ -416,14 +416,17 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 } else {
                     8192 // default for backwards compatibility
                 };
+                let memory_limit = if sort_shuffle_writer.memory_limit > 0 {
+                    sort_shuffle_writer.memory_limit as usize
+                } else {
+                    SortShuffleConfig::default().memory_limit_per_task_bytes
+                };
                 let config = SortShuffleConfig::new(
                     true,
-                    sort_shuffle_writer.buffer_size as usize,
-                    sort_shuffle_writer.memory_limit as usize,
-                    sort_shuffle_writer.spill_threshold,
                     datafusion::arrow::ipc::CompressionType::LZ4_FRAME,
                     batch_size,
-                );
+                )
+                .with_memory_limit_per_task_bytes(memory_limit);
 
                 Ok(Arc::new(SortShuffleWriterExec::try_new(
                     sort_shuffle_writer.job_id.clone().into(),
@@ -622,9 +625,12 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         stage_id: exec.stage_id() as u32,
                         input: None,
                         output_partitioning,
-                        buffer_size: config.buffer_size as u64,
-                        memory_limit: config.memory_limit as u64,
-                        spill_threshold: config.spill_threshold,
+                        // Deprecated proto fields retained for wire compat with
+                        // older schedulers/executors; writer ignores buffer_size
+                        // and spill_threshold.
+                        buffer_size: 1024 * 1024,
+                        memory_limit: config.memory_limit_per_task_bytes as u64,
+                        spill_threshold: 0.8,
                         batch_size: config.batch_size as u64,
                     },
                 )),
