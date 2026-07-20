@@ -286,8 +286,12 @@ async fn execute_shuffle_write(
             exec.metrics().unwrap_or_default()
         }
         WriterKind::Sort => {
-            let cfg =
-                SortShuffleConfig::new(true, CompressionType::LZ4_FRAME, args.batch_size);
+            let cfg = SortShuffleConfig {
+                enabled: true,
+                compression: CompressionType::LZ4_FRAME,
+                batch_size: args.batch_size,
+                ..Default::default()
+            };
             let exec = SortShuffleWriterExec::try_new(
                 format!("bench_job_{task_id}").into(),
                 1,

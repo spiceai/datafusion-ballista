@@ -58,9 +58,10 @@ use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics, displayable,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
@@ -97,7 +98,7 @@ pub struct ShuffleWriterExec {
 
 impl std::fmt::Display for ShuffleWriterExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let printable_plan = displayable(self.plan.as_ref())
+        let printable_plan = DisplayableExecutionPlan::with_metrics(self.plan.as_ref())
             .set_show_statistics(true)
             .indent(false);
         write!(

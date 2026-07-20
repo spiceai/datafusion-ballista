@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use log::{debug, error, info, warn};
@@ -65,7 +65,7 @@ use tokio::task::JoinHandle;
 
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
-use crate::executor_process::{ExecutorProcessConfig, remove_job_dir};
+use crate::executor_process::{ExecutorProcessConfig, remove_job_data};
 use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::shutdown::ShutdownNotifier;
 use crate::{TaskExecutionTimes, as_task_status};
@@ -403,7 +403,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
 
         let task_context = {
             let function_registry = task.function_registry;
-            let runtime = self.executor.produce_runtime(&task.session_config).unwrap();
+            let runtime = self
+                .executor
+                .produce_runtime_for_session(&task.session_id, &task.session_config)
+                .unwrap();
 
             Arc::new(TaskContext::new(
                 Some(task_identity.clone()),
@@ -419,6 +422,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
 
         info!("Start to execute shuffle write for task {task_identity}");
 
+        let task_start = Instant::now();
         let execution_result = self
             .executor
             .execute_query_stage(
@@ -428,7 +432,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 task_context,
             )
             .await;
-        info!("Done with task {task_identity}");
+        info!(
+            "Done with task {task_identity} in {:?}",
+            task_start.elapsed()
+        );
         debug!("Statistics: {execution_result:?}");
 
         let plan_metrics = query_stage_exec.collect_plan_metrics();
@@ -899,15 +906,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         &self,
         request: Request<RemoveJobDataParams>,
     ) -> Result<Response<RemoveJobDataResult>, Status> {
-        let job_id = request.into_inner().job_id;
-        let job_id_typed = JobId::from(job_id.clone());
+        let params = request.into_inner();
+        let job_id = JobId::from(params.job_id);
 
-        // Clean up in-memory shuffle partitions for this job
+        // Clean up in-memory shuffle partitions, honoring the same selective
+        // semantics as the on-disk cleanup: an empty stage list removes the
+        // whole job, otherwise only the listed (intermediate) stages.
         let shuffle_manager = global_shuffle_manager();
-        shuffle_manager.remove_job_partitions(&job_id_typed);
+        if params.remove_stage_ids.is_empty() {
+            shuffle_manager.remove_job_partitions(&job_id);
+        } else {
+            for stage_id in &params.remove_stage_ids {
+                shuffle_manager.remove_stage_partitions(&job_id, *stage_id as usize);
+            }
+        }
 
         // Clean up disk-based shuffle data
-        remove_job_dir(&self.executor.work_dir, &job_id)
+        remove_job_data(&self.executor.work_dir, &job_id, &params.remove_stage_ids)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 

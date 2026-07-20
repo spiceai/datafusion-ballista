@@ -359,6 +359,9 @@ pub trait JobState: Send + Sync {
     /// Returns the set of all active job IDs.
     async fn get_jobs(&self) -> Result<HashSet<JobId>>;
 
+    /// Returns the set of all job IDs including running, queued, and completed jobs.
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>>;
+
     /// Returns the status of the specified job.
     async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>>;
 

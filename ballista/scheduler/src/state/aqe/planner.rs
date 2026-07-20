@@ -30,6 +30,7 @@ use ballista_core::serde::scheduler::PartitionLocation;
 use datafusion::common;
 use datafusion::common::{HashMap, exec_err};
 use datafusion::error::DataFusionError;
+#[cfg(test)]
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SessionState, SessionStateBuilder};
@@ -113,24 +114,6 @@ impl AdaptivePlanner {
             runnable_stage_output: HashMap::new(),
         })
     }
-    /// A new instance of `AdaptivePlanner` or an error if the initialization fails.
-    #[cfg(test)]
-    pub fn try_new_from_physical_plan(
-        session_config: &SessionConfig,
-        plan: Arc<dyn ExecutionPlan>,
-        job_name: String,
-    ) -> common::Result<Self> {
-        let plan_id_generator = Arc::new(AtomicUsize::new(0));
-        let state_builder = SessionStateBuilder::new_with_default_features()
-            .with_config(session_config.clone());
-        Self::try_new_with_optimizers(
-            state_builder,
-            plan,
-            job_name,
-            Self::default_optimizers(plan_id_generator),
-        )
-    }
-
     /// Creates a new `AdaptivePlanner` with default physical optimizer rules.
     ///
     /// # Arguments

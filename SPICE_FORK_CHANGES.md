@@ -40,6 +40,21 @@ upstream `54.0.0`:
 
 The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 
+### Post-review repair commit (on top of the merge)
+
+The merge suffered a delete/modify pathology: files the fork had deleted
+relative to base 53.0.0 stayed deleted whenever upstream hadn't touched them
+during 53→54, and several conflict resolutions kept stale fork-side versions.
+A follow-up commit repaired the tree: restored upstream's TUI files
+(`tui/domain/mod.rs`, `tui/domain/executors.rs`, `ui/main/jobs/dot_parser.rs`),
+`exec.rs`, the python docs dir + example notebooks + `test_jupyter.py`, TUI
+screenshots, `standalone-broadcast-join.rs`, `tpch-gen.sh`, the vendored
+`datafusion*.proto` stubs, and upstream's `scheduler/src/api/` + `display.rs`;
+deleted orphaned fork files (`aqe/optimizer_rule/{datafusion_patch,
+eliminate_empty}.rs`, dead `executor/src/client_pool.rs`, stale
+`.pending-snap` snapshots); and re-adopted the clobbered upstream features
+listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
+
 ## Status legend for the inventory
 
 | Column | Meaning |
@@ -101,8 +116,8 @@ The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 |---|---|---|---|---|---|
 | Lazy `BatchCoalescer` init | #24 | present (restored on merge) | Absent upstream too | keep | `Option<LimitedBatchCoalescer>` lazy init in shuffle reader |
 | `find_fetch_failed` error drill-through | #36 | present (restored on merge) | Upstream `#1578`/`#1951` different form | keep drill-through | `find_fetch_failed` |
-| Evict + retry on fresh connection | #61 | present | Superseded by pool `discard()` + `with_retry` | `adopt-upstream` on merge | — |
-| h2 receive-window sizing | #62a | present | **Upstreamed** `#1951` (same defaults) | `adopt-upstream` config form | window sizes 16MB/64MB |
+| Evict + retry on fresh connection | #61 | present (**live**, not superseded) | Upstream solves differently (`#1951` pool `discard()` + `with_retry`) | keep with Spice fetch path; revisit if #1951 transport is ever adopted | evict-retry loop in `fetch_partition_remote` |
+| h2 receive-window sizing | #62a | present (hard-coded 16MB/64MB consts in `client.rs`) | **Upstreamed** `#1951` as config keys (`BALLISTA_CLIENT_INITIAL_*_WINDOW_SIZE`) | keep consts; adopt upstream config keys only with the #1951 transport | `HTTP2_INITIAL_STREAM_WINDOW_SIZE` |
 | `InactivityTimeoutStream` | #62b | present | Not upstreamed; protects `#1951` | keep; P1 upstream | `InactivityTimeoutStream` |
 | Unordered stream drain | #63a | present | Superseded by `#1951` buffering | design input only after merge | — |
 | Transport on I/O runtime + 60s keepalive-ack | #63b | present | Not upstreamed | keep; P1 upstream | I/O runtime handle for pooled channels |
@@ -154,19 +169,60 @@ row's sentinel disappears without an explicit disposition update.
 ## Upstream features the merge must pick up
 
 Not Spice patches — features the fork never absorbed because it skipped the
-53→54 development cycle:
+53→54 development cycle. Status after the post-review repair commit:
 
-- `#1567` / `#1635` distributed EXPLAIN ANALYZE
-- `#1900` / `#1904` broadcast-safe joins + demotion
-- `#1951` shuffle-fetch governor + h2 windows + retry
-- `#1911` partition pruning
-- `#1902` preserve user session config overrides
-- `#1982` shuffle cleanup on job success
-- `#1995` share read-side runtime state
-- `#1547` executor system/process metrics
-- `#1968` shuffle-read / per-operator metrics
-- `#1949` failed-task surfacing in TUI/REST
-- Ballista crate version bump to `54.0.0`
+- `#1567` / `#1635` distributed EXPLAIN ANALYZE — **adopted** (merge)
+- `#1900` / `#1904` broadcast-safe joins + demotion — **adopted** (AQE path via
+  merge; the static-planner half — `maybe_promote_to_broadcast`, CollectLeft
+  demotion guard, SMJ→hash conversion, broadcast stage lowering, the
+  `ballista.optimizer.broadcast_join_threshold_bytes` /
+  `broadcast_sort_merge_join_enabled` config keys and
+  `with_ballista_broadcast_join_threshold_bytes` — was clobbered and re-added
+  in the repair commit, with upstream's 12 planner broadcast tests)
+- `#1951` shuffle-fetch governor + h2 windows + retry — **NOT adopted**:
+  the Spice fetch transport (own client pool, evict-retry, fixed 16/64MB
+  windows, unordered drain, memory/object-store/vortex readers) stays; the
+  upstream governor config keys (`BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT`,
+  `..._MAX_BLOCKS_PER_ADDRESS`, `BALLISTA_CLIENT_INITIAL_*_WINDOW_SIZE`) do not
+  exist on the fork, and `client/tests/sort_shuffle.rs` is adapted to clamp
+  `BALLISTA_SHUFFLE_READER_MAX_REQUESTS` instead. Upstream's dead
+  `executor/src/client_pool.rs` was deleted; `core/src/client_pool.rs` remains
+  (compiled, unused) to ease a future adoption. The executor `--client-ttl`
+  option was dropped with it (would have been a silent no-op). Upstream's
+  `ballista.client.io_retries_times` / `io_retry_wait_time_ms` keys ARE
+  registered and wired into the fork's evict-and-retry fetch loop, but with
+  fork-preserving defaults (1 retry / 0 ms wait) instead of upstream's
+  (3 / 3000 ms). Also: `ballista.shuffle.remote_read_prefer_flight` now
+  defaults to **true** — the fork's block-IO transport cannot serve
+  sort-based shuffle (which is enabled by default), so the old `false`
+  default was an incoherent pair; the upstream sort-shuffle test's
+  block-IO cases were removed accordingly.
+- `#1911` partition pruning — **adopted** (repair commit; active under
+  `disable-stage-plan-cache`, ignored when the stage-plan cache is on)
+- `#1902` preserve user session config overrides — **adopted** (merge)
+- `#1982` selective shuffle cleanup on job success — **adopted** (repair
+  commit: `intermediate_stage_ids` → `remove_stage_ids` end-to-end; the
+  executor also applies the selective semantics to the in-memory shuffle
+  manager)
+- `#1995` share read-side runtime state — **adopted** (repair commit:
+  `runtime_cache` wired into executor lib/config/process, session-keyed LRU;
+  also restored upstream's `--memory-pool-size` FairSpillPool option)
+- `#1547` executor system/process metrics — **adopted** (merge)
+- `#1968` shuffle-read / per-operator metrics — **adopted** (repair commit:
+  `ShuffleReadMetrics` mapped onto the Spice fetch pipeline — memory + local
+  count as `local_partitions`, object-store + flight as `remote_partitions`,
+  `decoded_bytes` accumulates on stream drain since the fork streams rather
+  than buffers; writer Displays render child metrics)
+- `#1949` failed-task surfacing in TUI/REST — **adopted** (repair commit:
+  upstream `scheduler/src/api/` restored wholesale, incl. `get_job`,
+  `get_job_config`, `get_executor_info`, `get_scheduler_version`, typed
+  failed-task reasons, CORS options `--cors-allowed-origins/-methods` and
+  `--disable-rest-api` from `#1818`; `ExecutorManager::get_executors_state`
+  and `TaskManager::get_all_jobs` renamed to upstream form; **embedder note:**
+  the `JobState` trait gained `get_all_jobs` — external implementations must
+  add it)
+- Ballista crate version bump to `54.0.0` — **adopted** (merge)
+- `#1999` task duration in finished-task log — **adopted** (repair commit)
 
 ## Open upstream PRs (finish first when possible)
 

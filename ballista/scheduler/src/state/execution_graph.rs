@@ -274,6 +274,16 @@ pub trait ExecutionGraph: Debug + std::any::Any {
     /// Exposes executions stages and stage id's
     fn stages(&self) -> &HashMap<usize, ExecutionStage>;
 
+    /// Stage ids of all non-final (intermediate) stages — those whose
+    /// `output_links` is non-empty. The final stage(s) are excluded.
+    fn intermediate_stage_ids(&self) -> Vec<u32> {
+        self.stages()
+            .iter()
+            .filter(|(_, stage)| !stage.output_links().is_empty())
+            .map(|(stage_id, _)| *stage_id as u32)
+            .collect()
+    }
+
     /// returns next task to run
     /// (used for testing only)
     #[cfg(test)]
@@ -2276,6 +2286,33 @@ mod test {
         assert_eq!(decoded_variants, expected_variants);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_intermediate_stage_ids() {
+        // A simple aggregation produces a 2-stage graph: one intermediate
+        // stage (non-empty output_links) feeding one final stage (empty
+        // output_links).
+        let graph = test_aggregation_plan(4).await;
+
+        assert_eq!(graph.stages().len(), 2);
+
+        // Exactly one final stage.
+        let final_count = graph
+            .stages()
+            .values()
+            .filter(|s| s.output_links().is_empty())
+            .count();
+        assert_eq!(final_count, 1);
+
+        // Intermediate = all - final = exactly one stage, and none of the
+        // returned ids is a final stage.
+        let intermediate = graph.intermediate_stage_ids();
+        assert_eq!(intermediate.len(), 1);
+        for id in &intermediate {
+            let stage = graph.stages().get(&(*id as usize)).unwrap();
+            assert!(!stage.output_links().is_empty());
+        }
     }
 
     #[tokio::test]

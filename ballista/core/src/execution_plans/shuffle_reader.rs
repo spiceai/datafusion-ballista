@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::result;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
@@ -54,7 +55,7 @@ use datafusion::common::runtime::SpawnedTask;
 
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet,
+    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::{
     ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
@@ -302,6 +303,9 @@ impl ExecutionPlan for ShuffleReaderExec {
         let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
         let use_tls = config.ballista_use_tls();
         let metrics_callback = config.ballista_shuffle_read_metrics_callback();
+        let ballista_config = config.ballista_config();
+        let io_retries = ballista_config.io_retries_times();
+        let io_retry_wait_ms = ballista_config.io_retry_wait_time_ms() as u64;
 
         if force_remote_read {
             debug!(
@@ -329,6 +333,7 @@ impl ExecutionPlan for ShuffleReaderExec {
             .collect();
         // Shuffle partitions for evenly send fetching partition requests to avoid hot executors within multiple tasks
         partition_locations.shuffle(&mut rng());
+        let read_metrics = ShuffleReadMetrics::new(partition, &self.metrics);
         let response_receiver = send_fetch_partitions(
             partition_locations,
             max_request_num,
@@ -338,6 +343,9 @@ impl ExecutionPlan for ShuffleReaderExec {
             customize_endpoint,
             use_tls,
             metrics_callback,
+            read_metrics,
+            io_retries,
+            io_retry_wait_ms,
             context.runtime_env(),
         );
 
@@ -596,6 +604,61 @@ fn split_partition_locations(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fetch-side metrics for `ShuffleReaderExec`, recorded per output partition
+/// (upstream #1968, adapted to the Spice fetch pipeline).
+///
+/// NOTE: the reader's `BaselineMetrics::elapsed_compute` measures poll time of
+/// the consuming stream, which overlaps with background fetching. `fetch_time`
+/// here measures opening remote/object-store fetch streams (this reader streams
+/// fetched partitions instead of buffering them, so transfer time is spread
+/// across consumption). `decoded_bytes` is the in-memory Arrow footprint of
+/// remotely fetched batches, not compressed wire bytes. `fetch_time` and
+/// `permit_wait_time` are each summed across every concurrent remote fetch
+/// task, so their totals can exceed the operator's wall-clock elapsed time —
+/// read them as aggregate cost, not wall-clock.
+#[derive(Debug, Clone)]
+struct ShuffleReadMetrics {
+    /// Wall-time opening remote (Arrow-Flight / object-store) fetch streams.
+    fetch_time: metrics::Time,
+    /// Wall-time opening node-local shuffle files and in-memory partitions.
+    local_read_time: metrics::Time,
+    /// Wall-time blocked acquiring the reduce-side concurrent-request permit.
+    permit_wait_time: metrics::Time,
+    /// Decoded (in-memory Arrow) bytes of fetched remote partitions.
+    decoded_bytes: metrics::Count,
+    /// Number of remote fetch attempts issued, including retries.
+    fetch_requests: metrics::Count,
+    /// Extra fetch attempts taken by the evict-and-retry loop.
+    fetch_retries: metrics::Count,
+    /// Partitions served node-locally (local shuffle files + in-memory).
+    local_partitions: metrics::Count,
+    /// Partitions fetched from a remote executor or object store.
+    remote_partitions: metrics::Count,
+}
+
+impl ShuffleReadMetrics {
+    fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
+        Self {
+            fetch_time: MetricBuilder::new(metrics).subset_time("fetch_time", partition),
+            local_read_time: MetricBuilder::new(metrics)
+                .subset_time("local_read_time", partition),
+            permit_wait_time: MetricBuilder::new(metrics)
+                .subset_time("permit_wait_time", partition),
+            decoded_bytes: MetricBuilder::new(metrics)
+                .counter("decoded_bytes", partition),
+            fetch_requests: MetricBuilder::new(metrics)
+                .counter("fetch_requests", partition),
+            fetch_retries: MetricBuilder::new(metrics)
+                .counter("fetch_retries", partition),
+            local_partitions: MetricBuilder::new(metrics)
+                .counter("local_partitions", partition),
+            remote_partitions: MetricBuilder::new(metrics)
+                .counter("remote_partitions", partition),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_fetch_partitions(
     partition_locations: Vec<PartitionLocation>,
     max_request_num: usize,
@@ -605,6 +668,9 @@ fn send_fetch_partitions(
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
     metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
+    read_metrics: ShuffleReadMetrics,
+    io_retries: usize,
+    io_retry_wait_ms: u64,
     runtime_env: Arc<RuntimeEnv>,
 ) -> AbortableReceiverStream {
     let (response_sender, response_receiver) = mpsc::channel(max_request_num);
@@ -621,14 +687,27 @@ fn send_fetch_partitions(
         locations.remote.len()
     );
 
+    // Node-local = local shuffle files + in-memory partitions; remote = peer
+    // executors + object store. (Upstream #1968 has only local/remote classes.)
+    read_metrics
+        .local_partitions
+        .add(locations.local.len() + locations.memory.len());
+    read_metrics
+        .remote_partitions
+        .add(locations.remote.len() + locations.object_store.len());
+
     // Read memory partitions first (fastest path)
     let response_sender_m = response_sender.clone();
     let memory_locations = locations.memory;
+    let memory_read_time = read_metrics.local_read_time.clone();
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in memory_locations {
-            let r = PartitionReaderEnum::Memory
-                .fetch_partition(&p, max_message_size, flight_transport, None, false)
-                .await;
+            let r = {
+                let _timer = memory_read_time.timer();
+                PartitionReaderEnum::Memory
+                    .fetch_partition(&p, max_message_size, flight_transport, None, false)
+                    .await
+            };
             if let Err(e) = response_sender_m.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
@@ -640,18 +719,22 @@ fn send_fetch_partitions(
     let customize_endpoint_c = customize_endpoint.clone();
     let metrics_callback_c = metrics_callback.clone();
     let local_locations = locations.local;
+    let local_read_time = read_metrics.local_read_time.clone();
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in local_locations {
             let start_time = std::time::Instant::now();
-            let r = PartitionReaderEnum::Local
-                .fetch_partition(
-                    &p,
-                    max_message_size,
-                    flight_transport,
-                    customize_endpoint_c.clone(),
-                    use_tls,
-                )
-                .await;
+            let r = {
+                let _timer = local_read_time.timer();
+                PartitionReaderEnum::Local
+                    .fetch_partition(
+                        &p,
+                        max_message_size,
+                        flight_transport,
+                        customize_endpoint_c.clone(),
+                        use_tls,
+                    )
+                    .await
+            };
 
             // Record local read metrics if callback is set and read succeeded
             if r.is_ok()
@@ -681,13 +764,19 @@ fn send_fetch_partitions(
     let response_sender_os = response_sender.clone();
     let runtime_env_clone = Arc::clone(&runtime_env);
     let object_store_locations = locations.object_store;
+    let object_store_fetch_time = read_metrics.fetch_time.clone();
+    let object_store_fetch_requests = read_metrics.fetch_requests.clone();
     spawned_tasks.push(SpawnedTask::spawn(async move {
         for p in object_store_locations {
-            let r = fetch_partition_object_store_with_runtime(
-                &p,
-                Arc::clone(&runtime_env_clone),
-            )
-            .await;
+            object_store_fetch_requests.add(1);
+            let r = {
+                let _timer = object_store_fetch_time.timer();
+                fetch_partition_object_store_with_runtime(
+                    &p,
+                    Arc::clone(&runtime_env_clone),
+                )
+                .await
+            };
 
             if let Err(e) = response_sender_os.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
@@ -700,11 +789,22 @@ fn send_fetch_partitions(
         let response_sender = response_sender.clone();
         let customize_endpoint_c = customize_endpoint.clone();
         let metrics_callback_c = metrics_callback.clone();
+        let read_metrics = read_metrics.clone();
         spawned_tasks.push(SpawnedTask::spawn(async move {
             // Block if exceeds max request number.
-            let permit = semaphore.acquire_owned().await.unwrap();
+            let permit = {
+                let _permit_timer = read_metrics.permit_wait_time.timer();
+                semaphore.acquire_owned().await.unwrap()
+            };
             let start_time = std::time::Instant::now();
-            let r = PartitionReaderEnum::FlightRemote
+            let r = {
+                let _fetch_timer = read_metrics.fetch_time.timer();
+                PartitionReaderEnum::FlightRemote {
+                    fetch_requests: read_metrics.fetch_requests.clone(),
+                    fetch_retries: read_metrics.fetch_retries.clone(),
+                    io_retries,
+                    io_retry_wait_ms,
+                }
                 .fetch_partition(
                     &p,
                     max_message_size,
@@ -712,7 +812,23 @@ fn send_fetch_partitions(
                     customize_endpoint_c,
                     use_tls,
                 )
-                .await;
+                .await
+            };
+            // Count the decoded (in-memory Arrow) bytes of every batch as the
+            // stream drains; fetched partitions are streamed, not buffered, so
+            // decoded_bytes accumulates during consumption.
+            let r = r.map(|stream| {
+                let schema = stream.schema();
+                let decoded_bytes = read_metrics.decoded_bytes.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream.inspect(move |b| {
+                        if let Ok(batch) = b {
+                            decoded_bytes.add(batch.get_array_memory_size());
+                        }
+                    }),
+                )) as SendableRecordBatchStream
+            });
 
             // Record remote read metrics if callback is set and read succeeded
             if r.is_ok()
@@ -781,7 +897,16 @@ trait PartitionReader: Send + Sync + Clone {
 enum PartitionReaderEnum {
     Local,
     Memory,
-    FlightRemote,
+    FlightRemote {
+        /// Wire fetch attempts issued, including retries.
+        fetch_requests: metrics::Count,
+        /// Extra attempts taken by the evict-and-retry loop.
+        fetch_retries: metrics::Count,
+        /// Extra fetch attempts (each on a fresh connection) after a failure.
+        io_retries: usize,
+        /// Wait between attempts, in milliseconds.
+        io_retry_wait_ms: u64,
+    },
     #[allow(dead_code)]
     ObjectStoreRemote,
 }
@@ -798,13 +923,22 @@ impl PartitionReader for PartitionReaderEnum {
         use_tls: bool,
     ) -> result::Result<SendableRecordBatchStream, BallistaError> {
         match self {
-            PartitionReaderEnum::FlightRemote => {
+            PartitionReaderEnum::FlightRemote {
+                fetch_requests,
+                fetch_retries,
+                io_retries,
+                io_retry_wait_ms,
+            } => {
                 fetch_partition_remote(
                     location,
                     max_message_size,
                     flight_transport,
                     customize_endpoint,
                     use_tls,
+                    fetch_requests,
+                    fetch_retries,
+                    *io_retries,
+                    *io_retry_wait_ms,
                 )
                 .await
             }
@@ -981,12 +1115,17 @@ async fn evict_remote_client(host: &str, port: u16, use_tls: bool) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_partition_remote(
     location: &PartitionLocation,
     max_message_size: usize,
     flight_transport: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
+    fetch_requests: &metrics::Count,
+    fetch_retries: &metrics::Count,
+    io_retries: usize,
+    io_retry_wait_ms: u64,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
@@ -1003,8 +1142,16 @@ async fn fetch_partition_remote(
     // transport error") without touching the network. The fetch is an idempotent
     // read, so evict the pooled client and retry once on a fresh connection
     // before failing the task.
+    let max_attempts = 1 + io_retries;
     let mut last_err: Option<BallistaError> = None;
-    for attempt in 0..2 {
+    for attempt in 0..max_attempts {
+        fetch_requests.add(1);
+        if attempt > 0 {
+            fetch_retries.add(1);
+            if io_retry_wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(io_retry_wait_ms)).await;
+            }
+        }
         let mut ballista_client = cached_remote_client(
             host,
             port,
@@ -2331,6 +2478,7 @@ mod tests {
             file_path.to_str().unwrap().to_string(),
         );
 
+        let metrics_set = ExecutionPlanMetricsSet::new();
         let response_receiver = send_fetch_partitions(
             partition_locations,
             max_request_num,
@@ -2340,6 +2488,9 @@ mod tests {
             None,
             false,
             None, // No metrics callback in tests
+            ShuffleReadMetrics::new(0, &metrics_set),
+            1,
+            0,
             Arc::new(RuntimeEnv::default()),
         );
 

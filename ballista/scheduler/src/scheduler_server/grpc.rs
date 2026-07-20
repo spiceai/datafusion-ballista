@@ -216,9 +216,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .executor_manager
                 .drain_pending_cleanup_jobs(&executor_id)
                 .into_iter()
-                .map(|job_id| CleanJobDataParams {
+                .map(|(job_id, remove_stage_ids)| CleanJobDataParams {
                     job_id: job_id.into(),
-                    remove_stage_ids: vec![],
+                    remove_stage_ids,
                 })
                 .collect();
             Ok(Response::new(PollWorkResult {

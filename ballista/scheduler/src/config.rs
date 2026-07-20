@@ -209,6 +209,29 @@ pub struct Config {
         help = "The interval to check expired or dead executors"
     )]
     pub expire_dead_executor_interval_seconds: u64,
+    /// Should the rest api be disabled
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Should the REST API be disabled"
+    )]
+    pub disable_rest_api: bool,
+    #[cfg(feature = "rest-api")]
+    /// Comma-separated list of allowed origins for CORS
+    #[arg(
+        long,
+        default_value_t = String::default(),
+        help = "Comma-separated list of allowed origins for CORS. By default, http://localhost:8080 and https://nightlies.apache.org are allowed."
+    )]
+    pub cors_allowed_origins: String,
+    #[cfg(feature = "rest-api")]
+    /// Comma-separated list of allowed methods for CORS
+    #[arg(
+        long,
+        default_value_t = String::default(),
+        help = "Comma-separated list of allowed methods for CORS. By default, GET, PATCH, and OPTIONS are allowed."
+    )]
+    pub cors_allowed_methods: String,
 }
 
 /// Configurations for the ballista scheduler of scheduling jobs and tasks
@@ -271,6 +294,15 @@ pub struct SchedulerConfig {
     pub on_cancel_tasks: Option<OnCancelTasksFn>,
     /// Whether to use TLS when connecting to executors (for flight proxy)
     pub use_tls: bool,
+    #[cfg(feature = "rest-api")]
+    /// Should the rest api be disabled
+    pub disable_rest_api: bool,
+    #[cfg(feature = "rest-api")]
+    /// Comma-separated list of allowed origins for CORS
+    pub cors_allowed_origins: String,
+    #[cfg(feature = "rest-api")]
+    /// Comma-separated list of allowed methods for CORS
+    pub cors_allowed_methods: String,
 }
 
 impl Default for SchedulerConfig {
@@ -302,6 +334,12 @@ impl Default for SchedulerConfig {
             on_work_available: None,
             on_cancel_tasks: None,
             use_tls: false,
+            #[cfg(feature = "rest-api")]
+            disable_rest_api: false,
+            #[cfg(feature = "rest-api")]
+            cors_allowed_origins: String::default(),
+            #[cfg(feature = "rest-api")]
+            cors_allowed_methods: String::default(),
         }
     }
 }
@@ -561,6 +599,12 @@ impl TryFrom<Config> for SchedulerConfig {
             on_work_available: None,
             on_cancel_tasks: None,
             use_tls: false,
+            #[cfg(feature = "rest-api")]
+            disable_rest_api: opt.disable_rest_api,
+            #[cfg(feature = "rest-api")]
+            cors_allowed_origins: opt.cors_allowed_origins,
+            #[cfg(feature = "rest-api")]
+            cors_allowed_methods: opt.cors_allowed_methods,
         };
 
         Ok(config)

@@ -93,6 +93,24 @@ pub const BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD: &str =
 /// Configuration key for sort shuffle target batch size in rows.
 pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
+/// Number of retries for IO operations in the Ballista client
+pub const BALLISTA_CLIENT_IO_RETRIES_TIMES: &str = "ballista.client.io_retries_times";
+/// Wait time in milliseconds between IO retries in the Ballista client
+pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
+    "ballista.client.io_retry_wait_time_ms";
+
+/// Configuration key for the byte-size threshold below which a hash join's
+/// smaller side is promoted to `CollectLeft` and lowered via the broadcast
+/// pattern in the distributed planner. Set to `0` to disable promotion.
+pub const BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES: &str =
+    "ballista.optimizer.broadcast_join_threshold_bytes";
+
+/// Configuration key to enable broadcasting a small build side of a
+/// `SortMergeJoinExec` by converting it to a `CollectLeft` hash join in the
+/// static distributed planner. Enabled by default.
+pub const BALLISTA_BROADCAST_SORT_MERGE_JOIN_ENABLED: &str =
+    "ballista.optimizer.broadcast_sort_merge_join_enabled";
+
 /// Should client employ pull or push job tracking strategy
 pub const BALLISTA_CLIENT_PULL: &str = "ballista.client.pull";
 /// Configuration key to enable AQE coalesce-shuffle-partitions rule.
@@ -148,9 +166,11 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          DataType::Boolean,
                          Some((false).to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT.to_string(),
-                         "Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization".to_string(),
+                         "Forces the shuffle reader to use flight reader instead of block reader for remote read. \
+                          Defaults to true because the block reader does not support sort-based shuffle, \
+                          which is enabled by default.".to_string(),
                          DataType::Boolean,
-                         Some((false).to_string())),
+                         Some((true).to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_STORAGE_TYPE.to_string(),
                          "Storage type for shuffle data: 'local' (default), 's3', or 'azure'".to_string(),
                          DataType::Utf8,
@@ -218,6 +238,29 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Target batch size in rows for coalescing small batches in sort shuffle".to_string(),
                          DataType::UInt64,
                          Some((8192).to_string())),
+        ConfigEntry::new(BALLISTA_CLIENT_IO_RETRIES_TIMES.to_string(),
+                         "Number of extra fetch attempts (each on a fresh connection) after a failed \
+                          remote shuffle read in the Ballista client. Defaults to 1, preserving the \
+                          evict-and-retry-once behavior; upstream defaults to 3.".to_string(),
+                         DataType::UInt16,
+                         Some(1.to_string())),
+        ConfigEntry::new(BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS.to_string(),
+                         "Wait time in milliseconds between IO retries in the Ballista client. \
+                          Defaults to 0 (immediate retry on a fresh connection); upstream defaults to 3000.".to_string(),
+                         DataType::UInt64,
+                         Some(0.to_string())),
+        ConfigEntry::new(BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES.to_string(),
+                         "Byte-size threshold below which a hash join's smaller side is \
+                          promoted to CollectLeft and lowered via the broadcast pattern. \
+                          Set to 0 to disable promotion.".to_string(),
+                         DataType::UInt64,
+                         Some((10 * 1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_BROADCAST_SORT_MERGE_JOIN_ENABLED.to_string(),
+                         "Broadcast a small build side of a SortMergeJoinExec by converting it \
+                          to a CollectLeft hash join in the static distributed planner. \
+                          The build side must also fit under broadcast_join_threshold_bytes.".to_string(),
+                         DataType::Boolean,
+                         Some(true.to_string())),
         ConfigEntry::new(BALLISTA_CLIENT_PULL.to_string(),
                          "Should client employ pull or push job tracking. In pull mode client will make a request to server in the loop, until job finishes. Pull mode is kept for legacy clients.".to_string(),
                          DataType::Boolean,
@@ -591,6 +634,30 @@ impl BallistaConfig {
     /// Returns the target batch size for sort-based shuffle.
     pub fn shuffle_sort_based_batch_size(&self) -> usize {
         self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE)
+    }
+
+    /// Returns the number of retries for IO operations in the Ballista client.
+    pub fn io_retries_times(&self) -> usize {
+        self.get_usize_setting(BALLISTA_CLIENT_IO_RETRIES_TIMES)
+    }
+
+    /// Returns the wait time in milliseconds between IO retries in the Ballista client.
+    pub fn io_retry_wait_time_ms(&self) -> usize {
+        self.get_usize_setting(BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS)
+    }
+
+    /// Returns the byte-size threshold below which a hash join's smaller side
+    /// is promoted to `CollectLeft` and lowered via the broadcast pattern.
+    /// `0` disables promotion.
+    pub fn broadcast_join_threshold_bytes(&self) -> usize {
+        self.get_usize_setting(BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES)
+    }
+
+    /// Returns whether broadcasting a small build side of a `SortMergeJoinExec`
+    /// (by converting it to a `CollectLeft` hash join) is enabled in the static
+    /// distributed planner.
+    pub fn broadcast_sort_merge_join_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_BROADCAST_SORT_MERGE_JOIN_ENABLED)
     }
 
     /// Returns whether the AQE coalesce-shuffle-partitions rule is enabled.

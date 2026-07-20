@@ -33,7 +33,7 @@ pub mod vortex_shuffle;
 
 pub use chaos_exec::ChaosExec;
 pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
-pub use distributed_query::DistributedQueryExec;
+pub use distributed_query::{DistributedQueryExec, execute_physical_plan};
 pub use shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, ShufflePartitionKey,
     global_shuffle_manager,

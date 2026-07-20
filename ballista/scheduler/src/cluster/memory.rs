@@ -560,6 +560,17 @@ impl JobState for InMemoryJobState {
             .collect())
     }
 
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>> {
+        let mut all_jobs: HashSet<JobId> = self
+            .queued_jobs
+            .iter()
+            .map(|pair| pair.key().clone())
+            .collect();
+        all_jobs.extend(self.running_jobs.iter().map(|pair| pair.key().clone()));
+        all_jobs.extend(self.completed_jobs.iter().map(|pair| pair.key().clone()));
+        Ok(all_jobs)
+    }
+
     fn accept_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()> {
         self.queued_jobs
             .insert(job_id.clone(), (job_name.to_string(), queued_at));
