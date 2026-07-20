@@ -209,11 +209,10 @@ impl SortShuffleWriterExec {
             // buffered-bytes counter below; the reservation is best-effort
             // visibility so other operators see this writer's RSS (upstream
             // Ballista 54 behaviour).
-            let mut reservation = MemoryConsumer::new(format!(
-                "SortShuffleWriter[{input_partition}]"
-            ))
-            .with_can_spill(true)
-            .register(&context.runtime_env().memory_pool);
+            let mut reservation =
+                MemoryConsumer::new(format!("SortShuffleWriter[{input_partition}]"))
+                    .with_can_spill(true)
+                    .register(&context.runtime_env().memory_pool);
 
             let mut stream = plan.execute(input_partition, context)?;
             let schema = stream.schema();

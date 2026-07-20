@@ -679,14 +679,18 @@ impl BallistaConfig {
             .settings
             .contains_key(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
         {
-            self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
+            self.get_usize_setting(
+                BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES,
+            )
         } else if self
             .settings
             .contains_key(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
         {
             self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
         } else {
-            self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES)
+            self.get_usize_setting(
+                BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT_PER_TASK_BYTES,
+            )
         }
     }
 
