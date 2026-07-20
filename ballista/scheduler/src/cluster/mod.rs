@@ -693,7 +693,7 @@ pub(crate) async fn bind_task_consistent_hash(
     get_scan_files: GetScanFilesFunc,
 ) -> Result<(BindingResult, Option<ConsistentHash<TopologyNode>>)> {
     let mut total_slots = 0usize;
-    for (_, node) in topology_nodes.iter() {
+    for node in topology_nodes.values() {
         total_slots += node.available_slots as usize;
     }
     if total_slots == 0 {

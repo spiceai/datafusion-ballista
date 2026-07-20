@@ -21,6 +21,7 @@ use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::error::{BallistaError, Result as BResult};
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::protobuf::execute_query_params::Query;
+use ballista_core::serde::protobuf::executor_metric::Metric;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
 use ballista_core::serde::protobuf::{
     AvailableTaskSlots, CancelJobParams, CancelJobResult, CleanJobDataParams,
@@ -28,14 +29,13 @@ use ballista_core::serde::protobuf::{
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
     ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams,
-    GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
-    HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
-    PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
-    execute_query_failure_result, execute_query_result,
+    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
+    JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
+    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
+    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
+    execute_query_result,
 };
-use ballista_core::serde::protobuf::executor_metric::Metric;
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, ExecutorOperatingSystemSpecification,
 };
@@ -127,7 +127,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .map_err(|e| {
                     let msg = format!(
                         "Fail to update tasks status from executor {:?} due to {:?}",
-                        &executor_id, e
+                        executor_id, e
                     );
                     error!("{msg}");
                     Status::internal(msg)
@@ -387,7 +387,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             .map_err(|e| {
                 let msg = format!(
                     "Fail to update tasks status from executor {:?} due to {:?}",
-                    &executor_id, e
+                    executor_id, e
                 );
                 error!("{msg}");
                 Status::internal(msg)

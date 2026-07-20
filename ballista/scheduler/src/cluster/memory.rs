@@ -23,8 +23,8 @@ use crate::cluster::{
 };
 use crate::state::execution_graph::ExecutionGraphBox;
 use async_trait::async_trait;
-use ballista_core::error::{BallistaError, Result};
 use ballista_core::JobId;
+use ballista_core::error::{BallistaError, Result};
 use ballista_core::serde::protobuf::{
     AvailableTaskSlots, ExecutorHeartbeat, ExecutorStatus, FailedJob, QueuedJob,
     executor_status,
@@ -176,7 +176,7 @@ impl ClusterState for InMemoryClusterState {
                         if let Some(data) = guard.get_mut(&node.id) {
                             data.slots = node.available_slots;
                         } else {
-                            error!("Fail to find executor data for {}", &node.id);
+                            error!("Fail to find executor data for {}", node.id);
                         }
                     }
                 }
@@ -475,7 +475,10 @@ impl JobState for InMemoryJobState {
             .and_then(|(_, graph)| graph.as_ref().map(|e| e.cloned())))
     }
 
-    async fn try_acquire_job(&self, _job_id: &JobId) -> Result<Option<ExecutionGraphBox>> {
+    async fn try_acquire_job(
+        &self,
+        _job_id: &JobId,
+    ) -> Result<Option<ExecutionGraphBox>> {
         // Always return None. The only state stored here are for completed jobs
         // which cannot be acquired
         Ok(None)

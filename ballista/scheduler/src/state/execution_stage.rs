@@ -35,8 +35,8 @@ use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::{ShuffleWriterExec, SortShuffleWriterExec};
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
-    FailedTask, GraphStageInput, OperatorMetricsSet, ResultLost, SuccessfulTask, TaskKilled,
-    TaskStatus, task_info,
+    FailedTask, GraphStageInput, OperatorMetricsSet, ResultLost, SuccessfulTask,
+    TaskKilled, TaskStatus, task_info,
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::PartitionLocation;
@@ -683,7 +683,9 @@ impl RunningStage {
                                 error: "killed".to_string(),
                                 retryable: false,
                                 count_to_failures: false,
-                                failed_reason: Some(FailedReason::TaskKilled(TaskKilled {})),
+                                failed_reason: Some(FailedReason::TaskKilled(
+                                    TaskKilled {},
+                                )),
                             }),
                             ..info.clone()
                         }

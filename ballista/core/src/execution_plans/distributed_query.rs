@@ -345,8 +345,8 @@ pub async fn execute_physical_plan<U: 'static + AsExecutionPlan>(
     session_id: String,
     session_config: SessionConfig,
 ) -> Result<SendableRecordBatchStream> {
-    let plan_message = U::try_from_physical_plan(physical_plan.clone(), codec)
-        .map_err(|e| {
+    let plan_message =
+        U::try_from_physical_plan(physical_plan.clone(), codec).map_err(|e| {
             DataFusionError::Internal(format!("failed to serialize physical plan: {e:?}"))
         })?;
     let mut buf: Vec<u8> = vec![];
@@ -896,10 +896,10 @@ async fn fetch_partition(
 #[cfg(test)]
 mod test {
     use crate::execution_plans::distributed_query::get_client_host_port;
+    use crate::serde::protobuf::get_job_status_result::FlightProxy;
     use crate::serde::protobuf::{
         ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
     };
-    use crate::serde::protobuf::get_job_status_result::FlightProxy;
 
     #[test]
     fn test_client_host_port() {
@@ -912,9 +912,7 @@ mod test {
             host: "executor".to_string(),
             port: 12345,
             grpc_port: 1,
-            specification: Some(ExecutorSpecification {
-                resources: vec![],
-            }),
+            specification: Some(ExecutorSpecification { resources: vec![] }),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 

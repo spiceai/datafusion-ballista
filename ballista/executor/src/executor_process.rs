@@ -288,7 +288,8 @@ pub async fn start_executor_process(
     info!("Executor number of concurrent tasks: {concurrent_tasks}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
-    let executor_meta = structure_executor_metadata(&executor_id, &opt, concurrent_tasks as u32);
+    let executor_meta =
+        structure_executor_metadata(&executor_id, &opt, concurrent_tasks as u32);
 
     // put them to session config
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());
@@ -753,7 +754,7 @@ async fn clean_all_shuffle_data(work_dir: &str) -> ballista_core::error::Result<
         }
     }
 
-    info!("The work_dir {:?} will be deleted", &to_deleted);
+    info!("The work_dir {:?} will be deleted", to_deleted);
     for del in to_deleted {
         if let Err(e) = fs::remove_dir_all(&del).await {
             error!("Fail to remove the directory {del:?} due to {e}");
@@ -887,7 +888,8 @@ pub fn structure_executor_metadata(
 ) -> ExecutorRegistration {
     let system_name =
         System::name().unwrap_or_else(|| String::from("Unknown system name"));
-    let os_ver = System::os_version().unwrap_or_else(|| String::from("Unknown OS version"));
+    let os_ver =
+        System::os_version().unwrap_or_else(|| String::from("Unknown OS version"));
     let os_ver_long = System::long_os_version()
         .unwrap_or_else(|| String::from("Unknown long OS version"));
     let kernel_ver = System::kernel_long_version();

@@ -27,8 +27,8 @@ use datafusion::common::{ScalarValue, UnnestOptions};
 use datafusion::logical_expr::{LogicalPlan, PlanType, StringifiedPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::explain::ExplainExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::explain::ExplainExec;
 use datafusion::physical_plan::expressions::col;
 use datafusion::physical_plan::expressions::lit;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
@@ -190,8 +190,9 @@ pub(crate) async fn handle_explain_plan(
         let plans = explain.stringified_plans();
 
         let distributed_txt =
-            generate_distributed_explain_plan(job_id, Arc::new(ctx.clone()), inner_plan).await?;
-        let (logical_txt, physical_txt) = extract_logical_and_physical_plans(&plans);
+            generate_distributed_explain_plan(job_id, Arc::new(ctx.clone()), inner_plan)
+                .await?;
+        let (logical_txt, physical_txt) = extract_logical_and_physical_plans(plans);
 
         construct_distributed_explain_exec(logical_txt, physical_txt, distributed_txt)
     } else {

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ballista_core::JobStatusSubscriber;
 use ballista_core::JobId;
+use ballista_core::JobStatusSubscriber;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::datasource::source_as_provider;

@@ -33,7 +33,6 @@ use log::info;
 use std::{net::SocketAddr, sync::Arc};
 use tonic::service::RoutesBuilder;
 
-#[cfg(feature = "rest-api")]
 use crate::api::SchedulerErrorResponse;
 #[cfg(feature = "rest-api")]
 use crate::api::get_routes;

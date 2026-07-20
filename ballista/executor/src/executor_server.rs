@@ -243,6 +243,7 @@ unsafe impl Sync for ExecutorEnv {}
 pub static TERMINATING: AtomicBool = AtomicBool::new(false);
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T, U> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         scheduler_to_register: SchedulerGrpcClient<Channel>,
         executor: Arc<Executor>,
@@ -537,8 +538,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                         },
                     ];
                     let mut executor_system = System::new_all();
-                    executor_system
-                        .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+                    executor_system.refresh_memory_specifics(
+                        MemoryRefreshKind::nothing().with_ram(),
+                    );
 
                     process_metrics.extend([
                         ExecutorMetric {
@@ -564,8 +566,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                         "Could not get current process memory usage! Defaulting to system-wide metrics"
                     );
                     let mut executor_system = System::new_all();
-                    executor_system
-                        .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+                    executor_system.refresh_memory_specifics(
+                        MemoryRefreshKind::nothing().with_ram(),
+                    );
 
                     vec![
                         ExecutorMetric {
@@ -759,14 +762,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
                 if let Some(curator_task) = maybe_task {
                     let task_identity = format!(
                         "TID {} {}/{}.{}/{}.{}",
-                        &curator_task.task.task_id,
-                        &curator_task.task.job_id,
-                        &curator_task.task.stage_id,
-                        &curator_task.task.stage_attempt_num,
-                        &curator_task.task.partition_id,
-                        &curator_task.task.task_attempt_num,
+                        curator_task.task.task_id,
+                        curator_task.task.job_id,
+                        curator_task.task.stage_id,
+                        curator_task.task.stage_attempt_num,
+                        curator_task.task.partition_id,
+                        curator_task.task.task_attempt_num,
                     );
-                    info!("Received task {:?}", &task_identity);
+                    info!("Received task {:?}", task_identity);
 
                     let server = executor_server.clone();
                     dedicated_executor.spawn(async move {

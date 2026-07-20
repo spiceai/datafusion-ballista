@@ -776,11 +776,7 @@ impl BallistaConfig {
     /// Returns the optional RNG seed for chaos-monkey execution.
     pub fn chaos_execution_seed(&self) -> Option<u64> {
         let s = self.get_string_setting(BALLISTA_CHAOS_EXECUTION_SEED);
-        if s.is_empty() {
-            None
-        } else {
-            s.parse().ok()
-        }
+        if s.is_empty() { None } else { s.parse().ok() }
     }
 
     /// Should client employ pull or push job tracking strategy

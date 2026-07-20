@@ -514,9 +514,9 @@ fn decode_execution_graph<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
         failed_stage_attempts,
         session_config,
         logical_plan: None,
-        physical_plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
-            datafusion::arrow::datatypes::Schema::empty(),
-        ))),
+        physical_plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        )),
     })
 }
 
@@ -1594,7 +1594,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                         .map(|(task_id, stage_id, partition_id, executor_id)| {
                             RunningTaskInfo {
                                 task_id,
-                                job_id: self.job_id.clone().into(),
+                                job_id: self.job_id.clone(),
                                 stage_id,
                                 partition_id,
                                 executor_id,
@@ -1750,7 +1750,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                 .map(
                     |(task_id, stage_id, partition_id, executor_id)| RunningTaskInfo {
                         task_id,
-                        job_id: self.job_id.clone().into(),
+                        job_id: self.job_id.clone(),
                         stage_id,
                         partition_id,
                         executor_id,

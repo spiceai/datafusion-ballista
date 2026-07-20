@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ballista_core::config::BallistaConfig;
 use ballista_core::JobId;
+use ballista_core::config::BallistaConfig;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleConfig;
@@ -233,10 +233,14 @@ impl DefaultDistributedPlanner {
                     None,
                     config,
                 )?;
-                let unresolved_shuffle = create_unresolved_shuffle(shuffle_writer.as_ref());
+                let unresolved_shuffle =
+                    create_unresolved_shuffle(shuffle_writer.as_ref());
                 stages.push(shuffle_writer);
                 Ok((
-                    with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                    with_new_children_if_necessary(
+                        execution_plan,
+                        vec![unresolved_shuffle],
+                    )?,
                     stages,
                 ))
             }
@@ -832,11 +836,8 @@ mod test {
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
         let job_id = JobId::new(job_uuid.to_string());
-        let stages = planner.plan_query_stages(
-            &job_id,
-            plan,
-            ctx.state().config().options(),
-        )?;
+        let stages =
+            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
         for (i, stage) in stages.iter().enumerate() {
             println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
         }
@@ -948,11 +949,8 @@ order by
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
         let job_id = JobId::new(job_uuid.to_string());
-        let stages = planner.plan_query_stages(
-            &job_id,
-            plan,
-            ctx.state().config().options(),
-        )?;
+        let stages =
+            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
         for (i, stage) in stages.iter().enumerate() {
             println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
         }
@@ -1108,11 +1106,8 @@ order by
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
         let job_id = JobId::new(job_uuid.to_string());
-        let stages = planner.plan_query_stages(
-            &job_id,
-            plan,
-            ctx.state().config().options(),
-        )?;
+        let stages =
+            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
         for (i, stage) in stages.iter().enumerate() {
             println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
         }
@@ -1198,7 +1193,7 @@ order by
         Ok(())
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn distributed_broadcast_join_plan() -> Result<(), BallistaError> {
         use datafusion::physical_plan::joins::PartitionMode;
 
@@ -1850,7 +1845,6 @@ order by
         Ok((ctx, (*options).clone()))
     }
 
-
     #[tokio::test]
     async fn roundtrip_serde_aggregate() -> Result<(), BallistaError> {
         let ctx = datafusion_test_context("testdata").await?;
@@ -1873,11 +1867,8 @@ order by
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
         let job_id = JobId::new(job_uuid.to_string());
-        let stages = planner.plan_query_stages(
-            &job_id,
-            plan,
-            ctx.state().config().options(),
-        )?;
+        let stages =
+            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
 
         let partial_hash = stages[0].children()[0].clone();
         let partial_hash_serde =

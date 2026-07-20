@@ -209,8 +209,19 @@ impl SchedulerMetricsCollector for NoopMetricsCollector {
     }
 
     // Stage lifecycle
-    fn record_stage_started(&self, _job_id: &JobId, _stage_id: usize, _task_count: usize) {}
-    fn record_stage_completed(&self, _job_id: &JobId, _stage_id: usize, _duration_ms: u64) {
+    fn record_stage_started(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _task_count: usize,
+    ) {
+    }
+    fn record_stage_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _duration_ms: u64,
+    ) {
     }
     fn record_stage_failed(&self, _job_id: &JobId, _stage_id: usize, _error_type: &str) {}
     fn record_stage_retry(&self, _job_id: &JobId, _stage_id: usize) {}
@@ -224,7 +235,12 @@ impl SchedulerMetricsCollector for NoopMetricsCollector {
         _latency_ms: u64,
     ) {
     }
-    fn record_task_completed(&self, _job_id: &JobId, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
     }
     fn record_task_failed(
         &self,

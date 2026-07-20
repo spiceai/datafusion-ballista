@@ -38,9 +38,6 @@ use url::Url;
 
 use crate::client::BallistaClient;
 use crate::client_pool::BallistaClientPool;
-use crate::utils::GrpcClientConfig;
-use datafusion::prelude::SessionConfig;
-use std::future::Future;
 use crate::execution_plans::shuffle_manager::global_shuffle_manager;
 use crate::execution_plans::sort_shuffle::{
     get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
@@ -49,6 +46,9 @@ use crate::extension::{
     BallistaConfigGrpcEndpoint, SessionConfigExt, ShuffleReadMetricsCallback,
 };
 use crate::serde::scheduler::{PartitionLocation, PartitionStats};
+use crate::utils::GrpcClientConfig;
+use datafusion::prelude::SessionConfig;
+use std::future::Future;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
@@ -1874,7 +1874,6 @@ fn check_is_object_store_location(location: &PartitionLocation) -> bool {
         || path.starts_with("gs://")
 }
 
-
 struct CoalescedShuffleReaderStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
@@ -1968,10 +1967,12 @@ impl Stream for CoalescedShuffleReaderStream {
                             Ok(PushBatchStatus::LimitReached) => {
                                 self.completed = true;
                                 let Some(coalescer) = self.coalescer.as_mut() else {
-                                    return Poll::Ready(Some(Err(DataFusionError::Internal(
-                                        "coalescer missing after initialization"
-                                            .to_string(),
-                                    ))));
+                                    return Poll::Ready(Some(Err(
+                                        DataFusionError::Internal(
+                                            "coalescer missing after initialization"
+                                                .to_string(),
+                                        ),
+                                    )));
                                 };
                                 if let Err(e) = coalescer.finish() {
                                     return Poll::Ready(Some(Err(e)));

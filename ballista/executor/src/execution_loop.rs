@@ -22,9 +22,9 @@
 //! where the scheduler sends tasks to executors.
 
 use crate::cpu_bound_executor::DedicatedExecutor;
-use ballista_core::JobId;
 use crate::executor::Executor;
 use crate::executor_process::remove_job_data;
+use ballista_core::JobId;
 
 use crate::{TaskExecutionTimes, as_task_status};
 
@@ -417,11 +417,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
-        let part = PartitionId::new(
-            &job_id,
-            stage_id as usize,
-            partition_id as usize,
-        );
+        let part = PartitionId::new(&job_id, stage_id as usize, partition_id as usize);
 
         let task_start = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(

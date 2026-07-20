@@ -265,10 +265,7 @@ impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
             port: self.port as u16,
             grpc_port: self.grpc_port as u16,
             specification: self.specification.unwrap().into(),
-            os_info: self
-                .os_info
-                .map(Into::into)
-                .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
+            os_info: self.os_info.map(Into::into).unwrap_or_default(),
         }
     }
 }

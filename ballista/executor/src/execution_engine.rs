@@ -22,12 +22,12 @@
 //! for creating query stage executors from physical plans.
 
 use async_trait::async_trait;
+use ballista_core::JobId;
 use ballista_core::client_pool::BallistaClientPool;
-use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
+use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
-use ballista_core::JobId;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,

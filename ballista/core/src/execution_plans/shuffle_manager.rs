@@ -358,7 +358,8 @@ mod tests {
 
     #[test]
     fn test_hash_partition_key() {
-        let key = InMemoryShuffleManager::hash_partition_key(&JobId::from("job1"), 1, 2, 3);
+        let key =
+            InMemoryShuffleManager::hash_partition_key(&JobId::from("job1"), 1, 2, 3);
         assert_eq!(key, "job1/1/2/data-3");
     }
 
@@ -371,7 +372,11 @@ mod tests {
         // Store partitions for multiple stages in the same job
         for stage in 0..3 {
             for partition in 0..4 {
-                let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), stage, partition);
+                let key = InMemoryShuffleManager::partition_key(
+                    &JobId::from("job1"),
+                    stage,
+                    partition,
+                );
                 let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                 manager.store_partition(key, data);
             }

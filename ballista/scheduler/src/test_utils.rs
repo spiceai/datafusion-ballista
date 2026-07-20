@@ -759,7 +759,11 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
 
     fn record_failed(&self, job_id: &JobId, queued_at: u64, failed_at: u64) {
         let mut guard = self.events.lock();
-        guard.push(MetricEvent::Failed(job_id.to_string(), queued_at, failed_at));
+        guard.push(MetricEvent::Failed(
+            job_id.to_string(),
+            queued_at,
+            failed_at,
+        ));
     }
 
     fn record_cancelled(&self, job_id: &JobId) {
@@ -771,8 +775,19 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
     fn set_pending_jobs_queue_size(&self, _value: u64) {}
 
     // Stage lifecycle
-    fn record_stage_started(&self, _job_id: &JobId, _stage_id: usize, _task_count: usize) {}
-    fn record_stage_completed(&self, _job_id: &JobId, _stage_id: usize, _duration_ms: u64) {
+    fn record_stage_started(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _task_count: usize,
+    ) {
+    }
+    fn record_stage_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _duration_ms: u64,
+    ) {
     }
     fn record_stage_failed(&self, _job_id: &JobId, _stage_id: usize, _error_type: &str) {}
     fn record_stage_retry(&self, _job_id: &JobId, _stage_id: usize) {}
@@ -786,7 +801,12 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
         _latency_ms: u64,
     ) {
     }
-    fn record_task_completed(&self, _job_id: &JobId, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
     }
     fn record_task_failed(
         &self,

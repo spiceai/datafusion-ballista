@@ -31,8 +31,8 @@
 
 use ballista_core::client::BallistaClient;
 use ballista_core::client_pool::{BallistaClientPool, PooledClient};
-use ballista_core::execution_plans::connect_ballista_client;
 use ballista_core::error::Result;
+use ballista_core::execution_plans::connect_ballista_client;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::utils::GrpcClientConfig;
 use dashmap::DashMap;

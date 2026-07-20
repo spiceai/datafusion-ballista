@@ -903,7 +903,10 @@ mod tests {
 
         assert!(std::path::Path::new(&path).exists());
 
-        storage.delete_job_data(&JobId::from("test_job")).await.unwrap();
+        storage
+            .delete_job_data(&JobId::from("test_job"))
+            .await
+            .unwrap();
         assert!(!std::path::Path::new(&path).exists());
     }
 
@@ -1133,7 +1136,10 @@ mod tests {
         assert_eq!(read_batches.len(), 1);
         assert_eq!(read_batches[0].num_rows(), 3);
 
-        storage.delete_job_data(&JobId::from("job_a")).await.unwrap();
+        storage
+            .delete_job_data(&JobId::from("job_a"))
+            .await
+            .unwrap();
         assert!(storage.read_shuffle_data(&full_url).await.is_err());
     }
 }

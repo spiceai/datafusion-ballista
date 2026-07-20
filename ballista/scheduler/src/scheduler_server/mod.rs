@@ -18,8 +18,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ballista_core::JobStatusSubscriber;
 use ballista_core::JobId;
+use ballista_core::JobStatusSubscriber;
 use ballista_core::error::Result;
 use ballista_core::event_loop::{EventLoop, EventSender};
 use ballista_core::serde::BallistaCodec;
@@ -701,9 +701,9 @@ mod test {
     use datafusion_proto::protobuf::LogicalPlanNode;
     use datafusion_proto::protobuf::PhysicalPlanNode;
 
+    use crate::scheduler_server::event::SubmitPlan;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
-    use crate::scheduler_server::event::SubmitPlan;
 
     use crate::config::SchedulerConfig;
 

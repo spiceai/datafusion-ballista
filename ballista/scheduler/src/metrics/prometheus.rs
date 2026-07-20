@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::metrics::SchedulerMetricsCollector;
-use ballista_core::error::{BallistaError, Result};
 use ballista_core::JobId;
+use ballista_core::error::{BallistaError, Result};
 
 use once_cell::sync::OnceCell;
 use prometheus::{
@@ -410,11 +410,21 @@ impl SchedulerMetricsCollector for PrometheusMetricsCollector {
         self.pending_jobs_queue_size.set(value as f64);
     }
 
-    fn record_stage_started(&self, _job_id: &JobId, _stage_id: usize, _task_count: usize) {
+    fn record_stage_started(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _task_count: usize,
+    ) {
         self.stage_started.inc();
     }
 
-    fn record_stage_completed(&self, _job_id: &JobId, _stage_id: usize, duration_ms: u64) {
+    fn record_stage_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        duration_ms: u64,
+    ) {
         self.stage_completed.inc();
         self.stage_duration.observe(duration_ms as f64);
     }
@@ -439,7 +449,12 @@ impl SchedulerMetricsCollector for PrometheusMetricsCollector {
         self.task_scheduling_latency.observe(latency_ms as f64);
     }
 
-    fn record_task_completed(&self, _job_id: &JobId, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
         self.task_completed.inc();
     }
 

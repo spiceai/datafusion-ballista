@@ -166,7 +166,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                             }
                         }
 
-                        error!("{}", &fail_message);
+                        error!("{}", fail_message);
                         QueryStageSchedulerEvent::JobPlanningFailed {
                             job_id,
                             fail_message,
@@ -175,7 +175,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                         }
                     } else {
                         // Broadcast job running state when successfully submitted
-                        let _ = job_state_sender.send(JobStateEvent::running(job_id.clone()));
+                        let _ =
+                            job_state_sender.send(JobStateEvent::running(job_id.clone()));
                         QueryStageSchedulerEvent::JobSubmitted {
                             job_id,
                             queued_at,
@@ -220,7 +221,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 error!("Job {job_id} failed: {fail_message}");
 
                 // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(job_id.clone(), &fail_message));
+                self.broadcast_job_state(JobStateEvent::failed(
+                    job_id.clone(),
+                    &fail_message,
+                ));
 
                 if let Err(e) = self
                     .state
@@ -271,7 +275,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 error!("Job {job_id} running failed");
 
                 // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(job_id.clone(), &fail_message));
+                self.broadcast_job_state(JobStateEvent::failed(
+                    job_id.clone(),
+                    &fail_message,
+                ));
 
                 match self
                     .state

@@ -308,7 +308,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     }
 
     /// Enqueue a job for scheduling
-    pub fn queue_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()> {
+    pub fn queue_job(
+        &self,
+        job_id: &JobId,
+        job_name: &str,
+        queued_at: u64,
+    ) -> Result<()> {
         self.state.accept_job(job_id, job_name, queued_at)
     }
 
@@ -445,10 +450,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 )?) as ExecutionGraphBox
             }
         };
-        let string_plan =
-            DisplayableExecutionPlan::new(graph.physical_plan().as_ref())
-                .indent(false)
-                .to_string();
+        let string_plan = DisplayableExecutionPlan::new(graph.physical_plan().as_ref())
+            .indent(false)
+            .to_string();
 
         info!("Submitting execution graph for job_id [{job_id}]:\n{string_plan}");
 
