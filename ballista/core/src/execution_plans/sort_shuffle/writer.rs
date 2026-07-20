@@ -265,11 +265,14 @@ impl SortShuffleWriterExec {
 
                 let after_bytes: usize = buffers.iter().map(|b| b.memory_used()).sum();
                 let growth = after_bytes.saturating_sub(before_bytes);
-                // Best-effort: if the pool is exhausted, spill still proceeds
-                // based on the private counter below.
-                let _ = reservation.try_grow(growth);
+                // Prefer try_grow so the FairSpillPool sees this writer's RSS.
+                // If the pool is exhausted, spill immediately rather than
+                // continuing to buffer unaccounted bytes (Spice eager
+                // PartitionBuffers are heavier than upstream's index-based
+                // writer, so this matters under the TPC-H CI per-task budget).
+                let pool_ok = reservation.try_grow(growth).is_ok();
 
-                if after_bytes >= memory_limit {
+                if !pool_ok || after_bytes >= memory_limit {
                     let timer = metrics.spill_time.timer();
                     spill_all_buffers(
                         &mut buffers,

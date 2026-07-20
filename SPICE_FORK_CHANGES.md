@@ -231,7 +231,9 @@ Not Spice patches — features the fork never absorbed because it skipped the
   `--memory-pool-size 2GB` / `--concurrent-tasks 4` budget. The Spice
   path-based writer (eager `PartitionBuffer`) is retained; only the memory
   model was aligned. Deprecated config keys `buffer_size` / `spill_threshold`
-  / `memory_limit` remain accepted for wire/embedder compat.
+  / `memory_limit` remain accepted for wire/embedder compat. TPC-H SF10 CI
+  uses `--memory-pool-size 4GB` (vs upstream's 2GB) because the Spice eager
+  `PartitionBuffer` writer peaks higher under SMJ plans.
 - `#1911` partition pruning — **adopted** (repair commit; active under
   `disable-stage-plan-cache`, ignored when the stage-plan cache is on)
 - `#1902` preserve user session config overrides — **adopted** (merge)
