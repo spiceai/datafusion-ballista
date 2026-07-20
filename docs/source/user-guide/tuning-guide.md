@@ -164,14 +164,14 @@ let session_config = SessionConfig::new_with_ballista()
 
 The following session-level keys tune its behavior:
 
-| key                                                              | type    | default   | description                                                                                               |
-| ---------------------------------------------------------------- | ------- | --------- | --------------------------------------------------------------------------------------------------------- |
-| ballista.shuffle.sort_based.enabled                              | Boolean | true      | Enables the sort-based shuffle writer.                                                                    |
-| ballista.shuffle.sort_based.batch_size                           | UInt64  | 8192      | Target row count when coalescing buffered batches before they are written or spilled.                     |
-| ballista.shuffle.sort_based.memory_limit_per_task_bytes          | UInt64  | 268435456 | Per-task buffered-bytes budget at which the writer spills (256 MiB default). Independent of the runtime memory pool. |
-| ballista.shuffle.sort_based.memory_limit                         | UInt64  | 268435456 | Deprecated alias for `memory_limit_per_task_bytes`.                                                       |
-| ballista.shuffle.sort_based.buffer_size                          | UInt64  | 1048576   | Deprecated: ignored by the writer.                                                                        |
-| ballista.shuffle.sort_based.spill_threshold                      | Utf8    | "0.8"     | Deprecated: ignored by the writer.                                                                        |
+| key                                                     | type    | default   | description                                                                                                          |
+| ------------------------------------------------------- | ------- | --------- | -------------------------------------------------------------------------------------------------------------------- |
+| ballista.shuffle.sort_based.enabled                     | Boolean | true      | Enables the sort-based shuffle writer.                                                                               |
+| ballista.shuffle.sort_based.batch_size                  | UInt64  | 8192      | Target row count when coalescing buffered batches before they are written or spilled.                                |
+| ballista.shuffle.sort_based.memory_limit_per_task_bytes | UInt64  | 268435456 | Per-task buffered-bytes budget at which the writer spills (256 MiB default). Independent of the runtime memory pool. |
+| ballista.shuffle.sort_based.memory_limit                | UInt64  | 268435456 | Deprecated alias for `memory_limit_per_task_bytes`.                                                                  |
+| ballista.shuffle.sort_based.buffer_size                 | UInt64  | 1048576   | Deprecated: ignored by the writer.                                                                                   |
+| ballista.shuffle.sort_based.spill_threshold             | Utf8    | "0.8"     | Deprecated: ignored by the writer.                                                                                   |
 
 ## Adaptive Query Execution (Experimental)
 
