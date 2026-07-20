@@ -22,7 +22,7 @@ pub mod prometheus;
 
 #[cfg(feature = "prometheus")]
 use crate::metrics::prometheus::PrometheusMetricsCollector;
-use ballista_core::error::Result;
+use ballista_core::{JobId, error::Result};
 use std::sync::Arc;
 
 /// Interface for recording metrics events in the scheduler.
@@ -43,21 +43,21 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// on executors.
     /// When invoked should specify the timestamp in milliseconds when the job was originally
     /// queued and the timestamp in milliseconds when it was submitted
-    fn record_submitted(&self, job_id: &str, queued_at: u64, submitted_at: u64);
+    fn record_submitted(&self, job_id: &JobId, queued_at: u64, submitted_at: u64);
 
     /// Record that job with `job_id` has completed successfully. This should only
     /// be invoked on successful job completion.
     /// When invoked should specify the timestamp in milliseconds when the job was originally
     /// queued and the timestamp in milliseconds when it was completed
-    fn record_completed(&self, job_id: &str, queued_at: u64, completed_at: u64);
+    fn record_completed(&self, job_id: &JobId, queued_at: u64, completed_at: u64);
 
     /// Record that job with `job_id` has failed.
     /// When invoked should specify the timestamp in milliseconds when the job was originally
     /// queued and the timestamp in milliseconds when it failed.
-    fn record_failed(&self, job_id: &str, queued_at: u64, failed_at: u64);
+    fn record_failed(&self, job_id: &JobId, queued_at: u64, failed_at: u64);
 
     /// Record that job with `job_id` was cancelled.
-    fn record_cancelled(&self, job_id: &str);
+    fn record_cancelled(&self, job_id: &JobId);
 
     /// Set the current number of pending tasks in scheduler. A pending task is a task that is available
     /// to schedule on an executor but cannot be scheduled because no resources are available.
@@ -79,24 +79,24 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     ///
     /// Called when a stage transitions to Running state. The `task_count` is the
     /// total number of partitions/tasks in this stage.
-    fn record_stage_started(&self, job_id: &str, stage_id: usize, task_count: usize);
+    fn record_stage_started(&self, job_id: &JobId, stage_id: usize, task_count: usize);
 
     /// Record that a stage has completed successfully.
     ///
     /// Called when all tasks in a stage complete successfully. The `duration_ms`
     /// is the wall-clock time from stage start to completion.
-    fn record_stage_completed(&self, job_id: &str, stage_id: usize, duration_ms: u64);
+    fn record_stage_completed(&self, job_id: &JobId, stage_id: usize, duration_ms: u64);
 
     /// Record that a stage has failed.
     ///
     /// Called when a stage fails (e.g., due to task failures exceeding retry limit).
     /// The `error_type` is a categorized error string suitable for use as a metric label.
-    fn record_stage_failed(&self, job_id: &str, stage_id: usize, error_type: &str);
+    fn record_stage_failed(&self, job_id: &JobId, stage_id: usize, error_type: &str);
 
     /// Record that a stage is being retried.
     ///
     /// Called when a stage is reset for retry after a failure.
-    fn record_stage_retry(&self, job_id: &str, stage_id: usize);
+    fn record_stage_retry(&self, job_id: &JobId, stage_id: usize);
 
     // =========================================================================
     // Task scheduling events (new)
@@ -108,7 +108,7 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// is the time from when the task became schedulable to when it was assigned.
     fn record_task_scheduled(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         executor_id: &str,
         latency_ms: u64,
@@ -117,14 +117,14 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// Record that a task has completed on an executor.
     ///
     /// Called when the scheduler receives notification of task completion.
-    fn record_task_completed(&self, job_id: &str, stage_id: usize, executor_id: &str);
+    fn record_task_completed(&self, job_id: &JobId, stage_id: usize, executor_id: &str);
 
     /// Record that a task has failed on an executor.
     ///
     /// Called when the scheduler receives notification of task failure.
     fn record_task_failed(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         executor_id: &str,
         error_type: &str,
@@ -134,7 +134,7 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     ///
     /// Called when a task is rescheduled after a failure. This is distinct from
     /// stage-level retries and tracks individual task retry attempts.
-    fn record_task_retry(&self, job_id: &str, stage_id: usize);
+    fn record_task_retry(&self, job_id: &JobId, stage_id: usize);
 
     /// Record a shuffle affinity hit - task was assigned to an executor that has
     /// local shuffle data from a parent stage.
@@ -144,7 +144,7 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// This indicates the task can read shuffle data without network transfer.
     fn record_task_shuffle_affinity_hit(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         executor_id: &str,
     );
@@ -157,7 +157,7 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     /// to fetch shuffle data over the network from other executors.
     fn record_task_shuffle_affinity_miss(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         executor_id: &str,
     );
@@ -188,7 +188,7 @@ pub trait SchedulerMetricsCollector: Send + Sync {
     ///
     /// Called after a query has been planned and the ExecutionGraph is created.
     /// The `duration_ms` is the time spent in the distributed planner.
-    fn record_planning_duration(&self, job_id: &str, duration_ms: u64);
+    fn record_planning_duration(&self, job_id: &JobId, duration_ms: u64);
 }
 
 /// Implementation of `SchedulerMetricsCollector` that ignores all events. This can be used as
@@ -198,10 +198,10 @@ pub struct NoopMetricsCollector {}
 
 impl SchedulerMetricsCollector for NoopMetricsCollector {
     // Job lifecycle
-    fn record_submitted(&self, _job_id: &str, _queued_at: u64, _submitted_at: u64) {}
-    fn record_completed(&self, _job_id: &str, _queued_at: u64, _completed_at: u64) {}
-    fn record_failed(&self, _job_id: &str, _queued_at: u64, _failed_at: u64) {}
-    fn record_cancelled(&self, _job_id: &str) {}
+    fn record_submitted(&self, _job_id: &JobId, _queued_at: u64, _submitted_at: u64) {}
+    fn record_completed(&self, _job_id: &JobId, _queued_at: u64, _completed_at: u64) {}
+    fn record_failed(&self, _job_id: &JobId, _queued_at: u64, _failed_at: u64) {}
+    fn record_cancelled(&self, _job_id: &JobId) {}
     fn set_pending_tasks_queue_size(&self, _value: u64) {}
     fn set_pending_jobs_queue_size(&self, _value: u64) {}
     fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
@@ -209,42 +209,58 @@ impl SchedulerMetricsCollector for NoopMetricsCollector {
     }
 
     // Stage lifecycle
-    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, _task_count: usize) {}
-    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, _duration_ms: u64) {
+    fn record_stage_started(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _task_count: usize,
+    ) {
     }
-    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, _error_type: &str) {}
-    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_stage_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _duration_ms: u64,
+    ) {
+    }
+    fn record_stage_failed(&self, _job_id: &JobId, _stage_id: usize, _error_type: &str) {}
+    fn record_stage_retry(&self, _job_id: &JobId, _stage_id: usize) {}
 
     // Task scheduling
     fn record_task_scheduled(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         _latency_ms: u64,
     ) {
     }
-    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
     }
     fn record_task_failed(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         _error_type: &str,
     ) {
     }
-    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_task_retry(&self, _job_id: &JobId, _stage_id: usize) {}
     fn record_task_shuffle_affinity_hit(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
     }
     fn record_task_shuffle_affinity_miss(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
@@ -256,7 +272,7 @@ impl SchedulerMetricsCollector for NoopMetricsCollector {
     fn record_executor_deregistered(&self, _executor_id: &str) {}
 
     // Planning
-    fn record_planning_duration(&self, _job_id: &str, _duration_ms: u64) {}
+    fn record_planning_duration(&self, _job_id: &JobId, _duration_ms: u64) {}
 }
 
 /// Returns the default metrics collector for the system.

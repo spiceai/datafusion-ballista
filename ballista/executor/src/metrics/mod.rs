@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::execution_engine::QueryStageExecutor;
+use ballista_core::JobId;
 use log::info;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     ///
     /// Called when a task begins executing on this executor. Use this to track
     /// active task counts and task start times.
-    fn record_task_started(&self, job_id: &str, stage_id: usize, partition: usize);
+    fn record_task_started(&self, job_id: &JobId, stage_id: usize, partition: usize);
 
     /// Record metrics for a stage/task after successful execution.
     ///
@@ -39,7 +40,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// metrics from DataFusion, and `duration_ms` is the wall-clock execution time.
     fn record_stage(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         plan: Arc<dyn QueryStageExecutor>,
@@ -52,7 +53,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// error string suitable for use as a metric label.
     fn record_task_failed(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         error_type: &str,
@@ -64,7 +65,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// for shuffle write operations.
     fn record_shuffle_write(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -78,7 +79,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// for shuffle read operations.
     fn record_shuffle_read(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -92,7 +93,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     /// was written by this same executor in a previous stage, avoiding network transfer.
     fn record_shuffle_read_local(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -108,7 +109,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn record_shuffle_read_remote(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         source_executor_id: &str,
@@ -124,19 +125,57 @@ pub trait ExecutorMetricsCollector: Send + Sync {
     fn record_memory_available(&self, available_bytes: u64);
 }
 
+/// Configures which executor system/process metrics should be collected for heartbeats.
+#[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
+#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
+pub enum ExecutorMetricCollectionPolicy {
+    /// Collect only system-wide metrics.
+    #[cfg_attr(feature = "build-binary", clap(name = "sys"))]
+    SystemOnly,
+    /// Collect only current process metrics.
+    #[cfg_attr(feature = "build-binary", clap(name = "proc"))]
+    #[default]
+    ProcessOnly,
+    /// Collect both system-wide and process metrics.
+    #[cfg_attr(feature = "build-binary", clap(name = "all"))]
+    SystemAndProcess,
+    /// No metrics collected.
+    Off,
+}
+
+impl std::fmt::Display for ExecutorMetricCollectionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutorMetricCollectionPolicy::SystemOnly => f.write_str("sys"),
+            ExecutorMetricCollectionPolicy::ProcessOnly => f.write_str("proc"),
+            ExecutorMetricCollectionPolicy::SystemAndProcess => f.write_str("all"),
+            ExecutorMetricCollectionPolicy::Off => f.write_str("off"),
+        }
+    }
+}
+
+#[cfg(feature = "build-binary")]
+impl std::str::FromStr for ExecutorMetricCollectionPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        clap::ValueEnum::from_str(s, true)
+    }
+}
+
 /// Implementation of `ExecutorMetricsCollector` which logs the completed
 /// plan to stdout. Useful for debugging and development.
 #[derive(Default)]
 pub struct LoggingMetricsCollector {}
 
 impl ExecutorMetricsCollector for LoggingMetricsCollector {
-    fn record_task_started(&self, job_id: &str, stage_id: usize, partition: usize) {
+    fn record_task_started(&self, job_id: &JobId, stage_id: usize, partition: usize) {
         info!("=== [{job_id}/{stage_id}/{partition}] Task started ===");
     }
 
     fn record_stage(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         plan: Arc<dyn QueryStageExecutor>,
@@ -149,7 +188,7 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
 
     fn record_task_failed(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         error_type: &str,
@@ -159,7 +198,7 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
 
     fn record_shuffle_write(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -173,7 +212,7 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
 
     fn record_shuffle_read(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -187,7 +226,7 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
 
     fn record_shuffle_read_local(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         bytes: u64,
@@ -201,7 +240,7 @@ impl ExecutorMetricsCollector for LoggingMetricsCollector {
 
     fn record_shuffle_read_remote(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         source_executor_id: &str,

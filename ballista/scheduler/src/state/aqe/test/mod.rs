@@ -17,12 +17,20 @@
 
 /// Test if stages can be added or removed
 mod alter_stages;
+/// Functional tests for the CoalescePartitionsRule end-to-end through the planner
+mod coalesce_rule;
+/// Job-failure lifecycle tests for the adaptive graph
+mod job_failure;
+/// covers join selection tests
+mod join_selection;
 /// Tests if plan is going to be split to stages correctly
 mod plan_to_stages;
 
+use ballista_core::config::BALLISTA_SHUFFLE_SORT_BASED_ENABLED;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::scheduler::{
-    ExecutorMetadata, ExecutorSpecification, PartitionId, PartitionLocation,
-    PartitionStats,
+    ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    PartitionId, PartitionLocation, PartitionStats,
 };
 use datafusion::arrow::array::{Int32Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -37,7 +45,7 @@ pub(crate) fn mock_partitions_with_statistics() -> Vec<Vec<PartitionLocation>> {
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
-            job_id: "".to_string(),
+            job_id: "".into(),
             stage_id: 0,
             partition_id: 0,
         },
@@ -46,11 +54,12 @@ pub(crate) fn mock_partitions_with_statistics() -> Vec<Vec<PartitionLocation>> {
             host: "".to_string(),
             port: 0,
             grpc_port: 0,
-            specification: ExecutorSpecification { task_slots: 0 },
+            specification: ExecutorSpecification::default().with_task_slots(0),
+            os_info: ExecutorOperatingSystemSpecification::default(),
         },
-        path: "".to_string(),
         // next few properties are needed
         partition_stats: PartitionStats::new(Some(42), None, Some(10)),
+        path: String::new(),
     };
     vec![vec![location]]
 }
@@ -60,7 +69,7 @@ pub(crate) fn mock_partitions_with_statistics_no_data() -> Vec<Vec<PartitionLoca
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
-            job_id: "".to_string(),
+            job_id: "".into(),
             stage_id: 0,
             partition_id: 0,
         },
@@ -69,11 +78,12 @@ pub(crate) fn mock_partitions_with_statistics_no_data() -> Vec<Vec<PartitionLoca
             host: "".to_string(),
             port: 0,
             grpc_port: 0,
-            specification: ExecutorSpecification { task_slots: 0 },
+            specification: ExecutorSpecification::default().with_task_slots(0),
+            os_info: ExecutorOperatingSystemSpecification::default(),
         },
-        path: "".to_string(),
         // next few properties are needed
         partition_stats: PartitionStats::new(Some(0), None, Some(0)),
+        path: String::new(),
     };
     vec![vec![location]]
 }
@@ -109,6 +119,20 @@ pub(crate) fn mock_memory_table() -> Arc<dyn TableProvider> {
 
 pub(crate) fn mock_context() -> SessionContext {
     let config = SessionConfig::new()
+        .with_target_partitions(2)
+        .with_round_robin_repartition(false);
+
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .build();
+
+    SessionContext::new_with_state(state)
+}
+
+pub(crate) fn mock_context_sort_shuffle() -> SessionContext {
+    let config = SessionConfig::new_with_ballista()
+        .set_str(BALLISTA_SHUFFLE_SORT_BASED_ENABLED, "true")
         .with_target_partitions(2)
         .with_round_robin_repartition(false);
 

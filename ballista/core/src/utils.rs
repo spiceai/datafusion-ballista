@@ -53,7 +53,7 @@ use tonic::transport::{Channel, Endpoint, Error, Server};
 /// let ballista_config = BallistaConfig::default();
 /// let grpc_config = GrpcClientConfig::from(&ballista_config);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GrpcClientConfig {
     /// Connection timeout in seconds
     pub connect_timeout_seconds: u64,
@@ -63,6 +63,18 @@ pub struct GrpcClientConfig {
     pub tcp_keepalive_seconds: u64,
     /// HTTP/2 keep-alive ping interval in seconds
     pub http2_keepalive_interval_seconds: u64,
+    /// Should client use tls
+    pub use_tls: bool,
+    /// Returns the maximum message size for gRPC clients in bytes.
+    pub max_message_size: usize,
+    /// Number of retries for IO operations.
+    pub io_retries_times: u8,
+    /// Wait time in milliseconds between IO retries.
+    pub io_retry_wait_time_ms: u64,
+    /// HTTP/2 initial connection-level flow-control window in bytes. 0 = tonic default.
+    pub initial_connection_window_size: u32,
+    /// HTTP/2 initial stream-level flow-control window in bytes. 0 = tonic default.
+    pub initial_stream_window_size: u32,
 }
 
 impl From<&BallistaConfig> for GrpcClientConfig {
@@ -76,6 +88,13 @@ impl From<&BallistaConfig> for GrpcClientConfig {
             http2_keepalive_interval_seconds: config
                 .default_grpc_client_http2_keepalive_interval_seconds()
                 as u64,
+            use_tls: config.client_use_tls(),
+            max_message_size: config.default_grpc_client_max_message_size(),
+            io_retries_times: config.io_retries_times() as u8,
+            io_retry_wait_time_ms: config.io_retry_wait_time_ms() as u64,
+            initial_connection_window_size: config
+                .grpc_client_initial_connection_window_size(),
+            initial_stream_window_size: config.grpc_client_initial_stream_window_size(),
         }
     }
 }
@@ -87,6 +106,12 @@ impl Default for GrpcClientConfig {
             timeout_seconds: 20,
             tcp_keepalive_seconds: 3600,
             http2_keepalive_interval_seconds: 300,
+            use_tls: false,
+            max_message_size: 16 * 1024 * 1024,
+            io_retries_times: 3,
+            io_retry_wait_time_ms: 3000,
+            initial_connection_window_size: 67108864,
+            initial_stream_window_size: 16777216,
         }
     }
 }
@@ -333,6 +358,14 @@ pub fn get_time_before(interval_seconds: u64) -> u64 {
         .as_secs()
 }
 
+/// Current time since UNIX EPOCH. In milliseconds.
+pub fn get_current_time() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before UNIX epoch")
+        .as_millis()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +401,7 @@ mod tests {
             timeout_seconds: 30,
             tcp_keepalive_seconds: 1800,
             http2_keepalive_interval_seconds: 150,
+            ..Default::default()
         };
         let result = create_grpc_client_endpoint("http://localhost:50051", Some(&config));
         assert!(result.is_ok());

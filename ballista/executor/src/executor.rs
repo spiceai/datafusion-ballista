@@ -22,7 +22,9 @@ use crate::execution_engine::ExecutionEngine;
 use crate::execution_engine::QueryStageExecutor;
 use crate::metrics::ExecutorMetricsCollector;
 use crate::metrics::LoggingMetricsCollector;
+use crate::runtime_cache::SessionRuntimeCache;
 use ballista_core::ConfigProducer;
+use ballista_core::JobId;
 use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::ShuffleReaderExec;
@@ -248,6 +250,11 @@ pub struct Executor {
     /// Execution engine that the executor will delegate to
     /// for executing query stages
     pub(crate) execution_engine: Arc<dyn ExecutionEngine>,
+
+    /// Optional session-keyed cache of shared base runtime envs. When set,
+    /// `produce_runtime_for_session` reuses read-side state across a session's
+    /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
+    session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
 }
 
 impl Executor {
@@ -295,7 +302,8 @@ impl Executor {
             concurrent_tasks,
             abort_handles: Default::default(),
             execution_engine: execution_engine
-                .unwrap_or_else(|| Arc::new(DefaultExecutionEngine {})),
+                .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
+            session_runtime_cache: None,
         }
     }
 }
@@ -307,6 +315,30 @@ impl Executor {
         config: &SessionConfig,
     ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
         (self.runtime_producer)(config)
+    }
+
+    /// Attaches (or clears) the session-keyed runtime cache. Cloning the
+    /// `Executor` shares the same cache via `Arc`.
+    pub fn with_session_runtime_cache(
+        mut self,
+        cache: Option<Arc<dyn SessionRuntimeCache>>,
+    ) -> Self {
+        self.session_runtime_cache = cache;
+        self
+    }
+
+    /// Produces the runtime for a task, reusing the session's shared read-side
+    /// state when a session cache is attached; otherwise builds a runtime per
+    /// task via the `runtime_producer`.
+    pub fn produce_runtime_for_session(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+    ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
+        match &self.session_runtime_cache {
+            Some(cache) => cache.produce_runtime(session_id, config),
+            None => (self.runtime_producer)(config),
+        }
     }
 
     /// Creates a default [`SessionConfig`] using the configured config producer.
@@ -413,7 +445,7 @@ impl Executor {
     pub async fn cancel_task(
         &self,
         task_id: usize,
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         partition_id: usize,
     ) -> Result<bool, BallistaError> {
@@ -447,15 +479,23 @@ impl Executor {
 mod test {
     use crate::execution_engine::{DefaultQueryStageExec, ShuffleWriterVariant};
     use crate::executor::Executor;
+    use crate::runtime_cache::{
+        DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+    };
+    use ballista_core::JobId;
     use ballista_core::RuntimeProducer;
     use ballista_core::execution_plans::ShuffleWriterExec;
-    use ballista_core::serde::protobuf::ExecutorRegistration;
+    use ballista_core::serde::protobuf::{
+        ExecutorOperatingSystemSpecification, ExecutorRegistration,
+    };
     use ballista_core::serde::scheduler::PartitionId;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::error::{DataFusionError, Result};
     use datafusion::execution::context::TaskContext;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::prelude::SessionConfig;
 
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -570,8 +610,10 @@ mod test {
     async fn test_task_cancellation() {
         let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
 
+        let job_id = JobId::new("job-id");
+        let cancel_job_id = job_id.clone();
         let shuffle_write = ShuffleWriterExec::try_new(
-            "job-id".to_owned(),
+            job_id.clone(),
             1,
             Arc::new(NeverendingOperator::new()),
             work_dir.clone(),
@@ -588,6 +630,7 @@ mod test {
             grpc_port: 0,
             specification: None,
             host: None,
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();
@@ -609,7 +652,7 @@ mod test {
         let executor_clone = executor.clone();
         tokio::task::spawn(async move {
             let part = PartitionId {
-                job_id: "job-id".to_owned(),
+                job_id: job_id.clone(),
                 stage_id: 1,
                 partition_id: 0,
             };
@@ -623,7 +666,7 @@ mod test {
         // poll until that happens.
         for _ in 0..20 {
             if executor
-                .cancel_task(1, "job-id".to_owned(), 1, 0)
+                .cancel_task(1, cancel_job_id.clone(), 1, 0)
                 .await
                 .expect("cancelling task")
             {
@@ -642,5 +685,73 @@ mod test {
         // Make sure the actual task failed
         let inner_result = result.unwrap().unwrap();
         assert!(inner_result.is_err());
+    }
+
+    #[test]
+    fn produce_runtime_for_session_shares_read_side_state() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            port: 0,
+            grpc_port: 0,
+            specification: None,
+            host: None,
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+        };
+        let config_producer = Arc::new(default_config_producer);
+
+        // A base producer that builds a fresh env each call, plus an identity
+        // pool policy, so shared read-side state is observable via ptr equality.
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        let identity: MemoryPoolPolicy = Arc::new(|base, _| Ok(base));
+        let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
+            DefaultSessionRuntimeCache::new(base_producer.clone(), identity, 4),
+        );
+
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            2,
+        )
+        .with_session_runtime_cache(Some(cache));
+
+        let cfg = SessionConfig::new();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
+        let e3 = executor.produce_runtime_for_session("s2", &cfg).unwrap();
+
+        assert!(Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
+        assert!(!Arc::ptr_eq(&e1.cache_manager, &e3.cache_manager));
+    }
+
+    #[test]
+    fn produce_runtime_for_session_falls_back_without_cache() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            port: 0,
+            grpc_port: 0,
+            specification: None,
+            host: None,
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+        };
+        let config_producer = Arc::new(default_config_producer);
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+
+        // No cache attached: each call builds a fresh env.
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            2,
+        );
+
+        let cfg = SessionConfig::new();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
+        assert!(!Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
     }
 }

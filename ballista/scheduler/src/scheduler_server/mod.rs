@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ballista_core::JobId;
 use ballista_core::JobStatusSubscriber;
 use ballista_core::error::Result;
 use ballista_core::event_loop::{EventLoop, EventSender};
@@ -37,7 +38,7 @@ use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use log::{debug, error, warn};
 
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
+use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
 
 use crate::state::executor_manager::ExecutorManager;
@@ -246,7 +247,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
         self.query_stage_event_loop
             .get_sender()?
-            .post_event(QueryStageSchedulerEvent::JobCancel(job_id.to_owned()))
+            .post_event(QueryStageSchedulerEvent::JobCancel(JobId::from(job_id)))
             .await?;
 
         Ok(())
@@ -254,7 +255,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
     pub(crate) async fn fail_job(
         &self,
-        job_id: String,
+        job_id: JobId,
         fail_message: String,
     ) -> Result<()> {
         log::debug!("Received fail job request for job {job_id}");
@@ -280,8 +281,25 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         plan: &LogicalPlan,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<String> {
+        self.submit_plan(
+            job_name,
+            ctx,
+            &SubmitPlan::Logical(plan.clone()),
+            subscriber,
+        )
+        .await
+    }
+
+    /// Submits a logical or physical plan for distributed execution.
+    pub async fn submit_plan(
+        &self,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: &SubmitPlan,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<String> {
         let job_id = self.state.task_manager.generate_job_id();
-        self.submit_job_with_id(&job_id, job_name, ctx, plan, subscriber)
+        self.submit_plan_with_id(&job_id, job_name, ctx, plan, subscriber)
             .await
     }
 
@@ -295,11 +313,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         plan: &LogicalPlan,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<String> {
+        self.submit_plan_with_id(
+            &JobId::from(job_id),
+            job_name,
+            ctx,
+            &SubmitPlan::Logical(plan.clone()),
+            subscriber,
+        )
+        .await
+    }
+
+    /// Submits a plan using a caller-provided `job_id`.
+    pub async fn submit_plan_with_id(
+        &self,
+        job_id: &JobId,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: &SubmitPlan,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<String> {
         log::debug!("Received submit request for job {job_name} ({job_id})");
         self.query_stage_event_loop
             .get_sender()?
             .post_event(QueryStageSchedulerEvent::JobQueued {
-                job_id: job_id.to_owned(),
+                job_id: job_id.clone(),
                 job_name: job_name.to_owned(),
                 session_ctx: ctx,
                 plan: Box::new(plan.clone()),
@@ -308,14 +345,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             })
             .await?;
 
-        Ok(job_id.to_owned())
+        Ok(job_id.to_string())
     }
 
     /// Resumes driving a job whose execution graph was persisted to shared
     /// state by a scheduler that is no longer available. Acquires ownership
     /// and re-enters the scheduling loop. Returns `false` if the job could not
     /// be acquired.
-    pub async fn recover_job(&self, job_id: &str) -> Result<bool> {
+    pub async fn recover_job(&self, job_id: &JobId) -> Result<bool> {
         if !self.state.task_manager.recover_job(job_id).await? {
             return Ok(false);
         }
@@ -324,11 +361,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         // transition for recovered jobs too. (Best-effort: no subscribers is fine.)
         let _ = self
             .job_state_sender
-            .send(job_state_event::JobStateEvent::running(job_id));
+            .send(job_state_event::JobStateEvent::running(job_id.clone()));
         self.query_stage_event_loop
             .get_sender()?
             .post_event(QueryStageSchedulerEvent::JobSubmitted {
-                job_id: job_id.to_owned(),
+                job_id: job_id.clone(),
                 queued_at: timestamp_millis(),
                 submitted_at: timestamp_millis(),
             })
@@ -456,7 +493,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     RECONCILE_RUNNING_JOBS_INTERVAL_SECONDS,
                 ))
                 .await;
-                let job_ids: Vec<String> = state
+                let job_ids: Vec<JobId> = state
                     .task_manager
                     .get_running_job_cache()
                     .keys()
@@ -652,6 +689,7 @@ pub fn timestamp_millis() -> u64 {
 mod test {
     use std::sync::Arc;
 
+    use ballista_core::JobId;
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::protobuf::job_status::Status;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -663,6 +701,7 @@ mod test {
     use datafusion_proto::protobuf::LogicalPlanNode;
     use datafusion_proto::protobuf::PhysicalPlanNode;
 
+    use crate::scheduler_server::event::SubmitPlan;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
 
@@ -675,7 +714,8 @@ mod test {
         failed_task, job_status, task_status,
     };
     use ballista_core::serde::scheduler::{
-        ExecutorData, ExecutorMetadata, ExecutorSpecification,
+        ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
+        ExecutorSpecification,
     };
 
     use crate::scheduler_server::{SchedulerServer, timestamp_millis};
@@ -713,18 +753,18 @@ mod test {
             .create_or_update_session("session_id", &config)
             .await?;
 
-        let job_id = "job";
+        let job_id = JobId::new("job");
 
         // Enqueue job
         scheduler
             .state
             .task_manager
-            .queue_job(job_id, "", timestamp_millis())?;
+            .queue_job(&job_id, "", timestamp_millis())?;
 
         // Submit job
         scheduler
             .state
-            .submit_job(job_id, "", ctx, &plan, 0, None)
+            .submit_job(&job_id, "", ctx, &SubmitPlan::Logical(plan), 0, None)
             .await
             .expect("submitting plan");
 
@@ -732,7 +772,7 @@ mod test {
         while let Some(graph) = scheduler
             .state
             .task_manager
-            .get_active_execution_graph(job_id)
+            .get_active_execution_graph(&job_id)
         {
             let task = {
                 let mut graph = graph.write().await;
@@ -756,7 +796,7 @@ mod test {
                 // Complete the task
                 let task_status = TaskStatus {
                     task_id: task.task_id as u32,
-                    job_id: task.partition.job_id.clone(),
+                    job_id: task.partition.job_id.clone().into(),
                     stage_id: task.partition.stage_id as u32,
                     stage_attempt_num: task.stage_attempt_num as u32,
                     partition_id: task.partition.partition_id as u32,
@@ -782,7 +822,7 @@ mod test {
         let final_graph = scheduler
             .state
             .task_manager
-            .get_active_execution_graph(job_id)
+            .get_active_execution_graph(&job_id)
             .expect("Fail to find graph in the cache");
 
         let final_graph = final_graph.read().await;
@@ -1200,6 +1240,7 @@ mod test {
                     port: 8080,
                     grpc_port: 9090,
                     specification: ExecutorSpecification { task_slots },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 ExecutorData {
                     executor_id: "executor-1".to_owned(),
@@ -1216,6 +1257,7 @@ mod test {
                     specification: ExecutorSpecification {
                         task_slots: num_partitions as u32 - task_slots,
                     },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 ExecutorData {
                     executor_id: "executor-2".to_owned(),

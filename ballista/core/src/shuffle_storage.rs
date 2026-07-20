@@ -20,6 +20,7 @@
 //! This module provides a unified interface for reading and writing shuffle data
 //! to different storage backends including local filesystem, Amazon S3, and Azure Blob Storage.
 
+use crate::JobId;
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -245,7 +246,7 @@ pub trait ShuffleStorage: Send + Sync + Debug {
     /// Write a record batch to storage and return the path where it was written.
     async fn write_shuffle_data(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -258,7 +259,7 @@ pub trait ShuffleStorage: Send + Sync + Debug {
     async fn read_shuffle_data(&self, path: &str) -> Result<Vec<RecordBatch>>;
 
     /// Delete shuffle data for a job.
-    async fn delete_job_data(&self, job_id: &str) -> Result<()>;
+    async fn delete_job_data(&self, job_id: &JobId) -> Result<()>;
 
     /// Get the base path/URL for this storage.
     fn base_path(&self) -> &str;
@@ -286,7 +287,7 @@ impl LocalShuffleStorage {
 impl ShuffleStorage for LocalShuffleStorage {
     async fn write_shuffle_data(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -295,7 +296,7 @@ impl ShuffleStorage for LocalShuffleStorage {
         write_metric: &metrics::Time,
     ) -> Result<(String, PartitionStats)> {
         let mut path = PathBuf::from(&self.work_dir);
-        path.push(job_id);
+        path.push(job_id.as_str());
         path.push(format!("{}", stage_id));
         path.push(format!("{}", partition_id));
         std::fs::create_dir_all(&path)?;
@@ -363,9 +364,9 @@ impl ShuffleStorage for LocalShuffleStorage {
         Ok(batches)
     }
 
-    async fn delete_job_data(&self, job_id: &str) -> Result<()> {
+    async fn delete_job_data(&self, job_id: &JobId) -> Result<()> {
         let mut path = PathBuf::from(&self.work_dir);
-        path.push(job_id);
+        path.push(job_id.as_str());
         if path.exists() {
             std::fs::remove_dir_all(&path)?;
         }
@@ -578,7 +579,7 @@ impl ObjectStoreShuffleStorage {
     /// so it reattaches the prefix transparently.
     pub fn make_full_url(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -598,7 +599,7 @@ impl ObjectStoreShuffleStorage {
     /// then call `finish()` to complete the upload.
     pub async fn start_multipart_write(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -622,7 +623,7 @@ impl ObjectStoreShuffleStorage {
 
     fn make_path(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -641,7 +642,7 @@ impl ObjectStoreShuffleStorage {
 impl ShuffleStorage for ObjectStoreShuffleStorage {
     async fn write_shuffle_data(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition_id: usize,
         input_partition: usize,
@@ -734,8 +735,8 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         Ok(batches)
     }
 
-    async fn delete_job_data(&self, job_id: &str) -> Result<()> {
-        let prefix = ObjectPath::from(job_id.to_string());
+    async fn delete_job_data(&self, job_id: &JobId) -> Result<()> {
+        let prefix = ObjectPath::from(job_id.as_str().to_string());
 
         // List all objects with the job_id prefix (relative to the storage's path_prefix —
         // PrefixStore reattaches the URL path prefix on every operation).
@@ -861,9 +862,10 @@ mod tests {
         let time_metric =
             metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
 
+        let test_job = JobId::new("test_job");
         let (path, stats) = storage
             .write_shuffle_data(
-                "test_job",
+                &test_job,
                 1,
                 0,
                 0,
@@ -893,14 +895,18 @@ mod tests {
         let time_metric =
             metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
 
+        let test_job = JobId::new("test_job");
         let (path, _) = storage
-            .write_shuffle_data("test_job", 1, 0, 0, vec![batch], schema, &time_metric)
+            .write_shuffle_data(&test_job, 1, 0, 0, vec![batch], schema, &time_metric)
             .await
             .unwrap();
 
         assert!(std::path::Path::new(&path).exists());
 
-        storage.delete_job_data("test_job").await.unwrap();
+        storage
+            .delete_job_data(&JobId::from("test_job"))
+            .await
+            .unwrap();
         assert!(!std::path::Path::new(&path).exists());
     }
 
@@ -1076,7 +1082,8 @@ mod tests {
     fn test_make_full_url_returns_relative_object_path() {
         let (storage, _inner) = build_storage_for_test("s3://my-bucket/shuffle/prefix");
 
-        let (full_url, object_path) = storage.make_full_url("job_a", 1, 40, 40, "arrow");
+        let job_a = JobId::new("job_a");
+        let (full_url, object_path) = storage.make_full_url(&job_a, 1, 40, 40, "arrow");
         assert_eq!(
             full_url,
             "s3://my-bucket/shuffle/prefix/job_a/1/40/data.arrow"
@@ -1088,7 +1095,8 @@ mod tests {
     fn test_make_full_url_no_prefix_round_trip() {
         let (storage, _inner) = build_storage_for_test("s3://my-bucket");
 
-        let (full_url, object_path) = storage.make_full_url("job_a", 1, 0, 0, "arrow");
+        let job_a = JobId::new("job_a");
+        let (full_url, object_path) = storage.make_full_url(&job_a, 1, 0, 0, "arrow");
         assert_eq!(full_url, "s3://my-bucket/job_a/1/0/data.arrow");
         assert_eq!(object_path.as_ref(), "job_a/1/0/data.arrow");
     }
@@ -1106,8 +1114,9 @@ mod tests {
         let time_metric =
             metrics::MetricBuilder::new(&metrics).subset_time("write_time", 0);
 
+        let job_a = JobId::new("job_a");
         let (full_url, _stats) = storage
-            .write_shuffle_data("job_a", 1, 0, 0, vec![batch], schema, &time_metric)
+            .write_shuffle_data(&job_a, 1, 0, 0, vec![batch], schema, &time_metric)
             .await
             .unwrap();
         assert_eq!(
@@ -1127,7 +1136,10 @@ mod tests {
         assert_eq!(read_batches.len(), 1);
         assert_eq!(read_batches[0].num_rows(), 3);
 
-        storage.delete_job_data("job_a").await.unwrap();
+        storage
+            .delete_job_data(&JobId::from("job_a"))
+            .await
+            .unwrap();
         assert!(storage.read_shuffle_data(&full_url).await.is_err());
     }
 }

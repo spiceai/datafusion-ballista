@@ -20,6 +20,7 @@
 //! This trait provides a common interface for both standard hash-based shuffle
 //! (`ShuffleWriterExec`) and sort-based shuffle (`SortShuffleWriterExec`).
 
+use crate::JobId;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use std::sync::Arc;
 /// and execution graph to work with different shuffle implementations.
 pub trait ShuffleWriter: ExecutionPlan + Debug + Send + Sync {
     /// Get the Job ID for this query stage.
-    fn job_id(&self) -> &str;
+    fn job_id(&self) -> &JobId;
 
     /// Get the Stage ID for this query stage.
     fn stage_id(&self) -> usize;

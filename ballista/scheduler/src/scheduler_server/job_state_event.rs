@@ -21,6 +21,7 @@
 //! Consumers can subscribe to receive notifications when jobs change state, avoiding
 //! the need to poll for status updates.
 
+use ballista_core::JobId;
 use std::fmt;
 
 /// Represents the current state of a job in the scheduler.
@@ -60,14 +61,14 @@ impl fmt::Display for JobState {
 #[derive(Debug, Clone)]
 pub struct JobStateEvent {
     /// The unique identifier of the job.
-    pub job_id: String,
+    pub job_id: JobId,
     /// The new state of the job.
     pub state: JobState,
 }
 
 impl JobStateEvent {
     /// Creates a new job state event.
-    pub fn new(job_id: impl Into<String>, state: JobState) -> Self {
+    pub fn new(job_id: impl Into<JobId>, state: JobState) -> Self {
         Self {
             job_id: job_id.into(),
             state,
@@ -75,27 +76,27 @@ impl JobStateEvent {
     }
 
     /// Creates a queued event for the given job.
-    pub fn queued(job_id: impl Into<String>) -> Self {
+    pub fn queued(job_id: impl Into<JobId>) -> Self {
         Self::new(job_id, JobState::Queued)
     }
 
     /// Creates a running event for the given job.
-    pub fn running(job_id: impl Into<String>) -> Self {
+    pub fn running(job_id: impl Into<JobId>) -> Self {
         Self::new(job_id, JobState::Running)
     }
 
     /// Creates a completed event for the given job.
-    pub fn completed(job_id: impl Into<String>) -> Self {
+    pub fn completed(job_id: impl Into<JobId>) -> Self {
         Self::new(job_id, JobState::Completed)
     }
 
     /// Creates a failed event for the given job.
-    pub fn failed(job_id: impl Into<String>, error: impl Into<String>) -> Self {
+    pub fn failed(job_id: impl Into<JobId>, error: impl Into<String>) -> Self {
         Self::new(job_id, JobState::Failed(error.into()))
     }
 
     /// Creates a cancelled event for the given job.
-    pub fn cancelled(job_id: impl Into<String>) -> Self {
+    pub fn cancelled(job_id: impl Into<JobId>) -> Self {
         Self::new(job_id, JobState::Cancelled)
     }
 }
@@ -117,7 +118,7 @@ mod tests {
     #[test]
     fn test_job_state_event_creation() {
         let event = JobStateEvent::queued("job-123");
-        assert_eq!(event.job_id, "job-123");
+        assert_eq!(event.job_id, JobId::new("job-123"));
         assert_eq!(event.state, JobState::Queued);
 
         let event = JobStateEvent::running("job-123");

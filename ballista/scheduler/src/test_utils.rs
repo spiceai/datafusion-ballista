@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use ballista_core::JobId;
 use ballista_core::JobStatusSubscriber;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::extension::SessionConfigExt;
@@ -40,7 +41,8 @@ use ballista_core::serde::protobuf::{
     TaskId, TaskStatus, task_status,
 };
 use ballista_core::serde::scheduler::{
-    ExecutorData, ExecutorMetadata, ExecutorSpecification,
+    ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
+    ExecutorSpecification,
 };
 use ballista_core::serde::{BallistaCodec, protobuf};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -452,6 +454,7 @@ impl SchedulerTest {
                 specification: ExecutorSpecification {
                     task_slots: task_slots as u32,
                 },
+                os_info: ExecutorOperatingSystemSpecification::default(),
             };
 
             let executor_data = ExecutorData {
@@ -544,7 +547,7 @@ impl SchedulerTest {
         self.scheduler
             .query_stage_event_loop
             .get_sender()?
-            .post_event(QueryStageSchedulerEvent::JobCancel(job_id.to_owned()))
+            .post_event(QueryStageSchedulerEvent::JobCancel(JobId::from(job_id)))
             .await
     }
 
@@ -560,7 +563,7 @@ impl SchedulerTest {
                 .scheduler
                 .state
                 .task_manager
-                .get_job_status(job_id)
+                .get_job_status(&JobId::from(job_id))
                 .await?;
 
             if let Some(JobStatus {
@@ -596,7 +599,7 @@ impl SchedulerTest {
                 .scheduler
                 .state
                 .task_manager
-                .get_job_status(job_id)
+                .get_job_status(&JobId::from(job_id))
                 .await?;
 
             if let Some(JobStatus {
@@ -662,7 +665,7 @@ impl SchedulerTest {
                 .scheduler
                 .state
                 .task_manager
-                .get_job_status(&job_id)
+                .get_job_status(&JobId::from(job_id.as_str()))
                 .await?;
 
             if let Some(JobStatus {
@@ -736,74 +739,94 @@ impl TestMetricsCollector {
 }
 
 impl SchedulerMetricsCollector for TestMetricsCollector {
-    fn record_submitted(&self, job_id: &str, queued_at: u64, submitted_at: u64) {
+    fn record_submitted(&self, job_id: &JobId, queued_at: u64, submitted_at: u64) {
         let mut guard = self.events.lock();
         guard.push(MetricEvent::Submitted(
-            job_id.to_owned(),
+            job_id.to_string(),
             queued_at,
             submitted_at,
         ));
     }
 
-    fn record_completed(&self, job_id: &str, queued_at: u64, completed_at: u64) {
+    fn record_completed(&self, job_id: &JobId, queued_at: u64, completed_at: u64) {
         let mut guard = self.events.lock();
         guard.push(MetricEvent::Completed(
-            job_id.to_owned(),
+            job_id.to_string(),
             queued_at,
             completed_at,
         ));
     }
 
-    fn record_failed(&self, job_id: &str, queued_at: u64, failed_at: u64) {
+    fn record_failed(&self, job_id: &JobId, queued_at: u64, failed_at: u64) {
         let mut guard = self.events.lock();
-        guard.push(MetricEvent::Failed(job_id.to_owned(), queued_at, failed_at));
+        guard.push(MetricEvent::Failed(
+            job_id.to_string(),
+            queued_at,
+            failed_at,
+        ));
     }
 
-    fn record_cancelled(&self, job_id: &str) {
+    fn record_cancelled(&self, job_id: &JobId) {
         let mut guard = self.events.lock();
-        guard.push(MetricEvent::Cancelled(job_id.to_owned()));
+        guard.push(MetricEvent::Cancelled(job_id.to_string()));
     }
 
     fn set_pending_tasks_queue_size(&self, _value: u64) {}
     fn set_pending_jobs_queue_size(&self, _value: u64) {}
 
     // Stage lifecycle
-    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, _task_count: usize) {}
-    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, _duration_ms: u64) {
+    fn record_stage_started(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _task_count: usize,
+    ) {
     }
-    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, _error_type: &str) {}
-    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_stage_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _duration_ms: u64,
+    ) {
+    }
+    fn record_stage_failed(&self, _job_id: &JobId, _stage_id: usize, _error_type: &str) {}
+    fn record_stage_retry(&self, _job_id: &JobId, _stage_id: usize) {}
 
     // Task scheduling
     fn record_task_scheduled(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         _latency_ms: u64,
     ) {
     }
-    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(
+        &self,
+        _job_id: &JobId,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
     }
     fn record_task_failed(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         _error_type: &str,
     ) {
     }
-    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {}
+    fn record_task_retry(&self, _job_id: &JobId, _stage_id: usize) {}
     fn record_task_shuffle_affinity_hit(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
     }
     fn record_task_shuffle_affinity_miss(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
@@ -815,7 +838,7 @@ impl SchedulerMetricsCollector for TestMetricsCollector {
     fn record_executor_deregistered(&self, _executor_id: &str) {}
 
     // Planning
-    fn record_planning_duration(&self, _job_id: &str, _duration_ms: u64) {}
+    fn record_planning_duration(&self, _job_id: &JobId, _duration_ms: u64) {}
 
     fn gather_metrics(&self) -> Result<Option<(Vec<u8>, String)>> {
         Ok(None)
@@ -919,13 +942,13 @@ pub fn revive_graph_and_complete_next_stage_with_executor(
 
 /// Creates a test execution graph with a simple aggregation plan.
 pub async fn test_aggregation_plan(partition: usize) -> StaticExecutionGraph {
-    test_aggregation_plan_with_job_id(partition, "job").await
+    test_aggregation_plan_with_job_id(partition, &JobId::new("job")).await
 }
 
 /// Creates a test execution graph with a simple aggregation plan and custom job ID.
 pub async fn test_aggregation_plan_with_job_id(
     partition: usize,
-    job_id: &str,
+    job_id: &JobId,
 ) -> StaticExecutionGraph {
     let config = SessionConfig::new().with_target_partitions(partition);
     let ctx = Arc::new(SessionContext::new_with_config(config));
@@ -966,6 +989,7 @@ pub async fn test_aggregation_plan_with_job_id(
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap()
 }
@@ -1007,13 +1031,14 @@ pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGrap
 
     StaticExecutionGraph::new(
         "localhost:50050",
-        "job",
+        &JobId::new("job"),
         "",
         "session",
         plan,
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap()
 }
@@ -1047,13 +1072,14 @@ pub async fn test_coalesce_plan(partition: usize) -> StaticExecutionGraph {
 
     StaticExecutionGraph::new(
         "localhost:50050",
-        "job",
+        &JobId::new("job"),
         "",
         "session",
         plan,
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap()
 }
@@ -1107,13 +1133,14 @@ pub async fn test_join_plan(partition: usize) -> StaticExecutionGraph {
     let mut planner = DefaultDistributedPlanner::new();
     let graph = StaticExecutionGraph::new(
         "localhost:50050",
-        "job",
+        &JobId::new("job"),
         "",
         "session",
         plan,
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap();
 
@@ -1149,13 +1176,14 @@ pub async fn test_union_all_plan(partition: usize) -> StaticExecutionGraph {
     let mut planner = DefaultDistributedPlanner::new();
     let graph = StaticExecutionGraph::new(
         "localhost:50050",
-        "job",
+        &JobId::new("job"),
         "",
         "session",
         plan,
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap();
 
@@ -1191,13 +1219,14 @@ pub async fn test_union_plan(partition: usize) -> StaticExecutionGraph {
     let mut planner = DefaultDistributedPlanner::new();
     let graph = StaticExecutionGraph::new(
         "localhost:50050",
-        "job",
+        &JobId::new("job"),
         "",
         "session",
         plan,
         0,
         Arc::new(SessionConfig::new_with_ballista()),
         &mut planner,
+        None,
     )
     .unwrap();
 
@@ -1214,6 +1243,7 @@ pub fn mock_executor(executor_id: String) -> ExecutorMetadata {
         port: 8080,
         grpc_port: 9090,
         specification: ExecutorSpecification { task_slots: 1 },
+        os_info: ExecutorOperatingSystemSpecification::default(),
     }
 }
 
@@ -1241,7 +1271,7 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
     // Complete the task
     protobuf::TaskStatus {
         task_id: task.task_id as u32,
-        job_id: task.partition.job_id.clone(),
+        job_id: task.partition.job_id.clone().into(),
         stage_id: task.partition.stage_id as u32,
         stage_attempt_num: task.stage_attempt_num as u32,
         partition_id: task.partition.partition_id as u32,
@@ -1280,7 +1310,7 @@ pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskS
     // Fail the task
     protobuf::TaskStatus {
         task_id: task.task_id as u32,
-        job_id: task.partition.job_id.clone(),
+        job_id: task.partition.job_id.clone().into(),
         stage_id: task.partition.stage_id as u32,
         stage_attempt_num: task.stage_attempt_num as u32,
         partition_id: task.partition.partition_id as u32,

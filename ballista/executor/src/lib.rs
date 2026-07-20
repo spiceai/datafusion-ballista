@@ -18,6 +18,8 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+/// Connection pool for shuffle-fetch clients.
+mod client_pool;
 /// Execution plan for collecting distributed query results into a single partition.
 pub mod collect;
 /// Command-line configuration for the executor binary.
@@ -37,6 +39,8 @@ pub mod executor_server;
 pub mod flight_service;
 /// Metrics collection for executor runtime statistics.
 pub mod metrics;
+/// Session-scoped cache of shared executor runtime environments.
+pub mod runtime_cache;
 /// Graceful shutdown coordination for executor components.
 pub mod shutdown;
 /// Signal handling for process termination.
@@ -113,7 +117,7 @@ pub fn as_task_status(
             );
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id,
+                job_id: partition_id.job_id.clone().into(),
                 stage_id: partition_id.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 partition_id: partition_id.partition_id as u32,
@@ -133,7 +137,7 @@ pub fn as_task_status(
 
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id,
+                job_id: partition_id.job_id.clone().into(),
                 stage_id: partition_id.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 partition_id: partition_id.partition_id as u32,

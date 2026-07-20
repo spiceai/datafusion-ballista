@@ -62,10 +62,9 @@ use tonic::{Code, Streaming};
 #[derive(Clone)]
 pub struct BallistaClient {
     flight_client: FlightServiceClient<tonic::transport::channel::Channel>,
+    io_retries_times: u8,
+    io_retry_wait_time_ms: u64,
 }
-
-//TODO make this configurable
-const IO_RETRIES_TIMES: u8 = 3;
 
 /// True when the status says the pooled channel itself is unusable — tonic
 /// surfaces a failed channel as `Code::Unknown` with a transport-error message
@@ -79,20 +78,6 @@ fn is_dead_channel_error(status: &tonic::Status) -> bool {
         msg.contains("Service was not ready") || msg.contains("transport error")
     }
 }
-const IO_RETRY_WAIT_TIME_MS: u64 = 3000;
-
-/// HTTP/2 flow-control windows for the pooled shuffle-fetch connection. All of
-/// a peer's concurrent DoGet streams multiplex over one pooled connection, and
-/// for server->client data the CLIENT's advertised receive windows govern.
-/// The h2 defaults (64KB stream AND connection) mean every partition transfer
-/// to this executor shares a single 64KB connection window: with ~100
-/// concurrent reducer streams of real (SF100-sized) partitions the window
-/// exhausts instantly and streams starve each other — observed as every
-/// reducer task on the cluster parked mid-fetch indefinitely, pinning all task
-/// slots. Match the flight data plane's windows (16MB/stream, 64MB/connection).
-const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
-const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
-
 /// Read-inactivity bound for shuffle data streams. The endpoint's request
 /// timeout only bounds time-to-response-headers, not the streaming body, so a
 /// peer stream that stalls mid-transfer otherwise hangs the reducer task
@@ -163,12 +148,17 @@ impl RecordBatchStream for InactivityTimeoutStream {
 impl BallistaClient {
     /// Create a new BallistaClient to connect to the executor listening on the specified
     /// host and port
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_new(
         host: &str,
         port: u16,
         max_message_size: usize,
         use_tls: bool,
         customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+        io_retries_times: u8,
+        io_retry_wait_time_ms: u64,
+        initial_connection_window_size: u32,
+        initial_stream_window_size: u32,
     ) -> BResult<Self> {
         let scheme = if use_tls { "https" } else { "http" };
 
@@ -187,6 +177,7 @@ impl BallistaClient {
             timeout_seconds: 3600,
             tcp_keepalive_seconds: 3600,
             http2_keepalive_interval_seconds: 60,
+            ..Default::default()
         };
         let mut endpoint = create_grpc_client_endpoint(addr.clone(), Some(&grpc_config))
             .map_err(|e| {
@@ -194,8 +185,6 @@ impl BallistaClient {
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
                 ))
             })?
-            .initial_stream_window_size(Some(HTTP2_INITIAL_STREAM_WINDOW_SIZE))
-            .initial_connection_window_size(Some(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE))
             // Override the default 20s keepalive-ack timeout: PONG processing
             // happens on the connection driver task, and under heavy load a
             // delayed poll past the timeout makes hyper abort the connection,
@@ -203,6 +192,15 @@ impl BallistaClient {
             // delay while dead-path detection (interval + timeout ~2min) stays
             // well inside the stream-inactivity bound.
             .keep_alive_timeout(std::time::Duration::from_secs(60));
+
+        if initial_stream_window_size > 0 {
+            endpoint =
+                endpoint.initial_stream_window_size(Some(initial_stream_window_size));
+        }
+        if initial_connection_window_size > 0 {
+            endpoint = endpoint
+                .initial_connection_window_size(Some(initial_connection_window_size));
+        }
 
         if let Some(customize) = customize_endpoint {
             endpoint = customize
@@ -226,7 +224,27 @@ impl BallistaClient {
 
         debug!("BallistaClient connected OK: {flight_client:?}");
 
-        Ok(Self { flight_client })
+        Ok(Self {
+            flight_client,
+            io_retries_times,
+            io_retry_wait_time_ms,
+        })
+    }
+
+    /// creates a ballista client to be used for testing
+    /// it connects lazily and which can not really
+    /// be reconfigured.
+    pub fn new_for_test(host: &str, port: u16) -> Self {
+        use tonic::transport::Endpoint;
+        let addr = format!("http://{host}:{port}");
+        let channel = Endpoint::from_shared(addr)
+            .expect("valid address")
+            .connect_lazy();
+        Self {
+            flight_client: FlightServiceClient::new(channel),
+            io_retries_times: 3,
+            io_retry_wait_time_ms: 250,
+        }
     }
 
     /// Retrieves a partition from an executor.
@@ -315,13 +333,15 @@ impl BallistaClient {
             .encode(&mut buf)
             .map_err(|e| BallistaError::GrpcActionError(format!("{e:?}")))?;
 
-        for i in 0..IO_RETRIES_TIMES {
+        let io_retries_times = self.io_retries_times.max(1);
+        let io_retry_wait_time_ms = self.io_retry_wait_time_ms;
+        for i in 0..io_retries_times {
             if i > 0 {
                 warn!(
-                    "Remote shuffle read fail, retry {i} times, sleep {IO_RETRY_WAIT_TIME_MS} ms."
+                    "Remote shuffle read fail, retry {i} times, sleep {io_retry_wait_time_ms} ms."
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(
-                    IO_RETRY_WAIT_TIME_MS,
+                    io_retry_wait_time_ms,
                 ))
                 .await;
             }
@@ -345,7 +365,7 @@ impl BallistaClient {
                     // This means IO related error will retry. A dead pooled
                     // channel also reports Code::Unknown but can never recover
                     // by retrying on the same channel; fail fast instead.
-                    if i == IO_RETRIES_TIMES - 1
+                    if i == io_retries_times - 1
                         || err.code() != Code::Unknown
                         || is_dead_channel_error(err)
                     {
@@ -379,7 +399,7 @@ impl BallistaClient {
                     };
                 }
                 Err(e) => {
-                    if i == IO_RETRIES_TIMES - 1
+                    if i == io_retries_times - 1
                         || e.code() != Code::Unknown
                         || is_dead_channel_error(&e)
                     {
@@ -412,13 +432,15 @@ impl BallistaClient {
             .encode(&mut buf)
             .map_err(|e| BallistaError::GrpcActionError(format!("{e:?}")))?;
 
-        for i in 0..IO_RETRIES_TIMES {
+        let io_retries_times = self.io_retries_times.max(1);
+        let io_retry_wait_time_ms = self.io_retry_wait_time_ms;
+        for i in 0..io_retries_times {
             if i > 0 {
                 warn!(
-                    "Remote shuffle read fail, retry {i} times, sleep {IO_RETRY_WAIT_TIME_MS} ms."
+                    "Remote shuffle read fail, retry {i} times, sleep {io_retry_wait_time_ms} ms."
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(
-                    IO_RETRY_WAIT_TIME_MS,
+                    io_retry_wait_time_ms,
                 ))
                 .await;
             }
@@ -443,7 +465,7 @@ impl BallistaClient {
                     // This means IO related error will retry. A dead pooled
                     // channel also reports Code::Unknown but can never recover
                     // by retrying on the same channel; fail fast instead.
-                    if i == IO_RETRIES_TIMES - 1
+                    if i == io_retries_times - 1
                         || err.code() != Code::Unknown
                         || is_dead_channel_error(err)
                     {

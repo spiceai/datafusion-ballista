@@ -30,6 +30,7 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{error, info, warn};
+use sysinfo::{Disks, System};
 use tempfile::TempDir;
 use tokio::fs::DirEntry;
 use tokio::signal;
@@ -38,13 +39,19 @@ use tokio::task::JoinHandle;
 use tokio::{fs, time};
 use uuid::Uuid;
 
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::prelude::SessionConfig;
 
-use crate::execution_engine::ExecutionEngine;
+use crate::client_pool::DefaultBallistaClientPool;
+use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
 use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;
 use crate::flight_service::BallistaFlightService;
-use crate::metrics::LoggingMetricsCollector;
+use crate::metrics::{ExecutorMetricCollectionPolicy, LoggingMetricsCollector};
+use crate::runtime_cache::{
+    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+};
 use crate::shutdown::Shutdown;
 use crate::shutdown::ShutdownNotifier;
 use crate::{ArrowFlightServerProvider, terminate};
@@ -55,8 +62,9 @@ use ballista_core::extension::{EndpointOverrideFn, SessionConfigExt};
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::executor_status::Status;
 use ballista_core::serde::protobuf::{
-    ExecutorRegistration, ExecutorResource, ExecutorSpecification, ExecutorStatus,
-    ExecutorStoppedParams, HeartBeatParams, scheduler_grpc_client::SchedulerGrpcClient,
+    ExecutorOperatingSystemSpecification, ExecutorRegistration, ExecutorResource,
+    ExecutorSpecification, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
+    scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
@@ -65,7 +73,41 @@ use ballista_core::utils::{
     GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
     default_config_producer, get_time_before,
 };
-use ballista_core::{BALLISTA_VERSION, ConfigProducer, RuntimeProducer};
+use ballista_core::{BALLISTA_VERSION, ConfigProducer, JobId, RuntimeProducer};
+
+/// Builds a per-task memory-pool policy: each task's runtime is rebuilt from the
+/// shared base env with a fresh [`FairSpillPool`] of size
+/// `total_bytes / concurrent_tasks`. The base env's disk manager, cache manager,
+/// and object-store registry are preserved via
+/// [`RuntimeEnvBuilder::from_runtime_env`].
+///
+/// Returns an error if the per-task share would be zero (i.e. `total_bytes <
+/// concurrent_tasks`).
+fn memory_pool_policy(
+    total_bytes: u64,
+    concurrent_tasks: usize,
+) -> Result<MemoryPoolPolicy, BallistaError> {
+    let per_task = (total_bytes / concurrent_tasks as u64) as usize;
+    if per_task == 0 {
+        return Err(BallistaError::Configuration(format!(
+            "memory_pool_size ({total_bytes} bytes) is smaller than concurrent_tasks ({concurrent_tasks})"
+        )));
+    }
+    Ok(Arc::new(
+        move |base: Arc<RuntimeEnv>, _config: &SessionConfig| {
+            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(per_task));
+            RuntimeEnvBuilder::from_runtime_env(&base)
+                .with_memory_pool(pool)
+                .build_arc()
+        },
+    ))
+}
+
+/// A no-op policy: the task uses the shared base env unchanged (DataFusion's
+/// default unbounded pool). Used when `--memory-pool-size` is unset.
+fn identity_pool_policy() -> MemoryPoolPolicy {
+    Arc::new(|base, _config| Ok(base))
+}
 
 /// Configuration for the executor process.
 ///
@@ -113,6 +155,18 @@ pub struct ExecutorProcessConfig {
     pub grpc_server_config: GrpcServerConfig,
     /// Interval in seconds between heartbeat messages.
     pub executor_heartbeat_interval_seconds: u64,
+    /// Metric collection policy of this executor instance.
+    pub metric_collection_policy: ExecutorMetricCollectionPolicy,
+    /// Optional total memory pool size in bytes. When set, every task's
+    /// runtime env receives a FairSpillPool of size
+    /// `memory_pool_size / concurrent_tasks`. When `None`, no pool is
+    /// installed and DataFusion falls back to its unbounded default.
+    pub memory_pool_size: Option<u64>,
+    /// Maximum number of sessions whose shared base runtime env is retained on
+    /// the executor (LRU). Sharing reuses object-store clients and the Parquet
+    /// footer cache across a session's tasks and queries. `0` disables caching
+    /// and builds a fresh runtime per task.
+    pub session_runtime_cache_capacity: usize,
     /// Optional execution engine to use to execute physical plans, will default to
     /// DataFusion if none is provided.
     pub override_execution_engine: Option<Arc<dyn ExecutionEngine>>,
@@ -130,6 +184,8 @@ pub struct ExecutorProcessConfig {
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
     /// Override function for customizing gRPC client endpoints before they are used
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// Number of seconds established client connection should be cached (0 means no cache)
+    pub client_ttl: u64,
 }
 
 impl ExecutorProcessConfig {
@@ -168,6 +224,9 @@ impl Default for ExecutorProcessConfig {
             grpc_max_encoding_message_size: 16777216,
             grpc_server_config: Default::default(),
             executor_heartbeat_interval_seconds: 60,
+            metric_collection_policy: ExecutorMetricCollectionPolicy::default(),
+            memory_pool_size: None,
+            session_runtime_cache_capacity: 16,
             override_execution_engine: None,
             override_function_registry: None,
             override_runtime_producer: None,
@@ -176,6 +235,7 @@ impl Default for ExecutorProcessConfig {
             override_physical_codec: None,
             override_arrow_flight_service: None,
             override_create_grpc_client_endpoint: None,
+            client_ttl: 0,
         }
     }
 }
@@ -228,17 +288,8 @@ pub async fn start_executor_process(
     info!("Executor number of concurrent tasks: {concurrent_tasks}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
-    let executor_meta = ExecutorRegistration {
-        id: executor_id.clone(),
-        host: opt.external_host.clone(),
-        port: opt.port as u32,
-        grpc_port: opt.grpc_port as u32,
-        specification: Some(ExecutorSpecification {
-            resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
-            }],
-        }),
-    };
+    let executor_meta =
+        structure_executor_metadata(&executor_id, &opt, concurrent_tasks as u32);
 
     // put them to session config
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());
@@ -248,7 +299,7 @@ pub async fn start_executor_process(
         .unwrap_or_else(|| Arc::new(default_config_producer));
 
     let wd = work_dir.clone();
-    let runtime_producer: RuntimeProducer =
+    let base_runtime_producer: RuntimeProducer =
         opt.override_runtime_producer.clone().unwrap_or_else(|| {
             Arc::new(move |_| {
                 let runtime_env = RuntimeEnvBuilder::new()
@@ -257,6 +308,26 @@ pub async fn start_executor_process(
                 Ok(Arc::new(runtime_env))
             })
         });
+
+    let pool_policy: MemoryPoolPolicy = if let Some(total) = opt.memory_pool_size {
+        let policy = memory_pool_policy(total, concurrent_tasks)?;
+        let per_task = total / concurrent_tasks as u64;
+        info!(
+            "Memory pool: total {total} bytes split into {concurrent_tasks} tasks ({per_task} bytes each)"
+        );
+        policy
+    } else {
+        identity_pool_policy()
+    };
+
+    // Combined producer preserving the current per-task behavior: build a fresh
+    // base env, then apply the pool policy. Used by `Executor::produce_runtime`
+    // and as the fallback when session caching is disabled.
+    let runtime_producer: RuntimeProducer = {
+        let base = base_runtime_producer.clone();
+        let policy = pool_policy.clone();
+        Arc::new(move |config: &SessionConfig| policy(base(config)?, config))
+    };
 
     let logical = opt
         .override_logical_codec
@@ -273,16 +344,43 @@ pub async fn start_executor_process(
         datafusion_proto::protobuf::PhysicalPlanNode,
     > = BallistaCodec::new(logical, physical);
 
-    let executor = Arc::new(Executor::new(
-        executor_meta,
-        &work_dir,
-        runtime_producer,
-        config_producer,
-        opt.override_function_registry.clone().unwrap_or_default(),
-        metrics_collector,
-        concurrent_tasks,
-        opt.override_execution_engine.clone(),
-    ));
+    // Session caching applies only to the default runtime producer. With an
+    // override producer we cannot split base + pool, so we serve per-task as
+    // before by leaving the cache unset.
+    let session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>> =
+        if opt.override_runtime_producer.is_none() {
+            Some(Arc::new(DefaultSessionRuntimeCache::new(
+                base_runtime_producer.clone(),
+                pool_policy.clone(),
+                opt.session_runtime_cache_capacity,
+            )))
+        } else {
+            None
+        };
+
+    let executor = Arc::new(
+        Executor::new(
+            executor_meta,
+            &work_dir,
+            runtime_producer,
+            config_producer,
+            opt.override_function_registry.clone().unwrap_or_default(),
+            metrics_collector,
+            concurrent_tasks,
+            Some(opt.override_execution_engine.clone().unwrap_or_else(|| {
+                if opt.client_ttl > 0 {
+                    let client_pool =
+                        Arc::new(DefaultBallistaClientPool::with_eviction_thread(
+                            Duration::from_secs(opt.client_ttl),
+                        ));
+                    Arc::new(DefaultExecutionEngine::with_client_pool(client_pool))
+                } else {
+                    Arc::new(DefaultExecutionEngine::new())
+                }
+            })),
+        )
+        .with_session_runtime_cache(session_runtime_cache),
+    );
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
     let session_config = (executor.config_producer)();
@@ -500,17 +598,11 @@ pub async fn start_executor_process(
                 status: Some(ExecutorStatus {
                     status: Some(Status::Terminating(String::default())),
                 }),
-                metadata: Some(ExecutorRegistration {
-                    id: executor_id.clone(),
-                    host: opt.external_host.clone(),
-                    port: opt.port as u32,
-                    grpc_port: opt.grpc_port as u32,
-                    specification: Some(ExecutorSpecification {
-                        resources: vec![ExecutorResource {
-                            resource: Some(Resource::TaskSlots(concurrent_tasks as u32)),
-                        }],
-                    }),
-                }),
+                metadata: Some(structure_executor_metadata(
+                    &executor_id,
+                    &opt,
+                    concurrent_tasks as u32,
+                )),
             })
             .await
         {
@@ -662,7 +754,7 @@ async fn clean_all_shuffle_data(work_dir: &str) -> ballista_core::error::Result<
         }
     }
 
-    info!("The work_dir {:?} will be deleted", &to_deleted);
+    info!("The work_dir {:?} will be deleted", to_deleted);
     for del in to_deleted {
         if let Err(e) = fs::remove_dir_all(&del).await {
             error!("Fail to remove the directory {del:?} due to {e}");
@@ -671,14 +763,19 @@ async fn clean_all_shuffle_data(work_dir: &str) -> ballista_core::error::Result<
     Ok(())
 }
 
-/// Remove a job directory under work_dir.
+/// Remove job data under work_dir.
 /// Used by both push-based (gRPC handler) and pull-based (poll loop) cleanup.
-pub(crate) async fn remove_job_dir(
+///
+/// `remove_stage_ids` empty ⇒ remove the whole `work_dir/{job_id}` dir (legacy
+/// behavior). Non-empty ⇒ remove only the listed `work_dir/{job_id}/{stage_id}`
+/// subdirs, retaining the rest of the job dir (e.g. the final-stage output).
+pub(crate) async fn remove_job_data(
     work_dir: &str,
-    job_id: &str,
+    job_id: &JobId,
+    remove_stage_ids: &[u32],
 ) -> ballista_core::error::Result<()> {
     let work_path = PathBuf::from(&work_dir);
-    let job_path = work_path.join(job_id);
+    let job_path = work_path.join(job_id.as_str());
 
     // Match legacy behavior: If the job path does not exist, return OK
     if !tokio::fs::try_exists(&job_path).await.unwrap_or(false) {
@@ -695,11 +792,30 @@ pub(crate) async fn remove_job_dir(
         )));
     }
 
-    info!("Remove data for job {:?}", job_id);
+    // Empty stage list ⇒ remove the whole job dir (legacy behavior).
+    if remove_stage_ids.is_empty() {
+        info!("Remove data for job {:?}", job_id);
+        return tokio::fs::remove_dir_all(&job_path).await.map_err(|e| {
+            BallistaError::General(format!("Failed to remove {job_path:?} due to {e}"))
+        });
+    }
 
-    tokio::fs::remove_dir_all(&job_path).await.map_err(|e| {
-        BallistaError::General(format!("Failed to remove {job_path:?} due to {e}"))
-    })?;
+    // Otherwise remove only the given (intermediate) stage subdirs.
+    for stage_id in remove_stage_ids {
+        let stage_path = job_path.join(stage_id.to_string());
+        if !tokio::fs::try_exists(&stage_path).await.unwrap_or(false) {
+            continue;
+        }
+        if !is_subdirectory(stage_path.as_path(), job_path.as_path()) {
+            return Err(BallistaError::General(format!(
+                "Path {stage_path:?} is not a subdirectory of {job_path:?}"
+            )));
+        }
+        info!("Remove intermediate data for job {job_id:?} stage {stage_id}");
+        tokio::fs::remove_dir_all(&stage_path).await.map_err(|e| {
+            BallistaError::General(format!("Failed to remove {stage_path:?} due to {e}"))
+        })?;
+    }
 
     Ok(())
 }
@@ -762,6 +878,56 @@ pub async fn satisfy_dir_ttl(
     }
 
     Ok(false)
+}
+
+/// Builds executor registration metadata including OS/hardware specification.
+pub fn structure_executor_metadata(
+    executor_id: &str,
+    options: &Arc<ExecutorProcessConfig>,
+    concurrent_tasks: u32,
+) -> ExecutorRegistration {
+    let system_name =
+        System::name().unwrap_or_else(|| String::from("Unknown system name"));
+    let os_ver =
+        System::os_version().unwrap_or_else(|| String::from("Unknown OS version"));
+    let os_ver_long = System::long_os_version()
+        .unwrap_or_else(|| String::from("Unknown long OS version"));
+    let kernel_ver = System::kernel_long_version();
+
+    let physical_cores = System::physical_core_count().unwrap_or(0) as u32;
+    let open_files_limit = System::open_files_limit().unwrap_or(0) as u64;
+
+    let disks = Disks::new_with_refreshed_list();
+    let num_disks = disks.list().len() as u32;
+    let mut total_disk_space: u64 = 0;
+    let mut total_available_disk_space: u64 = 0;
+    for disk in disks.list() {
+        total_disk_space += disk.total_space();
+        total_available_disk_space += disk.available_space();
+    }
+
+    ExecutorRegistration {
+        id: executor_id.to_string(),
+        host: options.external_host.clone(),
+        port: options.port as u32,
+        grpc_port: options.grpc_port as u32,
+        specification: Some(ExecutorSpecification {
+            resources: vec![ExecutorResource {
+                resource: Some(Resource::TaskSlots(concurrent_tasks)),
+            }],
+        }),
+        os_info: Some(ExecutorOperatingSystemSpecification {
+            system_name,
+            kernel_ver,
+            os_ver,
+            os_ver_long,
+            physical_cores,
+            num_disks,
+            total_disk_space,
+            total_available_disk_space,
+            open_files_limit,
+        }),
+    }
 }
 
 #[cfg(test)]

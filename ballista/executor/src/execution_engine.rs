@@ -22,13 +22,15 @@
 //! for creating query stage executors from physical plans.
 
 use async_trait::async_trait;
-use ballista_core::execution_plans::ShuffleWriterExec;
+use ballista_core::JobId;
+use ballista_core::client_pool::BallistaClientPool;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
+use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfig, FileScanConfigBuilder,
+    FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
@@ -52,7 +54,7 @@ pub trait ExecutionEngine: Sync + Send {
     /// plan partition and writing shuffle output to the specified work directory.
     fn create_query_stage_exec(
         &self,
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
@@ -111,6 +113,44 @@ fn restrict_scans(
         .data)
 }
 
+/// Fix ParquetSource metadata_size_hint that is lost during protobuf
+/// serialization. The hint is preserved in TableParquetOptions but not
+/// transferred back to ParquetSource.metadata_size_hint on deserialization.
+/// Without this, each parquet file open requires 2 HTTP round trips instead
+/// of 1 for remote (S3/object store) files.
+fn fix_parquet_metadata_size_hint(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        let Some(dse) = node.downcast_ref::<DataSourceExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let Some((file_scan_config, parquet_source)) =
+            dse.downcast_to_file_source::<ParquetSource>()
+        else {
+            return Ok(Transformed::no(node));
+        };
+        // Recover metadata_size_hint from the table parquet options.
+        // During protobuf round-trip, the hint is preserved in
+        // TableParquetOptions but not transferred to the source-level field.
+        let Some(hint) = parquet_source
+            .table_parquet_options()
+            .global
+            .metadata_size_hint
+        else {
+            return Ok(Transformed::no(node));
+        };
+        let new_source = parquet_source.clone().with_metadata_size_hint(hint);
+        let new_config = FileScanConfigBuilder::from(file_scan_config.clone())
+            .with_source(Arc::new(new_source))
+            .build();
+        Ok(Transformed::yes(
+            DataSourceExec::from_data_source(new_config) as Arc<dyn ExecutionPlan>,
+        ))
+    })
+    .map(|t| t.data)
+}
+
 /// Executor for a single query stage in a distributed query.
 ///
 /// A query stage is a section of a query plan that has consistent partitioning
@@ -143,17 +183,56 @@ pub trait QueryStageExecutor: Sync + Send + Debug + Display {
 ///
 /// This implementation expects the input plan to be wrapped in a
 /// ShuffleWriterExec and creates a DefaultQueryStageExec to execute it.
-pub struct DefaultExecutionEngine {}
+#[derive(Default)]
+pub struct DefaultExecutionEngine {
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
+}
+
+impl DefaultExecutionEngine {
+    /// Creates new Default Execution Engine without client pooling
+    pub fn new() -> Self {
+        Self { client_pool: None }
+    }
+    /// Creates new Default Execution Engine with client pooling
+    pub fn with_client_pool(client_pool: Arc<dyn BallistaClientPool>) -> Self {
+        Self {
+            client_pool: Some(client_pool),
+        }
+    }
+}
 
 impl ExecutionEngine for DefaultExecutionEngine {
     fn create_query_stage_exec(
         &self,
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         partition_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
+        // Fix ParquetSource metadata_size_hint lost during serialization
+        let plan = fix_parquet_metadata_size_hint(plan)?;
+
+        // Route remote shuffle fetches through the executor's client pool when
+        // one is configured (upstream #1951); without a pool, readers connect
+        // per fetch.
+        let plan = match &self.client_pool {
+            Some(client_pool) => {
+                plan.transform(|p| {
+                    if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
+                        Ok(Transformed::yes(Arc::new(
+                            reader.with_client_pool(client_pool.clone()),
+                        )
+                            as Arc<dyn ExecutionPlan>))
+                    } else {
+                        Ok(Transformed::no(p))
+                    }
+                })?
+                .data
+            }
+            None => plan,
+        };
+
         // the query plan created by the scheduler always starts with a shuffle writer
         // (either ShuffleWriterExec or SortShuffleWriterExec)
         if let Some(shuffle_writer) = plan.downcast_ref::<ShuffleWriterExec>() {

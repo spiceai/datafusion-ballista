@@ -17,9 +17,12 @@
 
 use std::time::Duration;
 
+use ballista_core::JobId;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::serde::protobuf;
+use ballista_core::serde::protobuf::ExecutorMetric;
+use ballista_core::serde::protobuf::executor_metric::Metric;
 use log::trace;
 
 use crate::cluster::{BindingResult, ClusterState, ExecutorSlot};
@@ -62,8 +65,9 @@ pub struct ExecutorManager {
     config: Arc<SchedulerConfig>,
     /// Cached gRPC clients for communicating with executors.
     clients: ExecutorClients,
-    /// Jobs pending cleanup on each executor.
-    pending_cleanup_jobs: Arc<DashMap<String, HashSet<String>>>,
+    /// Per-executor pending cleanups: job id -> stage ids to remove
+    /// (empty stage ids ⇒ remove the whole job dir).
+    pending_cleanup_jobs: Arc<DashMap<String, HashMap<JobId, Vec<u32>>>>,
 }
 
 impl ExecutorManager {
@@ -92,7 +96,7 @@ impl ExecutorManager {
     /// Returns a binding result containing bound tasks and shuffle affinity info.
     pub async fn bind_schedulable_tasks(
         &self,
-        running_jobs: Arc<HashMap<String, JobInfoCache>>,
+        running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     ) -> Result<BindingResult> {
         if running_jobs.is_empty() {
             debug!("There's no active jobs for binding tasks");
@@ -148,7 +152,7 @@ impl ExecutorManager {
                     .into_iter()
                     .map(|task_info| protobuf::RunningTaskInfo {
                         task_id: task_info.task_id as u32,
-                        job_id: task_info.job_id,
+                        job_id: task_info.job_id.into(),
                         stage_id: task_info.stage_id as u32,
                         partition_id: task_info.partition_id as u32,
                     })
@@ -182,7 +186,7 @@ impl ExecutorManager {
     /// Send rpc to Executors to clean up the job data by delayed clean_up_interval seconds
     pub(crate) fn clean_up_job_data_delayed(
         &self,
-        job_id: String,
+        job_id: JobId,
         clean_up_interval: u64,
     ) {
         if clean_up_interval == 0 {
@@ -195,32 +199,72 @@ impl ExecutorManager {
         let executor_manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(clean_up_interval)).await;
-            executor_manager.clean_up_job_data_inner(job_id).await;
+            executor_manager
+                .clean_up_job_data_inner(job_id, vec![])
+                .await;
         });
     }
 
     /// Sends RPC requests to executors to clean up job data in a spawned task.
-    pub fn clean_up_job_data(&self, job_id: String) {
+    pub fn clean_up_job_data(&self, job_id: JobId) {
         let executor_manager = self.clone();
         tokio::spawn(async move {
-            executor_manager.clean_up_job_data_inner(job_id).await;
+            executor_manager
+                .clean_up_job_data_inner(job_id, vec![])
+                .await;
+        });
+    }
+
+    /// Immediately reclaim intermediate-stage shuffle data for a successful job,
+    /// retaining the rest of the job dir (e.g. the final-stage output) for the
+    /// existing delayed whole-job cleanup. No-op if `remove_stage_ids` is empty.
+    ///
+    /// Contract: call this AT MOST ONCE per job, passing the complete set of
+    /// intermediate stage ids. It is not designed for per-stage invocation.
+    /// In poll-based scheduling the pending-cleanup value is a `Vec<u32>` keyed
+    /// by job, and `HashMap::insert` REPLACES on key collision (it does not
+    /// merge). One intermediate call followed by the delayed whole-job cleanup
+    /// (empty `remove_stage_ids`) is correct: the empty/whole-job entry
+    /// supersedes and removes the entire job dir. But two DISTINCT partial calls
+    /// for the same job before the executor polls would drop the earlier stage
+    /// ids. Do not "fix" this by merging/extending: an empty vec means "remove
+    /// the whole job dir", so extending could never represent whole-job
+    /// supersession.
+    pub(crate) fn clean_up_intermediate_job_data(
+        &self,
+        job_id: JobId,
+        remove_stage_ids: Vec<u32>,
+    ) {
+        if remove_stage_ids.is_empty() {
+            return;
+        }
+        let executor_manager = self.clone();
+        tokio::spawn(async move {
+            executor_manager
+                .clean_up_job_data_inner(job_id, remove_stage_ids)
+                .await;
         });
     }
 
     /// 1. Push strategy: Send rpc to Executors to clean up the job data
     /// 2. Poll strategy: Save cleanup job ids and send them to executors
-    async fn clean_up_job_data_inner(&self, job_id: String) {
+    ///
+    /// `remove_stage_ids` empty ⇒ remove the whole job dir; non-empty ⇒ remove
+    /// only those stage subdirs.
+    async fn clean_up_job_data_inner(&self, job_id: JobId, remove_stage_ids: Vec<u32>) {
         let alive_executors = self.get_alive_executors();
 
         for executor in alive_executors {
-            let job_id_clone = job_id.to_owned();
+            let job_id_clone = job_id.clone().into_inner();
 
             if self.config.is_push_staged_scheduling() {
                 if let Ok(mut client) = self.get_client(&executor).await {
+                    let remove_stage_ids = remove_stage_ids.clone();
                     tokio::spawn(async move {
                         if let Err(err) = client
                             .remove_job_data(RemoveJobDataParams {
                                 job_id: job_id_clone,
+                                remove_stage_ids,
                             })
                             .await
                         {
@@ -236,26 +280,48 @@ impl ExecutorManager {
                 self.pending_cleanup_jobs
                     .entry(executor)
                     .or_default()
-                    .insert(job_id.clone());
+                    .insert(job_id.clone(), remove_stage_ids.clone());
             }
         }
     }
 
     /// Returns a list of all executors along with the timestamp of their last recorded heartbeat.
-    pub async fn get_executor_state(
+    pub async fn get_executors_state(
         &self,
-    ) -> Result<Vec<(ExecutorMetadata, Option<Duration>)>> {
-        let mut state: Vec<(ExecutorMetadata, Option<Duration>)> = vec![];
+    ) -> Result<Vec<(ExecutorMetadata, Option<Duration>, Vec<ExecutorMetric>)>> {
+        let mut state: Vec<(ExecutorMetadata, Option<Duration>, Vec<ExecutorMetric>)> =
+            vec![];
         for metadata in self.cluster_state.registered_executor_metadata().await {
-            let duration = self
-                .cluster_state
-                .get_executor_heartbeat(&metadata.id)
+            let heartbeat = self.cluster_state.get_executor_heartbeat(&metadata.id);
+            let duration = heartbeat
+                .as_ref()
                 .map(|hb| hb.timestamp)
                 .map(Duration::from_secs);
-            state.push((metadata, duration));
+            let mut metrics = heartbeat
+                .as_ref()
+                .map(|hb| hb.metrics.clone())
+                .unwrap_or_default();
+
+            if let Some(hb) = &heartbeat {
+                metrics.push(ExecutorMetric {
+                    metric: Some(Metric::PeakPhysicalMemory(
+                        hb.peak_proc_physical_memory,
+                    )),
+                });
+                metrics.push(ExecutorMetric {
+                    metric: Some(Metric::PeakVirtualMemory(hb.peak_proc_virtual_memory)),
+                });
+            }
+
+            state.push((metadata, duration, metrics));
         }
 
         Ok(state)
+    }
+
+    /// Return executor latest heartbeat, or None if not found.
+    pub fn get_executor_hearbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
+        self.cluster_state.get_executor_heartbeat(executor_id)
     }
 
     /// Returns executor metadata for the provided executor ID.
@@ -367,10 +433,10 @@ impl ExecutorManager {
     pub(crate) fn drain_pending_cleanup_jobs(
         &self,
         executor_id: &str,
-    ) -> HashSet<String> {
+    ) -> Vec<(JobId, Vec<u32>)> {
         self.pending_cleanup_jobs
             .remove(executor_id)
-            .map(|(_, jobs)| jobs)
+            .map(|(_, jobs)| jobs.into_iter().collect())
             .unwrap_or_default()
     }
 
@@ -546,21 +612,21 @@ mod tests {
         let tasks = vec![
             RunningTaskInfo {
                 task_id: 1,
-                job_id: "job-1".to_string(),
+                job_id: JobId::new("job-1"),
                 stage_id: 1,
                 partition_id: 0,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 2,
-                job_id: "job-1".to_string(),
+                job_id: JobId::new("job-1"),
                 stage_id: 1,
                 partition_id: 1,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 3,
-                job_id: "job-2".to_string(),
+                job_id: JobId::new("job-2"),
                 stage_id: 2,
                 partition_id: 0,
                 executor_id: "executor-b".to_string(),

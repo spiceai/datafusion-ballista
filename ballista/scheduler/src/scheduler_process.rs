@@ -33,8 +33,10 @@ use log::info;
 use std::{net::SocketAddr, sync::Arc};
 use tonic::service::RoutesBuilder;
 
+use crate::api::SchedulerErrorResponse;
 #[cfg(feature = "rest-api")]
 use crate::api::get_routes;
+use crate::api::route_disabled;
 use crate::cluster::BallistaCluster;
 use crate::config::SchedulerConfig;
 
@@ -133,17 +135,30 @@ pub async fn start_grpc_service<
     tonic_builder.add_service(ExternalScalerServer::new(scheduler.clone()));
 
     let tonic = tonic_builder.routes().into_axum_router();
-    let tonic = tonic.fallback(|| async { (StatusCode::NOT_FOUND, "404 - Not Found") });
+
+    // registering default handler for unmatched requests
+    let tonic =
+        tonic.fallback(|| async { SchedulerErrorResponse::new(StatusCode::NOT_FOUND) });
 
     #[cfg(feature = "rest-api")]
-    let axum = get_routes(Arc::new(scheduler));
-    #[cfg(feature = "rest-api")]
-    let final_route = axum
-        .merge(tonic)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let final_route = if config.disable_rest_api {
+        tonic
+            .merge(route_disabled(
+                "REST API has been disabled at startup".to_string(),
+            ))
+            .into_make_service_with_connect_info::<SocketAddr>()
+    } else {
+        let axum = get_routes(Arc::new(scheduler));
+        axum.merge(tonic)
+            .into_make_service_with_connect_info::<SocketAddr>()
+    };
 
     #[cfg(not(feature = "rest-api"))]
-    let final_route = tonic.into_make_service_with_connect_info::<SocketAddr>();
+    let final_route = tonic
+        .merge(route_disabled(
+            "REST API has been disabled at compile time".to_string(),
+        ))
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await

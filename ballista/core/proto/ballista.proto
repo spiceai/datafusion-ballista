@@ -50,7 +50,14 @@ message BallistaPhysicalPlanNode {
     ShuffleReaderExecNode shuffle_reader = 2;
     UnresolvedShuffleExecNode unresolved_shuffle = 3;
     SortShuffleWriterExecNode sort_shuffle_writer = 4;
+    ChaosExecNode chaos_exec = 5;
   }
+}
+
+message ChaosExecNode {
+  double failure_probability = 1;
+  string fault_type = 2;
+  uint64 seed = 3;
 }
 
 message ShuffleWriterExecNode {
@@ -79,6 +86,9 @@ message UnresolvedShuffleExecNode {
   uint32 stage_id = 1;
   datafusion_common.Schema schema = 2;
   datafusion.Partitioning partitioning = 5;
+  bool broadcast = 6;
+  uint32 upstream_partition_count = 7;
+  optional CoalescePlan coalesce = 8;
 }
 
 message ShuffleReaderExecNode {
@@ -87,11 +97,23 @@ message ShuffleReaderExecNode {
   // The stage to read from
   uint32 stage_id = 3;
   datafusion.Partitioning partitioning = 4;
+  bool broadcast = 5;
+  uint32 upstream_partition_count = 6;
+  optional CoalescePlan coalesce = 7;
 }
 
 message ShuffleReaderPartition {
   // each partition of a shuffle read can read data from multiple locations
   repeated PartitionLocation location = 1;
+}
+
+message CoalescePlan {
+  uint32 upstream_partition_count = 1;
+  repeated PartitionGroup groups = 2;
+}
+
+message PartitionGroup {
+  repeated uint32 upstream_indices = 1;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -331,6 +353,7 @@ message ExecutorMetadata {
   uint32 port = 3;
   uint32 grpc_port = 4;
   ExecutorSpecification specification = 5;
+  ExecutorOperatingSystemSpecification os_info = 6;
 }
 
 
@@ -342,6 +365,7 @@ message ExecutorRegistration {
   uint32 port = 3;
   uint32 grpc_port = 4;
   ExecutorSpecification specification = 5;
+  ExecutorOperatingSystemSpecification os_info = 6;
 }
 
 message ExecutorHeartbeat {
@@ -350,12 +374,20 @@ message ExecutorHeartbeat {
   uint64 timestamp = 2;
   repeated ExecutorMetric metrics = 3;
   ExecutorStatus status = 4;
+  uint64 peak_proc_physical_memory = 5;
+  uint64 peak_proc_virtual_memory = 6;
 }
 
 message ExecutorMetric {
   // TODO add more metrics
   oneof metric {
     uint64 available_memory = 1;
+    uint64 total_memory = 2;
+    uint64 used_memory = 3;
+    uint64 proc_physical_memory = 4;
+    uint64 proc_virtual_memory = 5;
+    uint64 peak_physical_memory = 6;
+    uint64 peak_virtual_memory = 7;
   }
 }
 
@@ -377,6 +409,18 @@ message ExecutorResource {
   oneof resource {
     uint32 task_slots = 1;
   }
+}
+
+message ExecutorOperatingSystemSpecification {
+  string system_name = 1;
+  string kernel_ver = 2;
+  string os_ver = 3;
+  string os_ver_long = 4;
+  uint32 physical_cores = 5;
+  uint32 num_disks = 6;
+  uint64 total_disk_space = 7;
+  uint64 total_available_disk_space = 8;
+  uint64 open_files_limit = 9;
 }
 
 message AvailableTaskSlots {
@@ -567,6 +611,11 @@ message ExecuteQueryParams {
   oneof query {
     bytes logical_plan = 1;
     bytes substrait_plan = 6;
+    // An already-built physical plan, serialized with the scheduler's
+    // physical extension codec. Lets clients bypass logical-plan creation
+    // on the scheduler, e.g. for plans containing custom operators that
+    // have no logical-plan representation.
+    bytes physical_plan = 7;
   }
   // reserved after removing deprecated `sql` query type.
   reserved 2;
@@ -635,6 +684,27 @@ message GetJobStatusParams {
   string job_id = 1;
 }
 
+message GetJobMetricsParams {
+  string job_id = 1;
+}
+
+message JobStageMetrics {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated OperatorWithMetrics operators = 3;
+}
+
+message OperatorWithMetrics {
+  uint32 depth = 1;
+  string operator_type = 2;
+  string operator_desc = 3;
+  repeated OperatorMetric metrics = 4;
+}
+
+message GetJobMetricsResult {
+  repeated JobStageMetrics stages = 1;
+}
+
 message SuccessfulJob {
   repeated PartitionLocation partition_location = 1;
   uint64 queued_at = 2;
@@ -694,6 +764,9 @@ message CancelJobResult {
 
 message CleanJobDataParams {
   string job_id = 1;
+  // Specific stage ids to remove within the job dir.
+  // Empty means remove the whole job dir (legacy behavior).
+  repeated uint32 remove_stage_ids = 2;
 }
 
 message CleanJobDataResult {
@@ -731,6 +804,9 @@ message CancelTasksResult {
 
 message RemoveJobDataParams {
   string job_id = 1;
+  // Specific stage ids to remove within the job dir.
+  // Empty means remove the whole job dir (legacy behavior).
+  repeated uint32 remove_stage_ids = 2;
 }
 
 message RemoveJobDataResult {
@@ -833,6 +909,8 @@ service SchedulerGrpc {
   rpc ExecuteQuery (ExecuteQueryParams) returns (ExecuteQueryResult) {}
 
   rpc GetJobStatus (GetJobStatusParams) returns (GetJobStatusResult) {}
+
+  rpc GetJobMetrics (GetJobMetricsParams) returns (GetJobMetricsResult) {}
 
   // Used by Executor to tell Scheduler it is stopped.
   rpc ExecutorStopped (ExecutorStoppedParams) returns (ExecutorStoppedResult) {}

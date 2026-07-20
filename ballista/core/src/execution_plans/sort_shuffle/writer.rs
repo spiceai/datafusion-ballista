@@ -44,6 +44,8 @@ use datafusion::arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -52,11 +54,12 @@ use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics, displayable,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, info};
 
+use crate::JobId;
 use crate::serde::scheduler::PartitionStats;
 
 /// Result of finalizing shuffle output: (data_path, index_path, partition_write_stats)
@@ -68,7 +71,7 @@ type FinalizeResult = (PathBuf, PathBuf, Vec<(usize, u64, u64, u64)>);
 #[derive(Debug, Clone)]
 pub struct SortShuffleWriterExec {
     /// Unique ID for the job (query) that this stage is a part of
-    job_id: String,
+    job_id: JobId,
     /// Unique query stage ID within the job
     stage_id: usize,
     /// Physical execution plan for this query stage
@@ -121,7 +124,7 @@ impl SortShuffleWriteMetrics {
 impl SortShuffleWriterExec {
     /// Create a new sort-based shuffle writer.
     pub fn try_new(
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: String,
@@ -158,7 +161,7 @@ impl SortShuffleWriterExec {
     }
 
     /// Get the Job ID for this query stage
-    pub fn job_id(&self) -> &str {
+    pub fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -201,6 +204,16 @@ impl SortShuffleWriterExec {
 
         async move {
             let now = Instant::now();
+            // Register against the runtime pool before taking ownership of
+            // `context` in `plan.execute`. Spill decisions use the private
+            // buffered-bytes counter below; the reservation is best-effort
+            // visibility so other operators see this writer's RSS (upstream
+            // Ballista 54 behaviour).
+            let mut reservation =
+                MemoryConsumer::new(format!("SortShuffleWriter[{input_partition}]"))
+                    .with_can_spill(true)
+                    .register(&context.runtime_env().memory_pool);
+
             let mut stream = plan.execute(input_partition, context)?;
             let schema = stream.schema();
 
@@ -232,10 +245,14 @@ impl SortShuffleWriterExec {
                 metrics.repart_time.clone(),
             )?;
 
+            let memory_limit = config.memory_limit_per_task_bytes;
+
             // Process input stream
             while let Some(result) = stream.next().await {
                 let input_batch = result?;
                 metrics.input_rows.add(input_batch.num_rows());
+
+                let before_bytes: usize = buffers.iter().map(|b| b.memory_used()).sum();
 
                 // Partition the batch
                 partitioner.partition(
@@ -246,15 +263,22 @@ impl SortShuffleWriterExec {
                     },
                 )?;
 
-                // Check if we need to spill
-                let total_memory: usize = buffers.iter().map(|b| b.memory_used()).sum();
-                if total_memory > config.spill_memory_threshold() {
+                let after_bytes: usize = buffers.iter().map(|b| b.memory_used()).sum();
+                let growth = after_bytes.saturating_sub(before_bytes);
+                // Prefer try_grow so the FairSpillPool sees this writer's RSS.
+                // If the pool is exhausted, spill immediately rather than
+                // continuing to buffer unaccounted bytes (Spice eager
+                // PartitionBuffers are heavier than upstream's index-based
+                // writer, so this matters under the TPC-H CI per-task budget).
+                let pool_ok = reservation.try_grow(growth).is_ok();
+
+                if !pool_ok || after_bytes >= memory_limit {
                     let timer = metrics.spill_time.timer();
-                    spill_largest_buffers(
+                    spill_all_buffers(
                         &mut buffers,
                         &mut spill_manager,
+                        &mut reservation,
                         &schema,
-                        config.spill_memory_threshold() / 2,
                         config.batch_size,
                     )?;
                     timer.done();
@@ -279,6 +303,10 @@ impl SortShuffleWriterExec {
                 &config,
             )?;
             timer.done();
+
+            // In-memory buffers are drained by finalize; release the reservation.
+            reservation.free();
+            drop(reservation);
 
             // Update metrics
             metrics.spill_count.add(spill_manager.total_spills());
@@ -324,38 +352,28 @@ impl SortShuffleWriterExec {
     }
 }
 
-/// Spills the largest buffers until total memory is below the target.
-fn spill_largest_buffers(
+/// Spills all non-empty partition buffers, then frees the memory reservation.
+///
+/// Mirrors upstream's spill-all behaviour so peak buffered bytes drop to zero
+/// after each spill event rather than lingering at half the threshold.
+fn spill_all_buffers(
     buffers: &mut [PartitionBuffer],
     spill_manager: &mut SpillManager,
+    reservation: &mut MemoryReservation,
     schema: &SchemaRef,
-    target_memory: usize,
     batch_size: usize,
 ) -> Result<()> {
-    loop {
-        let total_memory: usize = buffers.iter().map(|b| b.memory_used()).sum();
-        if total_memory <= target_memory {
-            break;
+    for buffer in buffers.iter_mut() {
+        if buffer.memory_used() == 0 {
+            continue;
         }
-
-        // Find the largest buffer
-        let largest_idx = buffers
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, b)| b.memory_used())
-            .map(|(i, _)| i);
-
-        match largest_idx {
-            Some(idx) if buffers[idx].memory_used() > 0 => {
-                let partition_id = buffers[idx].partition_id();
-                let batches = buffers[idx].drain_coalesced(batch_size);
-                spill_manager
-                    .spill(partition_id, batches, schema)
-                    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-            }
-            _ => break, // No more buffers to spill
-        }
+        let partition_id = buffer.partition_id();
+        let batches = buffer.drain_coalesced(batch_size);
+        spill_manager
+            .spill(partition_id, batches, schema)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
     }
+    reservation.free();
     Ok(())
 }
 
@@ -366,7 +384,7 @@ fn spill_largest_buffers(
 #[allow(clippy::too_many_arguments)]
 fn finalize_output(
     work_dir: &str,
-    job_id: &str,
+    job_id: &JobId,
     stage_id: usize,
     input_partition: usize,
     buffers: &mut [PartitionBuffer],
@@ -380,7 +398,7 @@ fn finalize_output(
 
     // Create output directory
     let mut output_dir = PathBuf::from(work_dir);
-    output_dir.push(job_id);
+    output_dir.push(job_id.as_str());
     output_dir.push(format!("{stage_id}"));
     output_dir.push(format!("{input_partition}"));
     std::fs::create_dir_all(&output_dir)?;
@@ -596,7 +614,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
 }
 
 impl ShuffleWriter for SortShuffleWriterExec {
-    fn job_id(&self) -> &str {
+    fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -631,7 +649,7 @@ fn result_schema() -> SchemaRef {
 
 impl std::fmt::Display for SortShuffleWriterExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let printable_plan = displayable(self.plan.as_ref())
+        let printable_plan = DisplayableExecutionPlan::with_metrics(self.plan.as_ref())
             .set_show_statistics(true)
             .indent(false);
         write!(
@@ -690,7 +708,7 @@ mod tests {
         let config = SortShuffleConfig::default();
 
         let writer = SortShuffleWriterExec::try_new(
-            "job1".to_string(),
+            JobId::new("job1"),
             1,
             input_plan,
             work_dir.path().to_str().unwrap().to_string(),

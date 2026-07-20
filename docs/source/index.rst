@@ -42,7 +42,7 @@ Table of content
    :maxdepth: 1
    :caption: Clients
 
-   Python <user-guide/python>
+   Python <user-guide/python/index>
    Rust <user-guide/rust>
    SQL CLI <user-guide/cli>
 
@@ -57,6 +57,18 @@ Table of content
    user-guide/extending-components
    user-guide/spark-compatible-functions
    user-guide/extensions-example
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Changelog
+
+   changelog/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Upgrade Guides
+
+   upgrading/index
 
 .. _toc.contributors:
 

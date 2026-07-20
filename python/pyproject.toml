@@ -40,11 +40,16 @@ classifiers = [
     "Programming Language :: Rust",
 ]
 dependencies = [
-    "pyarrow>=21.0.0",
-    "datafusion==51",
+    "pyarrow>=23.0.1",
+    "datafusion==54",
     "typing-extensions;python_version<'3.13'",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+jupyter = [
+    "ipython>=8.0.0",
+]
 
 [project.urls]
 homepage = "https://datafusion.apache.org/ballista"
@@ -53,6 +58,12 @@ repository = "https://github.com/apache/datafusion-ballista"
 
 [tool.isort]
 profile = "black"
+
+[tool.ruff.format]
+# Jupyter notebooks are committed with the JSON indentation that the Jupyter
+# UI writes; ruff format would rewrite that on every run, producing large
+# whitespace-only diffs. Lint (ruff check) still applies to notebook cells.
+exclude = ["*.ipynb"]
 
 [tool.maturin]
 python-source = "python"
@@ -67,7 +78,7 @@ locked = true
 [dependency-groups]
 dev = [
     "maturin>=1.8.1",
-    "pytest>=8.4.1",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.1.0",
     "ruff>=0.9.1",
     "toml>=0.10.2",

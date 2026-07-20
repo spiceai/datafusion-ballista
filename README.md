@@ -154,7 +154,7 @@ Ballista uses Cargo features to enable optional functionality. Below are the ava
 | Feature                    | Default | Description                                      |
 | -------------------------- | ------- | ------------------------------------------------ |
 | `build-binary`             | Yes     | Builds the scheduler binary with CLI and logging |
-| `substrait`                | Yes     | Enables Substrait plan support                   |
+| `substrait`                | No      | Enables Substrait plan support                   |
 | `prometheus-metrics`       | No      | Enables Prometheus metrics collection            |
 | `graphviz-support`         | No      | Enables execution graph visualization            |
 | `spark-compat`             | No      | Enables Spark compatibility mode                 |
@@ -191,6 +191,15 @@ but still there is a gap between DataFusion and Ballista which we want to bridge
 
 Refer to the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html) for more
 information on supported SQL.
+
+## Who uses Ballista
+
+The following organizations use Ballista. To add yours, open a pull request.
+
+| Organization                                                                                                                   |                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
+| <a href="https://spice.ai"><img src="docs/source/_static/images/adopters/spiceai.png" height="36" alt="Spice AI"/></a>         | [Spice AI](https://spice.ai/blog/apache-ballista-at-spice-ai) |
+| <a href="https://coralogix.com"><img src="docs/source/_static/images/adopters/coralogix.png" height="36" alt="Coralogix"/></a> | [Coralogix](https://coralogix.com/)                           |
 
 ## Contribution Guide
 

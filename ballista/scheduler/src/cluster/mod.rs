@@ -37,7 +37,7 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, PartitionId};
 use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_core::{ConfigProducer, JobStatusSubscriber, consistent_hash};
+use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber, consistent_hash};
 
 use crate::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 
@@ -164,7 +164,7 @@ pub type BoundTask = (String, TaskDescription);
 #[derive(Debug, Clone)]
 pub struct ShuffleAffinityInfo {
     /// Job ID for this task.
-    pub job_id: String,
+    pub job_id: JobId,
     /// Stage ID for this task.
     pub stage_id: usize,
     /// Executor ID where the task was scheduled.
@@ -228,7 +228,7 @@ pub trait ClusterState: Send + Sync + 'static {
     async fn bind_schedulable_tasks(
         &self,
         distribution: TaskDistributionPolicy,
-        active_jobs: Arc<HashMap<String, JobInfoCache>>,
+        active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
         executors: Option<HashSet<String>>,
     ) -> Result<BindingResult>;
 
@@ -279,7 +279,7 @@ pub enum JobStateEvent {
     /// Event when a job status has been updated
     JobUpdated {
         /// Job ID of updated job
-        job_id: String,
+        job_id: JobId,
         /// New job status
         status: JobStatus,
     },
@@ -289,14 +289,14 @@ pub enum JobStateEvent {
     /// different scheduler
     JobAcquired {
         /// Job ID of the acquired job
-        job_id: String,
+        job_id: JobId,
         /// The scheduler which acquired ownership of the job
         owner: String,
     },
     /// Event when a scheduler releases ownership of a still active job
     JobReleased {
         /// Job ID of the released job
-        job_id: String,
+        job_id: JobId,
     },
     /// Event when a new session has been created.
     SessionAccessed {
@@ -341,7 +341,7 @@ pub trait JobState: Send + Sync {
     /// Accepts a job into the scheduler's queue.
     ///
     /// Called when a job is received but before it is planned.
-    fn accept_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()>;
+    fn accept_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()>;
 
     /// Returns the number of queued jobs waiting to be scheduled.
     fn pending_job_number(&self) -> usize;
@@ -351,16 +351,19 @@ pub trait JobState: Send + Sync {
     /// The submitter is assumed to own the job.
     async fn submit_job(
         &self,
-        job_id: String,
+        job_id: JobId,
         graph: &ExecutionGraphBox,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()>;
 
     /// Returns the set of all active job IDs.
-    async fn get_jobs(&self) -> Result<HashSet<String>>;
+    async fn get_jobs(&self) -> Result<HashSet<JobId>>;
+
+    /// Returns the set of all job IDs including running, queued, and completed jobs.
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>>;
 
     /// Returns the status of the specified job.
-    async fn get_job_status(&self, job_id: &str) -> Result<Option<JobStatus>>;
+    async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>>;
 
     /// Returns the execution graph for a job.
     ///
@@ -368,27 +371,27 @@ pub trait JobState: Send + Sync {
     /// by another scheduler after this call returns.
     async fn get_execution_graph(
         &self,
-        job_id: &str,
+        job_id: &JobId,
     ) -> Result<Option<ExecutionGraphBox>>;
 
     /// Persists the current state of an owned job.
     ///
     /// Returns an error if the job is not owned by the caller.
-    async fn save_job(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()>;
+    async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()>;
 
     /// Marks an unscheduled job as failed.
     ///
     /// Called when a job fails during planning before an execution graph is created.
-    async fn fail_unscheduled_job(&self, job_id: &str, reason: String) -> Result<()>;
+    async fn fail_unscheduled_job(&self, job_id: &JobId, reason: String) -> Result<()>;
 
     /// Deletes a job from the state.
-    async fn remove_job(&self, job_id: &str) -> Result<()>;
+    async fn remove_job(&self, job_id: &JobId) -> Result<()>;
 
     /// Attempts to acquire ownership of a job.
     ///
     /// Returns the execution graph if the job is still running and successfully acquired,
     /// otherwise returns None.
-    async fn try_acquire_job(&self, job_id: &str) -> Result<Option<ExecutionGraphBox>>;
+    async fn try_acquire_job(&self, job_id: &JobId) -> Result<Option<ExecutionGraphBox>>;
 
     /// Returns a stream of job state events.
     async fn job_state_events(&self) -> Result<JobStateEventStream>;
@@ -435,7 +438,7 @@ fn get_executors_with_local_shuffle_data(
 
 pub(crate) async fn bind_task_bias(
     mut slots: Vec<&mut AvailableTaskSlots>,
-    running_jobs: Arc<HashMap<String, JobInfoCache>>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
 ) -> BindingResult {
     let mut result = BindingResult::new();
@@ -537,7 +540,7 @@ pub(crate) async fn bind_task_bias(
 
 pub(crate) async fn bind_task_round_robin(
     mut slots: Vec<&mut AvailableTaskSlots>,
-    running_jobs: Arc<HashMap<String, JobInfoCache>>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
 ) -> BindingResult {
     let mut result = BindingResult::new();
@@ -646,7 +649,7 @@ pub(crate) async fn bind_task_round_robin(
 
 /// Maps execution plan to list of files it scans
 type GetScanFilesFunc = fn(
-    &str,
+    &JobId,
     Arc<dyn ExecutionPlan>,
 ) -> datafusion::common::Result<Vec<Vec<Vec<PartitionedFile>>>>;
 
@@ -675,7 +678,7 @@ pub trait DistributionPolicy: std::fmt::Debug + Send + Sync {
     async fn bind_tasks(
         &self,
         mut slots: Vec<&mut AvailableTaskSlots>,
-        running_jobs: Arc<HashMap<String, JobInfoCache>>,
+        running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     ) -> datafusion::error::Result<Vec<BoundTask>>;
 
     /// Name of [DistributionPolicy]
@@ -686,11 +689,11 @@ pub(crate) async fn bind_task_consistent_hash(
     topology_nodes: HashMap<String, TopologyNode>,
     num_replicas: usize,
     tolerance: usize,
-    running_jobs: Arc<HashMap<String, JobInfoCache>>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     get_scan_files: GetScanFilesFunc,
 ) -> Result<(BindingResult, Option<ConsistentHash<TopologyNode>>)> {
     let mut total_slots = 0usize;
-    for (_, node) in topology_nodes.iter() {
+    for node in topology_nodes.values() {
         total_slots += node.available_slots as usize;
     }
     if total_slots == 0 {
@@ -805,6 +808,14 @@ pub(crate) fn is_skip_consistent_hash(scan_files: &[Vec<Vec<PartitionedFile>>]) 
     scan_files.is_empty() || scan_files.len() > 1
 }
 
+/// Callback adapter for [`GetScanFilesFunc`] that ignores job id.
+pub(crate) fn scan_files_for_binding(
+    _job_id: &JobId,
+    plan: Arc<dyn ExecutionPlan>,
+) -> datafusion::common::Result<Vec<Vec<Vec<PartitionedFile>>>> {
+    get_scan_files(plan)
+}
+
 /// Get all of the [`PartitionedFile`] to be scanned for an [`ExecutionPlan`]
 pub(crate) fn get_scan_files(
     plan: Arc<dyn ExecutionPlan>,
@@ -879,9 +890,12 @@ mod test {
     use object_store::ObjectMeta;
     use object_store::path::Path;
 
+    use ballista_core::JobId;
     use ballista_core::error::Result;
     use ballista_core::serde::protobuf::AvailableTaskSlots;
-    use ballista_core::serde::scheduler::{ExecutorMetadata, ExecutorSpecification};
+    use ballista_core::serde::scheduler::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    };
 
     use crate::cluster::{
         BoundTask, TopologyNode, bind_task_bias, bind_task_consistent_hash,
@@ -1029,7 +1043,7 @@ mod test {
                 num_replicas,
                 tolerance,
                 active_jobs,
-                |job_id, _| mock_get_scan_files("job_b", job_id, 8),
+                |job_id, _| mock_get_scan_files(&JobId::new("job_b"), job_id, 8),
             )
             .await?;
             assert_eq!(6, binding_result.bound_tasks.len());
@@ -1069,7 +1083,7 @@ mod test {
                 num_replicas,
                 tolerance,
                 active_jobs,
-                |job_id, _| mock_get_scan_files("job_b", job_id, 8),
+                |job_id, _| mock_get_scan_files(&JobId::new("job_b"), job_id, 8),
             )
             .await?;
             assert_eq!(7, binding_result.bound_tasks.len());
@@ -1101,7 +1115,7 @@ mod test {
 
         for bound_task in bound_tasks {
             let entry = result
-                .entry(bound_task.1.partition.job_id)
+                .entry(bound_task.1.partition.job_id.to_string())
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
             *n += 1;
@@ -1112,18 +1126,18 @@ mod test {
 
     async fn mock_active_jobs(
         num_partition: usize,
-    ) -> Result<HashMap<String, JobInfoCache>> {
-        let graph_a = mock_graph("job_a", num_partition, 2).await?;
+    ) -> Result<HashMap<JobId, JobInfoCache>> {
+        let graph_a = mock_graph(&JobId::new("job_a"), num_partition, 2).await?;
 
-        let graph_b = mock_graph("job_b", num_partition, 7).await?;
+        let graph_b = mock_graph(&JobId::new("job_b"), num_partition, 7).await?;
 
         let mut active_jobs = HashMap::new();
         active_jobs.insert(
-            graph_a.job_id().to_string(),
+            graph_a.job_id().clone(),
             JobInfoCache::new(Box::new(graph_a)),
         );
         active_jobs.insert(
-            graph_b.job_id().to_string(),
+            graph_b.job_id().clone(),
             JobInfoCache::new(Box::new(graph_b)),
         );
 
@@ -1131,7 +1145,7 @@ mod test {
     }
 
     async fn mock_graph(
-        job_id: &str,
+        job_id: &JobId,
         num_target_partitions: usize,
         num_pending_task: usize,
     ) -> Result<StaticExecutionGraph> {
@@ -1143,6 +1157,7 @@ mod test {
             port: 50051,
             grpc_port: 50052,
             specification: ExecutorSpecification { task_slots: 32 },
+            os_info: ExecutorOperatingSystemSpecification::default(),
         };
 
         // complete first stage
@@ -1193,8 +1208,8 @@ mod test {
     }
 
     fn mock_get_scan_files(
-        expected_job_id: &str,
-        job_id: &str,
+        expected_job_id: &JobId,
+        job_id: &JobId,
         num_partition: usize,
     ) -> datafusion::common::Result<Vec<Vec<Vec<PartitionedFile>>>> {
         Ok(if expected_job_id.eq(job_id) {

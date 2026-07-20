@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::JobId;
 use crate::config::ShuffleFormat;
 use crate::error::BallistaError;
 use crate::execution_plans::shuffle_manager::{
@@ -57,9 +58,10 @@ use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics, displayable,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
@@ -78,7 +80,7 @@ use super::shuffle_writer_trait::ShuffleWriter;
 #[derive(Debug, Clone)]
 pub struct ShuffleWriterExec {
     /// Unique ID for the job (query) that this stage is a part of
-    job_id: String,
+    job_id: JobId,
     /// Unique query stage ID within the job
     stage_id: usize,
     /// Physical execution plan for this query stage
@@ -96,7 +98,7 @@ pub struct ShuffleWriterExec {
 
 impl std::fmt::Display for ShuffleWriterExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let printable_plan = displayable(self.plan.as_ref())
+        let printable_plan = DisplayableExecutionPlan::with_metrics(self.plan.as_ref())
             .set_show_statistics(true)
             .indent(false);
         write!(
@@ -245,7 +247,7 @@ impl ShuffleWriteMetrics {
 impl ShuffleWriterExec {
     /// Create a new shuffle writer
     pub fn try_new(
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: String,
@@ -274,7 +276,7 @@ impl ShuffleWriterExec {
     }
 
     /// Get the Job ID for this query stage
-    pub fn job_id(&self) -> &str {
+    pub fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -303,7 +305,7 @@ impl ShuffleWriterExec {
         context: Arc<TaskContext>,
     ) -> impl Future<Output = Result<Vec<ShuffleWritePartition>>> {
         let mut path = PathBuf::from(&self.work_dir);
-        path.push(&self.job_id);
+        path.push(self.job_id.as_str());
         path.push(format!("{}", self.stage_id));
 
         let write_metrics = ShuffleWriteMetrics::new(input_partition, &self.metrics);
@@ -549,7 +551,7 @@ impl ShuffleWriterExec {
     /// IPC format requires all arrays to be available before serialization.
     #[allow(clippy::too_many_arguments)]
     async fn execute_shuffle_write_object_store(
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         input_partition: usize,
         stream: &mut std::pin::Pin<
@@ -746,7 +748,7 @@ impl ShuffleWriterExec {
     /// partition's multipart upload.
     #[allow(clippy::too_many_arguments)]
     async fn execute_hash_repart_object_store_ipc(
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         input_partition: usize,
         stream: &mut std::pin::Pin<
@@ -854,7 +856,7 @@ impl ShuffleWriterExec {
     #[cfg(feature = "vortex")]
     #[allow(clippy::too_many_arguments)]
     async fn execute_hash_repart_object_store_vortex(
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         input_partition: usize,
         stream: &mut std::pin::Pin<
@@ -970,7 +972,7 @@ impl ShuffleWriterExec {
     /// Executes shuffle write to in-memory storage.
     #[allow(clippy::too_many_arguments)]
     async fn execute_shuffle_write_memory(
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         input_partition: usize,
         stream: &mut std::pin::Pin<
@@ -1314,7 +1316,7 @@ impl ExecutionPlan for ShuffleWriterExec {
 }
 
 impl ShuffleWriter for ShuffleWriterExec {
-    fn job_id(&self) -> &str {
+    fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -1496,7 +1498,7 @@ mod tests {
         let input_plan = Arc::new(CoalescePartitionsExec::new(create_input_plan()?));
         let work_dir = TempDir::new()?;
         let query_stage = ShuffleWriterExec::try_new(
-            "jobOne".to_owned(),
+            JobId::new("jobOne"),
             1,
             input_plan,
             work_dir.path().to_str().unwrap().to_owned(),
@@ -1555,7 +1557,7 @@ mod tests {
         let input_plan = create_input_plan()?;
         let work_dir = TempDir::new()?;
         let query_stage = ShuffleWriterExec::try_new(
-            "jobOne".to_owned(),
+            JobId::new("jobOne"),
             1,
             input_plan,
             work_dir.path().to_str().unwrap().to_owned(),
@@ -1661,7 +1663,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         let (multipart_writer, full_url) = storage
-            .start_multipart_write("job_a", 1, 0, 0, "arrow")
+            .start_multipart_write(&JobId::from("job_a"), 1, 0, 0, "arrow")
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
