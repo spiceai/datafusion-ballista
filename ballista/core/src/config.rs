@@ -237,8 +237,12 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          Some(3.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_ENABLED.to_string(),
                          "Enable sort-based shuffle which writes consolidated files with index".to_string(),
+                         // Fork keeps this off by default: the Spice sort-shuffle writer
+                         // still accounts memory against the runtime FairSpillPool (unlike
+                         // upstream's per-task budget), and enabling it by default OOMs
+                         // TPC-H SF10 Q18 under the CI executor memory budget.
                          DataType::Boolean,
-                         Some(true.to_string())),
+                         Some(false.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE.to_string(),
                          "Per-partition buffer size in bytes for sort shuffle".to_string(),
                          DataType::UInt64,

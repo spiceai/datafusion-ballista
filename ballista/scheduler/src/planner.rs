@@ -782,7 +782,7 @@ mod test {
     use crate::test_utils::datafusion_test_context;
     use ballista_core::JobId;
     use ballista_core::error::BallistaError;
-    use ballista_core::execution_plans::{SortShuffleWriterExec, UnresolvedShuffleExec};
+    use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
     use ballista_core::serde::BallistaCodec;
     use datafusion::arrow::compute::SortOptions;
     use datafusion::execution::TaskContext;
@@ -1137,8 +1137,8 @@ order by
 
         // stage0
         let stage0 = stages[0].clone();
-        let shuffle_write = downcast_exec!(stage0, SortShuffleWriterExec);
-        let partitioning = shuffle_write.shuffle_output_partitioning();
+        let shuffle_write = downcast_exec!(stage0, ShuffleWriterExec);
+        let partitioning = shuffle_write.shuffle_output_partitioning().expect("stage0");
         assert_eq!(2, partitioning.partition_count());
         let partition_col = match partitioning {
             Partitioning::Hash(exprs, 2) => match exprs.as_slice() {

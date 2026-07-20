@@ -143,7 +143,7 @@ async fn should_split_plan_into_stages() -> datafusion::error::Result<()> {
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ "
-    SortShuffleWriterExec: partitioning=Hash([c@0], 2)
+    ShuffleWriterExec: partitioning: Hash([c@0], 2)
       AggregateExec: mode=Partial, gby=[c@2 as c], aggr=[min(t.a), max(t.b)]
         DataSourceExec: partitions=1, partition_sizes=[1]
     ");
@@ -489,8 +489,8 @@ async fn should_use_sort_shuffle_when_enabled() -> datafusion::error::Result<()>
 }
 
 #[tokio::test]
-async fn should_use_sort_shuffle_by_default() -> datafusion::error::Result<()> {
-    // Uses Ballista session defaults (sort-based shuffle enabled).
+async fn should_use_hash_shuffle_by_default() -> datafusion::error::Result<()> {
+    // Fork default: sort-based shuffle is off (Spice writer memory model).
     let config = SessionConfig::new_with_ballista()
         .with_target_partitions(2)
         .with_round_robin_repartition(false);
@@ -519,8 +519,8 @@ async fn should_use_sort_shuffle_by_default() -> datafusion::error::Result<()> {
     assert!(
         (plan as &dyn ExecutionPlan)
             .downcast_ref::<SortShuffleWriterExec>()
-            .is_some(),
-        "expected SortShuffleWriterExec by default, got plan: {plan:?}"
+            .is_none(),
+        "expected hash ShuffleWriterExec by default, got plan: {plan:?}"
     );
 
     Ok(())
