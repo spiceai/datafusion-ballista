@@ -239,6 +239,104 @@ Not Spice patches — features the fork never absorbed because it skipped the
 | [#1891](https://github.com/apache/datafusion-ballista/pull/1891) | #15 | Needs design answers |
 | [#1893](https://github.com/apache/datafusion-ballista/pull/1893) | #12 | Needs rework per review |
 
+## Structural gaps to full upstream reliance
+
+The individual patches above are the small stuff — each is a rebase or a
+one-off upstream PR. What actually decides whether this fork can shrink to a
+thin re-pin (or disappear) are the five structural gaps below. Track them
+here across upgrade cycles; update `Status` whenever an RFC, upstream PR, or
+benchmark moves one of them.
+
+Goal state: **unforked Ballista source consumed via `[patch]` against the
+Spice DataFusion fork**, with Spice-only pieces (Vortex codec, remote
+catalog, Prometheus collector) living as plugins behind upstream extension
+points instead of in-tree edits.
+
+### Gap 1 — Pluggable shuffle storage (the long pole)
+
+The fork's center of gravity: `memory://`, S3/Azure object-store shuffle,
+and Vortex all hang off the **path-based `PartitionLocation` model**, while
+upstream committed to `file_id`/`is_sort_shuffle`. This proto divergence is
+the recurring merge-conflict source, and it is why block-IO sort-shuffle is
+unsupported on the fork.
+
+- **Exit**: upstream's own invitations — the
+  [#1539](https://github.com/apache/datafusion-ballista/issues/1539)
+  object-store-shuffle RFC and
+  [#1980](https://github.com/apache/datafusion-ballista/issues/1980) format
+  hooks. A `ShuffleStorage`-style trait upstream lets memory/object-store/
+  Vortex become backends and retires the path-vs-file_id fork.
+- **Prereq for Vortex specifically**: a non-git-fork dependency story
+  (upstream will not take a git dep on `spiceai/vortex`).
+- **Effort**: design doc + months; community project, not a patch.
+- **Status**: not started. Next step: write the RFC against #1539.
+
+### Gap 2 — Embedding API upstream
+
+Spice runs the scheduler and executor **in-process**; upstream is
+binary-first. The embedder hooks (`readiness` oneshot, `OnCancelTasksFn`,
+`override_metrics_collector`, `get_job_execution_graph`,
+`submit_job_with_id`/`recover_job`, `BallistaBuilder`, `poll_now_notify`)
+are individually small but need upstream to accept *embedders as a
+first-class consumer* as a design stance.
+
+- **Exit**: one umbrella "embedding API" proposal rather than ten drive-by
+  hook PRs; #56 (graph serde / recovery) already has a path via the
+  [#2030](https://github.com/apache/datafusion-ballista/issues/2030) HA RFC.
+- **Status**: not started as an umbrella; individual pieces tracked in the
+  inventory above. Next step: draft the umbrella issue, fold #1891/#1893
+  review feedback into it.
+
+### Gap 3 — Catalog/UDF sync as an extension point
+
+`remote_catalog` / `RemoteScalarUDF` were **rejected upstream**
+([apache#1333](https://github.com/apache/datafusion-ballista/pull/1333))
+with a counter-offer: a gRPC service-extension hook. This is a redesign,
+not a rebase — the sync logic moves into Spice, implemented against an
+upstream extension point.
+
+- **Exit**: upstream service-extension hook lands; fork keeps only a plugin.
+- **Status**: waiting on hook design. Next step: propose the hook shape
+  upstream (can cite the fork's implementation as the motivating consumer).
+
+### Gap 4 — Consistent-hash task binding: benchmark, then decide
+
+Upstream deleted the consistent-hash policy and bet on `#1911` partition
+pruning instead. The fork now has **both** (pruning adopted in the repair
+commit), which makes the question empirical for the first time.
+
+- **Exit A**: SF100 benchmark shows pruning covers it → drop the fork
+  policy.
+- **Exit B**: benchmark shows a real win → re-propose upstream with the
+  numbers (exactly the evidence upstream asked for when removing it).
+- **Status**: testable now. Next step: SF100 run with consistent-hash
+  disabled, compare shuffle-read locality + QPH.
+
+### Gap 5 — DataFusion pin alignment
+
+Spice runs on its own DataFusion fork; upstream Ballista pins apache
+releases. This does **not** force a Ballista source fork — `[patch]`-
+substituting the DF crates works as long as the Spice DF fork stays
+API-compatible — but it fixes the endgame as "unforked Ballista source,
+rebuilt against our DF", never "crates.io binaries".
+
+- **Exit**: keep the Spice DF fork patch-thin (API-additive only); verify
+  each Ballista upgrade builds with `[patch.crates-io]` substitution.
+- **Status**: ongoing discipline, no one-time fix. Next step: try building
+  this branch against unmodified upstream Ballista source + `[patch]`ed DF
+  to measure how far away that already is.
+
+### Burndown order
+
+1. Finish the four open upstream PRs (mechanical; deletes 4 fork patches).
+2. Batch-upstream the correctness fixes (#26, #58, #60 residuals, #53,
+   #57-buffer, #36, #24, #54 NotFound typing) — small, evidence-backed,
+   high acceptance likelihood. File the #29 root-cause fix in DataFusion.
+3. Start Gap 1 (shuffle-storage RFC) immediately — it is the long pole and
+   gates the proto convergence every future merge pays for.
+4. Gap 4 benchmark next SF100 cycle (cheap, may delete a subsystem).
+5. Gap 2 umbrella proposal once #1891/#1893 conclude.
+
 ## Related maps
 
 - Merged Spice PR number list (talk artifact): `ballista-ha-talk-copy/fork-pr-map.md` in `spiceai-project` / `ballista-talk`
