@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use async_trait::async_trait;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::stats::Precision;
 use datafusion::physical_plan::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::BufReader;
 use std::pin::Pin;
 use std::result;
 use std::sync::Arc;
@@ -32,13 +31,16 @@ use std::time::Duration;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
-use object_store::azure::MicrosoftAzureBuilder;
 
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use url::Url;
 
 use crate::client::BallistaClient;
+use crate::client_pool::BallistaClientPool;
+use crate::utils::GrpcClientConfig;
+use datafusion::prelude::SessionConfig;
+use std::future::Future;
 use crate::execution_plans::shuffle_manager::global_shuffle_manager;
 use crate::execution_plans::sort_shuffle::{
     get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
@@ -67,10 +69,10 @@ use crate::error::BallistaError;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use itertools::Itertools;
-use log::{debug, error, trace, warn};
+use log::{debug, error, trace};
 use rand::prelude::SliceRandom;
 use rand::rng;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Coalesce plan attached to a `ShuffleReaderExec` or `UnresolvedShuffleExec`.
@@ -113,6 +115,10 @@ pub struct ShuffleReaderExec {
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     properties: Arc<PlanProperties>,
+    /// Pool of reusable clients for remote shuffle fetches. `None` until the
+    /// executor stamps its pool in (see `with_client_pool`); unpooled fetches
+    /// connect per fetch.
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
 }
 
 impl ShuffleReaderExec {
@@ -139,6 +145,7 @@ impl ShuffleReaderExec {
             coalesce: None,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
+            client_pool: None, // to be updated at the executor side
         })
     }
 
@@ -165,6 +172,7 @@ impl ShuffleReaderExec {
             coalesce: None,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
+            client_pool: None, // to be updated at the executor side
         })
     }
 
@@ -202,7 +210,25 @@ impl ShuffleReaderExec {
             coalesce: Some(coalesce),
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
+            client_pool: None, // to be updated at the executor side
         })
+    }
+
+    /// Returns a copy of this reader that fetches remote partitions through the
+    /// given client pool instead of connecting per fetch. Stamped in by the
+    /// executor when it rebuilds the deserialized stage plan.
+    pub fn with_client_pool(&self, client_pool: Arc<dyn BallistaClientPool>) -> Self {
+        Self {
+            stage_id: self.stage_id,
+            schema: self.schema.clone(),
+            partition: self.partition.clone(),
+            broadcast: self.broadcast,
+            upstream_partition_count: self.upstream_partition_count,
+            coalesce: self.coalesce.clone(),
+            metrics: self.metrics.clone(),
+            properties: self.properties.clone(),
+            client_pool: Some(client_pool),
+        }
     }
 }
 
@@ -274,6 +300,7 @@ impl ExecutionPlan for ShuffleReaderExec {
                 coalesce: self.coalesce.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
                 properties: self.properties.clone(),
+                client_pool: self.client_pool.clone(),
             }))
         } else {
             Err(DataFusionError::Plan(
@@ -296,16 +323,9 @@ impl ExecutionPlan for ShuffleReaderExec {
 
         let max_request_num =
             config.ballista_shuffle_reader_maximum_concurrent_requests();
-        let max_message_size = config.ballista_grpc_client_max_message_size();
         let force_remote_read = config.ballista_shuffle_reader_force_remote_read();
-        let prefer_flight = config.ballista_shuffle_reader_remote_prefer_flight();
         let batch_size = config.batch_size();
-        let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
-        let use_tls = config.ballista_use_tls();
         let metrics_callback = config.ballista_shuffle_read_metrics_callback();
-        let ballista_config = config.ballista_config();
-        let io_retries = ballista_config.io_retries_times();
-        let io_retry_wait_ms = ballista_config.io_retry_wait_time_ms() as u64;
 
         if force_remote_read {
             debug!(
@@ -315,7 +335,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         }
 
         log::debug!(
-            "ShuffleReaderExec::execute({task_id}) max_request_num: {max_request_num}, max_message_size: {max_message_size}"
+            "ShuffleReaderExec::execute({task_id}) max_request_num: {max_request_num}"
         );
         let mut partition_locations = HashMap::new();
         for p in &self.partition[partition] {
@@ -336,32 +356,20 @@ impl ExecutionPlan for ShuffleReaderExec {
         let read_metrics = ShuffleReadMetrics::new(partition, &self.metrics);
         let response_receiver = send_fetch_partitions(
             partition_locations,
-            max_request_num,
-            max_message_size,
-            force_remote_read,
-            prefer_flight,
-            customize_endpoint,
-            use_tls,
+            config,
+            self.client_pool.clone(),
             metrics_callback,
             read_metrics,
-            io_retries,
-            io_retry_wait_ms,
             context.runtime_env(),
         );
 
-        // Consume the fetched streams CONCURRENTLY, not sequentially: all of a
-        // peer's streams multiplex over one pooled HTTP/2 connection, and h2
-        // only releases flow-control credit as the application reads. With
-        // sequential consumption every opened-but-parked stream pins up to a
-        // full stream window of unread bytes, and once the parked total reaches
-        // the connection window nothing can send on ANY stream — a permanent,
-        // silent, all-tasks stall (observed at SF100; small scale factors never
-        // reach the threshold). Unordered flattening keeps every open stream
-        // draining so credit always recycles. Shuffle output has no ordering
-        // guarantee, so cross-stream interleaving is safe.
+        // Remote partitions are fully buffered before their stream is handed
+        // over (see fetch_partition_buffered), so h2 flow-control credit never
+        // pins on an unconsumed stream; ordered flattening is safe and matches
+        // upstream #1951.
         let input_stream = Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
-            response_receiver.try_flatten_unordered(None),
+            response_receiver.try_flatten(),
         ));
 
         Ok(Box::pin(CoalescedShuffleReaderStream::new(
@@ -605,30 +613,32 @@ fn split_partition_locations(
 
 #[allow(clippy::too_many_arguments)]
 /// Fetch-side metrics for `ShuffleReaderExec`, recorded per output partition
-/// (upstream #1968, adapted to the Spice fetch pipeline).
+/// (upstream #1968, adapted to the Spice fetch pipeline: memory:// and local
+/// files count as local, flight and object-store fetches as remote).
 ///
 /// NOTE: the reader's `BaselineMetrics::elapsed_compute` measures poll time of
 /// the consuming stream, which overlaps with background fetching. `fetch_time`
-/// here measures opening remote/object-store fetch streams (this reader streams
-/// fetched partitions instead of buffering them, so transfer time is spread
-/// across consumption). `decoded_bytes` is the in-memory Arrow footprint of
-/// remotely fetched batches, not compressed wire bytes. `fetch_time` and
-/// `permit_wait_time` are each summed across every concurrent remote fetch
-/// task, so their totals can exceed the operator's wall-clock elapsed time —
-/// read them as aggregate cost, not wall-clock.
+/// here is *additive* wall-time spent inside the fetch tasks — do not sum the
+/// two. `decoded_bytes` is the in-memory Arrow footprint of fetched batches,
+/// not compressed wire bytes. `fetch_time` and `permit_wait_time` are each
+/// summed across every concurrent remote fetch task, so their totals can
+/// exceed the operator's wall-clock elapsed time — read them as aggregate
+/// cost, not wall-clock.
 #[derive(Debug, Clone)]
 struct ShuffleReadMetrics {
-    /// Wall-time opening remote (Arrow-Flight / object-store) fetch streams.
+    /// Wall-time fetching remote partitions (Arrow-Flight fetch + buffering,
+    /// or object-store reads).
     fetch_time: metrics::Time,
     /// Wall-time opening node-local shuffle files and in-memory partitions.
     local_read_time: metrics::Time,
-    /// Wall-time blocked acquiring the reduce-side concurrent-request permit.
+    /// Wall-time blocked acquiring the reduce-side in-flight governor permits
+    /// (request + per-address + byte semaphores, #1951).
     permit_wait_time: metrics::Time,
     /// Decoded (in-memory Arrow) bytes of fetched remote partitions.
     decoded_bytes: metrics::Count,
     /// Number of remote fetch attempts issued, including retries.
     fetch_requests: metrics::Count,
-    /// Extra fetch attempts taken by the evict-and-retry loop.
+    /// Extra fetch attempts taken by the reduce-side retry loop.
     fetch_retries: metrics::Count,
     /// Partitions served node-locally (local shuffle files + in-memory).
     local_partitions: metrics::Count,
@@ -658,23 +668,40 @@ impl ShuffleReadMetrics {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn send_fetch_partitions(
     partition_locations: Vec<PartitionLocation>,
-    max_request_num: usize,
-    max_message_size: usize,
-    force_remote_read: bool,
-    flight_transport: bool,
-    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
-    use_tls: bool,
+    config: &SessionConfig,
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
     metrics_callback: Option<Arc<dyn ShuffleReadMetricsCallback>>,
     read_metrics: ShuffleReadMetrics,
-    io_retries: usize,
-    io_retry_wait_ms: u64,
     runtime_env: Arc<RuntimeEnv>,
 ) -> AbortableReceiverStream {
-    let (response_sender, response_receiver) = mpsc::channel(max_request_num);
-    let semaphore = Arc::new(Semaphore::new(max_request_num));
+    let ballista_config = config.ballista_config();
+    let max_reqs = config.ballista_shuffle_reader_maximum_concurrent_requests();
+    let max_bytes = ballista_config.shuffle_reader_max_bytes_in_flight();
+    let max_blocks_per_addr =
+        ballista_config.shuffle_reader_max_blocks_in_flight_per_address();
+    let default_block_size = ballista_config.shuffle_reader_default_block_size_bytes();
+    let force_remote_read = config.ballista_shuffle_reader_force_remote_read();
+    let prefer_flight = config.ballista_shuffle_reader_remote_prefer_flight();
+    let customize_endpoint = config.ballista_override_create_grpc_client_endpoint();
+
+    let (response_sender, response_receiver) = mpsc::channel(max_reqs.max(1));
+
+    // Reduce-side in-flight governor. Each remote fetch acquires:
+    //   * `byte_sem`  — min(block_size, max_bytes) permits (in-flight-bytes budget)
+    //   * `req_sem`   — 1 permit (in-flight-request count)
+    //   * an addr semaphore — 1 permit (per-address in-flight cap)
+    // All three are held for the lifetime of the returned stream (see
+    // GovernedStream), so budget is released only when the body is fully
+    // consumed. Because total in-flight bytes stay <= the sized h2 window, the
+    // governor — not the 64 KB transport window — is the binding backpressure,
+    // which is what makes multiplexing over few connections safe.
+    let byte_sem = Arc::new(Semaphore::new(byte_permits_cap(max_bytes)));
+    let req_sem = Arc::new(Semaphore::new(max_reqs.max(1)));
+    let addr_sems: Arc<std::sync::Mutex<HashMap<String, Arc<Semaphore>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     let mut spawned_tasks: Vec<SpawnedTask<()>> = vec![];
 
     let locations = split_partition_locations(partition_locations, force_remote_read);
@@ -704,9 +731,7 @@ fn send_fetch_partitions(
         for p in memory_locations {
             let r = {
                 let _timer = memory_read_time.timer();
-                PartitionReaderEnum::Memory
-                    .fetch_partition(&p, max_message_size, flight_transport, None, false)
-                    .await
+                fetch_partition_memory(&p).await
             };
             if let Err(e) = response_sender_m.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
@@ -716,7 +741,6 @@ fn send_fetch_partitions(
 
     // keep local shuffle files reading in serial order for memory control.
     let response_sender_c = response_sender.clone();
-    let customize_endpoint_c = customize_endpoint.clone();
     let metrics_callback_c = metrics_callback.clone();
     let local_locations = locations.local;
     let local_read_time = read_metrics.local_read_time.clone();
@@ -725,15 +749,7 @@ fn send_fetch_partitions(
             let start_time = std::time::Instant::now();
             let r = {
                 let _timer = local_read_time.timer();
-                PartitionReaderEnum::Local
-                    .fetch_partition(
-                        &p,
-                        max_message_size,
-                        flight_transport,
-                        customize_endpoint_c.clone(),
-                        use_tls,
-                    )
-                    .await
+                fetch_partition_local(&p).await
             };
 
             // Record local read metrics if callback is set and read succeeded
@@ -784,55 +800,98 @@ fn send_fetch_partitions(
         }
     }));
 
+    // The reduce-side with_retry owns fetch retries; disable the client's inner
+    // establish-retry loop (set to a single attempt) so the two layers don't
+    // multiply. Read the retry budget BEFORE overriding it for the client.
+    let grpc_config: Arc<GrpcClientConfig> = {
+        let mut c: GrpcClientConfig = (&ballista_config).into();
+        // The fork can also enable TLS via the session extension, not only the
+        // `ballista.client.use_tls` config key.
+        c.use_tls = c.use_tls || config.ballista_use_tls();
+        Arc::new(c)
+    };
+    let outer_retries = grpc_config.io_retries_times;
+    let io_wait = grpc_config.io_retry_wait_time_ms;
+    let client_grpc_config: Arc<GrpcClientConfig> = {
+        let mut c = (*grpc_config).clone();
+        c.io_retries_times = 1;
+        Arc::new(c)
+    };
+
     for p in locations.remote.into_iter() {
-        let semaphore = semaphore.clone();
+        let byte_sem = byte_sem.clone();
+        let req_sem = req_sem.clone();
+        let addr_sems = addr_sems.clone();
         let response_sender = response_sender.clone();
-        let customize_endpoint_c = customize_endpoint.clone();
-        let metrics_callback_c = metrics_callback.clone();
+        let customize_endpoint = customize_endpoint.clone();
+        let client_grpc_config = client_grpc_config.clone();
+        let client_pool = client_pool.clone();
+        let metrics_callback = metrics_callback.clone();
         let read_metrics = read_metrics.clone();
+
         spawned_tasks.push(SpawnedTask::spawn(async move {
-            // Block if exceeds max request number.
-            let permit = {
+            let addr = p.executor_meta.id.clone();
+            let size = block_size(&p, default_block_size);
+
+            // Time spent blocked acquiring the three governor permits (#1951).
+            let (req_permit, addr_permit, byte_permit) = {
                 let _permit_timer = read_metrics.permit_wait_time.timer();
-                semaphore.acquire_owned().await.unwrap()
+                let req_permit = req_sem.acquire_owned().await.unwrap();
+                let addr_sem = {
+                    let mut map = addr_sems.lock().unwrap();
+                    map.entry(addr.clone())
+                        .or_insert_with(|| {
+                            Arc::new(Semaphore::new(max_blocks_per_addr.max(1)))
+                        })
+                        .clone()
+                };
+                let addr_permit = addr_sem.acquire_owned().await.unwrap();
+                let byte_permit = byte_sem
+                    .acquire_many_owned(byte_permits_for(size, max_bytes))
+                    .await
+                    .unwrap();
+                (req_permit, addr_permit, byte_permit)
             };
+
             let start_time = std::time::Instant::now();
+            let mut attempts = 0usize;
+            // Cloned (rather than used by reference) to avoid a partial move of
+            // `read_metrics`, which is still needed below for
+            // `fetch_requests`/`fetch_retries`.
+            let decoded_bytes = read_metrics.decoded_bytes.clone();
             let r = {
                 let _fetch_timer = read_metrics.fetch_time.timer();
-                PartitionReaderEnum::FlightRemote {
-                    fetch_requests: read_metrics.fetch_requests.clone(),
-                    fetch_retries: read_metrics.fetch_retries.clone(),
-                    io_retries,
-                    io_retry_wait_ms,
-                }
-                .fetch_partition(
-                    &p,
-                    max_message_size,
-                    flight_transport,
-                    customize_endpoint_c,
-                    use_tls,
-                )
+                with_retry(outer_retries, io_wait, is_retriable_fetch_error, || {
+                    attempts += 1;
+                    fetch_partition_buffered(
+                        &p,
+                        client_grpc_config.clone(),
+                        prefer_flight,
+                        customize_endpoint.clone(),
+                        client_pool.clone(),
+                    )
+                })
                 .await
-            };
-            // Count the decoded (in-memory Arrow) bytes of every batch as the
-            // stream drains; fetched partitions are streamed, not buffered, so
-            // decoded_bytes accumulates during consumption.
-            let r = r.map(|stream| {
-                let schema = stream.schema();
-                let decoded_bytes = read_metrics.decoded_bytes.clone();
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream.inspect(move |b| {
-                        if let Ok(batch) = b {
-                            decoded_bytes.add(batch.get_array_memory_size());
-                        }
-                    }),
+            }
+            .map(|(schema, batches)| {
+                let bytes: usize =
+                    batches.iter().map(|b| b.get_array_memory_size()).sum();
+                decoded_bytes.add(bytes);
+                Box::pin(GovernedStream::new(
+                    buffered_stream(schema, batches),
+                    byte_permit,
+                    req_permit,
+                    addr_permit,
                 )) as SendableRecordBatchStream
             });
+            // Total wire attempts (initial + retries), recorded only after
+            // `with_retry` has finished retrying.
+            read_metrics.fetch_requests.add(attempts);
+            read_metrics.fetch_retries.add(attempts.saturating_sub(1));
 
             // Record remote read metrics if callback is set and read succeeded
             if r.is_ok()
-                && let Some(ref callback) = metrics_callback_c
+                && let Some(ref callback) = metrics_callback
             {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 let bytes = p.partition_stats.num_bytes().unwrap_or(0);
@@ -848,12 +907,9 @@ fn send_fetch_partitions(
                 );
             }
 
-            // Block if the channel buffer is full.
             if let Err(e) = response_sender.send(r).await {
                 error!("Fail to send response event to the channel due to {e}");
             }
-            // Increase semaphore by dropping existing permits.
-            drop(permit);
         }));
     }
 
@@ -876,78 +932,6 @@ fn check_is_local_memory_location(location: &PartitionLocation) -> bool {
         global_shuffle_manager().contains_partition(key)
     } else {
         false
-    }
-}
-
-/// Partition reader Trait, different partition reader can have
-#[async_trait]
-trait PartitionReader: Send + Sync + Clone {
-    // Read partition data from PartitionLocation
-    async fn fetch_partition(
-        &self,
-        location: &PartitionLocation,
-        max_message_size: usize,
-        flight_transport: bool,
-        customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
-        use_tls: bool,
-    ) -> result::Result<SendableRecordBatchStream, BallistaError>;
-}
-
-#[derive(Clone)]
-enum PartitionReaderEnum {
-    Local,
-    Memory,
-    FlightRemote {
-        /// Wire fetch attempts issued, including retries.
-        fetch_requests: metrics::Count,
-        /// Extra attempts taken by the evict-and-retry loop.
-        fetch_retries: metrics::Count,
-        /// Extra fetch attempts (each on a fresh connection) after a failure.
-        io_retries: usize,
-        /// Wait between attempts, in milliseconds.
-        io_retry_wait_ms: u64,
-    },
-    #[allow(dead_code)]
-    ObjectStoreRemote,
-}
-
-#[async_trait]
-impl PartitionReader for PartitionReaderEnum {
-    // Notice return `BallistaError::FetchFailed` will let scheduler re-schedule the task.
-    async fn fetch_partition(
-        &self,
-        location: &PartitionLocation,
-        max_message_size: usize,
-        flight_transport: bool,
-        customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
-        use_tls: bool,
-    ) -> result::Result<SendableRecordBatchStream, BallistaError> {
-        match self {
-            PartitionReaderEnum::FlightRemote {
-                fetch_requests,
-                fetch_retries,
-                io_retries,
-                io_retry_wait_ms,
-            } => {
-                fetch_partition_remote(
-                    location,
-                    max_message_size,
-                    flight_transport,
-                    customize_endpoint,
-                    use_tls,
-                    fetch_requests,
-                    fetch_retries,
-                    *io_retries,
-                    *io_retry_wait_ms,
-                )
-                .await
-            }
-            PartitionReaderEnum::Local => fetch_partition_local(location).await,
-            PartitionReaderEnum::Memory => fetch_partition_memory(location).await,
-            PartitionReaderEnum::ObjectStoreRemote => {
-                fetch_partition_object_store(location).await
-            }
-        }
     }
 }
 
@@ -980,26 +964,7 @@ fn missing_disk_partition_is_empty(location: &PartitionLocation) -> bool {
     disk_backed && no_rows
 }
 
-/// Identifies a pooled shuffle-fetch client by peer address and transport.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct PeerKey {
-    host: String,
-    port: u16,
-    use_tls: bool,
-}
-
-/// Process-global pool of shuffle-fetch clients, keyed by peer.
-///
-/// A distributed shuffle issues thousands of fetches; opening a fresh client (new gRPC
-/// connection + TLS handshake) per fetch storms the peer with handshakes that reset
-/// under load. Clients clone a shared multiplexed HTTP/2 `Channel`, so caching one
-/// per peer collapses the storm to a single connection per peer.
-type RemoteShuffleClients = Mutex<HashMap<PeerKey, BallistaClient>>;
-
-static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<RemoteShuffleClients> =
-    std::sync::OnceLock::new();
-
-/// Runtime that owns the pooled shuffle channels' transport tasks (the tower
+/// Runtime that owns shuffle-fetch channels' transport tasks (the tower
 /// buffer worker and the hyper h2 connection driver are spawned onto whichever
 /// runtime performs the connect). Reducer tasks run on a dedicated, saturated,
 /// down-prioritized CPU runtime; connecting from there parks the connection
@@ -1011,60 +976,57 @@ static REMOTE_SHUFFLE_CLIENTS: std::sync::OnceLock<RemoteShuffleClients> =
 static SHUFFLE_TRANSPORT_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> =
     std::sync::OnceLock::new();
 
-/// Register the runtime that pooled shuffle-client transport tasks should run
+/// Register the runtime that shuffle-client transport tasks should run
 /// on. First call wins; subsequent calls are ignored.
 pub fn set_shuffle_transport_runtime(handle: tokio::runtime::Handle) {
     let _ = SHUFFLE_TRANSPORT_RUNTIME.set(handle);
 }
 
-fn remote_shuffle_clients() -> &'static RemoteShuffleClients {
-    REMOTE_SHUFFLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Return a cloned, connected [`BallistaClient`] for `host:port`, reusing a pooled
-/// connection when one exists and connecting (then caching) on a miss. The clone is
-/// cheap and shares the pooled connection's multiplexed tonic `Channel`.
-async fn cached_remote_client(
+async fn new_ballista_client(
     host: &str,
     port: u16,
-    max_message_size: usize,
-    use_tls: bool,
+    config: &GrpcClientConfig,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
 ) -> result::Result<BallistaClient, BallistaError> {
-    let key = PeerKey {
-        host: host.to_string(),
+    BallistaClient::try_new(
+        host,
         port,
-        use_tls,
-    };
-    // Fast path: a pooled client clones cheaply. The lock is not held across the
-    // connect below, so a slow handshake to one peer cannot block fetches to others.
-    if let Some(client) = remote_shuffle_clients().lock().await.get(&key) {
-        return Ok(client.clone());
-    }
-    // Cache miss: connect without holding the lock. Concurrent first-time fetches
-    // to the same peer may each connect briefly; the first to re-acquire the lock
-    // wins and the rest reuse its client, dropping their redundant connection.
-    let client = match SHUFFLE_TRANSPORT_RUNTIME.get() {
+        config.max_message_size,
+        config.use_tls,
+        customize_endpoint,
+        config.io_retries_times,
+        config.io_retry_wait_time_ms,
+        config.initial_connection_window_size,
+        config.initial_stream_window_size,
+    )
+    .await
+}
+
+/// Connect a new [`BallistaClient`], placing the channel's transport tasks on
+/// the registered shuffle transport runtime when one is set (see
+/// [`set_shuffle_transport_runtime`]). Used both for unpooled fetches and by
+/// the executor-side client pool on a pool miss.
+pub async fn connect_ballista_client(
+    host: &str,
+    port: u16,
+    config: &GrpcClientConfig,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+) -> result::Result<BallistaClient, BallistaError> {
+    match SHUFFLE_TRANSPORT_RUNTIME.get() {
         // Connect on the transport runtime so the channel's h2 driver and
         // buffer worker are polled there, not on the CPU-saturated pool that
         // is running this fetch (see SHUFFLE_TRANSPORT_RUNTIME).
         Some(handle) => {
             let host_owned = host.to_string();
+            let cfg = config.clone();
             let ep = customize_endpoint.clone();
             match handle
-                .spawn(async move {
-                    BallistaClient::try_new(
-                        &host_owned,
-                        port,
-                        max_message_size,
-                        use_tls,
-                        ep,
-                    )
-                    .await
-                })
+                .spawn(
+                    async move { new_ballista_client(&host_owned, port, &cfg, ep).await },
+                )
                 .await
             {
-                Ok(connect_result) => connect_result?,
+                Ok(connect_result) => connect_result,
                 // The registered transport runtime has already shut down (e.g. a
                 // short-lived executor in an embedded test harness outlived the
                 // stale registration — see `set_shuffle_transport_runtime`).
@@ -1074,102 +1036,98 @@ async fn cached_remote_client(
                     log::warn!(
                         "shuffle transport runtime is no longer available, connecting on the caller's runtime instead"
                     );
-                    BallistaClient::try_new(
-                        host,
-                        port,
-                        max_message_size,
-                        use_tls,
-                        customize_endpoint,
-                    )
-                    .await?
+                    new_ballista_client(host, port, config, customize_endpoint).await
                 }
-                Err(join_err) => {
-                    return Err(BallistaError::GrpcConnectionError(format!(
-                        "shuffle client connect task failed: {join_err}"
-                    )));
-                }
+                Err(join_err) => Err(BallistaError::GrpcConnectionError(format!(
+                    "shuffle client connect task failed: {join_err}"
+                ))),
             }
         }
-        None => {
-            BallistaClient::try_new(
-                host,
-                port,
-                max_message_size,
-                use_tls,
-                customize_endpoint,
-            )
-            .await?
-        }
-    };
-    let mut pool = remote_shuffle_clients().lock().await;
-    Ok(pool.entry(key).or_insert(client).clone())
+        None => new_ballista_client(host, port, config, customize_endpoint).await,
+    }
 }
 
-/// Drop the pooled client for `host:port` so the next fetch reconnects. Called when a
-/// fetch fails, since the cached connection may be broken (e.g. the peer restarted).
-async fn evict_remote_client(host: &str, port: u16, use_tls: bool) {
-    remote_shuffle_clients().lock().await.remove(&PeerKey {
-        host: host.to_string(),
-        port,
-        use_tls,
-    });
+/// Handle a NotFound from a remote fetch: a missing disk partition file that is
+/// expected-empty is an empty partition; otherwise the data is lost and the
+/// stage must be resubmitted. A data-level signal, not a broken connection.
+fn not_found_result(
+    location: &PartitionLocation,
+) -> result::Result<SendableRecordBatchStream, BallistaError> {
+    if missing_disk_partition_is_empty(location) {
+        Ok(empty_partition_stream())
+    } else {
+        Err(BallistaError::FetchFailed(
+            location.executor_meta.id.clone(),
+            location.partition_id.stage_id,
+            location.partition_id.partition_id,
+            format!(
+                "remote partition file missing but stats report {:?} rows",
+                location.partition_stats.num_rows
+            ),
+        ))
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn fetch_partition_remote(
     location: &PartitionLocation,
-    max_message_size: usize,
-    flight_transport: bool,
+    config: Arc<GrpcClientConfig>,
+    prefer_flight: bool,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
-    use_tls: bool,
-    fetch_requests: &metrics::Count,
-    fetch_retries: &metrics::Count,
-    io_retries: usize,
-    io_retry_wait_ms: u64,
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
     let metadata = &location.executor_meta;
     let partition_id = &location.partition_id;
     let host = metadata.host.as_str();
     let port = metadata.port;
 
-    // Reuse one pooled connection per peer instead of dialing a new one per fetch
-    // (see `cached_remote_client`); this avoids the connection storm that caused
-    // `connection reset by peer` failures during large distributed shuffles.
-    //
-    // A pooled connection can be stale: the peer restarted, or HTTP/2 keepalive
-    // detected a dead path and closed the channel while it sat in the pool. The
-    // first fetch on such a client fails immediately ("Service was not ready:
-    // transport error") without touching the network. The fetch is an idempotent
-    // read, so evict the pooled client and retry once on a fresh connection
-    // before failing the task.
-    let max_attempts = 1 + io_retries;
-    let mut last_err: Option<BallistaError> = None;
-    for attempt in 0..max_attempts {
-        fetch_requests.add(1);
-        if attempt > 0 {
-            fetch_retries.add(1);
-            if io_retry_wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(io_retry_wait_ms)).await;
+    let map_conn_err = |error: BallistaError| match error {
+        // map grpc connection error to partition fetch error.
+        BallistaError::GrpcConnectionError(msg) => BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            msg,
+        ),
+        other => other,
+    };
+
+    if let Some(pool) = client_pool {
+        let mut pooled = pool
+            .acquire(host, port, &config, customize_endpoint)
+            .await
+            .map_err(map_conn_err)?;
+
+        match pooled
+            .fetch_partition(
+                &metadata.id,
+                partition_id,
+                &location.path,
+                host,
+                port,
+                prefer_flight,
+            )
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            // NotFound keeps the pooled client: the connection is healthy.
+            Err(BallistaError::GrpcError(status))
+                if status.code() == tonic::Code::NotFound =>
+            {
+                not_found_result(location)
+            }
+            // Any other failure may indicate the pooled connection is broken;
+            // discard it so the next fetch reconnects rather than reusing a
+            // dead channel.
+            Err(e) => {
+                pooled.discard();
+                Err(e)
             }
         }
-        let mut ballista_client = cached_remote_client(
-            host,
-            port,
-            max_message_size,
-            use_tls,
-            customize_endpoint.clone(),
-        )
-        .await
-        .map_err(|error| match error {
-            // map grpc connection error to partition fetch error.
-            BallistaError::GrpcConnectionError(msg) => BallistaError::FetchFailed(
-                metadata.id.clone(),
-                partition_id.stage_id,
-                partition_id.partition_id,
-                msg,
-            ),
-            other => other,
-        })?;
+    } else {
+        let mut ballista_client =
+            connect_ballista_client(host, port, &config, customize_endpoint)
+                .await
+                .map_err(map_conn_err)?;
 
         match ballista_client
             .fetch_partition(
@@ -1178,49 +1136,184 @@ async fn fetch_partition_remote(
                 &location.path,
                 host,
                 port,
-                flight_transport,
+                prefer_flight,
             )
             .await
         {
-            Ok(stream) => return Ok(stream),
-            // A missing disk partition file comes back as a NotFound status. If the
-            // partition is an expected-empty disk partition, treat it as empty; otherwise
-            // a missing file means lost data and must fail so the stage is resubmitted.
-            // NotFound is a data-level signal, not a broken connection — keep the pooled
-            // client and don't retry.
+            Ok(stream) => Ok(stream),
             Err(BallistaError::GrpcError(status))
                 if status.code() == tonic::Code::NotFound =>
             {
-                return if missing_disk_partition_is_empty(location) {
-                    Ok(empty_partition_stream())
-                } else {
-                    Err(BallistaError::FetchFailed(
-                        metadata.id.clone(),
-                        partition_id.stage_id,
-                        partition_id.partition_id,
-                        format!(
-                            "remote partition file missing but stats report {:?} rows",
-                            location.partition_stats.num_rows
-                        ),
-                    ))
-                };
+                not_found_result(location)
             }
-            // Any other failure may indicate the pooled connection is broken; evict it
-            // so the next attempt (and any concurrent fetch) reconnects rather than
-            // reusing a dead channel.
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Retry an idempotent async operation up to `retries` times after the initial
+/// attempt, sleeping `wait_ms` between tries. Shuffle partition fetches are
+/// idempotent (the server re-reads the file), so a transport error — including
+/// one mid-body — can be recovered by refetching the whole partition. Only
+/// errors accepted by `should_retry` are retried; anything else is returned
+/// immediately on the first failure.
+async fn with_retry<T, F, Fut>(
+    retries: u8,
+    wait_ms: u64,
+    should_retry: impl Fn(&BallistaError) -> bool,
+    mut f: F,
+) -> result::Result<T, BallistaError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = result::Result<T, BallistaError>>,
+{
+    let mut attempt: u8 = 0;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
             Err(e) => {
-                evict_remote_client(host, port, use_tls).await;
-                if attempt == 0 {
-                    warn!(
-                        "shuffle fetch from {host}:{port} failed on pooled connection ({e}); retrying on a fresh connection"
-                    );
+                if attempt >= retries || !should_retry(&e) {
+                    return Err(e);
                 }
-                last_err = Some(e);
+                attempt += 1;
+                debug!(
+                    "retrying shuffle fetch (attempt {attempt}/{retries}) after error: {e}"
+                );
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
             }
         }
     }
+}
 
-    Err(last_err.expect("fetch retry loop exits early on success"))
+/// Transport/fetch failures worth refetching an idempotent shuffle block for.
+/// Deterministic failures (bad config, schema/decoding logic errors) are not
+/// retried. Mirrors the transport-only retry policy of the client's inner loop.
+fn is_retriable_fetch_error(e: &BallistaError) -> bool {
+    matches!(
+        e,
+        BallistaError::GrpcConnectionError(_) | BallistaError::FetchFailed(..)
+    )
+}
+
+/// Fetch a remote partition and buffer its entire body into memory, turning the
+/// open-ended stream into a discrete, refetchable unit. Buffering is what makes
+/// a mid-body transport failure retriable without emitting duplicate batches
+/// downstream. The governor charges each block its compressed (serialized) size,
+/// so the byte budget bounds concurrent in-flight **wire** bytes — which is the
+/// quantity the h2 window must accommodate. The decoded in-memory footprint is
+/// larger by the Arrow/compression expansion ratio, so peak buffered RAM exceeds
+/// the byte budget by that factor. Bounding decoded memory precisely is the
+/// deferred disk-spill work.
+async fn fetch_partition_buffered(
+    location: &PartitionLocation,
+    config: Arc<GrpcClientConfig>,
+    prefer_flight: bool,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
+) -> result::Result<(SchemaRef, Vec<RecordBatch>), BallistaError> {
+    let stream = fetch_partition_remote(
+        location,
+        config,
+        prefer_flight,
+        customize_endpoint,
+        client_pool,
+    )
+    .await?;
+    let schema = stream.schema();
+    let metadata = &location.executor_meta;
+    let partition_id = &location.partition_id;
+    let batches = stream.try_collect::<Vec<_>>().await.map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            e.to_string(),
+        )
+    })?;
+    Ok((schema, batches))
+}
+
+/// Build an in-memory `SendableRecordBatchStream` from already-buffered batches.
+fn buffered_stream(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(batches.into_iter().map(Ok)),
+    ))
+}
+
+/// In-flight bytes charged to the governor for a block. Uses the partition's
+/// recorded byte size, falling back to `default` when stats carry none. Never 0,
+/// so every block occupies at least one permit.
+fn block_size(location: &PartitionLocation, default: u64) -> u64 {
+    location
+        .partition_stats
+        .num_bytes()
+        .unwrap_or(default)
+        .max(1)
+}
+
+/// Size of the byte semaphore. tokio permits are `usize`; clamp so it is at least
+/// 1 and never exceeds `u32::MAX` (the `acquire_many` argument type).
+fn byte_permits_cap(max_bytes: u64) -> usize {
+    max_bytes.clamp(1, u32::MAX as u64) as usize
+}
+
+/// Byte permits to acquire for a block: `min(size, max_bytes)`, clamped to
+/// `[1, u32::MAX]`. Capping at `max_bytes` means an oversized block requests the
+/// entire budget and can only proceed once all other fetches drain — the
+/// application-layer analog of Spark's `bytesInFlight == 0` progress clause.
+fn byte_permits_for(size: u64, max_bytes: u64) -> u32 {
+    let cap = max_bytes.clamp(1, u32::MAX as u64);
+    size.clamp(1, cap) as u32
+}
+
+/// Wraps a fetched partition stream and holds the governor permits for its
+/// lifetime. Dropping the stream — on normal end, consumer cancellation, or a
+/// mid-body error — releases all three permits, freeing budget for the next
+/// fetch. This is the release-on-body-completion behavior the governor needs.
+struct GovernedStream {
+    inner: SendableRecordBatchStream,
+    _byte_permit: OwnedSemaphorePermit,
+    _req_permit: OwnedSemaphorePermit,
+    _addr_permit: OwnedSemaphorePermit,
+}
+
+impl GovernedStream {
+    fn new(
+        inner: SendableRecordBatchStream,
+        byte_permit: OwnedSemaphorePermit,
+        req_permit: OwnedSemaphorePermit,
+        addr_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            inner,
+            _byte_permit: byte_permit,
+            _req_permit: req_permit,
+            _addr_permit: addr_permit,
+        }
+    }
+}
+
+impl Stream for GovernedStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.inner.poll_next_unpin(cx)
+    }
+}
+
+impl RecordBatchStream for GovernedStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
 }
 
 async fn fetch_partition_local(
@@ -1781,124 +1874,6 @@ fn check_is_object_store_location(location: &PartitionLocation) -> bool {
         || path.starts_with("gs://")
 }
 
-async fn fetch_partition_object_store(
-    location: &PartitionLocation,
-) -> result::Result<SendableRecordBatchStream, BallistaError> {
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-
-    let path = &location.path;
-    let metadata = &location.executor_meta;
-    let partition_id = &location.partition_id;
-
-    debug!("Fetching shuffle partition from object store: {path}");
-
-    let batches = fetch_partition_object_store_inner(path)
-        .await
-        .map_err(|e| {
-            // return BallistaError::FetchFailed may let scheduler retry this task.
-            BallistaError::FetchFailed(
-                metadata.id.clone(),
-                partition_id.stage_id,
-                partition_id.partition_id,
-                e.to_string(),
-            )
-        })?;
-
-    if batches.is_empty() {
-        return Err(BallistaError::General(format!(
-            "No batches found in shuffle partition at {path}"
-        )));
-    }
-
-    let schema = batches[0].schema();
-    let stream = futures::stream::iter(batches.into_iter().map(Ok));
-    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-}
-
-async fn fetch_partition_object_store_inner(
-    path: &str,
-) -> result::Result<Vec<RecordBatch>, BallistaError> {
-    use object_store::path::Path as ObjectPath;
-
-    let url = Url::parse(path).map_err(|e| {
-        BallistaError::General(format!(
-            "Failed to parse object store URL '{path}': {e:?}"
-        ))
-    })?;
-
-    let scheme = url.scheme();
-    let store: Arc<dyn ObjectStore> = match scheme {
-        "s3" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No bucket in S3 URL: {path}"))
-            })?;
-            let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-            Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create S3 client: {e:?}"))
-            })?)
-        }
-        "abfs" | "az" => {
-            // Parse Azure URL: abfs://container@account.dfs.core.windows.net/path
-            let host = url.host_str().ok_or_else(|| {
-                BallistaError::General(format!("No host in Azure URL: {path}"))
-            })?;
-
-            // Extract container from username portion
-            let container = url.username();
-            if container.is_empty() {
-                return Err(BallistaError::General(format!(
-                    "No container in Azure URL. Expected format: abfs://container@account.dfs.core.windows.net/path. Got: {path}"
-                )));
-            }
-
-            // Extract account from host (account.dfs.core.windows.net)
-            let account = host.split('.').next().ok_or_else(|| {
-                BallistaError::General(format!("No account in Azure URL: {path}"))
-            })?;
-
-            let builder = MicrosoftAzureBuilder::from_env()
-                .with_account(account)
-                .with_container_name(container);
-            Arc::new(builder.build().map_err(|e| {
-                BallistaError::General(format!("Failed to create Azure client: {e:?}"))
-            })?)
-        }
-        _ => {
-            return Err(BallistaError::General(format!(
-                "Unsupported object store scheme: {scheme}. Supported: s3, abfs, az"
-            )));
-        }
-    };
-
-    // Extract the object path from the URL
-    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
-
-    debug!("Reading object from path: {object_path:?}");
-
-    let get_result = store.get(&object_path).await.map_err(|e| {
-        BallistaError::General(format!("Failed to read object from {path}: {e:?}"))
-    })?;
-
-    let bytes = get_result.bytes().await.map_err(|e| {
-        BallistaError::General(format!("Failed to read bytes from {path}: {e:?}"))
-    })?;
-
-    let cursor = Cursor::new(bytes.to_vec());
-    let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        BallistaError::General(format!(
-            "Failed to create Arrow stream reader for {path}: {e:?}"
-        ))
-    })?;
-
-    let mut batches = Vec::new();
-    for batch_result in stream_reader {
-        batches.push(batch_result.map_err(|e| {
-            BallistaError::General(format!("Failed to read batch from {path}: {e:?}"))
-        })?);
-    }
-
-    Ok(batches)
-}
 
 struct CoalescedShuffleReaderStream {
     schema: SchemaRef,
@@ -2478,25 +2453,21 @@ mod tests {
             file_path.to_str().unwrap().to_string(),
         );
 
+        let config = SessionConfig::new_with_ballista()
+            .with_ballista_shuffle_reader_maximum_concurrent_requests(max_request_num);
         let metrics_set = ExecutionPlanMetricsSet::new();
         let response_receiver = send_fetch_partitions(
             partition_locations,
-            max_request_num,
-            4 * 1024 * 1024,
-            false,
-            true,
+            &config,
             None,
-            false,
             None, // No metrics callback in tests
             ShuffleReadMetrics::new(0, &metrics_set),
-            1,
-            0,
             Arc::new(RuntimeEnv::default()),
         );
 
         let stream = RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            response_receiver.try_flatten_unordered(None),
+            response_receiver.try_flatten(),
         );
 
         let result = common::collect(Box::pin(stream)).await.unwrap();

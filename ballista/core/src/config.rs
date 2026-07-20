@@ -93,11 +93,28 @@ pub const BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD: &str =
 /// Configuration key for sort shuffle target batch size in rows.
 pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
+/// Should connection between client, scheduler, and executors use TLS
+pub const BALLISTA_CLIENT_USE_TLS: &str = "ballista.client.use_tls";
 /// Number of retries for IO operations in the Ballista client
 pub const BALLISTA_CLIENT_IO_RETRIES_TIMES: &str = "ballista.client.io_retries_times";
 /// Wait time in milliseconds between IO retries in the Ballista client
 pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
     "ballista.client.io_retry_wait_time_ms";
+/// Configuration key for the reduce-side in-flight-bytes governor budget.
+pub const BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT: &str =
+    "ballista.shuffle.reader.max_bytes_in_flight";
+/// Configuration key for the per-address in-flight block cap.
+pub const BALLISTA_SHUFFLE_READER_MAX_BLOCKS_PER_ADDRESS: &str =
+    "ballista.shuffle.reader.max_blocks_in_flight_per_address";
+/// Configuration key for the assumed block size when partition stats lack a byte count.
+pub const BALLISTA_SHUFFLE_READER_DEFAULT_BLOCK_SIZE: &str =
+    "ballista.shuffle.reader.default_block_size_bytes";
+/// Configuration key for the gRPC client HTTP/2 initial connection-level flow-control window.
+pub const BALLISTA_CLIENT_INITIAL_CONNECTION_WINDOW_SIZE: &str =
+    "ballista.client.initial_connection_window_size";
+/// Configuration key for the gRPC client HTTP/2 initial stream-level flow-control window.
+pub const BALLISTA_CLIENT_INITIAL_STREAM_WINDOW_SIZE: &str =
+    "ballista.client.initial_stream_window_size";
 
 /// Configuration key for the byte-size threshold below which a hash join's
 /// smaller side is promoted to `CollectLeft` and lowered via the broadcast
@@ -238,17 +255,38 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Target batch size in rows for coalescing small batches in sort shuffle".to_string(),
                          DataType::UInt64,
                          Some((8192).to_string())),
+        ConfigEntry::new(BALLISTA_CLIENT_USE_TLS.to_string(),
+                         "Should connection between client, scheduler, and executors use TLS.".to_string(),
+                         DataType::Boolean,
+                         Some(false.to_string())),
         ConfigEntry::new(BALLISTA_CLIENT_IO_RETRIES_TIMES.to_string(),
-                         "Number of extra fetch attempts (each on a fresh connection) after a failed \
-                          remote shuffle read in the Ballista client. Defaults to 1, preserving the \
-                          evict-and-retry-once behavior; upstream defaults to 3.".to_string(),
+                         "Number of retries for IO operations in the Ballista client.".to_string(),
                          DataType::UInt16,
-                         Some(1.to_string())),
+                         Some(3.to_string())),
         ConfigEntry::new(BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS.to_string(),
-                         "Wait time in milliseconds between IO retries in the Ballista client. \
-                          Defaults to 0 (immediate retry on a fresh connection); upstream defaults to 3000.".to_string(),
+                         "Wait time in milliseconds between IO retries in the Ballista client.".to_string(),
                          DataType::UInt64,
-                         Some(0.to_string())),
+                         Some(3000.to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT.to_string(),
+                         "Reduce-side shuffle governor: maximum total in-flight bytes across concurrent remote partition fetches. Mirrors Spark's spark.reducer.maxSizeInFlight. Values above 4 GiB are clamped to 4 GiB (u32 semaphore limit).".to_string(),
+                         DataType::UInt64,
+                         Some((50331648).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_READER_MAX_BLOCKS_PER_ADDRESS.to_string(),
+                         "Reduce-side shuffle governor: maximum concurrent in-flight partition fetches to a single executor address.".to_string(),
+                         DataType::UInt64,
+                         Some((128).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_READER_DEFAULT_BLOCK_SIZE.to_string(),
+                         "Assumed per-partition byte size charged to the shuffle governor when partition stats carry no byte count.".to_string(),
+                         DataType::UInt64,
+                         Some((1048576).to_string())),
+        ConfigEntry::new(BALLISTA_CLIENT_INITIAL_CONNECTION_WINDOW_SIZE.to_string(),
+                         "HTTP/2 initial connection-level flow-control window for gRPC data-plane clients, in bytes. Should be >= the shuffle governor byte budget so the governor, not the transport window, is the binding backpressure. 0 leaves the tonic default.".to_string(),
+                         DataType::UInt64,
+                         Some((67108864).to_string())),
+        ConfigEntry::new(BALLISTA_CLIENT_INITIAL_STREAM_WINDOW_SIZE.to_string(),
+                         "HTTP/2 initial stream-level flow-control window for gRPC data-plane clients, in bytes. 0 leaves the tonic default.".to_string(),
+                         DataType::UInt64,
+                         Some((16777216).to_string())),
         ConfigEntry::new(BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES.to_string(),
                          "Byte-size threshold below which a hash join's smaller side is \
                           promoted to CollectLeft and lowered via the broadcast pattern. \
@@ -636,6 +674,11 @@ impl BallistaConfig {
         self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE)
     }
 
+    /// should client use TLS to communicate with ballista cluster
+    pub fn client_use_tls(&self) -> bool {
+        self.get_bool_setting(BALLISTA_CLIENT_USE_TLS)
+    }
+
     /// Returns the number of retries for IO operations in the Ballista client.
     pub fn io_retries_times(&self) -> usize {
         self.get_usize_setting(BALLISTA_CLIENT_IO_RETRIES_TIMES)
@@ -644,6 +687,31 @@ impl BallistaConfig {
     /// Returns the wait time in milliseconds between IO retries in the Ballista client.
     pub fn io_retry_wait_time_ms(&self) -> usize {
         self.get_usize_setting(BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS)
+    }
+
+    /// Reduce-side shuffle governor byte budget (`max_bytes_in_flight`).
+    pub fn shuffle_reader_max_bytes_in_flight(&self) -> u64 {
+        self.get_usize_setting(BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT) as u64
+    }
+
+    /// Reduce-side shuffle governor per-address in-flight block cap.
+    pub fn shuffle_reader_max_blocks_in_flight_per_address(&self) -> usize {
+        self.get_usize_setting(BALLISTA_SHUFFLE_READER_MAX_BLOCKS_PER_ADDRESS)
+    }
+
+    /// Assumed block size charged to the governor when stats lack a byte count.
+    pub fn shuffle_reader_default_block_size_bytes(&self) -> u64 {
+        self.get_usize_setting(BALLISTA_SHUFFLE_READER_DEFAULT_BLOCK_SIZE) as u64
+    }
+
+    /// HTTP/2 initial connection-level flow-control window (bytes) for data-plane clients.
+    pub fn grpc_client_initial_connection_window_size(&self) -> u32 {
+        self.get_usize_setting(BALLISTA_CLIENT_INITIAL_CONNECTION_WINDOW_SIZE) as u32
+    }
+
+    /// HTTP/2 initial stream-level flow-control window (bytes) for data-plane clients.
+    pub fn grpc_client_initial_stream_window_size(&self) -> u32 {
+        self.get_usize_setting(BALLISTA_CLIENT_INITIAL_STREAM_WINDOW_SIZE) as u32
     }
 
     /// Returns the byte-size threshold below which a hash join's smaller side

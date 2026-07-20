@@ -434,6 +434,9 @@ async fn execute_query_pull(
     let customize_endpoint =
         session_config.ballista_override_create_grpc_client_endpoint();
     let use_tls = session_config.ballista_use_tls();
+    let io_retries_times = session_config.ballista_config().io_retries_times() as u8;
+    let io_retry_wait_time_ms =
+        session_config.ballista_config().io_retry_wait_time_ms() as u64;
     let result_fetch_callback = session_config.ballista_result_fetch_metrics_callback();
 
     // Capture query submission time for total_query_time_ms
@@ -576,6 +579,8 @@ async fn execute_query_pull(
                         flight_proxy.clone(),
                         customize_endpoint.clone(),
                         use_tls,
+                        io_retries_times,
+                        io_retry_wait_time_ms,
                         callback,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
@@ -606,6 +611,9 @@ async fn execute_query_push(
     let customize_endpoint =
         session_config.ballista_override_create_grpc_client_endpoint();
     let use_tls = session_config.ballista_use_tls();
+    let io_retries_times = session_config.ballista_config().io_retries_times() as u8;
+    let io_retry_wait_time_ms =
+        session_config.ballista_config().io_retry_wait_time_ms() as u64;
     let result_fetch_callback = session_config.ballista_result_fetch_metrics_callback();
 
     // Capture query submission time for total_query_time_ms
@@ -741,6 +749,8 @@ async fn execute_query_push(
                         flight_proxy.clone(),
                         customize_endpoint.clone(),
                         use_tls,
+                        io_retries_times,
+                        io_retry_wait_time_ms,
                         callback,
                     )
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)));
@@ -808,6 +818,8 @@ async fn fetch_partition(
     flight_proxy: Option<FlightProxy>,
     customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     use_tls: bool,
+    io_retries_times: u8,
+    io_retry_wait_time_ms: u64,
     metrics_callback: Option<Arc<dyn ResultFetchMetricsCallback>>,
 ) -> Result<SendableRecordBatchStream> {
     let start_time = std::time::Instant::now();
@@ -844,6 +856,10 @@ async fn fetch_partition(
         max_message_size,
         use_tls,
         customize_endpoint,
+        io_retries_times,
+        io_retry_wait_time_ms,
+        0,
+        0,
     )
     .await
     .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;

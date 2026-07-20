@@ -40,8 +40,8 @@ pub use shuffle_manager::{
 };
 pub use shuffle_reader::ShuffleReaderExec;
 pub use shuffle_reader::{
-    CoalescePlan, PartitionGroup, set_shuffle_transport_runtime, stats_for_partition,
-    stats_for_partitions,
+    CoalescePlan, PartitionGroup, connect_ballista_client,
+    set_shuffle_transport_runtime, stats_for_partition, stats_for_partitions,
 };
 pub use shuffle_writer::ShuffleWriterExec;
 pub use shuffle_writer_trait::ShuffleWriter;

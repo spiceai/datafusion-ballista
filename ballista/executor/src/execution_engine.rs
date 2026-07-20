@@ -22,7 +22,8 @@
 //! for creating query stage executors from physical plans.
 
 use async_trait::async_trait;
-use ballista_core::execution_plans::ShuffleWriterExec;
+use ballista_core::client_pool::BallistaClientPool;
+use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::utils;
@@ -182,7 +183,23 @@ pub trait QueryStageExecutor: Sync + Send + Debug + Display {
 ///
 /// This implementation expects the input plan to be wrapped in a
 /// ShuffleWriterExec and creates a DefaultQueryStageExec to execute it.
-pub struct DefaultExecutionEngine {}
+#[derive(Default)]
+pub struct DefaultExecutionEngine {
+    client_pool: Option<Arc<dyn BallistaClientPool>>,
+}
+
+impl DefaultExecutionEngine {
+    /// Creates new Default Execution Engine without client pooling
+    pub fn new() -> Self {
+        Self { client_pool: None }
+    }
+    /// Creates new Default Execution Engine with client pooling
+    pub fn with_client_pool(client_pool: Arc<dyn BallistaClientPool>) -> Self {
+        Self {
+            client_pool: Some(client_pool),
+        }
+    }
+}
 
 impl ExecutionEngine for DefaultExecutionEngine {
     fn create_query_stage_exec(
@@ -195,6 +212,26 @@ impl ExecutionEngine for DefaultExecutionEngine {
     ) -> Result<Arc<dyn QueryStageExecutor>> {
         // Fix ParquetSource metadata_size_hint lost during serialization
         let plan = fix_parquet_metadata_size_hint(plan)?;
+
+        // Route remote shuffle fetches through the executor's client pool when
+        // one is configured (upstream #1951); without a pool, readers connect
+        // per fetch.
+        let plan = match &self.client_pool {
+            Some(client_pool) => {
+                plan.transform(|p| {
+                    if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
+                        Ok(Transformed::yes(Arc::new(
+                            reader.with_client_pool(client_pool.clone()),
+                        )
+                            as Arc<dyn ExecutionPlan>))
+                    } else {
+                        Ok(Transformed::no(p))
+                    }
+                })?
+                .data
+            }
+            None => plan,
+        };
 
         // the query plan created by the scheduler always starts with a shuffle writer
         // (either ShuffleWriterExec or SortShuffleWriterExec)

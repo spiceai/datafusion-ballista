@@ -302,7 +302,7 @@ impl Executor {
             concurrent_tasks,
             abort_handles: Default::default(),
             execution_engine: execution_engine
-                .unwrap_or_else(|| Arc::new(DefaultExecutionEngine {})),
+                .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
         }
     }

@@ -180,6 +180,13 @@ pub struct Config {
         help = "Max number of sessions whose shared runtime state (object-store clients, Parquet footer cache) is retained on the executor (LRU). 0 disables caching."
     )]
     pub session_runtime_cache_capacity: usize,
+    /// Number of seconds established client connection should be cached if not used (0 means no cache)
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Number of seconds established client connection should be cached if not used (0 means no cache, connection will be disposed)."
+    )]
+    pub client_ttl: u64,
 }
 
 impl TryFrom<Config> for ExecutorProcessConfig {
@@ -210,6 +217,7 @@ impl TryFrom<Config> for ExecutorProcessConfig {
             metric_collection_policy: opt.metric_collection_policy,
             memory_pool_size: opt.memory_pool_size,
             session_runtime_cache_capacity: opt.session_runtime_cache_capacity,
+            client_ttl: opt.client_ttl,
             override_execution_engine: None,
             override_function_registry: None,
             override_config_producer: None,

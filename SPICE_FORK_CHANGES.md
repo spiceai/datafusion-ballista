@@ -116,11 +116,11 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 |---|---|---|---|---|---|
 | Lazy `BatchCoalescer` init | #24 | present (restored on merge) | Absent upstream too | keep | `Option<LimitedBatchCoalescer>` lazy init in shuffle reader |
 | `find_fetch_failed` error drill-through | #36 | present (restored on merge) | Upstream `#1578`/`#1951` different form | keep drill-through | `find_fetch_failed` |
-| Evict + retry on fresh connection | #61 | present (**live**, not superseded) | Upstream solves differently (`#1951` pool `discard()` + `with_retry`) | keep with Spice fetch path; revisit if #1951 transport is ever adopted | evict-retry loop in `fetch_partition_remote` |
-| h2 receive-window sizing | #62a | present (hard-coded 16MB/64MB consts in `client.rs`) | **Upstreamed** `#1951` as config keys (`BALLISTA_CLIENT_INITIAL_*_WINDOW_SIZE`) | keep consts; adopt upstream config keys only with the #1951 transport | `HTTP2_INITIAL_STREAM_WINDOW_SIZE` |
-| `InactivityTimeoutStream` | #62b | present | Not upstreamed; protects `#1951` | keep; P1 upstream | `InactivityTimeoutStream` |
-| Unordered stream drain | #63a | present | Superseded by `#1951` buffering | design input only after merge | — |
-| Transport on I/O runtime + 60s keepalive-ack | #63b | present | Not upstreamed | keep; P1 upstream | I/O runtime handle for pooled channels |
+| Evict + retry on fresh connection | #61 | **replaced** by upstream `#1951` pool `discard()` + reduce-side `with_retry` | **adopted** | done | `with_retry`, `PooledClient::discard` |
+| h2 receive-window sizing | #62a | **adopted** upstream config keys (`ballista.client.initial_*_window_size`, defaults 64MB/16MB) | **Upstreamed** `#1951` | done | `BALLISTA_CLIENT_INITIAL_*_WINDOW_SIZE` |
+| `InactivityTimeoutStream` | #62b | present (wraps streams inside `BallistaClient` fetch) | Not upstreamed; protects `#1951` | keep; P1 upstream | `InactivityTimeoutStream` |
+| Unordered stream drain | #63a | **removed** — remote partitions are fully buffered (`fetch_partition_buffered`), so h2 credit never pins; reader uses upstream's ordered `try_flatten` | Superseded by `#1951` buffering | done | — |
+| Transport on I/O runtime + 60s keepalive-ack | #63b | present (pool misses connect via `connect_ballista_client` on the registered transport runtime; keepalive tuning lives in `BallistaClient::try_new`) | Not upstreamed | keep; P1 upstream | `set_shuffle_transport_runtime`, `connect_ballista_client` |
 
 ### Planner / correctness / perf
 
@@ -179,24 +179,31 @@ Not Spice patches — features the fork never absorbed because it skipped the
   `broadcast_sort_merge_join_enabled` config keys and
   `with_ballista_broadcast_join_threshold_bytes` — was clobbered and re-added
   in the repair commit, with upstream's 12 planner broadcast tests)
-- `#1951` shuffle-fetch governor + h2 windows + retry — **NOT adopted**:
-  the Spice fetch transport (own client pool, evict-retry, fixed 16/64MB
-  windows, unordered drain, memory/object-store/vortex readers) stays; the
-  upstream governor config keys (`BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT`,
-  `..._MAX_BLOCKS_PER_ADDRESS`, `BALLISTA_CLIENT_INITIAL_*_WINDOW_SIZE`) do not
-  exist on the fork, and `client/tests/sort_shuffle.rs` is adapted to clamp
-  `BALLISTA_SHUFFLE_READER_MAX_REQUESTS` instead. Upstream's dead
-  `executor/src/client_pool.rs` was deleted; `core/src/client_pool.rs` remains
-  (compiled, unused) to ease a future adoption. The executor `--client-ttl`
-  option was dropped with it (would have been a silent no-op). Upstream's
-  `ballista.client.io_retries_times` / `io_retry_wait_time_ms` keys ARE
-  registered and wired into the fork's evict-and-retry fetch loop, but with
-  fork-preserving defaults (1 retry / 0 ms wait) instead of upstream's
-  (3 / 3000 ms). Also: `ballista.shuffle.remote_read_prefer_flight` now
-  defaults to **true** — the fork's block-IO transport cannot serve
-  sort-based shuffle (which is enabled by default), so the old `false`
-  default was an incoherent pair; the upstream sort-shuffle test's
-  block-IO cases were removed accordingly.
+- `#1951` shuffle-fetch governor + h2 windows + retry — **ADOPTED**
+  (follow-up commit): the remote-fetch path now uses upstream's mechanics —
+  three-gate reduce-side governor (`max_bytes_in_flight`,
+  `max_blocks_in_flight_per_address`, max concurrent requests), fully
+  buffered fetches (`fetch_partition_buffered` + `GovernedStream`),
+  reduce-side `with_retry` with `ballista.client.io_retries_times` /
+  `io_retry_wait_time_ms` at upstream defaults (3 / 3000 ms), the
+  `BallistaClientPool` / `DefaultBallistaClientPool` client pool with the
+  executor `--client-ttl` option (default 0 = no pooling, upstream default),
+  and config-driven h2 windows. Retained fork deltas inside that path:
+  (a) pool misses connect via `connect_ballista_client`, which places the
+  channel's h2 driver on the registered shuffle transport runtime (#63b);
+  (b) `BallistaClient::try_new` keeps the fork's keepalive tuning (60s
+  keepalive-ack) and `InactivityTimeoutStream` wrapping (#62b);
+  (c) NotFound-from-fetch keeps the fork's missing-partition-is-empty
+  semantics (#54) and does not discard the pooled client;
+  (d) the fetch action stays path-based (fork location model), and the
+  memory:// / object-store / vortex reader classes sit outside the governor.
+  **Deployment note:** pooling is opt-in via `--client-ttl` (or
+  `DefaultExecutionEngine::with_client_pool` for embedders); the spiceai
+  runtime MUST configure a pool when repinning or fetches connect per
+  request (the pre-#57 connection-storm regime).
+  `ballista.shuffle.remote_read_prefer_flight` still defaults to **true** —
+  the fork's block-IO transport cannot serve sort-based shuffle (enabled by
+  default), so the upstream sort-shuffle test's block-IO cases stay removed.
 - `#1911` partition pruning — **adopted** (repair commit; active under
   `disable-stage-plan-cache`, ignored when the stage-plan cache is on)
 - `#1902` preserve user session config overrides — **adopted** (merge)
@@ -210,9 +217,8 @@ Not Spice patches — features the fork never absorbed because it skipped the
 - `#1547` executor system/process metrics — **adopted** (merge)
 - `#1968` shuffle-read / per-operator metrics — **adopted** (repair commit:
   `ShuffleReadMetrics` mapped onto the Spice fetch pipeline — memory + local
-  count as `local_partitions`, object-store + flight as `remote_partitions`,
-  `decoded_bytes` accumulates on stream drain since the fork streams rather
-  than buffers; writer Displays render child metrics)
+  count as `local_partitions`, object-store + flight as `remote_partitions`;
+  writer Displays render child metrics)
 - `#1949` failed-task surfacing in TUI/REST — **adopted** (repair commit:
   upstream `scheduler/src/api/` restored wholesale, incl. `get_job`,
   `get_job_config`, `get_executor_info`, `get_scheduler_version`, typed
