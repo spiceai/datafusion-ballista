@@ -22,6 +22,7 @@ use crate::execution_engine::ExecutionEngine;
 use crate::execution_engine::QueryStageExecutor;
 use crate::metrics::ExecutorMetricsCollector;
 use crate::metrics::LoggingMetricsCollector;
+use ballista_core::JobId;
 use ballista_core::ConfigProducer;
 use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
@@ -413,7 +414,7 @@ impl Executor {
     pub async fn cancel_task(
         &self,
         task_id: usize,
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         partition_id: usize,
     ) -> Result<bool, BallistaError> {
@@ -447,9 +448,12 @@ impl Executor {
 mod test {
     use crate::execution_engine::{DefaultQueryStageExec, ShuffleWriterVariant};
     use crate::executor::Executor;
+    use ballista_core::JobId;
     use ballista_core::RuntimeProducer;
     use ballista_core::execution_plans::ShuffleWriterExec;
-    use ballista_core::serde::protobuf::ExecutorRegistration;
+    use ballista_core::serde::protobuf::{
+        ExecutorOperatingSystemSpecification, ExecutorRegistration,
+    };
     use ballista_core::serde::scheduler::PartitionId;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -570,8 +574,10 @@ mod test {
     async fn test_task_cancellation() {
         let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
 
+        let job_id = JobId::new("job-id");
+        let cancel_job_id = job_id.clone();
         let shuffle_write = ShuffleWriterExec::try_new(
-            "job-id".to_owned(),
+            job_id.clone(),
             1,
             Arc::new(NeverendingOperator::new()),
             work_dir.clone(),
@@ -588,6 +594,7 @@ mod test {
             grpc_port: 0,
             specification: None,
             host: None,
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();
@@ -609,7 +616,7 @@ mod test {
         let executor_clone = executor.clone();
         tokio::task::spawn(async move {
             let part = PartitionId {
-                job_id: "job-id".to_owned(),
+                job_id: job_id.clone(),
                 stage_id: 1,
                 partition_id: 0,
             };
@@ -623,7 +630,7 @@ mod test {
         // poll until that happens.
         for _ in 0..20 {
             if executor
-                .cancel_task(1, "job-id".to_owned(), 1, 0)
+                .cancel_task(1, cancel_job_id.clone(), 1, 0)
                 .await
                 .expect("cancelling task")
             {

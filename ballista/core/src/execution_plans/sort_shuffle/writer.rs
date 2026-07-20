@@ -57,6 +57,7 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, info};
 
+use crate::JobId;
 use crate::serde::scheduler::PartitionStats;
 
 /// Result of finalizing shuffle output: (data_path, index_path, partition_write_stats)
@@ -68,7 +69,7 @@ type FinalizeResult = (PathBuf, PathBuf, Vec<(usize, u64, u64, u64)>);
 #[derive(Debug, Clone)]
 pub struct SortShuffleWriterExec {
     /// Unique ID for the job (query) that this stage is a part of
-    job_id: String,
+    job_id: JobId,
     /// Unique query stage ID within the job
     stage_id: usize,
     /// Physical execution plan for this query stage
@@ -121,7 +122,7 @@ impl SortShuffleWriteMetrics {
 impl SortShuffleWriterExec {
     /// Create a new sort-based shuffle writer.
     pub fn try_new(
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: String,
@@ -158,7 +159,7 @@ impl SortShuffleWriterExec {
     }
 
     /// Get the Job ID for this query stage
-    pub fn job_id(&self) -> &str {
+    pub fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -366,7 +367,7 @@ fn spill_largest_buffers(
 #[allow(clippy::too_many_arguments)]
 fn finalize_output(
     work_dir: &str,
-    job_id: &str,
+    job_id: &JobId,
     stage_id: usize,
     input_partition: usize,
     buffers: &mut [PartitionBuffer],
@@ -380,7 +381,7 @@ fn finalize_output(
 
     // Create output directory
     let mut output_dir = PathBuf::from(work_dir);
-    output_dir.push(job_id);
+    output_dir.push(job_id.as_str());
     output_dir.push(format!("{stage_id}"));
     output_dir.push(format!("{input_partition}"));
     std::fs::create_dir_all(&output_dir)?;
@@ -596,7 +597,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
 }
 
 impl ShuffleWriter for SortShuffleWriterExec {
-    fn job_id(&self) -> &str {
+    fn job_id(&self) -> &JobId {
         &self.job_id
     }
 
@@ -690,7 +691,7 @@ mod tests {
         let config = SortShuffleConfig::default();
 
         let writer = SortShuffleWriterExec::try_new(
-            "job1".to_string(),
+            JobId::new("job1"),
             1,
             input_plan,
             work_dir.path().to_str().unwrap().to_string(),

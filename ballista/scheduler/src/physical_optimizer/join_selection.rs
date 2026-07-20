@@ -64,6 +64,19 @@ impl JoinSelection {
 
 // TODO: We need some performance test for Right Semi/Right Join swap to Left Semi/Left Join in case that the right side is smaller but not much smaller.
 // TODO: In PrestoSQL, the optimizer flips join sides only if one side is much smaller than the other by more than SIZE_DIFFERENCE_THRESHOLD times, by default is 8 times.
+
+/// Returns true when a CollectLeft broadcast of the build (left) side is safe for `join_type`.
+pub(crate) fn collect_left_broadcast_safe(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Inner
+            | JoinType::Right
+            | JoinType::RightSemi
+            | JoinType::RightAnti
+            | JoinType::RightMark
+    )
+}
+
 /// Checks statistics for join swap.
 pub(crate) fn should_swap_join_order(
     left: &dyn ExecutionPlan,

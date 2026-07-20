@@ -113,7 +113,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 info!("Job {job_id} queued with name {job_name:?}");
 
                 // Broadcast job queued state
-                self.broadcast_job_state(JobStateEvent::queued(&job_id));
+                self.broadcast_job_state(JobStateEvent::queued(job_id.clone()));
 
                 if let Err(e) = self
                     .state
@@ -134,7 +134,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                             &job_id,
                             &job_name,
                             session_ctx,
-                            &plan,
+                            plan.as_ref(),
                             queued_at,
                             subscriber.clone(),
                         )
@@ -148,7 +148,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                         if let Some(subscriber) = subscriber {
                             let timestamp = timestamp_millis();
                             let job_status = JobStatus {
-                                job_id: job_id.clone(),
+                                job_id: job_id.clone().into(),
                                 job_name,
                                 status: Some(ballista_core::serde::protobuf::job_status::Status::Failed(
                                     FailedJob { error, queued_at, started_at: timestamp, ended_at: timestamp }
@@ -175,7 +175,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                         }
                     } else {
                         // Broadcast job running state when successfully submitted
-                        let _ = job_state_sender.send(JobStateEvent::running(&job_id));
+                        let _ = job_state_sender.send(JobStateEvent::running(job_id.clone()));
                         QueryStageSchedulerEvent::JobSubmitted {
                             job_id,
                             queued_at,
@@ -220,7 +220,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 error!("Job {job_id} failed: {fail_message}");
 
                 // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(&job_id, &fail_message));
+                self.broadcast_job_state(JobStateEvent::failed(job_id.clone(), &fail_message));
 
                 if let Err(e) = self
                     .state
@@ -244,7 +244,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 info!("Job {job_id} success");
 
                 // Broadcast job completed state
-                self.broadcast_job_state(JobStateEvent::completed(&job_id));
+                self.broadcast_job_state(JobStateEvent::completed(job_id.clone()));
 
                 if let Err(e) = self.state.task_manager.succeed_job(&job_id).await {
                     error!("Fail to invoke succeed_job for job {job_id} due to {e:?}");
@@ -263,7 +263,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 error!("Job {job_id} running failed");
 
                 // Broadcast job failed state
-                self.broadcast_job_state(JobStateEvent::failed(&job_id, &fail_message));
+                self.broadcast_job_state(JobStateEvent::failed(job_id.clone(), &fail_message));
 
                 match self
                     .state
@@ -298,7 +298,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 info!("Job {job_id} Cancelled");
 
                 // Broadcast job cancelled state
-                self.broadcast_job_state(JobStateEvent::cancelled(&job_id));
+                self.broadcast_job_state(JobStateEvent::cancelled(job_id.clone()));
 
                 match self.state.task_manager.cancel_job(&job_id).await {
                     Ok((running_tasks, _pending_tasks)) => {

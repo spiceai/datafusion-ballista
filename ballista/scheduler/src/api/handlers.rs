@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use ballista_core::JobId;
 use crate::scheduler_server::SchedulerServer;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::state::execution_graph::ExecutionStage;
@@ -97,7 +98,7 @@ pub async fn get_executors<
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|(metadata, duration)| ExecutorMetaResponse {
+        .map(|(metadata, duration, _metrics)| ExecutorMetaResponse {
             id: metadata.id,
             host: metadata.host,
             port: metadata.port,
@@ -180,6 +181,7 @@ pub async fn cancel_job<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
     Path(job_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let job_id = JobId::from(job_id);
     // 404 if job doesn't exist
     data_server
         .state
@@ -212,6 +214,7 @@ pub async fn get_query_stages<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
     Path(job_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let job_id = JobId::from(job_id);
     if let Some(graph) = data_server
         .state
         .task_manager
@@ -311,6 +314,7 @@ pub async fn get_job_dot_graph<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
     Path(job_id): Path<String>,
 ) -> Result<String, StatusCode> {
+    let job_id = JobId::from(job_id);
     if let Some(graph) = data_server
         .state
         .task_manager
@@ -332,6 +336,7 @@ pub async fn get_query_stage_dot_graph<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
     Path((job_id, stage_id)): Path<(String, usize)>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let job_id = JobId::from(job_id);
     if let Some(graph) = data_server
         .state
         .task_manager

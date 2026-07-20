@@ -25,11 +25,15 @@ mod supported {
     };
     use ballista_core::config::BallistaConfig;
 
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::*;
     use datafusion::{assert_batches_eq, prelude::SessionContext};
     use rstest::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[rstest::fixture]
     fn test_data() -> String {
@@ -516,17 +520,14 @@ mod supported {
         Ok(())
     }
 
-    // As mentioned in https://github.com/apache/datafusion-ballista/issues/1055
-    // "Left/full outer join incorrect for CollectLeft / broadcast"
-    //
-    // In order to make correct results (decreasing performance) CollectLeft
-    // has been disabled until fixed
-
+    // Ballista raises these DataFusion thresholds above zero so the adaptive
+    // join resolver can collect a small build side into a broadcast
+    // (CollectLeft) hash join instead of repartitioning it.
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
     #[tokio::test]
-    async fn should_disable_collect_left(
+    async fn should_set_collect_left_thresholds(
         #[future(awt)]
         #[case]
         ctx: SessionContext,
@@ -538,12 +539,12 @@ mod supported {
             .await?;
 
         let expected = [
-            "+----------------------------------------------------------------+-------+",
-            "| name                                                           | value |",
-            "+----------------------------------------------------------------+-------+",
-            "| datafusion.optimizer.hash_join_single_partition_threshold      | 0     |",
-            "| datafusion.optimizer.hash_join_single_partition_threshold_rows | 0     |",
-            "+----------------------------------------------------------------+-------+",
+            "+----------------------------------------------------------------+----------+",
+            "| name                                                           | value    |",
+            "+----------------------------------------------------------------+----------+",
+            "| datafusion.optimizer.hash_join_single_partition_threshold      | 10485760 |",
+            "| datafusion.optimizer.hash_join_single_partition_threshold_rows | 1000000  |",
+            "+----------------------------------------------------------------+----------+",
         ];
 
         assert_batches_eq!(expected, &result);
@@ -947,12 +948,76 @@ mod supported {
     }
 
     // Sort Merge Join is supported since DF.v50
-    // testing if it will work in ballista
+    // Ballista defaults to sort-merge join (see issue #1648). This test
+    // verifies that default by inspecting the physical plan.
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
     #[tokio::test]
     async fn should_support_sort_merge_join(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+        test_data: String,
+    ) -> datafusion::error::Result<()> {
+        // Exercise the plain sort-merge-join execution path: disable the
+        // default SortMergeJoinExec broadcast conversion so the join stays a
+        // SortMergeJoinExec in the distributed plan.
+        ctx.sql("SET ballista.optimizer.broadcast_sort_merge_join_enabled = false")
+            .await?
+            .collect()
+            .await?;
+
+        ctx.register_parquet(
+            "t0",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        ctx.register_parquet(
+            "t1",
+            &format!("{test_data}/alltypes_plain.parquet"),
+            Default::default(),
+        )
+        .await?;
+
+        let join_sql =
+            "select t0.id from t0 join t1 on t0.id = t1.id order by t0.id desc limit 5";
+
+        let plan = ctx
+            .sql(&format!("EXPLAIN {join_sql}"))
+            .await?
+            .collect()
+            .await?;
+        let plan_text = pretty_format_batches(&plan).unwrap().to_string();
+        assert!(
+            plan_text.contains("SortMergeJoinExec"),
+            "expected SortMergeJoinExec in plan, got:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("HashJoinExec"),
+            "did not expect HashJoinExec in plan, got:\n{plan_text}"
+        );
+
+        let result = ctx.sql(join_sql).await?.collect().await?;
+
+        let expected = [
+            "+----+", "| id |", "+----+", "| 7  |", "| 6  |", "| 5  |", "| 4  |",
+            "| 3  |", "+----+",
+        ];
+        assert_batches_eq!(expected, &result);
+
+        Ok(())
+    }
+
+    // Users can opt back into hash join via the standard DataFusion knob,
+    // even though Ballista defaults `prefer_hash_join` to false. See #1648.
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+    async fn should_support_hash_join_when_opted_in(
         #[future(awt)]
         #[case]
         ctx: SessionContext,
@@ -971,16 +1036,31 @@ mod supported {
             Default::default(),
         )
         .await?;
-        ctx.sql("SET datafusion.optimizer.prefer_hash_join = false")
+
+        ctx.sql("SET datafusion.optimizer.prefer_hash_join = true")
             .await?
             .show()
             .await?;
-        let result = ctx.sql(
-            "select t0.id from t0 join t1 on t0.id = t1.id order by t0.id desc limit 5",
-        )
-        .await?
-        .collect()
-        .await?;
+
+        let join_sql =
+            "select t0.id from t0 join t1 on t0.id = t1.id order by t0.id desc limit 5";
+
+        let plan = ctx
+            .sql(&format!("EXPLAIN {join_sql}"))
+            .await?
+            .collect()
+            .await?;
+        let plan_text = pretty_format_batches(&plan).unwrap().to_string();
+        assert!(
+            plan_text.contains("HashJoinExec"),
+            "expected HashJoinExec in plan after opt-in, got:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SortMergeJoinExec"),
+            "did not expect SortMergeJoinExec in plan after opt-in, got:\n{plan_text}"
+        );
+
+        let result = ctx.sql(join_sql).await?.collect().await?;
 
         let expected = [
             "+----+", "| id |", "+----+", "| 7  |", "| 6  |", "| 5  |", "| 4  |",
@@ -1028,7 +1108,7 @@ mod supported {
             "|                  |               PlaceholderRowExec                                                                                                                                                 |",
             "|                  |                                                                                                                                                                                  |",
             "| distributed_plan | =========ResolvedStage[stage_id=1.0, partitions=1]=========                                                                                                                      |",
-            "|                  | ShuffleWriterExec: partitioning: Hash([id@0], 16)                                                                                                                                |",
+            "|                  | SortShuffleWriterExec: partitioning=Hash([id@0], 16)                                                                                                                             |",
             "|                  |   AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                                          |",
             "|                  |     ProjectionExec: expr=[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)),depth=1)@0 as id]                                                        |",
             "|                  |       UnnestExec                                                                                                                                                                 |",
@@ -1040,12 +1120,96 @@ mod supported {
             "|                  | ShuffleWriterExec: partitioning: None                                                                                                                                            |",
             "|                  |   ProjectionExec: expr=[count(Int64(1))@1 as count(*), id@0 as id]                                                                                                               |",
             "|                  |     AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[count(Int64(1))]                                                                                               |",
-            "|                  |       UnresolvedShuffleExec: partitioning: Hash([id@0], 16)                                                                                                                      |",
+            "|                  |       UnresolvedShuffleExec: stage=1, partitioning: Hash([id@0], 16)                                                                                                             |",
             "|                  |                                                                                                                                                                                  |",
             "|                  |                                                                                                                                                                                  |",
             "+------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
         ];
         assert_batches_eq!(expected, &result);
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+    async fn should_execute_explain_analyze_query(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+    ) -> datafusion::error::Result<()> {
+        let result = ctx
+            .sql(
+                "EXPLAIN ANALYZE select count(*), id from (select unnest([1,2,3,4,5]) as id) group by id",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Replace the metric values with "..." to keep the test stable.
+        let sanitized_plan_text = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .lines()
+            .map(|line| {
+                if let Some(index) = line.find("metrics=[") {
+                    let prefix = &line[..index];
+                    let metrics = &line[index + "metrics=[".len()..];
+                    let sanitized_metrics = metrics.strip_suffix(']').map_or_else(
+                        || "...".to_string(),
+                        |body| {
+                            body.split(", ")
+                                .map(|metric| {
+                                    metric.split_once('=').map_or_else(
+                                        || "...".to_string(),
+                                        |(name, _)| format!("{name}=..."),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        },
+                    );
+                    format!("{prefix}metrics=[{sanitized_metrics}]")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let sanitized = RecordBatch::try_new(
+            result[0].schema(),
+            vec![
+                result[0].column(0).clone(),
+                Arc::new(StringArray::from(vec![sanitized_plan_text])),
+            ],
+        )?;
+
+        let expected = [
+            "+-------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            "| plan_type         | plan                                                                                                                                                                                                                                                                                                                                                                                              |",
+            "+-------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            "| Plan with Metrics | =========SuccessfulStage[stage_id=1, partitions=1]=========                                                                                                                                                                                                                                                                                                                                       |",
+            "|                   | SortShuffleWriterExec: partitioning=Hash([id@0], 16), metrics=[output_rows=..., input_rows=..., spill_bytes=..., spill_count=..., repart_time=..., spill_time=..., write_time=...]                                                                                                                                                                                                                |",
+            "|                   |   AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[count(Int64(1))], metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., spill_count=..., spilled_bytes=..., spilled_rows=..., skipped_aggregation_rows=..., peak_mem_used=..., aggregate_arguments_time=..., aggregation_time=..., emitting_time=..., time_calculating_group_ids=..., reduction_factor=...] |",
+            "|                   |     ProjectionExec: expr=[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)),depth=1)@0 as id], metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., expr_0_eval_time=...]                                                                                                                                                             |",
+            "|                   |       UnnestExec, metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., input_batches=..., input_rows=...]                                                                                                                                                                                                                                                         |",
+            "|                   |         ProjectionExec: expr=[[1, 2, 3, 4, 5] as __unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)))], metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., expr_0_eval_time=...]                                                                                                                                                      |",
+            "|                   |           PlaceholderRowExec, metrics=[...]                                                                                                                                                                                                                                                                                                                                                       |",
+            "|                   |                                                                                                                                                                                                                                                                                                                                                                                                   |",
+            "|                   | =========SuccessfulStage[stage_id=2, partitions=16]=========                                                                                                                                                                                                                                                                                                                                      |",
+            "|                   | ShuffleWriterExec: partitioning: None, metrics=[output_rows=..., input_rows=..., repart_time=..., write_time=...]                                                                                                                                                                                                                                                                                 |",
+            "|                   |   ProjectionExec: expr=[count(Int64(1))@1 as count(*), id@0 as id], metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., expr_0_eval_time=..., expr_1_eval_time=...]                                                                                                                                                                                              |",
+            "|                   |     AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[count(Int64(1))], metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., spill_count=..., spilled_bytes=..., spilled_rows=..., peak_mem_used=..., aggregate_arguments_time=..., aggregation_time=..., emitting_time=..., time_calculating_group_ids=...]                                          |",
+            "|                   |       ShuffleReaderExec: upstream_stage: 1, partitioning: Hash([id@0], 16), metrics=[output_rows=..., elapsed_compute=..., output_bytes=..., output_batches=..., decoded_bytes=..., fetch_requests=..., fetch_retries=..., local_partitions=..., remote_partitions=..., fetch_time=..., local_read_time=..., permit_wait_time=...]                                                                |",
+            "+-------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        ];
+
+        assert_batches_eq!(expected, &[sanitized]);
+
+        Ok(())
     }
 
     #[rstest]
@@ -1100,6 +1264,83 @@ mod supported {
             .await?
             .collect()
             .await?;
+
+        assert_batches_eq!(expected, &result);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+
+    async fn should_execute_sql_collect_from_arrow_file(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+        test_data: String,
+    ) -> datafusion::error::Result<()> {
+        ctx.register_arrow(
+            "test",
+            &format!("{test_data}/alltypes_plain.arrow"),
+            Default::default(),
+        )
+        .await?;
+
+        let result = ctx
+            .sql("select string_col, timestamp_col from test where id > 4")
+            .await?
+            .collect()
+            .await?;
+        let expected = [
+            "+------------+---------------------+",
+            "| string_col | timestamp_col       |",
+            "+------------+---------------------+",
+            "| 31         | 2009-03-01T00:01:00 |",
+            "| 30         | 2009-04-01T00:00:00 |",
+            "| 31         | 2009-04-01T00:01:00 |",
+            "+------------+---------------------+",
+        ];
+
+        assert_batches_eq!(expected, &result);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::standalone(standalone_context())]
+    #[case::remote(remote_context())]
+    #[tokio::test]
+    async fn should_set_io_retry_config(
+        #[future(awt)]
+        #[case]
+        ctx: SessionContext,
+    ) -> datafusion::error::Result<()> {
+        ctx.sql("SET ballista.client.io_retries_times = 5")
+            .await?
+            .show()
+            .await?;
+
+        ctx.sql("SET ballista.client.io_retry_wait_time_ms = 1500")
+            .await?
+            .show()
+            .await?;
+
+        let result = ctx
+            .sql("select name, value from information_schema.df_settings where name like 'ballista.client.io_%' order by name")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+---------------------------------------+-------+",
+            "| name                                  | value |",
+            "+---------------------------------------+-------+",
+            "| ballista.client.io_retries_times      | 5     |",
+            "| ballista.client.io_retry_wait_time_ms | 1500  |",
+            "+---------------------------------------+-------+",
+        ];
 
         assert_batches_eq!(expected, &result);
 

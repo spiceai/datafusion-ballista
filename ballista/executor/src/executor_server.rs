@@ -30,9 +30,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use log::{debug, error, info, warn};
+use memory_stats::memory_stats;
+use sysinfo::{MemoryRefreshKind, System};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+use ballista_core::JobId;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::global_shuffle_manager;
 use ballista_core::extension::EndpointOverrideFn;
@@ -63,6 +66,7 @@ use tokio::task::JoinHandle;
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::{ExecutorProcessConfig, remove_job_dir};
+use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::shutdown::ShutdownNotifier;
 use crate::{TaskExecutionTimes, as_task_status};
 
@@ -117,6 +121,7 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         config.grpc_max_encoding_message_size as usize,
         config.grpc_max_decoding_message_size as usize,
         config.override_create_grpc_client_endpoint.clone(),
+        config.metric_collection_policy,
     );
 
     // 1. Start executor grpc service
@@ -216,6 +221,8 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     grpc_max_encoding_message_size: usize,
     /// Maximum size for incoming gRPC messages.
     grpc_max_decoding_message_size: usize,
+    /// Metric collection policy for this executor.
+    metric_collection_policy: ExecutorMetricCollectionPolicy,
     override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
@@ -244,12 +251,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
         override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+        metric_collection_policy: ExecutorMetricCollectionPolicy,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
             executor,
             executor_env,
             codec,
@@ -257,6 +265,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             schedulers: Default::default(),
             grpc_max_encoding_message_size,
             grpc_max_decoding_message_size,
+            metric_collection_policy,
             override_create_grpc_client_endpoint,
         }
     }
@@ -304,9 +313,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             executor_status::Status::Active(String::default())
         };
 
+        let metrics = self.get_executor_metrics();
+        if let Some(available_memory) = metrics.iter().find_map(|m| match m.metric {
+            Some(executor_metric::Metric::AvailableMemory(v)) => Some(v),
+            _ => None,
+        }) {
+            self.executor
+                .metrics_collector
+                .record_memory_available(available_memory);
+        }
+
         let heartbeat_params = HeartBeatParams {
             executor_id: self.executor.metadata.id.clone(),
-            metrics: self.get_executor_metrics(),
+            metrics,
             status: Some(ExecutorStatus {
                 status: Some(status),
             }),
@@ -451,13 +470,117 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             .unwrap();
     }
 
-    // TODO populate with real metrics
+    /// Collect executor system/process metrics for heartbeat reporting.
     fn get_executor_metrics(&self) -> Vec<ExecutorMetric> {
-        let available_memory = ExecutorMetric {
-            metric: Some(executor_metric::Metric::AvailableMemory(u64::MAX)),
-        };
-        let executor_metrics = vec![available_memory];
-        executor_metrics
+        match self.metric_collection_policy {
+            ExecutorMetricCollectionPolicy::SystemOnly => {
+                let mut executor_system = System::new_all();
+                executor_system
+                    .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+
+                vec![
+                    ExecutorMetric {
+                        metric: Some(executor_metric::Metric::TotalMemory(
+                            executor_system.total_memory(),
+                        )),
+                    },
+                    ExecutorMetric {
+                        metric: Some(executor_metric::Metric::AvailableMemory(
+                            executor_system.available_memory(),
+                        )),
+                    },
+                    ExecutorMetric {
+                        metric: Some(executor_metric::Metric::UsedMemory(
+                            executor_system.used_memory(),
+                        )),
+                    },
+                ]
+            }
+            ExecutorMetricCollectionPolicy::ProcessOnly => {
+                if let Some(usage) = memory_stats() {
+                    vec![
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::ProcPhysicalMemory(
+                                usage.physical_mem as u64,
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::ProcVirtualMemory(
+                                usage.virtual_mem as u64,
+                            )),
+                        },
+                    ]
+                } else {
+                    warn!("Could not get current process memory usage!");
+                    vec![]
+                }
+            }
+            ExecutorMetricCollectionPolicy::SystemAndProcess => {
+                if let Some(usage) = memory_stats() {
+                    let mut process_metrics = vec![
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::ProcPhysicalMemory(
+                                usage.physical_mem as u64,
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::ProcVirtualMemory(
+                                usage.virtual_mem as u64,
+                            )),
+                        },
+                    ];
+                    let mut executor_system = System::new_all();
+                    executor_system
+                        .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+
+                    process_metrics.extend([
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::TotalMemory(
+                                executor_system.total_memory(),
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::AvailableMemory(
+                                executor_system.available_memory(),
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::UsedMemory(
+                                executor_system.used_memory(),
+                            )),
+                        },
+                    ]);
+
+                    process_metrics
+                } else {
+                    warn!(
+                        "Could not get current process memory usage! Defaulting to system-wide metrics"
+                    );
+                    let mut executor_system = System::new_all();
+                    executor_system
+                        .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+
+                    vec![
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::TotalMemory(
+                                executor_system.total_memory(),
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::AvailableMemory(
+                                executor_system.available_memory(),
+                            )),
+                        },
+                        ExecutorMetric {
+                            metric: Some(executor_metric::Metric::UsedMemory(
+                                executor_system.used_memory(),
+                            )),
+                        },
+                    ]
+                }
+            }
+            ExecutorMetricCollectionPolicy::Off => vec![],
+        }
     }
 }
 
@@ -758,7 +881,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                 .executor
                 .cancel_task(
                     task.task_id as usize,
-                    task.job_id,
+                    JobId::from(task.job_id),
                     task.stage_id as usize,
                     task.partition_id as usize,
                 )
@@ -777,10 +900,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
         request: Request<RemoveJobDataParams>,
     ) -> Result<Response<RemoveJobDataResult>, Status> {
         let job_id = request.into_inner().job_id;
+        let job_id_typed = JobId::from(job_id.clone());
 
         // Clean up in-memory shuffle partitions for this job
         let shuffle_manager = global_shuffle_manager();
-        shuffle_manager.remove_job_partitions(&job_id);
+        shuffle_manager.remove_job_partitions(&job_id_typed);
 
         // Clean up disk-based shuffle data
         remove_job_dir(&self.executor.work_dir, &job_id)

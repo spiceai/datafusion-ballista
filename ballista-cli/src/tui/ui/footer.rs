@@ -1,0 +1,173 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::tui::app::App;
+use crate::tui::domain::jobs::PlanTab;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+pub(super) fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    let mut current_view_key_bindings = Vec::with_capacity(10);
+    let mut global_key_bindings = Vec::with_capacity(10);
+
+    if app.is_edit_mode() {
+        current_view_key_bindings.push(Span::from("[Esc] Quit edit mode"));
+    } else {
+        global_key_bindings.push(Span::from("Global key bindings: "));
+
+        if app.is_scheduler_up() {
+            global_key_bindings.push(Span::from("[j] Jobs, "));
+            global_key_bindings.push(Span::from("[e] Executors, "));
+            global_key_bindings.push(Span::from("[m] Metrics, "));
+
+            if app.is_jobs_view() {
+                if app.job_dot_popup.is_some() {
+                    current_view_key_bindings.push(Span::from("[↑↓←→] Scroll, "));
+                    current_view_key_bindings.push(Span::from("[Esc] Close popup, "));
+                } else if app.job_plan_popup.is_some() {
+                    current_view_key_bindings.push(Span::from("[↑↓←→] Scroll, "));
+                    current_view_key_bindings.push(Span::from("[s] Stage plan, "));
+                    current_view_key_bindings.push(Span::from("[p] Physical plan, "));
+                    if let Some(popup) = app.job_plan_popup.as_ref()
+                        && popup.get_tab() == &PlanTab::Physical
+                    {
+                        current_view_key_bindings
+                            .push(Span::from("[d] Default format, "));
+                        current_view_key_bindings.push(Span::from("[t] Tree format, "));
+                    }
+                    current_view_key_bindings.push(Span::from("[l] Logical plan, "));
+                    current_view_key_bindings.push(Span::from("[Esc] Close popup, "));
+                } else if app.is_job_config_popup_open() {
+                    current_view_key_bindings.push(Span::from("[↑↓] Navigate, "));
+                    current_view_key_bindings.push(Span::from("[/] Search config, "));
+                    current_view_key_bindings.push(Span::from("[Esc] Close popup, "));
+                } else {
+                    if app.has_selected_job() {
+                        if !app.is_job_stages_popup_open() {
+                            if app.has_more_than_one_job() {
+                                current_view_key_bindings
+                                    .push(Span::from("[↑↓] Navigate, "));
+                                current_view_key_bindings
+                                    .push(Span::from("[/] Search jobs, "));
+                                current_view_key_bindings.push(Span::from(
+                                    "[1,2,3] Sort by first/second/third/... column, ",
+                                ));
+                            }
+                            current_view_key_bindings
+                                .push(Span::from("[Enter] View stages, "));
+                            current_view_key_bindings
+                                .push(Span::from("[g] View job stages graph, "));
+                            current_view_key_bindings
+                                .push(Span::from("[o] View job config, "));
+
+                            if app.is_selected_job_cancelable() {
+                                current_view_key_bindings
+                                    .push(Span::from("[c] Cancel job, "));
+                            }
+
+                            if app.does_job_have_plan() {
+                                current_view_key_bindings
+                                    .push(Span::from("[p] View job plans, "));
+                            }
+                        } else if app.is_job_stage_no_details_popup_open() {
+                            current_view_key_bindings.push(Span::from("[↑↓] Navigate, "));
+                            current_view_key_bindings
+                                .push(Span::from("[Enter] View tasks, "));
+                            current_view_key_bindings.push(Span::from("[p] View plan, "));
+                            current_view_key_bindings
+                                .push(Span::from("[Esc] Close popup, "));
+                        } else if app.is_job_stage_plan_popup_open() {
+                            current_view_key_bindings.push(Span::from("[↑↓←→] Scroll, "));
+                            current_view_key_bindings
+                                .push(Span::from("[d] Default format, "));
+                            current_view_key_bindings
+                                .push(Span::from("[t] Tree format, "));
+                            current_view_key_bindings
+                                .push(Span::from("[m] Show metrics, "));
+                            current_view_key_bindings
+                                .push(Span::from("[Esc] Close popup, "));
+                        } else if app.is_job_stage_tasks_popup_open() {
+                            current_view_key_bindings.push(Span::from("[↑↓] Navigate, "));
+                            current_view_key_bindings
+                                .push(Span::from("[Esc] Close popup, "));
+                        }
+                    } else if app.has_more_than_one_job() {
+                        current_view_key_bindings.push(Span::from("[↑↓] Navigate, "));
+                        current_view_key_bindings.push(Span::from("[/] Search jobs, "));
+                        current_view_key_bindings.push(Span::from(
+                            "[1,2,3] Sort by first/second/third/... column, ",
+                        ));
+                    }
+                }
+                if !current_view_key_bindings.is_empty() {
+                    current_view_key_bindings
+                        .insert(0, Span::from("Current view key bindings: "));
+                }
+            } else if app.is_executors_view() {
+                if app.is_executor_details_popup_open() {
+                    current_view_key_bindings.push(Span::from("[↑↓] Scroll up/down, "));
+                    current_view_key_bindings.push(Span::from("[Esc] Close popup, "));
+                } else {
+                    if app.has_selected_executor() {
+                        current_view_key_bindings
+                            .push(Span::from("[Enter] View details, "));
+                    }
+                    current_view_key_bindings.push(Span::from("[↑↓] Navigate, "));
+                    current_view_key_bindings
+                        .push(Span::from("[1,2,...] Sort by first/second/... column, "));
+                }
+                if !current_view_key_bindings.is_empty() {
+                    current_view_key_bindings
+                        .insert(0, Span::from("Current view key bindings: "));
+                }
+            } else if app.is_metrics_view() {
+                current_view_key_bindings.push(Span::from("Metrics key bindings: "));
+                current_view_key_bindings.push(Span::from("[/] Search metrics, "));
+            }
+            global_key_bindings.push(Span::from("[i] Scheduler info, "));
+        }
+
+        global_key_bindings.push(Span::from("[?/h] Help, "));
+        global_key_bindings.push(Span::from("[q/Esc] Quit"));
+    }
+
+    let global_area = if !current_view_key_bindings.is_empty() {
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1), // page keybindings
+                Constraint::Min(1), // global keybindings
+            ])
+            .split(area);
+
+        let paragraph = Paragraph::new(Line::from(current_view_key_bindings))
+            .style(app.theme.footer)
+            .centered();
+        f.render_widget(paragraph, areas[0]);
+
+        areas[1]
+    } else {
+        area
+    };
+
+    let paragraph = Paragraph::new(Line::from(global_key_bindings))
+        .style(app.theme.footer)
+        .centered();
+    f.render_widget(paragraph, global_area);
+}

@@ -37,10 +37,11 @@ use crate::extension::SessionConfigHelperExt;
 use crate::serde::protobuf::{NamedPruningMetrics, NamedRatio};
 use crate::serde::scheduler::{
     Action, BallistaFunctionRegistry, ExecutorData, ExecutorMetadata,
-    ExecutorSpecification, PartitionId, PartitionLocation, PartitionStats,
-    TaskDefinition,
+    ExecutorOperatingSystemSpecification, ExecutorSpecification, PartitionId,
+    PartitionLocation, PartitionStats, TaskDefinition,
 };
 
+use crate::JobId;
 use crate::RuntimeProducer;
 use crate::serde::{BallistaCodec, protobuf};
 use protobuf::{NamedCount, NamedGauge, NamedTime, operator_metric};
@@ -52,7 +53,7 @@ impl TryInto<Action> for protobuf::Action {
         match self.action_type {
             Some(protobuf::action::ActionType::FetchPartition(fetch)) => {
                 Ok(Action::FetchPartition {
-                    job_id: fetch.job_id,
+                    job_id: fetch.job_id.into(),
                     stage_id: fetch.stage_id as usize,
                     partition_id: fetch.partition_id as usize,
                     path: fetch.path,
@@ -71,7 +72,7 @@ impl TryInto<Action> for protobuf::Action {
 impl Into<PartitionId> for protobuf::PartitionId {
     fn into(self) -> PartitionId {
         PartitionId::new(
-            &self.job_id,
+            &JobId::from(self.job_id),
             self.stage_id as usize,
             self.partition_id as usize,
         )
@@ -264,6 +265,29 @@ impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
             port: self.port as u16,
             grpc_port: self.grpc_port as u16,
             specification: self.specification.unwrap().into(),
+            os_info: self
+                .os_info
+                .map(Into::into)
+                .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
+        }
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<ExecutorOperatingSystemSpecification>
+    for protobuf::ExecutorOperatingSystemSpecification
+{
+    fn into(self) -> ExecutorOperatingSystemSpecification {
+        ExecutorOperatingSystemSpecification {
+            system_name: self.system_name,
+            kernel_ver: self.kernel_ver,
+            os_ver: self.os_ver,
+            os_ver_long: self.os_ver_long,
+            physical_cores: self.physical_cores,
+            num_disks: self.num_disks,
+            total_disk_space: self.total_disk_space,
+            total_available_disk_space: self.total_available_disk_space,
+            open_files_limit: self.open_files_limit,
         }
     }
 }
@@ -329,6 +353,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         scalar_functions: scalar_functions.clone(),
         aggregate_functions: aggregate_functions.clone(),
         window_functions: window_functions.clone(),
+        higher_order_functions: HashMap::new(),
     });
 
     let ctx = TaskContext::new(
@@ -347,7 +372,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         proto.try_into_physical_plan(&ctx, codec.physical_extension_codec())
     })?;
 
-    let job_id = task.job_id;
+    let job_id = task.job_id.into();
     let stage_id = task.stage_id as usize;
     let partition_id = task.partition_id as usize;
     let task_attempt_num = task.task_attempt_num as usize;
@@ -394,6 +419,7 @@ pub fn get_task_definition_vec<
         scalar_functions: scalar_functions.clone(),
         aggregate_functions: aggregate_functions.clone(),
         window_functions: window_functions.clone(),
+        higher_order_functions: HashMap::new(),
     });
 
     let ctx = TaskContext::new(
@@ -412,7 +438,7 @@ pub fn get_task_definition_vec<
         proto.try_into_physical_plan(&ctx, codec.physical_extension_codec())
     })?;
 
-    let job_id = multi_task.job_id;
+    let job_id: JobId = multi_task.job_id.into();
     let stage_id = multi_task.stage_id as usize;
     let stage_attempt_num = multi_task.stage_attempt_num as usize;
     let launch_time = multi_task.launch_time;

@@ -4,8 +4,9 @@ Living inventory of intentional differences between
 [`spiceai/datafusion-ballista`](https://github.com/spiceai/datafusion-ballista)
 and [`apache/datafusion-ballista`](https://github.com/apache/datafusion-ballista).
 
-Status snapshot: **2026-07-20**. Verified against tip bookmark `spiceai-54`
-(`ab207a1c`) and upstream tag `54.0.0` (`18566b9c`). Cross-checked against the
+Status snapshot: **2026-07-20** (post Ballista 54 merge). Working tip:
+`phillip/merge-upstream-ballista-54` (merge of `spiceai-54` × upstream `54.0.0`
+`18566b9c`). Cross-checked against the
 [upstreaming audit](https://ember-reef-w54j.here.now/).
 
 ## How to use this document
@@ -98,8 +99,8 @@ The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 
 | Change | Fork | Tip | Upstream | Disposition | Sentinel |
 |---|---|---|---|---|---|
-| Lazy `BatchCoalescer` init | #24 | **lost** | Absent upstream too | **restore** (latent panic) | `Option<…BatchCoalescer>` / lazy init in `CoalescedShuffleReaderStream` |
-| `find_fetch_failed` error drill-through | #36 | **lost** (drill-through); retry/pool parts superseded | Upstream `#1578`/`#1951` different form | **decide**: restore drill-through if still needed with shared streams | `find_fetch_failed` |
+| Lazy `BatchCoalescer` init | #24 | present (restored on merge) | Absent upstream too | keep | `Option<LimitedBatchCoalescer>` lazy init in shuffle reader |
+| `find_fetch_failed` error drill-through | #36 | present (restored on merge) | Upstream `#1578`/`#1951` different form | keep drill-through | `find_fetch_failed` |
 | Evict + retry on fresh connection | #61 | present | Superseded by pool `discard()` + `with_retry` | `adopt-upstream` on merge | — |
 | h2 receive-window sizing | #62a | present | **Upstreamed** `#1951` (same defaults) | `adopt-upstream` config form | window sizes 16MB/64MB |
 | `InactivityTimeoutStream` | #62b | present | Not upstreamed; protects `#1951` | keep; P1 upstream | `InactivityTimeoutStream` |
@@ -110,11 +111,11 @@ The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 
 | Change | Fork | Tip | Upstream | Disposition | Sentinel |
 |---|---|---|---|---|---|
-| INNER broadcast joins | #27 | **lost** (thresholds forced to `0`) | **Fixed differently** `#1900`/`#1904` | `adopt-upstream` on merge | thresholds currently `0` in `extension.rs` |
-| TopK single-stage for small `fetch` | #28.1 | **lost** | No upstream equivalent | **restore** after/during merge | planner skip stage break when `fetch ≤ 1000` |
+| INNER broadcast joins | #27 | present (upstream thresholds via merge) | **Fixed differently** `#1900`/`#1904` | `adopt-upstream` | non-zero thresholds in `extension.rs` |
+| TopK single-stage for small `fetch` | #28.1 | present (restored on merge) | No upstream equivalent | keep | `TOPK_FETCH_THRESHOLD` in `planner.rs` |
 | TopK executor dynamic-filter re-link | #28.2 | **lost** | Propose on `#1375` | P2 | — |
-| Parquet `metadata_size_hint` round-trip workaround | #29 | **lost** | Root bug still in DF54 proto | **restore** workaround; file DF fix | `fix_parquet_metadata_size_hint` in `execution_engine.rs` |
-| HashJoin dynamic-filter strip | #33 | **lost** | Upstream globally disables (`enable_dynamic_filter_pushdown=false` on `54.0.0`) | `adopt-upstream` on merge | — |
+| Parquet `metadata_size_hint` round-trip workaround | #29 | present (restored on merge) | Root bug still in DF54 proto | keep; file DF fix | `fix_parquet_metadata_size_hint` in `execution_engine.rs` |
+| HashJoin dynamic-filter strip | #33 | present (upstream default) | Upstream globally disables (`enable_dynamic_filter_pushdown=false` on `54.0.0`) | `adopt-upstream` | `enable_dynamic_filter_pushdown` false in `extension.rs` |
 | Null-aware anti-join guards | #58 | present | Gaps still live upstream (+ `#1900` demotion hazard) | keep; P0 upstream | `null_aware` guards + tests in vendored `join_selection.rs` |
 
 ### Observability
@@ -122,9 +123,9 @@ The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 | Change | Fork | Tip | Upstream | Disposition | Sentinel |
 |---|---|---|---|---|---|
 | Collector traits + Prometheus (~62 metrics) | #10 | present | Upstream invested in different surfaces (`#1968`/`#1949`/`#1999`) | keep; P1 upstream candidate | `MetricsCollector`, `override_metrics_collector` |
-| Distributed EXPLAIN ANALYZE + `GetJobMetrics` | #34a | **lost** | **Upstreamed** `#1567`/`#1635` (and more) | `adopt-upstream` on merge | `DistributedExplainAnalyzeExec`, `GetJobMetrics` |
+| Distributed EXPLAIN ANALYZE + `GetJobMetrics` | #34a | present (adopted on merge) | **Upstreamed** `#1567`/`#1635` (and more) | `adopt-upstream` | `DistributedExplainAnalyzeExec`, `GetJobMetrics` |
 | EXPLAIN FORMAT TREE round-trip | #34b | **lost** | Appetite via `#1627` | restore from history (`07be66a8` / #34) as P2 | FORMAT TREE codec |
-| Executor system/process metrics (`memory-stats`) | upstream `#1547` | **lost** (fork dropped) | Present on `54.0.0` | `adopt-upstream` on merge | `memory-stats` dep |
+| Executor system/process metrics (`memory-stats`) | upstream `#1547` | present (adopted on merge) | Present on `54.0.0` | `adopt-upstream` | `ExecutorMetricCollectionPolicy`, `os_info`, expanded `ExecutorMetric` |
 
 ---
 
@@ -133,17 +134,18 @@ The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
 These were present before the lossy `53.0.0` whole-tree merge (`0b95c9d7`)
 and/or were never carried through the DF54 bump. Independent of upstreaming.
 
-| # | Action on Ballista 54 merge | Source commit(s) |
-|---|---|---|
-| #29 parquet `metadata_size_hint` | **Restore** fork workaround | `a4b0db68` |
-| #34 EXPLAIN ANALYZE | **Adopt upstream** `#1567`/`#1635` via merge | upstream |
-| #27/#33 broadcast + dynamic filters | **Adopt upstream** `#1900`/`#1904` + `enable_dynamic_filter_pushdown=false` | upstream |
-| #28.1 TopK single-stage | **Restore** | `8bc4d752` / `42f17f88` |
-| #36 `find_fetch_failed` drill-through | **Verify** still needed; restore if yes | `c14e3e7c` (error conversion hunk) |
-| #24 lazy `BatchCoalescer` | **Restore** | `ad88031f` |
-| #39 stuck-query watchdog | Low urgency; concept → `#2030` | `7e9872a5` |
-| `#1547` executor metrics | **Adopt upstream** via merge | upstream |
-| Crate versions `52.0.0` → `54.0.0` | Bump during merge | upstream `#2004` |
+| # | Action on Ballista 54 merge | Source commit(s) | Merge status |
+|---|---|---|---|
+| #29 parquet `metadata_size_hint` | **Restore** fork workaround | `a4b0db68` | **done** |
+| #34 EXPLAIN ANALYZE | **Adopt upstream** `#1567`/`#1635` via merge | upstream | **done** (`GetJobMetrics` RPC + client exec) |
+| #27/#33 broadcast + dynamic filters | **Adopt upstream** `#1900`/`#1904` + `enable_dynamic_filter_pushdown=false` | upstream | **done** (extension defaults) |
+| #28.1 TopK single-stage | **Restore** | `8bc4d752` / `42f17f88` | **done** |
+| #36 `find_fetch_failed` drill-through | **Verify** still needed; restore if yes | `c14e3e7c` (error conversion hunk) | **done** |
+| #24 lazy `BatchCoalescer` | **Restore** | `ad88031f` | **done** (`LimitedBatchCoalescer`) |
+| #39 stuck-query watchdog | Low urgency; concept → `#2030` | `7e9872a5` | deferred |
+| `#1547` executor metrics | **Adopt upstream** via merge | upstream | **done** (Spice `ExecutorMetricsCollector` retained alongside) |
+| Crate versions `52.0.0` → `54.0.0` | Bump during merge | upstream `#2004` | **done** |
+| Upstream AQE coalesce / `CoalescePlan` | Adopt upstream AQE; add coalesce/broadcast APIs to Spice shuffle reader | upstream | **done** (Spice fetch transport kept) |
 
 Process rule for this merge and future ones: after resolving conflicts, run a
 sentinel grep pass over this inventory and fail the upgrade if any `present`

@@ -16,6 +16,7 @@
 // under the License.
 
 use axum::extract::ConnectInfo;
+use ballista_core::JobId;
 use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::error::{BallistaError, Result as BResult};
 use ballista_core::extension::SessionConfigHelperExt;
@@ -26,14 +27,18 @@ use ballista_core::serde::protobuf::{
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
-    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobStatusParams,
+    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
+    GetJobMetricsResult, GetJobStatusParams,
     GetJobStatusResult, GetRemoteFunctionsParams, GetRemoteFunctionsResult,
     HeartBeatParams, HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams,
     PollWorkResult, RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
     RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
     execute_query_failure_result, execute_query_result,
 };
-use ballista_core::serde::scheduler::ExecutorMetadata;
+use ballista_core::serde::protobuf::executor_metric::Metric;
+use ballista_core::serde::scheduler::{
+    ExecutorMetadata, ExecutorOperatingSystemSpecification,
+};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use futures::{Stream, StreamExt};
@@ -54,11 +59,11 @@ use std::ops::Deref;
 use crate::cluster::{BindingResult, bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::SchedulerServer;
-use crate::scheduler_server::event::QueryStageSchedulerEvent;
+use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
 use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,6 +107,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
+                    os_info: metadata
+                        .os_info
+                        .map(Into::into)
+                        .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
                 };
                 if let Err(e) = self
                     .state
@@ -207,7 +216,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .executor_manager
                 .drain_pending_cleanup_jobs(&executor_id)
                 .into_iter()
-                .map(|job_id| CleanJobDataParams { job_id })
+                .map(|job_id| CleanJobDataParams {
+                    job_id: job_id.into(),
+                    remove_stage_ids: vec![],
+                })
                 .collect();
             Ok(Response::new(PollWorkResult {
                 tasks,
@@ -237,6 +249,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 port: metadata.port as u16,
                 grpc_port: metadata.grpc_port as u16,
                 specification: metadata.specification.unwrap().into(),
+                os_info: metadata
+                    .os_info
+                    .map(Into::into)
+                    .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
             };
 
             self.do_register_executor(metadata).await.map_err(|e| {
@@ -282,6 +298,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     port: metadata.port as u16,
                     grpc_port: metadata.grpc_port as u16,
                     specification: metadata.specification.unwrap().into(),
+                    os_info: metadata
+                        .os_info
+                        .map(Into::into)
+                        .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
                 };
 
                 self.do_register_executor(metadata).await.map_err(|e| {
@@ -296,6 +316,34 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             }
         }
 
+        let current_proc_physical = metrics
+            .iter()
+            .find_map(|m| match m.metric {
+                Some(Metric::ProcPhysicalMemory(v)) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let current_proc_virtual = metrics
+            .iter()
+            .find_map(|m| match m.metric {
+                Some(Metric::ProcVirtualMemory(v)) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let (peak_proc_physical_memory, peak_proc_virtual_memory) = self
+            .state
+            .executor_manager
+            .get_executor_hearbeat(&executor_id)
+            .map(|hb| {
+                (
+                    hb.peak_proc_physical_memory.max(current_proc_physical),
+                    hb.peak_proc_virtual_memory.max(current_proc_virtual),
+                )
+            })
+            .unwrap_or((current_proc_physical, current_proc_virtual));
+
         let executor_heartbeat = ExecutorHeartbeat {
             executor_id,
             timestamp: SystemTime::now()
@@ -304,6 +352,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .as_secs(),
             metrics,
             status,
+            peak_proc_physical_memory,
+            peak_proc_virtual_memory,
         };
 
         self.state
@@ -424,8 +474,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             })?;
 
             debug!(
-                "Decoded logical plan for execution:\n{}",
-                plan.display_indent()
+                "Decoded plan for execution:\n{}",
+                Self::describe_submitted_plan(&plan)
             );
             log::trace!("setting job name: {job_name}");
 
@@ -440,7 +490,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             });
 
             let job_id = self
-                .submit_job(&job_name, session_ctx, &plan, Some(subscriber))
+                .submit_plan(&job_name, session_ctx, &plan, Some(subscriber))
                 .await
                 .map_err(|e| {
                     let msg =
@@ -509,13 +559,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             };
 
             debug!(
-                "Decoded logical plan for execution:\n{}",
-                plan.display_indent()
+                "Decoded plan for execution:\n{}",
+                Self::describe_submitted_plan(&plan)
             );
 
             log::trace!("setting job name: {job_name}");
             let job_id = self
-                .submit_job(&job_name, session_ctx, &plan, None)
+                .submit_plan(&job_name, session_ctx, &plan, None)
                 .await
                 .map_err(|e| {
                     let msg =
@@ -545,6 +595,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         request: Request<GetJobStatusParams>,
     ) -> Result<Response<GetJobStatusResult>, Status> {
         let job_id = request.into_inner().job_id;
+        let job_id = JobId::from(job_id);
         trace!("Received get_job_status request for job {}", job_id);
 
         let flight_proxy = self.flight_proxy_config();
@@ -561,6 +612,135 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 Err(Status::internal(msg))
             }
         }
+    }
+
+    async fn get_job_metrics(
+        &self,
+        request: Request<GetJobMetricsParams>,
+    ) -> Result<Response<GetJobMetricsResult>, Status> {
+        let job_id = request.into_inner().job_id;
+        let job_id = JobId::from(job_id);
+        trace!("Received get_job_metrics request for job {}", job_id);
+
+        let graph = self
+            .state
+            .task_manager
+            .get_job_execution_graph(&job_id)
+            .await
+            .map_err(|e| {
+                let msg =
+                    format!("Error fetching execution graph for job {job_id}: {e:?}");
+                error!("{msg}");
+                Status::internal(msg)
+            })?
+            .ok_or_else(|| {
+                Status::not_found(format!("Execution graph not found for job {job_id}"))
+            })?;
+
+        let mut stage_metrics_list = graph
+            .stages()
+            .iter()
+            .filter_map(|(stage_id, stage)| {
+                let successful = match stage {
+                    crate::state::execution_graph::ExecutionStage::Successful(stage) => {
+                        stage
+                    }
+                    _ => return None,
+                };
+
+                let raw_metrics = &successful.stage_metrics;
+                let mut metric_index = 0;
+                let operators = (|| -> Result<
+                    Vec<ballista_core::serde::protobuf::OperatorWithMetrics>,
+                    BallistaError,
+                > {
+                    let mut stack = vec![(successful.plan.as_ref(), 0_u32)];
+                    let mut operators = Vec::with_capacity(raw_metrics.len());
+
+                    while let Some((plan, depth)) = stack.pop() {
+                        let operator_desc = {
+                            struct DisplayableOperator<'a> {
+                                plan: &'a dyn ExecutionPlan,
+                            }
+
+                            impl std::fmt::Display for DisplayableOperator<'_> {
+                                fn fmt(
+                                    &self,
+                                    f: &mut std::fmt::Formatter<'_>,
+                                ) -> std::fmt::Result {
+                                    self.plan.fmt_as(DisplayFormatType::Default, f)
+                                }
+                            }
+
+                            DisplayableOperator { plan }.to_string()
+                        };
+                        let metrics = if plan.metrics().is_some() {
+                            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet =
+                                raw_metrics
+                                    .get(metric_index)
+                                    .ok_or_else(|| {
+                                        BallistaError::Internal(format!(
+                                            "Missing metrics for operator {} at depth {}",
+                                            plan.name(),
+                                            depth
+                                        ))
+                                    })?
+                                    .clone()
+                                    .try_into()?;
+                            metric_index += 1;
+                            metrics.metrics
+                        } else {
+                            vec![]
+                        };
+
+                        operators.push(
+                            ballista_core::serde::protobuf::OperatorWithMetrics {
+                                depth,
+                                operator_type: plan.name().to_string(),
+                                operator_desc,
+                                metrics,
+                            },
+                        );
+
+                        for child in plan.children().into_iter().rev() {
+                            stack.push((child.as_ref(), depth + 1));
+                        }
+                    }
+
+                    Ok(operators)
+                })()
+                .and_then(|operators| {
+                    if metric_index == raw_metrics.len() {
+                        Ok(operators)
+                    } else {
+                        Err(BallistaError::Internal(format!(
+                            "Stage metrics size mismatch for job {job_id} stage {stage_id}: operators {} != stage metrics {}",
+                            metric_index,
+                            raw_metrics.len()
+                        )))
+                    }
+                })
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
+                    ))
+                });
+
+                Some(operators.map(|operators| {
+                    ballista_core::serde::protobuf::JobStageMetrics {
+                        stage_id: *stage_id as u32,
+                        partitions: successful.partitions as u32,
+                        operators,
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        stage_metrics_list.sort_by_key(|stage| stage.stage_id);
+
+        Ok(Response::new(GetJobMetricsResult {
+            stages: stage_metrics_list,
+        }))
     }
 
     async fn executor_stopped(
@@ -626,7 +806,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 error!("{msg}");
                 Status::internal(msg)
             })?
-            .post_event(QueryStageSchedulerEvent::JobDataClean(job_id))
+            .post_event(QueryStageSchedulerEvent::JobDataClean(JobId::from(job_id)))
             .await
             .map_err(|e| {
                 let msg = format!("Post to query stage event loop error due to {e:?}");
@@ -706,7 +886,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         &self,
         query: Query,
         session_ctx: &SessionContext,
-    ) -> BResult<LogicalPlan> {
+    ) -> BResult<SubmitPlan> {
         match query {
             Query::LogicalPlan(message) => T::try_decode(message.as_slice())
                 .and_then(|m| {
@@ -715,7 +895,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                         self.state.codec.logical_extension_codec(),
                     )
                 })
+                .map(SubmitPlan::Logical)
                 .map_err(|e| e.into()),
+
+            Query::PhysicalPlan(message) => {
+                let task_ctx = session_ctx.task_ctx();
+                U::try_decode(message.as_slice())
+                    .and_then(|m| {
+                        m.try_into_physical_plan(
+                            task_ctx.as_ref(),
+                            self.state.codec.physical_extension_codec(),
+                        )
+                    })
+                    .map(SubmitPlan::Physical)
+                    .map_err(|e| e.into())
+            }
 
             #[cfg(not(feature = "substrait"))]
             Query::SubstraitPlan(_) => {
@@ -728,7 +922,20 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                 let ctx = session_ctx.clone();
                 from_substrait_plan(&ctx.state(), &plan)
                     .await
+                    .map(SubmitPlan::Logical)
                     .map_err(|e| e.into())
+            }
+        }
+    }
+
+    /// Returns a human-readable representation of a submitted plan, for logging.
+    fn describe_submitted_plan(plan: &SubmitPlan) -> String {
+        match plan {
+            SubmitPlan::Logical(plan) => plan.display_indent().to_string(),
+            SubmitPlan::Physical(plan) => {
+                datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string()
             }
         }
     }
@@ -767,8 +974,9 @@ mod test {
     use ballista_core::error::BallistaError;
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::{
-        ExecutorRegistration, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
-        PollWorkParams, RegisterExecutorParams, executor_status,
+        ExecutorOperatingSystemSpecification, ExecutorRegistration, ExecutorStatus,
+        ExecutorStoppedParams, HeartBeatParams, PollWorkParams, RegisterExecutorParams,
+        executor_status,
     };
     use ballista_core::serde::scheduler::ExecutorSpecification;
 
@@ -800,6 +1008,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
@@ -890,6 +1099,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -975,6 +1185,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -1028,6 +1239,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1114,6 +1326,7 @@ mod test {
             port: 0,
             grpc_port: 0,
             specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 
         let request: Request<RegisterExecutorParams> =

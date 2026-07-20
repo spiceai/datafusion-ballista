@@ -22,6 +22,7 @@
 //! shuffle writers store data in memory and shuffle readers fetch it directly
 //! from memory instead of reading from disk.
 
+use crate::JobId;
 use dashmap::DashMap;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -207,7 +208,7 @@ impl InMemoryShuffleManager {
     ///
     /// # Arguments
     /// * `job_id` - The job identifier
-    pub fn remove_job_partitions(&self, job_id: &str) {
+    pub fn remove_job_partitions(&self, job_id: &JobId) {
         let prefix = format!("{job_id}/");
         self.partitions.retain(|k, _| !k.starts_with(&prefix));
         log::debug!("Removed all shuffle partitions for job: {job_id}");
@@ -224,7 +225,7 @@ impl InMemoryShuffleManager {
     ///
     /// # Returns
     /// The number of partitions that were removed
-    pub fn remove_stage_partitions(&self, job_id: &str, stage_id: usize) -> usize {
+    pub fn remove_stage_partitions(&self, job_id: &JobId, stage_id: usize) -> usize {
         let prefix = format!("{job_id}/{stage_id}/");
         let initial_count = self.partitions.len();
         self.partitions.retain(|k, _| !k.starts_with(&prefix));
@@ -252,13 +253,13 @@ impl InMemoryShuffleManager {
     }
 
     /// Generates the partition key for a simple partition (no repartitioning).
-    pub fn partition_key(job_id: &str, stage_id: usize, partition_id: usize) -> String {
+    pub fn partition_key(job_id: &JobId, stage_id: usize, partition_id: usize) -> String {
         format!("{job_id}/{stage_id}/{partition_id}/data")
     }
 
     /// Generates the partition key for a hash-partitioned output.
     pub fn hash_partition_key(
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         output_partition: usize,
         input_partition: usize,
@@ -314,7 +315,7 @@ mod tests {
         let schema = batch.schema();
         let data = ShufflePartitionData::new(schema.clone(), vec![batch]);
 
-        let key = InMemoryShuffleManager::partition_key("job1", 1, 0);
+        let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 1, 0);
         manager.store_partition(key.clone(), data);
 
         assert!(manager.contains_partition(&key));
@@ -333,11 +334,11 @@ mod tests {
         let schema = batch.schema();
 
         // Store partitions for two jobs
-        for job in ["job1", "job2"] {
+        for job in [JobId::from("job1"), JobId::from("job2")] {
             for stage in 0..2 {
                 for partition in 0..3 {
                     let key =
-                        InMemoryShuffleManager::partition_key(job, stage, partition);
+                        InMemoryShuffleManager::partition_key(&job, stage, partition);
                     let data =
                         ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                     manager.store_partition(key, data);
@@ -347,17 +348,17 @@ mod tests {
 
         assert_eq!(manager.partition_count(), 12);
 
-        manager.remove_job_partitions("job1");
+        manager.remove_job_partitions(&JobId::from("job1"));
         assert_eq!(manager.partition_count(), 6);
 
         // Verify job2 partitions still exist
-        let key = InMemoryShuffleManager::partition_key("job2", 0, 0);
+        let key = InMemoryShuffleManager::partition_key(&JobId::from("job2"), 0, 0);
         assert!(manager.contains_partition(&key));
     }
 
     #[test]
     fn test_hash_partition_key() {
-        let key = InMemoryShuffleManager::hash_partition_key("job1", 1, 2, 3);
+        let key = InMemoryShuffleManager::hash_partition_key(&JobId::from("job1"), 1, 2, 3);
         assert_eq!(key, "job1/1/2/data-3");
     }
 
@@ -370,7 +371,7 @@ mod tests {
         // Store partitions for multiple stages in the same job
         for stage in 0..3 {
             for partition in 0..4 {
-                let key = InMemoryShuffleManager::partition_key("job1", stage, partition);
+                let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), stage, partition);
                 let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                 manager.store_partition(key, data);
             }
@@ -379,18 +380,18 @@ mod tests {
         assert_eq!(manager.partition_count(), 12);
 
         // Remove stage 1 partitions
-        let removed = manager.remove_stage_partitions("job1", 1);
+        let removed = manager.remove_stage_partitions(&JobId::from("job1"), 1);
         assert_eq!(removed, 4);
         assert_eq!(manager.partition_count(), 8);
 
         // Verify stage 0 and 2 partitions still exist
-        let key0 = InMemoryShuffleManager::partition_key("job1", 0, 0);
-        let key2 = InMemoryShuffleManager::partition_key("job1", 2, 0);
+        let key0 = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 0, 0);
+        let key2 = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 2, 0);
         assert!(manager.contains_partition(&key0));
         assert!(manager.contains_partition(&key2));
 
         // Verify stage 1 partitions are gone
-        let key1 = InMemoryShuffleManager::partition_key("job1", 1, 0);
+        let key1 = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 1, 0);
         assert!(!manager.contains_partition(&key1));
     }
 
@@ -401,9 +402,9 @@ mod tests {
         let schema = batch.schema();
 
         // Store partitions for stage 1 in two different jobs
-        for job in ["job1", "job2"] {
+        for job in [JobId::from("job1"), JobId::from("job2")] {
             for partition in 0..3 {
-                let key = InMemoryShuffleManager::partition_key(job, 1, partition);
+                let key = InMemoryShuffleManager::partition_key(&job, 1, partition);
                 let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
                 manager.store_partition(key, data);
             }
@@ -412,12 +413,12 @@ mod tests {
         assert_eq!(manager.partition_count(), 6);
 
         // Remove stage 1 from job1 only
-        let removed = manager.remove_stage_partitions("job1", 1);
+        let removed = manager.remove_stage_partitions(&JobId::from("job1"), 1);
         assert_eq!(removed, 3);
         assert_eq!(manager.partition_count(), 3);
 
         // Verify job2 stage 1 partitions still exist
-        let key = InMemoryShuffleManager::partition_key("job2", 1, 0);
+        let key = InMemoryShuffleManager::partition_key(&JobId::from("job2"), 1, 0);
         assert!(manager.contains_partition(&key));
     }
 
@@ -428,7 +429,7 @@ mod tests {
         let schema = batch.schema();
         let data = ShufflePartitionData::new(schema.clone(), vec![batch]);
 
-        let key = InMemoryShuffleManager::partition_key("job1", 1, 0);
+        let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 1, 0);
         manager.store_partition(key.clone(), data);
 
         assert!(manager.contains_partition(&key));
@@ -456,7 +457,7 @@ mod tests {
 
         // Store multiple partitions
         for i in 0..3 {
-            let key = InMemoryShuffleManager::partition_key("job1", 1, i);
+            let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 1, i);
             let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
             manager.store_partition(key, data);
         }
@@ -466,7 +467,7 @@ mod tests {
         assert!(usage > 0);
 
         // Remove partitions and verify usage decreases
-        manager.remove_job_partitions("job1");
+        manager.remove_job_partitions(&JobId::from("job1"));
         assert_eq!(manager.total_memory_usage(), 0);
     }
 
@@ -477,7 +478,7 @@ mod tests {
         let schema = batch.schema();
 
         for i in 0..5 {
-            let key = InMemoryShuffleManager::partition_key("job1", 1, i);
+            let key = InMemoryShuffleManager::partition_key(&JobId::from("job1"), 1, i);
             let data = ShufflePartitionData::new(schema.clone(), vec![batch.clone()]);
             manager.store_partition(key, data);
         }

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ballista_core::config::BallistaConfig;
+use ballista_core::JobId;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleConfig;
@@ -57,7 +58,7 @@ pub trait DistributedPlanner {
     /// partitioning changes.
     fn plan_query_stages<'a>(
         &'a mut self,
-        job_id: &'a str,
+        job_id: &'a JobId,
         execution_plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Vec<Arc<dyn ShuffleWriter>>>;
@@ -98,7 +99,7 @@ impl DistributedPlanner for DefaultDistributedPlanner {
     /// A shuffle writer is created whenever the partitioning changes.
     fn plan_query_stages<'a>(
         &'a mut self,
-        job_id: &'a str,
+        job_id: &'a JobId,
         execution_plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Vec<Arc<dyn ShuffleWriter>>> {
@@ -122,7 +123,7 @@ impl DefaultDistributedPlanner {
     /// complete query stage (its parent might also belong to the same stage)
     fn plan_query_stages_internal<'a>(
         &'a mut self,
-        job_id: &'a str,
+        job_id: &'a JobId,
         execution_plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<PartialQueryStageResult> {
@@ -157,22 +158,33 @@ impl DefaultDistributedPlanner {
                 with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
                 stages,
             ))
-        } else if let Some(_sort_preserving_merge) =
+        } else if let Some(sort_preserving_merge) =
             execution_plan.downcast_ref::<SortPreservingMergeExec>()
         {
-            let shuffle_writer = create_shuffle_writer_with_config(
-                job_id,
-                self.next_stage_id(),
-                children[0].clone(),
-                None,
-                config,
-            )?;
-            let unresolved_shuffle = create_unresolved_shuffle(shuffle_writer.as_ref());
-            stages.push(shuffle_writer);
-            Ok((
-                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
-                stages,
-            ))
+            const TOPK_FETCH_THRESHOLD: usize = 1000;
+            if sort_preserving_merge
+                .fetch()
+                .is_some_and(|f| f <= TOPK_FETCH_THRESHOLD)
+            {
+                Ok((
+                    with_new_children_if_necessary(execution_plan, children)?,
+                    stages,
+                ))
+            } else {
+                let shuffle_writer = create_shuffle_writer_with_config(
+                    job_id,
+                    self.next_stage_id(),
+                    children[0].clone(),
+                    None,
+                    config,
+                )?;
+                let unresolved_shuffle = create_unresolved_shuffle(shuffle_writer.as_ref());
+                stages.push(shuffle_writer);
+                Ok((
+                    with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                    stages,
+                ))
+            }
         } else if let Some(repart) = execution_plan.downcast_ref::<RepartitionExec>() {
             match repart.properties().output_partitioning() {
                 Partitioning::Hash(_, _) => {
@@ -252,7 +264,6 @@ pub fn remove_unresolved_shuffles(
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
         if let Some(unresolved_shuffle) = child.downcast_ref::<UnresolvedShuffleExec>() {
-            let mut relevant_locations = vec![];
             let p = partition_locations
                 .get(&unresolved_shuffle.stage_id)
                 .ok_or_else(|| {
@@ -263,35 +274,72 @@ pub fn remove_unresolved_shuffles(
                 })?
                 .clone();
 
-            for i in 0..unresolved_shuffle.output_partition_count {
-                if let Some(x) = p.get(&i) {
-                    relevant_locations.push(x.to_owned());
-                } else {
-                    relevant_locations.push(vec![]);
+            if unresolved_shuffle.broadcast {
+                let mut all_locations = vec![];
+                for i in 0..unresolved_shuffle.upstream_partition_count {
+                    if let Some(locs) = p.get(&i) {
+                        all_locations.extend(locs.iter().cloned());
+                    }
                 }
-            }
-            debug!(
-                "Creating shuffle reader: {}",
-                relevant_locations
-                    .iter()
-                    .map(|c| c
+                new_children.push(Arc::new(ShuffleReaderExec::try_new_broadcast(
+                    unresolved_shuffle.stage_id,
+                    all_locations,
+                    unresolved_shuffle.schema().clone(),
+                    unresolved_shuffle.upstream_partition_count,
+                )?));
+            } else if let Some(coalesce) = unresolved_shuffle.coalesce.clone() {
+                let mut k_shape = vec![];
+                for group in &coalesce.groups {
+                    let mut concat = Vec::new();
+                    for &idx in &group.upstream_indices {
+                        if let Some(locs) = p.get(&(idx as usize)) {
+                            concat.extend(locs.iter().cloned());
+                        }
+                    }
+                    k_shape.push(concat);
+                }
+                new_children.push(Arc::new(ShuffleReaderExec::try_new_coalesced(
+                    unresolved_shuffle.stage_id,
+                    k_shape,
+                    coalesce,
+                    unresolved_shuffle.schema().clone(),
+                    unresolved_shuffle
+                        .properties()
+                        .output_partitioning()
+                        .clone(),
+                )?));
+            } else {
+                let mut relevant_locations = vec![];
+                for i in 0..unresolved_shuffle.output_partition_count {
+                    if let Some(x) = p.get(&i) {
+                        relevant_locations.push(x.to_owned());
+                    } else {
+                        relevant_locations.push(vec![]);
+                    }
+                }
+                debug!(
+                    "Creating shuffle reader: {}",
+                    relevant_locations
                         .iter()
-                        .filter(|l| !l.path.is_empty())
-                        .map(|l| l.path.clone())
+                        .map(|c| c
+                            .iter()
+                            .filter(|l| !l.path.is_empty())
+                            .map(|l| l.path.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "))
                         .collect::<Vec<_>>()
-                        .join(", "))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            new_children.push(Arc::new(ShuffleReaderExec::try_new(
-                unresolved_shuffle.stage_id,
-                relevant_locations,
-                unresolved_shuffle.schema().clone(),
-                unresolved_shuffle
-                    .properties()
-                    .output_partitioning()
-                    .clone(),
-            )?))
+                        .join("\n")
+                );
+                new_children.push(Arc::new(ShuffleReaderExec::try_new(
+                    unresolved_shuffle.stage_id,
+                    relevant_locations,
+                    unresolved_shuffle.schema().clone(),
+                    unresolved_shuffle
+                        .properties()
+                        .output_partitioning()
+                        .clone(),
+                )?));
+            }
         } else {
             new_children.push(remove_unresolved_shuffles(
                 child.clone(),
@@ -312,13 +360,27 @@ pub fn rollback_resolved_shuffles(
     for child in stage.children() {
         if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
             let stage_id = shuffle_reader.stage_id;
-
-            let unresolved_shuffle = Arc::new(UnresolvedShuffleExec::new(
-                stage_id,
-                shuffle_reader.schema(),
-                shuffle_reader.properties().partitioning.clone(),
-            ));
-            new_children.push(unresolved_shuffle);
+            let unresolved = if shuffle_reader.broadcast {
+                Arc::new(UnresolvedShuffleExec::new_broadcast(
+                    stage_id,
+                    shuffle_reader.schema(),
+                    shuffle_reader.upstream_partition_count,
+                ))
+            } else if let Some(coalesce) = shuffle_reader.coalesce.clone() {
+                Arc::new(UnresolvedShuffleExec::new_coalesced(
+                    stage_id,
+                    shuffle_reader.schema(),
+                    shuffle_reader.properties().partitioning.clone(),
+                    coalesce,
+                ))
+            } else {
+                Arc::new(UnresolvedShuffleExec::new(
+                    stage_id,
+                    shuffle_reader.schema(),
+                    shuffle_reader.properties().partitioning.clone(),
+                ))
+            };
+            new_children.push(unresolved);
         } else {
             new_children.push(rollback_resolved_shuffles(child.clone())?);
         }
@@ -326,8 +388,8 @@ pub fn rollback_resolved_shuffles(
     Ok(with_new_children_if_necessary(stage, new_children)?)
 }
 
-fn create_shuffle_writer_with_config(
-    job_id: &str,
+pub(crate) fn create_shuffle_writer_with_config(
+    job_id: &JobId,
     stage_id: usize,
     plan: Arc<dyn ExecutionPlan>,
     partitioning: Option<Partitioning>,
@@ -353,7 +415,7 @@ fn create_shuffle_writer_with_config(
             );
 
             return Ok(Arc::new(SortShuffleWriterExec::try_new(
-                job_id.to_owned(),
+                job_id.clone(),
                 stage_id,
                 plan,
                 "".to_owned(),
@@ -365,7 +427,7 @@ fn create_shuffle_writer_with_config(
 
     // Fall back to standard shuffle writer
     Ok(Arc::new(ShuffleWriterExec::try_new(
-        job_id.to_owned(),
+        job_id.clone(),
         stage_id,
         plan,
         "".to_owned(),
@@ -377,8 +439,11 @@ fn create_shuffle_writer_with_config(
 mod test {
     use crate::planner::{DefaultDistributedPlanner, DistributedPlanner};
     use crate::test_utils::datafusion_test_context;
+    use ballista_core::JobId;
     use ballista_core::error::BallistaError;
-    use ballista_core::execution_plans::{ShuffleWriterExec, UnresolvedShuffleExec};
+    use ballista_core::execution_plans::{
+        ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
+    };
     use ballista_core::serde::BallistaCodec;
     use datafusion::arrow::compute::SortOptions;
     use datafusion::execution::TaskContext;
@@ -431,8 +496,9 @@ mod test {
 
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
+        let job_id = JobId::new(job_uuid.to_string());
         let stages = planner.plan_query_stages(
-            &job_uuid.to_string(),
+            &job_id,
             plan,
             ctx.state().config().options(),
         )?;
@@ -546,8 +612,9 @@ order by
 
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
+        let job_id = JobId::new(job_uuid.to_string());
         let stages = planner.plan_query_stages(
-            &job_uuid.to_string(),
+            &job_id,
             plan,
             ctx.state().config().options(),
         )?;
@@ -705,8 +772,9 @@ order by
 
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
+        let job_id = JobId::new(job_uuid.to_string());
         let stages = planner.plan_query_stages(
-            &job_uuid.to_string(),
+            &job_id,
             plan,
             ctx.state().config().options(),
         )?;
@@ -739,8 +807,8 @@ order by
 
         // stage0
         let stage0 = stages[0].clone();
-        let shuffle_write = downcast_exec!(stage0, ShuffleWriterExec);
-        let partitioning = shuffle_write.shuffle_output_partitioning().expect("stage0");
+        let shuffle_write = downcast_exec!(stage0, SortShuffleWriterExec);
+        let partitioning = shuffle_write.shuffle_output_partitioning();
         assert_eq!(2, partitioning.partition_count());
         let partition_col = match partitioning {
             Partitioning::Hash(exprs, 2) => match exprs.as_slice() {
@@ -816,8 +884,9 @@ order by
 
         let mut planner = DefaultDistributedPlanner::new();
         let job_uuid = Uuid::new_v4();
+        let job_id = JobId::new(job_uuid.to_string());
         let stages = planner.plan_query_stages(
-            &job_uuid.to_string(),
+            &job_id,
             plan,
             ctx.state().config().options(),
         )?;

@@ -53,7 +53,8 @@ use std::{convert::TryInto, io::Cursor};
 
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
+    ChaosExec, CoalescePlan, PartitionGroup, ShuffleReaderExec, ShuffleWriterExec,
+    SortShuffleWriterExec, UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -66,6 +67,40 @@ pub use generated::ballista as protobuf;
 pub mod generated;
 /// Scheduler-specific serialization types and conversions.
 pub mod scheduler;
+
+impl From<&protobuf::PartitionGroup> for PartitionGroup {
+    fn from(p: &protobuf::PartitionGroup) -> Self {
+        Self {
+            upstream_indices: p.upstream_indices.clone(),
+        }
+    }
+}
+
+impl From<&PartitionGroup> for protobuf::PartitionGroup {
+    fn from(p: &PartitionGroup) -> Self {
+        Self {
+            upstream_indices: p.upstream_indices.clone(),
+        }
+    }
+}
+
+impl From<&protobuf::CoalescePlan> for CoalescePlan {
+    fn from(p: &protobuf::CoalescePlan) -> Self {
+        Self {
+            upstream_partition_count: p.upstream_partition_count,
+            groups: p.groups.iter().map(PartitionGroup::from).collect(),
+        }
+    }
+}
+
+impl From<&CoalescePlan> for protobuf::CoalescePlan {
+    fn from(p: &CoalescePlan) -> Self {
+        Self {
+            upstream_partition_count: p.upstream_partition_count,
+            groups: p.groups.iter().map(Into::into).collect(),
+        }
+    }
+}
 
 impl ProstMessageExt for protobuf::Action {
     fn type_url() -> &'static str {
@@ -353,7 +388,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 )?;
 
                 Ok(Arc::new(ShuffleWriterExec::try_new(
-                    shuffle_writer.job_id.clone(),
+                    shuffle_writer.job_id.clone().into(),
                     shuffle_writer.stage_id as usize,
                     input,
                     "".to_string(), // this is intentional but hacky - the executor will fill this in
@@ -391,7 +426,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 );
 
                 Ok(Arc::new(SortShuffleWriterExec::try_new(
-                    sort_shuffle_writer.job_id.clone(),
+                    sort_shuffle_writer.job_id.clone().into(),
                     sort_shuffle_writer.stage_id as usize,
                     input,
                     "".to_string(), // executor will fill this in
@@ -427,13 +462,37 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
-                let shuffle_reader = ShuffleReaderExec::try_new(
-                    stage_id,
-                    partition_location,
-                    schema,
-                    partitioning,
-                )?;
-                Ok(Arc::new(shuffle_reader))
+                let exec = if let Some(c) = shuffle_reader.coalesce.as_ref() {
+                    ShuffleReaderExec::try_new_coalesced(
+                        stage_id,
+                        partition_location,
+                        CoalescePlan::from(c),
+                        schema,
+                        partitioning,
+                    )?
+                } else if shuffle_reader.broadcast {
+                    let all_locations = partition_location.into_iter().next().ok_or_else(
+                        || {
+                            proto_error(
+                                "broadcast ShuffleReaderExec: expected exactly one partition in proto",
+                            )
+                        },
+                    )?;
+                    ShuffleReaderExec::try_new_broadcast(
+                        stage_id,
+                        all_locations,
+                        schema,
+                        shuffle_reader.upstream_partition_count as usize,
+                    )?
+                } else {
+                    ShuffleReaderExec::try_new(
+                        stage_id,
+                        partition_location,
+                        schema,
+                        partitioning,
+                    )?
+                };
+                Ok(Arc::new(exec))
             }
             PhysicalPlanType::UnresolvedShuffle(unresolved_shuffle) => {
                 let schema: SchemaRef =
@@ -446,11 +505,44 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
-                Ok(Arc::new(UnresolvedShuffleExec::new(
-                    unresolved_shuffle.stage_id as usize,
-                    schema,
-                    partitioning,
-                )))
+                let exec = if let Some(c) = unresolved_shuffle.coalesce.as_ref() {
+                    UnresolvedShuffleExec::new_coalesced(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        partitioning,
+                        CoalescePlan::from(c),
+                    )
+                } else if unresolved_shuffle.broadcast {
+                    UnresolvedShuffleExec::new_broadcast(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        unresolved_shuffle.upstream_partition_count as usize,
+                    )
+                } else {
+                    UnresolvedShuffleExec::new(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        partitioning,
+                    )
+                };
+                Ok(Arc::new(exec))
+            }
+            PhysicalPlanType::ChaosExec(chaos_exec) => {
+                let input = match inputs {
+                    [input] => input.clone(),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "ChaosExec expects exactly 1 input, got {}",
+                            inputs.len()
+                        )));
+                    }
+                };
+                Ok(Arc::new(ChaosExec::new(
+                    input,
+                    chaos_exec.failure_probability,
+                    &chaos_exec.fault_type,
+                    Some(chaos_exec.seed),
+                )?))
             }
         }
     }
@@ -574,6 +666,9 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         partition,
                         schema: Some(exec.schema().as_ref().try_into()?),
                         partitioning: Some(partitioning),
+                        broadcast: exec.broadcast,
+                        upstream_partition_count: exec.upstream_partition_count as u32,
+                        coalesce: exec.coalesce.as_ref().map(|c| c.into()),
                     },
                 )),
             };
@@ -596,6 +691,9 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         stage_id: exec.stage_id as u32,
                         schema: Some(exec.schema().as_ref().try_into()?),
                         partitioning: Some(partitioning),
+                        broadcast: exec.broadcast,
+                        upstream_partition_count: exec.upstream_partition_count as u32,
+                        coalesce: exec.coalesce.as_ref().map(|c| c.into()),
                     },
                 )),
             };
@@ -605,6 +703,22 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 ))
             })?;
 
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<ChaosExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::ChaosExec(
+                    protobuf::ChaosExecNode {
+                        failure_probability: exec.failure_probability(),
+                        fault_type: exec.fault_type().to_string(),
+                        seed: exec.seed(),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode chaos monkey execution plan: {e:?}"
+                ))
+            })?;
             Ok(())
         } else {
             Err(DataFusionError::Internal(format!(

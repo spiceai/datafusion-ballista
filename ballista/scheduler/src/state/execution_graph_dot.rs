@@ -427,40 +427,50 @@ mod tests {
         let expected = r#"digraph G {
 	subgraph cluster0 {
 		label = "Stage 1 [Resolved]";
-		stage_1_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_1_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
 		stage_1_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_1_0_0 -> stage_1_0
 	}
 	subgraph cluster1 {
 		label = "Stage 2 [Resolved]";
-		stage_2_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_2_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
 		stage_2_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_2_0_0 -> stage_2_0
 	}
 	subgraph cluster2 {
 		label = "Stage 3 [Unresolved]";
-		stage_3_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_3_0 [shape=box, label="SortShuffleWriter [48 partitions]"]
 		stage_3_0_0 [shape=box, label="HashJoin
-join_expr=b@1 = b@3
-filter_expr="]
-		stage_3_0_0_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0 -> stage_3_0_0
-		stage_3_0_0_1 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_3_0_0_1_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_1_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_1_0_0 -> stage_3_0_0_1_0
-		stage_3_0_0_1_0 -> stage_3_0_0_1
-		stage_3_0_0_1_1 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
-		stage_3_0_0_1_1 -> stage_3_0_0_1
+		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
+		stage_3_0_0_0 -> stage_3_0_0
+		stage_3_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
 		stage_3_0_0_1 -> stage_3_0_0
 		stage_3_0_0 -> stage_3_0
 	}
-	stage_1_0 -> stage_3_0_0_0_0
-	stage_2_0 -> stage_3_0_0_1_0_0
+	subgraph cluster3 {
+		label = "Stage 4 [Resolved]";
+		stage_4_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_4_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
+		stage_4_0_0 -> stage_4_0
+	}
+	subgraph cluster4 {
+		label = "Stage 5 [Unresolved]";
+		stage_5_0 [shape=box, label="ShuffleWriter [48 partitions]"]
+		stage_5_0_0 [shape=box, label="HashJoin
+join_expr=b@3 = b@1
+filter_expr="]
+		stage_5_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_5_0_0_0 -> stage_5_0_0
+		stage_5_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=4]"]
+		stage_5_0_0_1 -> stage_5_0_0
+		stage_5_0_0 -> stage_5_0
+	}
+	stage_1_0 -> stage_3_0_0_0
+	stage_2_0 -> stage_3_0_0_1
+	stage_3_0 -> stage_5_0_0_0
+	stage_4_0 -> stage_5_0_0_1
 }
 "#;
         assert_eq!(expected, &dot);
@@ -474,23 +484,13 @@ filter_expr="]
             .map_err(|e| BallistaError::Internal(format!("{e:?}")))?;
 
         let expected = r#"digraph G {
-		stage_3_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_3_0 [shape=box, label="SortShuffleWriter [48 partitions]"]
 		stage_3_0_0 [shape=box, label="HashJoin
-join_expr=b@1 = b@3
-filter_expr="]
-		stage_3_0_0_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0 -> stage_3_0_0
-		stage_3_0_0_1 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_3_0_0_1_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_1_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_1_0_0 -> stage_3_0_0_1_0
-		stage_3_0_0_1_0 -> stage_3_0_0_1
-		stage_3_0_0_1_1 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
-		stage_3_0_0_1_1 -> stage_3_0_0_1
+		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
+		stage_3_0_0_0 -> stage_3_0_0
+		stage_3_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
 		stage_3_0_0_1 -> stage_3_0_0
 		stage_3_0_0 -> stage_3_0
 }
@@ -508,40 +508,43 @@ filter_expr="]
         let expected = r#"digraph G {
 	subgraph cluster0 {
 		label = "Stage 1 [Resolved]";
-		stage_1_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_1_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
 		stage_1_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_1_0_0 -> stage_1_0
 	}
 	subgraph cluster1 {
 		label = "Stage 2 [Resolved]";
-		stage_2_0 [shape=box, label="ShuffleWriter [2 partitions]"]
+		stage_2_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
 		stage_2_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_2_0_0 -> stage_2_0
 	}
 	subgraph cluster2 {
-		label = "Stage 3 [Unresolved]";
-		stage_3_0 [shape=box, label="ShuffleWriter [2 partitions]"]
-		stage_3_0_0 [shape=box, label="HashJoin
-join_expr=a@0 = a@1
-filter_expr="]
-		stage_3_0_0_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0 -> stage_3_0_0
-		stage_3_0_0_1 [shape=box, label="HashJoin
-join_expr=a@0 = a@0
-filter_expr="]
-		stage_3_0_0_1_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_1_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_1_0_0 -> stage_3_0_0_1_0
-		stage_3_0_0_1_0 -> stage_3_0_0_1
-		stage_3_0_0_1_1 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
-		stage_3_0_0_1_1 -> stage_3_0_0_1
-		stage_3_0_0_1 -> stage_3_0_0
+		label = "Stage 3 [Resolved]";
+		stage_3_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_3_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_3_0_0 -> stage_3_0
 	}
-	stage_1_0 -> stage_3_0_0_0_0
-	stage_2_0 -> stage_3_0_0_1_0_0
+	subgraph cluster3 {
+		label = "Stage 4 [Unresolved]";
+		stage_4_0 [shape=box, label="ShuffleWriter [48 partitions]"]
+		stage_4_0_0 [shape=box, label="HashJoin
+join_expr=a@1 = a@0
+filter_expr="]
+		stage_4_0_0_0 [shape=box, label="HashJoin
+join_expr=a@0 = a@0
+filter_expr="]
+		stage_4_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
+		stage_4_0_0_0_0 -> stage_4_0_0_0
+		stage_4_0_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
+		stage_4_0_0_0_1 -> stage_4_0_0_0
+		stage_4_0_0_0 -> stage_4_0_0
+		stage_4_0_0_1 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_4_0_0_1 -> stage_4_0_0
+		stage_4_0_0 -> stage_4_0
+	}
+	stage_1_0 -> stage_4_0_0_0_0
+	stage_2_0 -> stage_4_0_0_0_1
+	stage_3_0 -> stage_4_0_0_1
 }
 "#;
         assert_eq!(expected, &dot);
@@ -555,24 +558,8 @@ filter_expr="]
             .map_err(|e| BallistaError::Internal(format!("{e:?}")))?;
 
         let expected = r#"digraph G {
-		stage_3_0 [shape=box, label="ShuffleWriter [2 partitions]"]
-		stage_3_0_0 [shape=box, label="HashJoin
-join_expr=a@0 = a@1
-filter_expr="]
-		stage_3_0_0_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_3_0_0_0_0 -> stage_3_0_0_0
-		stage_3_0_0_0 -> stage_3_0_0
-		stage_3_0_0_1 [shape=box, label="HashJoin
-join_expr=a@0 = a@0
-filter_expr="]
-		stage_3_0_0_1_0 [shape=box, label="CoalescePartitions [1 partitions]"]
-		stage_3_0_0_1_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_3_0_0_1_0_0 -> stage_3_0_0_1_0
-		stage_3_0_0_1_0 -> stage_3_0_0_1
-		stage_3_0_0_1_1 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
-		stage_3_0_0_1_1 -> stage_3_0_0_1
-		stage_3_0_0_1 -> stage_3_0_0
+		stage_3_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
+		stage_3_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
 		stage_3_0_0 -> stage_3_0
 }
 "#;
@@ -588,6 +575,14 @@ filter_expr="]
             .options_mut()
             .optimizer
             .enable_round_robin_repartition = false;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
         let ctx = SessionContext::new_with_config(config);
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::UInt32, false),
@@ -605,13 +600,14 @@ filter_expr="]
         let mut planner = DefaultDistributedPlanner::new();
         StaticExecutionGraph::new(
             "scheduler_id",
-            "job_id",
+            &ballista_core::JobId::new("job_id"),
             "job_name",
             "session_id",
             plan,
             0,
             Arc::new(SessionConfig::new_with_ballista()),
             &mut planner,
+            None,
         )
     }
 
@@ -625,6 +621,14 @@ filter_expr="]
             .options_mut()
             .optimizer
             .enable_round_robin_repartition = false;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
         let ctx = SessionContext::new_with_config(config);
         let schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::UInt32, false)]));
@@ -641,13 +645,14 @@ filter_expr="]
         let mut planner = DefaultDistributedPlanner::new();
         StaticExecutionGraph::new(
             "scheduler_id",
-            "job_id",
+            &ballista_core::JobId::new("job_id"),
             "job_name",
             "session_id",
             plan,
             0,
             Arc::new(SessionConfig::new_with_ballista()),
             &mut planner,
+            None,
         )
     }
 }

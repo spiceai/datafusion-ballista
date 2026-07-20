@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::JobId;
 use crate::error::BallistaError;
 use crate::registry::BallistaFunctionRegistry;
 use datafusion::arrow::array::{
@@ -39,7 +40,7 @@ pub enum Action {
     /// Collect a shuffle partition
     FetchPartition {
         /// The job identifier.
-        job_id: String,
+        job_id: JobId,
         /// The stage identifier within the job.
         stage_id: usize,
         /// The partition identifier within the stage.
@@ -57,7 +58,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartitionId {
     /// The job identifier.
-    pub job_id: String,
+    pub job_id: JobId,
     /// The stage identifier within the job.
     pub stage_id: usize,
     /// The partition identifier within the stage.
@@ -66,9 +67,9 @@ pub struct PartitionId {
 
 impl PartitionId {
     /// Creates a new partition ID with the given job, stage, and partition identifiers.
-    pub fn new(job_id: &str, stage_id: usize, partition_id: usize) -> Self {
+    pub fn new(job_id: &JobId, stage_id: usize, partition_id: usize) -> Self {
         Self {
-            job_id: job_id.to_string(),
+            job_id: job_id.to_owned(),
             stage_id,
             partition_id,
         }
@@ -103,6 +104,8 @@ pub struct ExecutorMetadata {
     pub grpc_port: u16,
     /// Resource specification for this executor.
     pub specification: ExecutorSpecification,
+    /// OS and hardware info for this executor.
+    pub os_info: ExecutorOperatingSystemSpecification,
 }
 
 /// Specification of an executor, indicating executor resources, like total task slots.
@@ -110,6 +113,59 @@ pub struct ExecutorMetadata {
 pub struct ExecutorSpecification {
     /// Number of concurrent task slots available on this executor.
     pub task_slots: u32,
+}
+
+impl Default for ExecutorSpecification {
+    fn default() -> Self {
+        Self { task_slots: 1 }
+    }
+}
+
+impl ExecutorSpecification {
+    /// Sets the number of task slots for this executor specification.
+    pub fn with_task_slots(mut self, task_slots: u32) -> Self {
+        self.task_slots = task_slots;
+        self
+    }
+}
+
+/// Operating system level specification of an executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorOperatingSystemSpecification {
+    /// System name.
+    pub system_name: String,
+    /// Kernel version.
+    pub kernel_ver: String,
+    /// OS version.
+    pub os_ver: String,
+    /// OS version (long).
+    pub os_ver_long: String,
+    /// Number of physical cores available on this executor.
+    pub physical_cores: u32,
+    /// Number of physical disks available on this executor.
+    pub num_disks: u32,
+    /// Total disk space on this executor, in bytes.
+    pub total_disk_space: u64,
+    /// Total available disk space on this executor, in bytes.
+    pub total_available_disk_space: u64,
+    /// Open files limit on this executor.
+    pub open_files_limit: u64,
+}
+
+impl Default for ExecutorOperatingSystemSpecification {
+    fn default() -> Self {
+        Self {
+            physical_cores: 1,
+            num_disks: 2,
+            total_disk_space: 1024 * 1024 * 8,
+            total_available_disk_space: 1024 * 1024 * 4,
+            open_files_limit: 1024,
+            system_name: String::from("Ubuntu"),
+            kernel_ver: String::from("Linux 6.17.0-20-generic"),
+            os_ver: String::from("24.04"),
+            os_ver_long: String::from("Linux (Ubuntu 24.04)"),
+        }
+    }
 }
 
 /// Available resources for an executor, including total and available task slots.
@@ -260,7 +316,7 @@ impl PartitionStats {
 #[derive(Debug, Clone)]
 pub struct ExecutePartition {
     /// Unique ID representing this query execution
-    pub job_id: String,
+    pub job_id: JobId,
     /// Unique ID representing this query stage within the overall query
     pub stage_id: usize,
     /// The partitions to execute. The same plan could be sent to multiple executors and each
@@ -277,7 +333,7 @@ pub struct ExecutePartition {
 impl ExecutePartition {
     /// Creates a new execute partition task.
     pub fn new(
-        job_id: String,
+        job_id: JobId,
         stage_id: usize,
         partition_id: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
@@ -337,7 +393,7 @@ pub struct TaskDefinition {
     /// Current attempt number for this task.
     pub task_attempt_num: usize,
     /// Job identifier this task belongs to.
-    pub job_id: String,
+    pub job_id: JobId,
     /// Stage identifier within the job.
     pub stage_id: usize,
     /// Current attempt number for the stage.

@@ -72,6 +72,27 @@ use rand::rng;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Coalesce plan attached to a `ShuffleReaderExec` or `UnresolvedShuffleExec`.
+///
+/// Produced by the AQE `CoalescePartitionsRule` and round-tripped through
+/// proto so it survives stage retries. Absent (`None` on the parent operator)
+/// means "no coalesce" — the existing one-to-one read behavior.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoalescePlan {
+    /// Original upstream partition count (M) before coalescing.
+    pub upstream_partition_count: u32,
+    /// Output partition groups. Length is K (the post-coalesce partition count).
+    pub groups: Vec<PartitionGroup>,
+}
+
+/// One output partition's upstream-index list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionGroup {
+    /// Indices into the upstream `Vec<Vec<PartitionLocation>>` that this output
+    /// partition concatenates.
+    pub upstream_indices: Vec<u32>,
+}
+
 /// ShuffleReaderExec reads partitions that have already been materialized by a ShuffleWriterExec
 /// being executed by an executor
 #[derive(Debug, Clone)]
@@ -81,6 +102,13 @@ pub struct ShuffleReaderExec {
     pub(crate) schema: SchemaRef,
     /// Each partition of a shuffle can read data from multiple locations
     pub partition: Vec<Vec<PartitionLocation>>,
+    /// When true, every call to `execute(partition)` reads `partition[0]`
+    /// regardless of the partition index (broadcast hash-join lowering).
+    pub broadcast: bool,
+    /// Number of shuffle output partitions on the upstream stage.
+    pub upstream_partition_count: usize,
+    /// Optional coalesce metadata. `None` means legacy one-to-one read behavior.
+    pub coalesce: Option<CoalescePlan>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     properties: Arc<PlanProperties>,
@@ -94,6 +122,7 @@ impl ShuffleReaderExec {
         schema: SchemaRef,
         partitioning: Partitioning,
     ) -> Result<Self> {
+        let upstream_partition_count = partition.len();
         let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
             partitioning,
@@ -104,6 +133,72 @@ impl ShuffleReaderExec {
             stage_id,
             schema,
             partition,
+            broadcast: false,
+            upstream_partition_count,
+            coalesce: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            properties,
+        })
+    }
+
+    /// Create a broadcast ShuffleReaderExec. `all_locations` is the flattened
+    /// concatenation of every upstream partition's locations.
+    pub fn try_new_broadcast(
+        stage_id: usize,
+        all_locations: Vec<PartitionLocation>,
+        schema: SchemaRef,
+        upstream_partition_count: usize,
+    ) -> Result<Self> {
+        let properties = Arc::new(PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        ));
+        Ok(Self {
+            stage_id,
+            schema,
+            partition: vec![all_locations],
+            broadcast: true,
+            upstream_partition_count,
+            coalesce: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            properties,
+        })
+    }
+
+    /// Create a coalesced ShuffleReaderExec with pre-concatenated K-shape locations.
+    pub fn try_new_coalesced(
+        stage_id: usize,
+        partition: Vec<Vec<PartitionLocation>>,
+        coalesce: CoalescePlan,
+        schema: SchemaRef,
+        partitioning: Partitioning,
+    ) -> Result<Self> {
+        debug_assert_eq!(
+            partition.len(),
+            coalesce.groups.len(),
+            "K-shape partition vector length must equal coalesce.groups.len()",
+        );
+        debug_assert_eq!(
+            partitioning.partition_count(),
+            coalesce.groups.len(),
+            "partitioning.partition_count() must equal coalesce.groups.len() (= K)",
+        );
+        let upstream_partition_count = coalesce.upstream_partition_count as usize;
+        let properties = Arc::new(PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            partitioning,
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        ));
+        Ok(Self {
+            stage_id,
+            schema,
+            partition,
+            broadcast: false,
+            upstream_partition_count,
+            coalesce: Some(coalesce),
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
         })
@@ -118,11 +213,28 @@ impl DisplayAs for ShuffleReaderExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "ShuffleReaderExec: partitioning: {}",
-                    self.properties.partitioning,
-                )
+                if self.broadcast {
+                    write!(
+                        f,
+                        "ShuffleReaderExec: upstream_stage: {}, broadcast: true, upstream_partition_count: {}",
+                        self.stage_id, self.upstream_partition_count,
+                    )
+                } else {
+                    write!(
+                        f,
+                        "ShuffleReaderExec: upstream_stage: {}, partitioning: {}",
+                        self.stage_id, self.properties.partitioning,
+                    )?;
+                    if let Some(c) = &self.coalesce {
+                        write!(
+                            f,
+                            ", coalesce: {} of {}",
+                            c.groups.len(),
+                            c.upstream_partition_count,
+                        )?;
+                    }
+                    Ok(())
+                }
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "partitioning={}", self.properties.partitioning)
@@ -152,7 +264,16 @@ impl ExecutionPlan for ShuffleReaderExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.is_empty() {
-            Ok(self)
+            Ok(Arc::new(Self {
+                stage_id: self.stage_id,
+                schema: self.schema.clone(),
+                partition: self.partition.clone(),
+                broadcast: self.broadcast,
+                upstream_partition_count: self.upstream_partition_count,
+                coalesce: self.coalesce.clone(),
+                metrics: ExecutionPlanMetricsSet::new(),
+                properties: self.properties.clone(),
+            }))
         } else {
             Err(DataFusionError::Plan(
                 "Ballista ShuffleReaderExec does not support children plans".to_owned(),
@@ -167,6 +288,8 @@ impl ExecutionPlan for ShuffleReaderExec {
     ) -> Result<SendableRecordBatchStream> {
         let task_id = context.task_id().unwrap_or_else(|| partition.to_string());
         debug!("ShuffleReaderExec::execute({task_id})");
+        // Broadcast readers have a single logical output partition.
+        let partition = if self.broadcast { 0 } else { partition };
 
         let config = context.session_config();
 
@@ -1633,7 +1756,12 @@ async fn fetch_partition_object_store_inner(
 struct CoalescedShuffleReaderStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
-    coalescer: LimitedBatchCoalescer,
+    /// Lazily initialized from the first batch's actual schema rather than the
+    /// declared schema to avoid type mismatches (e.g. plan declares LargeUtf8
+    /// but IPC shuffle data contains Utf8).
+    coalescer: Option<LimitedBatchCoalescer>,
+    batch_size: usize,
+    limit: Option<usize>,
     completed: bool,
     baseline_metrics: BaselineMetrics,
 }
@@ -1648,9 +1776,11 @@ impl CoalescedShuffleReaderStream {
     ) -> Self {
         let schema = input.schema();
         Self {
-            schema: schema.clone(),
+            schema,
             input,
-            coalescer: LimitedBatchCoalescer::new(schema, batch_size, limit),
+            coalescer: None,
+            batch_size,
+            limit,
             completed: false,
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
@@ -1669,7 +1799,9 @@ impl Stream for CoalescedShuffleReaderStream {
 
         loop {
             // If there is already a completed batch ready, return it directly
-            if let Some(batch) = self.coalescer.next_completed_batch() {
+            if let Some(ref mut coalescer) = self.coalescer
+                && let Some(batch) = coalescer.next_completed_batch()
+            {
                 self.baseline_metrics.record_output(batch.num_rows());
                 return Poll::Ready(Some(Ok(batch)));
             }
@@ -1681,26 +1813,45 @@ impl Stream for CoalescedShuffleReaderStream {
 
             // Pull from upstream
             match ready!(self.input.poll_next_unpin(cx)) {
-                // If upstream is completed, then flush remaning buffered batches
+                // If upstream is completed, then flush remaining buffered batches
                 None => {
                     self.completed = true;
-                    if let Err(e) = self.coalescer.finish() {
+                    if let Some(ref mut coalescer) = self.coalescer
+                        && let Err(e) = coalescer.finish()
+                    {
                         return Poll::Ready(Some(Err(e)));
                     }
                 }
                 // If upstream is not completed, then push to coalescer
                 Some(Ok(batch)) => {
                     if batch.num_rows() > 0 {
-                        // Try to push to coalescer
-                        match self.coalescer.push_batch(batch) {
-                            // If push is successful, then continue
+                        if self.coalescer.is_none() {
+                            self.coalescer = Some(LimitedBatchCoalescer::new(
+                                batch.schema(),
+                                self.batch_size,
+                                self.limit,
+                            ));
+                        }
+
+                        let Some(coalescer) = self.coalescer.as_mut() else {
+                            return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                "coalescer missing after initialization".to_string(),
+                            ))));
+                        };
+
+                        match coalescer.push_batch(batch) {
                             Ok(PushBatchStatus::Continue) => {
                                 continue;
                             }
-                            // If limit is reached, then finish coalescer and set completed to true
                             Ok(PushBatchStatus::LimitReached) => {
                                 self.completed = true;
-                                if let Err(e) = self.coalescer.finish() {
+                                let Some(coalescer) = self.coalescer.as_mut() else {
+                                    return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                        "coalescer missing after initialization"
+                                            .to_string(),
+                                    ))));
+                                };
+                                if let Err(e) = coalescer.finish() {
                                     return Poll::Ready(Some(Err(e)));
                                 }
                             }
@@ -1723,8 +1874,12 @@ impl RecordBatchStream for CoalescedShuffleReaderStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::JobId;
     use crate::execution_plans::ShuffleWriterExec;
-    use crate::serde::scheduler::{ExecutorMetadata, ExecutorSpecification, PartitionId};
+    use crate::serde::scheduler::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+        PartitionId,
+    };
     use crate::utils;
 
     /// A `PartitionLocation` pointing at a disk path that does not exist, with the
@@ -1733,7 +1888,7 @@ mod tests {
         PartitionLocation {
             map_partition_id: 0,
             partition_id: PartitionId {
-                job_id: "job".to_string(),
+                job_id: JobId::new("job"),
                 stage_id: 1,
                 partition_id: 0,
             },
@@ -1743,6 +1898,7 @@ mod tests {
                 port: 7070,
                 grpc_port: 8080,
                 specification: ExecutorSpecification { task_slots: 1 },
+                os_info: ExecutorOperatingSystemSpecification::default(),
             },
             partition_stats: PartitionStats {
                 num_rows,
@@ -1883,7 +2039,7 @@ mod tests {
             partitions.push(PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
-                    job_id: job_id.to_string(),
+                    job_id: JobId::from(job_id),
                     stage_id: input_stage_id,
                     partition_id,
                 },
@@ -1893,6 +2049,7 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -1932,7 +2089,7 @@ mod tests {
             partitions.push(PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
-                    job_id: job_id.to_string(),
+                    job_id: JobId::from(job_id),
                     stage_id: input_stage_id,
                     partition_id,
                 },
@@ -1942,6 +2099,7 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -1982,7 +2140,7 @@ mod tests {
             partitions.push(PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
-                    job_id: job_id.to_string(),
+                    job_id: JobId::from(job_id),
                     stage_id: input_stage_id,
                     partition_id,
                 },
@@ -1992,6 +2150,7 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 partition_stats: PartitionStats {
                     num_rows: Some(1),
@@ -2032,7 +2191,7 @@ mod tests {
             partitions.push(PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
-                    job_id: job_id.to_string(),
+                    job_id: JobId::from(job_id),
                     stage_id: input_stage_id,
                     partition_id,
                 },
@@ -2042,6 +2201,7 @@ mod tests {
                     port: 7070,
                     grpc_port: 8080,
                     specification: ExecutorSpecification { task_slots: 1 },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 partition_stats: Default::default(),
                 path: "test_path".to_string(),
@@ -2085,7 +2245,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let work_dir = TempDir::new().unwrap();
         let input = ShuffleWriterExec::try_new(
-            "local_file".to_owned(),
+            JobId::new("local_file"),
             1,
             create_test_data_plan().unwrap(),
             work_dir.path().to_str().unwrap().to_owned(),
@@ -2197,7 +2357,7 @@ mod tests {
             .map(|partition_id| PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
-                    job_id: "job".to_string(),
+                    job_id: JobId::new("job"),
                     stage_id: 1,
                     partition_id,
                 },
@@ -2207,6 +2367,7 @@ mod tests {
                     port: 50051,
                     grpc_port: 50052,
                     specification: ExecutorSpecification { task_slots: 12 },
+                    os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 partition_stats: Default::default(),
                 path: path.clone(),

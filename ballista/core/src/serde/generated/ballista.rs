@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4"
+        tags = "1, 2, 3, 4, 5"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -49,7 +49,18 @@ pub mod ballista_physical_plan_node {
         UnresolvedShuffle(super::UnresolvedShuffleExecNode),
         #[prost(message, tag = "4")]
         SortShuffleWriter(super::SortShuffleWriterExecNode),
+        #[prost(message, tag = "5")]
+        ChaosExec(super::ChaosExecNode),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChaosExecNode {
+    #[prost(double, tag = "1")]
+    pub failure_probability: f64,
+    #[prost(string, tag = "2")]
+    pub fault_type: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub seed: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShuffleWriterExecNode {
@@ -97,6 +108,12 @@ pub struct UnresolvedShuffleExecNode {
     pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
     #[prost(message, optional, tag = "5")]
     pub partitioning: ::core::option::Option<::datafusion_proto::protobuf::Partitioning>,
+    #[prost(bool, tag = "6")]
+    pub broadcast: bool,
+    #[prost(uint32, tag = "7")]
+    pub upstream_partition_count: u32,
+    #[prost(message, optional, tag = "8")]
+    pub coalesce: ::core::option::Option<CoalescePlan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShuffleReaderExecNode {
@@ -109,12 +126,30 @@ pub struct ShuffleReaderExecNode {
     pub stage_id: u32,
     #[prost(message, optional, tag = "4")]
     pub partitioning: ::core::option::Option<::datafusion_proto::protobuf::Partitioning>,
+    #[prost(bool, tag = "5")]
+    pub broadcast: bool,
+    #[prost(uint32, tag = "6")]
+    pub upstream_partition_count: u32,
+    #[prost(message, optional, tag = "7")]
+    pub coalesce: ::core::option::Option<CoalescePlan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ShuffleReaderPartition {
     /// each partition of a shuffle read can read data from multiple locations
     #[prost(message, repeated, tag = "1")]
     pub location: ::prost::alloc::vec::Vec<PartitionLocation>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoalescePlan {
+    #[prost(uint32, tag = "1")]
+    pub upstream_partition_count: u32,
+    #[prost(message, repeated, tag = "2")]
+    pub groups: ::prost::alloc::vec::Vec<PartitionGroup>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionGroup {
+    #[prost(uint32, repeated, tag = "1")]
+    pub upstream_indices: ::prost::alloc::vec::Vec<u32>,
 }
 /// /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Ballista Scheduling
@@ -515,6 +550,8 @@ pub struct ExecutorMetadata {
     pub grpc_port: u32,
     #[prost(message, optional, tag = "5")]
     pub specification: ::core::option::Option<ExecutorSpecification>,
+    #[prost(message, optional, tag = "6")]
+    pub os_info: ::core::option::Option<ExecutorOperatingSystemSpecification>,
 }
 /// Used for scheduler-executor
 /// communication
@@ -530,6 +567,8 @@ pub struct ExecutorRegistration {
     pub grpc_port: u32,
     #[prost(message, optional, tag = "5")]
     pub specification: ::core::option::Option<ExecutorSpecification>,
+    #[prost(message, optional, tag = "6")]
+    pub os_info: ::core::option::Option<ExecutorOperatingSystemSpecification>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutorHeartbeat {
@@ -542,11 +581,15 @@ pub struct ExecutorHeartbeat {
     pub metrics: ::prost::alloc::vec::Vec<ExecutorMetric>,
     #[prost(message, optional, tag = "4")]
     pub status: ::core::option::Option<ExecutorStatus>,
+    #[prost(uint64, tag = "5")]
+    pub peak_proc_physical_memory: u64,
+    #[prost(uint64, tag = "6")]
+    pub peak_proc_virtual_memory: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutorMetric {
     /// TODO add more metrics
-    #[prost(oneof = "executor_metric::Metric", tags = "1")]
+    #[prost(oneof = "executor_metric::Metric", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub metric: ::core::option::Option<executor_metric::Metric>,
 }
 /// Nested message and enum types in `ExecutorMetric`.
@@ -556,6 +599,18 @@ pub mod executor_metric {
     pub enum Metric {
         #[prost(uint64, tag = "1")]
         AvailableMemory(u64),
+        #[prost(uint64, tag = "2")]
+        TotalMemory(u64),
+        #[prost(uint64, tag = "3")]
+        UsedMemory(u64),
+        #[prost(uint64, tag = "4")]
+        ProcPhysicalMemory(u64),
+        #[prost(uint64, tag = "5")]
+        ProcVirtualMemory(u64),
+        #[prost(uint64, tag = "6")]
+        PeakPhysicalMemory(u64),
+        #[prost(uint64, tag = "7")]
+        PeakVirtualMemory(u64),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -596,6 +651,27 @@ pub mod executor_resource {
         #[prost(uint32, tag = "1")]
         TaskSlots(u32),
     }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecutorOperatingSystemSpecification {
+    #[prost(string, tag = "1")]
+    pub system_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub kernel_ver: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub os_ver: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub os_ver_long: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "5")]
+    pub physical_cores: u32,
+    #[prost(uint32, tag = "6")]
+    pub num_disks: u32,
+    #[prost(uint64, tag = "7")]
+    pub total_disk_space: u64,
+    #[prost(uint64, tag = "8")]
+    pub total_available_disk_space: u64,
+    #[prost(uint64, tag = "9")]
+    pub open_files_limit: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AvailableTaskSlots {
@@ -876,7 +952,7 @@ pub struct ExecuteQueryParams {
     /// client and scheduler
     #[prost(string, tag = "5")]
     pub operation_id: ::prost::alloc::string::String,
-    #[prost(oneof = "execute_query_params::Query", tags = "1, 6")]
+    #[prost(oneof = "execute_query_params::Query", tags = "1, 6, 7")]
     pub query: ::core::option::Option<execute_query_params::Query>,
 }
 /// Nested message and enum types in `ExecuteQueryParams`.
@@ -887,6 +963,12 @@ pub mod execute_query_params {
         LogicalPlan(::prost::alloc::vec::Vec<u8>),
         #[prost(bytes, tag = "6")]
         SubstraitPlan(::prost::alloc::vec::Vec<u8>),
+        /// An already-built physical plan, serialized with the scheduler's
+        /// physical extension codec. Lets clients bypass logical-plan creation
+        /// on the scheduler, e.g. for plans containing custom operators that
+        /// have no logical-plan representation.
+        #[prost(bytes, tag = "7")]
+        PhysicalPlan(::prost::alloc::vec::Vec<u8>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -973,6 +1055,36 @@ pub mod execute_query_failure_result {
 pub struct GetJobStatusParams {
     #[prost(string, tag = "1")]
     pub job_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetJobMetricsParams {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobStageMetrics {
+    #[prost(uint32, tag = "1")]
+    pub stage_id: u32,
+    #[prost(uint32, tag = "2")]
+    pub partitions: u32,
+    #[prost(message, repeated, tag = "3")]
+    pub operators: ::prost::alloc::vec::Vec<OperatorWithMetrics>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OperatorWithMetrics {
+    #[prost(uint32, tag = "1")]
+    pub depth: u32,
+    #[prost(string, tag = "2")]
+    pub operator_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub operator_desc: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub metrics: ::prost::alloc::vec::Vec<OperatorMetric>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetJobMetricsResult {
+    #[prost(message, repeated, tag = "1")]
+    pub stages: ::prost::alloc::vec::Vec<JobStageMetrics>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessfulJob {
@@ -1070,6 +1182,10 @@ pub struct CancelJobResult {
 pub struct CleanJobDataParams {
     #[prost(string, tag = "1")]
     pub job_id: ::prost::alloc::string::String,
+    /// Specific stage ids to remove within the job dir.
+    /// Empty means remove the whole job dir (legacy behavior).
+    #[prost(uint32, repeated, tag = "2")]
+    pub remove_stage_ids: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CleanJobDataResult {}
@@ -1115,6 +1231,10 @@ pub struct CancelTasksResult {
 pub struct RemoveJobDataParams {
     #[prost(string, tag = "1")]
     pub job_id: ::prost::alloc::string::String,
+    /// Specific stage ids to remove within the job dir.
+    /// Empty means remove the whole job dir (legacy behavior).
+    #[prost(uint32, repeated, tag = "2")]
+    pub remove_stage_ids: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveJobDataResult {}
@@ -1553,6 +1673,32 @@ pub mod scheduler_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_job_metrics(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetJobMetricsParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetJobMetricsResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/GetJobMetrics",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ballista.protobuf.SchedulerGrpc", "GetJobMetrics"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Used by Executor to tell Scheduler it is stopped.
         pub async fn executor_stopped(
             &mut self,
@@ -1766,6 +1912,13 @@ pub mod scheduler_grpc_server {
             request: tonic::Request<super::GetJobStatusParams>,
         ) -> std::result::Result<
             tonic::Response<super::GetJobStatusResult>,
+            tonic::Status,
+        >;
+        async fn get_job_metrics(
+            &self,
+            request: tonic::Request<super::GetJobMetricsParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetJobMetricsResult>,
             tonic::Status,
         >;
         /// Used by Executor to tell Scheduler it is stopped.
@@ -2279,6 +2432,51 @@ pub mod scheduler_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetJobStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ballista.protobuf.SchedulerGrpc/GetJobMetrics" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetJobMetricsSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::GetJobMetricsParams>
+                    for GetJobMetricsSvc<T> {
+                        type Response = super::GetJobMetricsResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetJobMetricsParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::get_job_metrics(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetJobMetricsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

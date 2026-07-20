@@ -16,30 +16,30 @@
 # under the License.
 
 [package]
+name = "pyballista"
+version = "54.0.0"
+homepage = "https://datafusion.apache.org/ballista/"
+repository = "https://github.com/apache/datafusion-ballista"
 authors = ["Apache DataFusion <dev@datafusion.apache.org>"]
 description = "Apache Arrow Ballista Python Client"
-edition = "2021"
-homepage = "https://datafusion.apache.org/ballista/"
-include = ["/src", "/ballista", "/LICENSE.txt", "pyproject.toml", "Cargo.toml", "Cargo.lock"]
-license = "Apache-2.0"
-name = "pyballista"
-publish = false
 readme = "README.md"
-repository = "https://github.com/apache/datafusion-ballista"
+license = "Apache-2.0"
+edition = "2021"
 rust-version = "1.82.0"
-version = "51.0.0"
+include = ["/src", "/ballista", "/LICENSE.txt", "pyproject.toml", "Cargo.toml", "Cargo.lock"]
+publish = false
 
 [dependencies]
 async-trait = "0.1.89"
-ballista = { path = "../ballista/client" }
-ballista-core = { path = "../ballista/core" }
-ballista-executor = { path = "../ballista/executor" }
-ballista-scheduler = { path = "../ballista/scheduler" }
-datafusion = { version = "52.0.0", features = ["pyarrow", "avro"] }
-datafusion-proto = "52.0.0"
-datafusion-python = { version = "51" }
+ballista = { path = "../ballista/client", version = "54.0.0" }
+ballista-core = { path = "../ballista/core", version = "54.0.0" }
+ballista-executor = { path = "../ballista/executor", version = "54.0.0", default-features = false }
+ballista-scheduler = { path = "../ballista/scheduler", version = "54.0.0", default-features = false }
+datafusion = { version = "54", features = ["avro"] }
+datafusion-proto = { version = "54" }
+datafusion-python = { version = "54", default-features = false }
 log = { version = "0.4" }
-pyo3 = { version = "0.26", features = ["extension-module", "abi3", "abi3-py310"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3", "abi3-py310"] }
 pyo3-log = "0.13"
 tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 tonic = { version = "0.14" }
@@ -49,4 +49,4 @@ crate-type = ["cdylib"]
 name = "ballista"
 
 [build-dependencies]
-pyo3-build-config = "0.26"
+pyo3-build-config = "0.29"

@@ -45,6 +45,7 @@ pub mod terminate;
 mod cpu_bound_executor;
 mod standalone;
 
+use ballista_core::JobId;
 use ballista_core::error::BallistaError;
 use std::net::SocketAddr;
 
@@ -113,7 +114,7 @@ pub fn as_task_status(
             );
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id,
+                job_id: partition_id.job_id.clone().into(),
                 stage_id: partition_id.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 partition_id: partition_id.partition_id as u32,
@@ -133,7 +134,7 @@ pub fn as_task_status(
 
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id,
+                job_id: partition_id.job_id.clone().into(),
                 stage_id: partition_id.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 partition_id: partition_id.partition_id as u32,

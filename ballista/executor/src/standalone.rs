@@ -30,7 +30,10 @@ use ballista_core::{
     BALLISTA_VERSION,
     error::Result,
     serde::BallistaCodec,
-    serde::protobuf::{ExecutorRegistration, scheduler_grpc_client::SchedulerGrpcClient},
+    serde::protobuf::{
+        ExecutorOperatingSystemSpecification, ExecutorRegistration,
+        scheduler_grpc_client::SchedulerGrpcClient,
+    },
     serde::scheduler::ExecutorSpecification,
     utils::create_grpc_server,
 };
@@ -110,6 +113,7 @@ pub async fn new_standalone_executor_from_builder(
             }
             .into(),
         ),
+        os_info: Some(ExecutorOperatingSystemSpecification::default()),
     };
 
     let config = config_producer();

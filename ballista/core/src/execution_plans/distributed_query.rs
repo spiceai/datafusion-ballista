@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::JobId;
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
 use crate::extension::{
@@ -49,6 +50,7 @@ use datafusion_proto::logical_plan::{
 };
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use log::{debug, error, info};
+use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -83,6 +85,9 @@ pub struct DistributedQueryExec<T: 'static + AsLogicalPlan> {
     /// - job_execution_time_ms: Time spent executing on the cluster (ended_at - started_at)
     /// - job_scheduling_in_ms: Time job waited in scheduler queue (started_at - queued_at)
     metrics: ExecutionPlanMetricsSet,
+    /// Job id assigned by the scheduler once the query is accepted.
+    /// Populated during [`ExecutionPlan::execute`] so EXPLAIN ANALYZE can fetch metrics.
+    job_id: Arc<Mutex<Option<JobId>>>,
 }
 
 impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
@@ -104,6 +109,7 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -126,7 +132,13 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
             session_id,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the scheduler-assigned job id once the query has been accepted.
+    pub fn job_id(&self) -> Option<JobId> {
+        self.job_id.lock().clone()
     }
 
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
@@ -192,6 +204,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                 self.plan.schema().as_arrow().clone().into(),
             ),
             metrics: ExecutionPlanMetricsSet::new(),
+            job_id: Arc::clone(&self.job_id),
         }))
     }
 
@@ -255,6 +268,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                     Arc::new(self.metrics.clone()),
                     partition,
                     session_config,
+                    Arc::clone(&self.job_id),
                 )
                 .map_err(|e| ArrowError::ExternalError(Box::new(e))),
             )
@@ -282,6 +296,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
                     Arc::new(self.metrics.clone()),
                     partition,
                     session_config,
+                    Arc::clone(&self.job_id),
                 )
                 .map_err(|e| ArrowError::ExternalError(Box::new(e))),
             )
@@ -327,6 +342,7 @@ async fn execute_query_pull(
     metrics: Arc<ExecutionPlanMetricsSet>,
     partition: usize,
     session_config: SessionConfig,
+    job_id_handle: Arc<Mutex<Option<JobId>>>,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     let grpc_interceptor = session_config.ballista_grpc_interceptor();
     let customize_endpoint =
@@ -381,7 +397,8 @@ async fn execute_query_pull(
         "Session id inconsistent between Client and Server side in DistributedQueryExec."
     );
 
-    let job_id = query_result.job_id;
+    let job_id: JobId = query_result.job_id.into();
+    *job_id_handle.lock() = Some(job_id.clone());
     let mut prev_status: Option<job_status::Status> = None;
 
     loop {
@@ -390,7 +407,7 @@ async fn execute_query_pull(
             flight_proxy,
         } = scheduler
             .get_job_status(GetJobStatusParams {
-                job_id: job_id.clone(),
+                job_id: job_id.clone().into(),
             })
             .await
             .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?
@@ -497,6 +514,7 @@ async fn execute_query_push(
     metrics: Arc<ExecutionPlanMetricsSet>,
     partition: usize,
     session_config: SessionConfig,
+    job_id_handle: Arc<Mutex<Option<JobId>>>,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
     let grpc_interceptor = session_config.ballista_grpc_interceptor();
     let customize_endpoint =
@@ -552,10 +570,17 @@ async fn execute_query_push(
             status,
             flight_proxy,
         } = item;
-        let job_id = status
+        let job_id: JobId = status
             .as_ref()
             .map(|s| s.job_id.to_owned())
-            .unwrap_or("unknown_job_id".to_string()); // should not happen
+            .unwrap_or("unknown_job_id".to_string()) // should not happen
+            .into();
+        if !job_id.as_str().starts_with("unknown_") {
+            let mut shared_job_id = job_id_handle.lock();
+            if shared_job_id.is_none() {
+                *shared_job_id = Some(job_id.clone());
+            }
+        }
         let status = status.and_then(|s| s.status);
         let has_status_change = prev_status != status;
         match status {
@@ -716,7 +741,7 @@ async fn fetch_partition(
     #[expect(clippy::cast_sign_loss)]
     let expected_rows = stats.map(|s| s.num_rows as u64).unwrap_or(0);
 
-    let job_id = partition_id.job_id.clone();
+    let job_id: JobId = partition_id.job_id.clone().into();
     let stage_id = partition_id.stage_id as usize;
     let partition = partition_id.partition_id as usize;
     let executor_id = metadata.id.clone();
@@ -769,7 +794,9 @@ async fn fetch_partition(
 #[cfg(test)]
 mod test {
     use crate::execution_plans::distributed_query::get_client_host_port;
-    use crate::serde::protobuf::ExecutorMetadata;
+    use crate::serde::protobuf::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    };
     use crate::serde::protobuf::get_job_status_result::FlightProxy;
 
     #[test]
@@ -783,7 +810,10 @@ mod test {
             host: "executor".to_string(),
             port: 12345,
             grpc_port: 1,
-            specification: None,
+            specification: Some(ExecutorSpecification {
+                resources: vec![],
+            }),
+            os_info: Some(ExecutorOperatingSystemSpecification::default()),
         };
 
         // no flight proxy -> client should fetch results from executor

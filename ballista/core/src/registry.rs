@@ -19,6 +19,7 @@ use datafusion::common::DataFusionError;
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::functions::all_default_functions;
 use datafusion::functions_aggregate::all_default_aggregate_functions;
+use datafusion::functions_nested::all_default_higher_order_functions;
 use datafusion::functions_window::all_default_window_functions;
 use datafusion::logical_expr::planner::ExprPlanner;
 use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
@@ -41,6 +42,8 @@ pub struct BallistaFunctionRegistry {
     pub aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Window user-defined functions.
     pub window_functions: HashMap<String, Arc<WindowUDF>>,
+    /// Higher-order (lambda) user-defined functions.
+    pub higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
 }
 
 impl Default for BallistaFunctionRegistry {
@@ -58,6 +61,12 @@ impl Default for BallistaFunctionRegistry {
 
         let window_functions: HashMap<String, Arc<WindowUDF>> =
             all_default_window_functions()
+                .into_iter()
+                .map(|f| (f.name().to_string(), f))
+                .collect();
+
+        let higher_order_functions: HashMap<String, Arc<HigherOrderUDF>> =
+            all_default_higher_order_functions()
                 .into_iter()
                 .map(|f| (f.name().to_string(), f))
                 .collect();
@@ -85,6 +94,7 @@ impl Default for BallistaFunctionRegistry {
             scalar_functions,
             aggregate_functions,
             window_functions,
+            higher_order_functions,
         }
     }
 }
@@ -92,19 +102,6 @@ impl Default for BallistaFunctionRegistry {
 impl FunctionRegistry for BallistaFunctionRegistry {
     fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
         vec![]
-    }
-
-    fn higher_order_function_names(&self) -> HashSet<String> {
-        HashSet::new()
-    }
-
-    fn higher_order_function(
-        &self,
-        name: &str,
-    ) -> datafusion::common::Result<Arc<HigherOrderUDF>> {
-        Err(DataFusionError::Internal(format!(
-            "There is no higher order function named \"{name}\" in the TaskContext"
-        )))
     }
 
     fn udfs(&self) -> HashSet<String> {
@@ -117,6 +114,21 @@ impl FunctionRegistry for BallistaFunctionRegistry {
 
     fn udwfs(&self) -> HashSet<String> {
         self.window_functions.keys().cloned().collect()
+    }
+
+    fn higher_order_function_names(&self) -> HashSet<String> {
+        self.higher_order_functions.keys().cloned().collect()
+    }
+
+    fn higher_order_function(
+        &self,
+        name: &str,
+    ) -> datafusion::common::Result<Arc<HigherOrderUDF>> {
+        self.higher_order_functions.get(name).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "There is no higher-order function named \"{name}\" in the TaskContext"
+            ))
+        })
     }
 
     fn udf(&self, name: &str) -> datafusion::common::Result<Arc<ScalarUDF>> {
@@ -155,11 +167,13 @@ impl From<&SessionState> for BallistaFunctionRegistry {
         let scalar_functions = state.scalar_functions().clone();
         let aggregate_functions = state.aggregate_functions().clone();
         let window_functions = state.window_functions().clone();
+        let higher_order_functions = state.higher_order_functions().clone();
 
         Self {
             scalar_functions,
             aggregate_functions,
             window_functions,
+            higher_order_functions,
         }
     }
 }
@@ -175,6 +189,26 @@ mod tests {
         // DataFusion's `abs` function should always be available
         assert!(registry.udf("abs").is_ok());
         assert!(registry.udfs().contains("abs"));
+    }
+
+    #[test]
+    fn test_higher_order_functions_available() {
+        let registry = BallistaFunctionRegistry::default();
+
+        // DataFusion ships built-in higher-order functions (e.g. array_filter);
+        // the registry the executor runs with must carry them or those queries
+        // fail to plan on the executor.
+        let names = registry.higher_order_function_names();
+        assert!(
+            !names.is_empty(),
+            "registry must expose DataFusion's built-in higher-order functions"
+        );
+        for name in &names {
+            assert!(
+                registry.higher_order_function(name).is_ok(),
+                "named higher-order function {name} must be retrievable"
+            );
+        }
     }
 
     #[test]

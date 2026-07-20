@@ -16,6 +16,7 @@
 # under the License.
 
 from ballista import BallistaSessionContext, setup_test_cluster
+from ballista.extension import DataFrame, DistributedDataFrame, SessionContext
 from datafusion import col, lit
 import pytest
 import pyarrow as pa
@@ -73,3 +74,96 @@ def test_read_dataframe_api(ctx):
 
     assert result.column(0) == pa.array([3, 4, 5])
     assert result.column(1) == pa.array([-4, -5, -6])
+
+
+def test_cluster_config_propagates_to_distributed_dataframe():
+    """The cluster_config dict should be passed to DistributedDataFrame
+    instances created through the BallistaSessionContext, so it can be
+    forwarded to the scheduler-side session.
+    """
+    (address, port) = setup_test_cluster()
+    overrides = {"datafusion.execution.target_partitions": "256"}
+    ctx = BallistaSessionContext(
+        address=f"df://{address}:{port}",
+        cluster_config=overrides,
+    )
+
+    assert ctx.cluster_config == overrides
+
+    df = ctx.sql("SELECT 1")
+    assert df.cluster_config == overrides
+
+
+def test_cluster_config_accepts_ballista_namespaced_keys():
+    """Ballista-namespaced keys (e.g. ``ballista.shuffle.sort_based.enabled``)
+    are not understood by the local DataFusion ``SessionConfig`` and used to
+    panic when applied to it. They are forwarded to the scheduler only and
+    must be ignored locally rather than crashing context construction.
+    """
+    (address, port) = setup_test_cluster()
+    overrides = {
+        "datafusion.execution.target_partitions": "8",
+        "ballista.shuffle.sort_based.enabled": "true",
+    }
+    ctx = BallistaSessionContext(
+        address=f"df://{address}:{port}",
+        cluster_config=overrides,
+    )
+
+    assert ctx.cluster_config == overrides
+
+    df = ctx.sql("SELECT 1")
+    assert df.cluster_config == overrides
+    assert len(df.collect()) == 1
+
+
+def test_write_csv(ctx, tmp_path):
+    df = ctx.read_csv("testdata/test.csv", has_header=True)
+    out_dir = str(tmp_path / "out")
+    df.write_csv(out_dir, with_header=True)
+    csv_files = list((tmp_path / "out").glob("*.csv"))
+    assert len(csv_files) > 0
+
+
+def test_write_parquet(ctx, tmp_path):
+    df = ctx.read_csv("testdata/test.csv", has_header=True)
+    out_dir = str(tmp_path / "out")
+    df.write_parquet(out_dir)
+    parquet_files = list((tmp_path / "out").glob("*.parquet"))
+    assert len(parquet_files) > 0
+
+
+def test_write_json(ctx, tmp_path):
+    df = ctx.read_csv("testdata/test.csv", has_header=True)
+    out_dir = str(tmp_path / "out")
+    df.write_json(out_dir)
+    json_files = list((tmp_path / "out").glob("*.json"))
+    assert len(json_files) > 0
+
+
+def _assert_dataframe_returning_methods_wrapped(base_cls, sub_cls):
+    should_be_wrapped = {
+        name
+        for name, val in base_cls.__dict__.items()
+        if callable(val)
+        and not name.startswith("__")
+        and val.__annotations__.get("return") == DataFrame.__name__
+    }
+
+    assert should_be_wrapped
+    for name in should_be_wrapped:
+        assert name in sub_cls.__dict__, f"{name} not found in {sub_cls.__name__}"
+        assert callable(sub_cls.__dict__[name]), (
+            f"{name} is not callable in {sub_cls.__name__}"
+        )
+        assert sub_cls.__dict__[name] is not base_cls.__dict__[name], (
+            f"{name} was not replaced in {sub_cls.__name__}"
+        )
+
+
+def test_distributed_dataframe_wraps_dataframe_returning_methods():
+    _assert_dataframe_returning_methods_wrapped(DataFrame, DistributedDataFrame)
+
+
+def test_ballista_session_context_wraps_dataframe_returning_methods():
+    _assert_dataframe_returning_methods_wrapped(SessionContext, BallistaSessionContext)

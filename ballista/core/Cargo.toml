@@ -29,7 +29,7 @@ name = "ballista-core"
 readme = "README.md"
 repository = "https://github.com/apache/datafusion-ballista"
 rust-version = { workspace = true }
-version = "52.0.0"
+version = "54.0.0"
 
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
@@ -46,7 +46,8 @@ vortex = ["vortex-array", "vortex-buffer", "vortex-error", "vortex-ipc"]
 [dependencies]
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
-aws-config = { version = "1.8.13", optional = true }
+aws-config = { version = "1.8.18", optional = true }
+
 aws-credential-types = { version = "1.2.0", optional = true }
 bytes = { workspace = true }
 chrono = { version = "0.4", default-features = false }
@@ -57,7 +58,7 @@ datafusion-proto = { workspace = true }
 datafusion-proto-common = { workspace = true }
 datafusion-spark = { workspace = true, optional = true }
 futures = { workspace = true }
-itertools = "0.14"
+itertools = "0.15"
 log = { workspace = true }
 md-5 = { version = "^0.10.0" }
 object_store = { workspace = true, features = ["aws", "azure", "http"] }

@@ -27,6 +27,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, accept};
 use datafusion::prelude::SessionConfig;
 use log::{debug, error, info, warn};
 
+use ballista_core::JobId;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::{
     ShuffleWriter, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
@@ -68,25 +69,25 @@ use crate::state::task_manager::UpdatedStages;
 pub struct StageMetricsInfo {
     /// Stages that started running (transitioned from Resolved to Running).
     /// Contains (job_id, stage_id, task_count, started_at_ms).
-    pub stages_started: Vec<(String, usize, usize, u64)>,
+    pub stages_started: Vec<(JobId, usize, usize, u64)>,
     /// Stages that completed successfully.
     /// Contains (job_id, stage_id, duration_ms).
-    pub stages_completed: Vec<(String, usize, u64)>,
+    pub stages_completed: Vec<(JobId, usize, u64)>,
     /// Stages that failed.
     /// Contains (job_id, stage_id, error_type).
-    pub stages_failed: Vec<(String, usize, String)>,
+    pub stages_failed: Vec<(JobId, usize, String)>,
     /// Stages that are being retried.
     /// Contains (job_id, stage_id).
-    pub stages_retried: Vec<(String, usize)>,
+    pub stages_retried: Vec<(JobId, usize)>,
     /// Tasks that completed successfully.
     /// Contains (job_id, stage_id, executor_id).
-    pub tasks_completed: Vec<(String, usize, String)>,
+    pub tasks_completed: Vec<(JobId, usize, String)>,
     /// Tasks that failed.
     /// Contains (job_id, stage_id, executor_id, error_type).
-    pub tasks_failed: Vec<(String, usize, String, String)>,
+    pub tasks_failed: Vec<(JobId, usize, String, String)>,
     /// Tasks that are being retried.
     /// Contains (job_id, stage_id).
-    pub tasks_retried: Vec<(String, usize)>,
+    pub tasks_retried: Vec<(JobId, usize)>,
 }
 
 /// Result from updating task statuses in an execution graph.
@@ -147,13 +148,22 @@ pub struct TaskStatusUpdateResult {
 /// publish its outputs to the `ExecutionGraph`s `output_locations` representing the final query results.
 pub trait ExecutionGraph: Debug + std::any::Any {
     /// Returns the job ID for this execution graph.
-    fn job_id(&self) -> &str;
+    fn job_id(&self) -> &JobId;
 
     /// Returns the job name for this execution graph.
     fn job_name(&self) -> &str;
 
     /// Returns the session ID associated with this job.
     fn session_id(&self) -> &str;
+
+    /// Returns the session config associated with this job.
+    fn session_config(&self) -> Arc<SessionConfig>;
+
+    /// Returns the logical plan as a string, if captured at submission time.
+    fn logical_plan(&self) -> Option<&str>;
+
+    /// Returns the root physical plan for this job.
+    fn physical_plan(&self) -> Arc<dyn ExecutionPlan>;
 
     /// Returns the current job status.
     fn status(&self) -> &JobStatus;
@@ -274,6 +284,16 @@ pub trait ExecutionGraph: Debug + std::any::Any {
 
     /// Clones execution graph
     fn cloned(&self) -> ExecutionGraphBox;
+
+    /// Transitions every running stage to Failed and returns in-flight tasks to cancel.
+    fn abort_running(&mut self, error: String) -> Vec<RunningTaskInfo> {
+        let running_tasks = self.running_tasks();
+        self.fail_job(error.clone());
+        for stage_id in self.running_stages() {
+            self.fail_stage(stage_id, error.clone());
+        }
+        running_tasks
+    }
 }
 
 /// Type alias for a boxed [ExecutionGraph] trait object.
@@ -375,7 +395,7 @@ fn encode_execution_graph<T: AsLogicalPlan, U: AsExecutionPlan>(
         .collect();
 
     Ok(protobuf::ExecutionGraph {
-        job_id: graph.job_id.clone(),
+        job_id: graph.job_id.clone().into(),
         job_name: graph.job_name.clone(),
         session_id: graph.session_id.clone(),
         status: Some(graph.status.clone()),
@@ -467,7 +487,7 @@ fn decode_execution_graph<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
 
     Ok(StaticExecutionGraph {
         scheduler_id: (!proto.scheduler_id.is_empty()).then_some(proto.scheduler_id),
-        job_id: proto.job_id,
+        job_id: proto.job_id.into(),
         job_name: proto.job_name,
         session_id: proto.session_id,
         status: proto.status.ok_or_else(|| {
@@ -483,6 +503,10 @@ fn decode_execution_graph<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
         task_id_gen: proto.task_id_gen as usize,
         failed_stage_attempts,
         session_config,
+        logical_plan: None,
+        physical_plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+            datafusion::arrow::datatypes::Schema::empty(),
+        ))),
     })
 }
 
@@ -494,7 +518,7 @@ pub struct StaticExecutionGraph {
     #[allow(dead_code)] // not used at the moment, will be used later
     scheduler_id: Option<String>,
     /// ID for this job
-    job_id: String,
+    job_id: JobId,
     /// Job name, can be empty string
     job_name: String,
     /// Session ID for this job
@@ -519,6 +543,10 @@ pub struct StaticExecutionGraph {
     failed_stage_attempts: HashMap<usize, HashSet<usize>>,
     /// Session config for this job
     session_config: Arc<SessionConfig>,
+    /// Logical plan as a human-readable string, captured at submission time.
+    logical_plan: Option<String>,
+    /// Root physical plan captured at submission time.
+    physical_plan: Arc<dyn ExecutionPlan>,
 }
 
 /// Information about a currently running task.
@@ -530,7 +558,7 @@ pub struct RunningTaskInfo {
     /// Unique identifier for this task within the execution graph.
     pub task_id: usize,
     /// The job ID this task belongs to.
-    pub job_id: String,
+    pub job_id: JobId,
     /// The stage ID this task belongs to.
     pub stage_id: usize,
     /// The partition this task is processing.
@@ -547,16 +575,17 @@ impl StaticExecutionGraph {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scheduler_id: &str,
-        job_id: &str,
+        job_id: &JobId,
         job_name: &str,
         session_id: &str,
         plan: Arc<dyn ExecutionPlan>,
         queued_at: u64,
         session_config: Arc<SessionConfig>,
         planner: &mut dyn DistributedPlanner,
+        logical_plan: Option<String>,
     ) -> Result<Self> {
         let shuffle_stages =
-            planner.plan_query_stages(job_id, plan, session_config.options())?;
+            planner.plan_query_stages(job_id, plan.clone(), session_config.options())?;
 
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
@@ -565,12 +594,12 @@ impl StaticExecutionGraph {
 
         Ok(Self {
             scheduler_id: Some(scheduler_id.to_string()),
-            job_id: job_id.to_string(),
+            job_id: job_id.to_owned(),
             job_name: job_name.to_string(),
             session_id: session_id.to_string(),
 
             status: JobStatus {
-                job_id: job_id.to_string(),
+                job_id: job_id.clone().into(),
                 job_name: job_name.to_string(),
                 status: Some(Status::Running(RunningJob {
                     queued_at,
@@ -586,6 +615,8 @@ impl StaticExecutionGraph {
             task_id_gen: 0,
             failed_stage_attempts: HashMap::new(),
             session_config,
+            logical_plan,
+            physical_plan: plan,
         })
     }
 
@@ -1445,8 +1476,8 @@ impl ExecutionGraph for StaticExecutionGraph {
         Box::new(self.clone())
     }
 
-    fn job_id(&self) -> &str {
-        self.job_id.as_str()
+    fn job_id(&self) -> &JobId {
+        &self.job_id
     }
 
     fn job_name(&self) -> &str {
@@ -1455,6 +1486,18 @@ impl ExecutionGraph for StaticExecutionGraph {
 
     fn session_id(&self) -> &str {
         self.session_id.as_str()
+    }
+
+    fn session_config(&self) -> Arc<SessionConfig> {
+        self.session_config.clone()
+    }
+
+    fn logical_plan(&self) -> Option<&str> {
+        self.logical_plan.as_deref()
+    }
+
+    fn physical_plan(&self) -> Arc<dyn ExecutionPlan> {
+        self.physical_plan.clone()
     }
 
     fn status(&self) -> &JobStatus {
@@ -1541,7 +1584,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                         .map(|(task_id, stage_id, partition_id, executor_id)| {
                             RunningTaskInfo {
                                 task_id,
-                                job_id: self.job_id.clone(),
+                                job_id: self.job_id.clone().into(),
                                 stage_id,
                                 partition_id,
                                 executor_id,
@@ -1697,7 +1740,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                 .map(
                     |(task_id, stage_id, partition_id, executor_id)| RunningTaskInfo {
                         task_id,
-                        job_id: self.job_id.clone(),
+                        job_id: self.job_id.clone().into(),
                         stage_id,
                         partition_id,
                         executor_id,
@@ -1754,7 +1797,7 @@ impl ExecutionGraph for StaticExecutionGraph {
     /// fail job with error message
     fn fail_job(&mut self, error: String) {
         self.status = JobStatus {
-            job_id: self.job_id.clone(),
+            job_id: self.job_id.clone().into(),
             job_name: self.job_name.clone(),
             status: Some(Status::Failed(FailedJob {
                 error,
@@ -1786,7 +1829,7 @@ impl ExecutionGraph for StaticExecutionGraph {
             .as_millis() as u64;
 
         self.status = JobStatus {
-            job_id: self.job_id.clone(),
+            job_id: self.job_id.clone().into(),
             job_name: self.job_name.clone(),
             status: Some(job_status::Status::Successful(SuccessfulJob {
                 partition_location,
@@ -2144,7 +2187,7 @@ impl TaskDescription {
 }
 
 pub(crate) fn partition_to_location(
-    job_id: &str,
+    job_id: &JobId,
     map_partition_id: usize,
     stage_id: usize,
     executor: &ExecutorMetadata,

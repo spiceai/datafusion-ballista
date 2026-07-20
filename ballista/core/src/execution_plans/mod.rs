@@ -18,6 +18,8 @@
 //! This module contains execution plans that are needed to distribute DataFusion's execution plans into
 //! several Ballista executors.
 
+mod chaos_exec;
+mod distributed_explain_analyze;
 mod distributed_query;
 mod shuffle_manager;
 pub(crate) mod shuffle_reader;
@@ -29,6 +31,8 @@ mod unresolved_shuffle;
 #[cfg(feature = "vortex")]
 pub mod vortex_shuffle;
 
+pub use chaos_exec::ChaosExec;
+pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
 pub use distributed_query::DistributedQueryExec;
 pub use shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, ShufflePartitionKey,
@@ -36,7 +40,8 @@ pub use shuffle_manager::{
 };
 pub use shuffle_reader::ShuffleReaderExec;
 pub use shuffle_reader::{
-    set_shuffle_transport_runtime, stats_for_partition, stats_for_partitions,
+    CoalescePlan, PartitionGroup, set_shuffle_transport_runtime, stats_for_partition,
+    stats_for_partitions,
 };
 pub use shuffle_writer::ShuffleWriterExec;
 pub use shuffle_writer_trait::ShuffleWriter;

@@ -29,6 +29,7 @@
 use ballista_core::error::BallistaError;
 
 use crate::executor_process::ExecutorProcessConfig;
+use crate::metrics::ExecutorMetricCollectionPolicy;
 
 /// Command-line arguments for configuring a Ballista executor.
 ///
@@ -142,6 +143,13 @@ pub struct Config {
         help = "The heartbeat interval in seconds to the scheduler for push-based task scheduling"
     )]
     pub executor_heartbeat_interval_seconds: u64,
+    /// Which system/process metrics to collect and report via heartbeat.
+    #[arg(
+        long,
+        default_value_t = ExecutorMetricCollectionPolicy::ProcessOnly,
+        help = "Executor metric collection policy: sys, proc, all, off. Default: proc"
+    )]
+    pub metric_collection_policy: ExecutorMetricCollectionPolicy,
 }
 
 impl TryFrom<Config> for ExecutorProcessConfig {
@@ -169,6 +177,7 @@ impl TryFrom<Config> for ExecutorProcessConfig {
             grpc_max_encoding_message_size: opt.grpc_server_max_encoding_message_size,
             grpc_server_config: ballista_core::utils::GrpcServerConfig::default(),
             executor_heartbeat_interval_seconds: opt.executor_heartbeat_interval_seconds,
+            metric_collection_policy: opt.metric_collection_policy,
             override_execution_engine: None,
             override_function_registry: None,
             override_config_producer: None,

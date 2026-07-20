@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::JobId;
 use crate::config::{
-    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME, BALLISTA_SHUFFLE_FORMAT,
-    BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
+    BALLISTA_COALESCE_ENABLED, BALLISTA_COALESCE_TARGET_PARTITION_BYTES,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME,
+    BALLISTA_SHUFFLE_FORMAT, BALLISTA_SHUFFLE_MEMORY_MODE, BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
     BALLISTA_SHUFFLE_READER_MAX_REQUESTS, BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT,
     BALLISTA_SHUFFLE_STORAGE_TYPE, BALLISTA_SHUFFLE_STORAGE_URL,
     BALLISTA_STANDALONE_PARALLELISM, BallistaConfig, ShuffleFormat,
@@ -225,6 +227,15 @@ pub trait SessionConfigExt {
     /// Number of times that the adaptive optimizer will attempt to optimize the plan
     fn adaptive_query_planner_max_passes(&self) -> usize;
 
+    /// Returns whether the AQE coalesce-shuffle-partitions rule is enabled.
+    fn ballista_coalesce_enabled(&self) -> bool;
+
+    /// Sets whether the AQE coalesce-shuffle-partitions rule is enabled.
+    fn with_ballista_coalesce_enabled(self, enabled: bool) -> Self;
+
+    /// Sets the target post-coalesce partition byte size in bytes.
+    fn with_ballista_coalesce_target_partition_bytes(self, bytes: u64) -> Self;
+
     /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
 
@@ -387,15 +398,22 @@ impl SessionConfigExt for SessionConfig {
     }
 
     fn upgrade_for_ballista(self) -> SessionConfig {
-        // if ballista config is not provided
-        // one is created and session state is updated
-        let ballista_config = self.ballista_config();
+        // Ballista's opinionated DataFusion defaults are applied once, when a
+        // plain config is first upgraded. The `BallistaConfig` extension marks a
+        // config that has already been through this path; re-applying the
+        // defaults on such a config would overwrite any values the user set
+        // afterwards (e.g. via `-c`/`SET`), so they are left untouched.
+        let already_upgraded =
+            self.options().extensions.get::<BallistaConfig>().is_some();
 
-        // session config has ballista config extension and
-        // default datafusion configuration is altered
-        // to fit ballista execution
-        self.with_option_extension(ballista_config)
-            .ballista_restricted_configuration()
+        let ballista_config = self.ballista_config();
+        let config = self.with_option_extension(ballista_config);
+
+        if already_upgraded {
+            config
+        } else {
+            config.ballista_restricted_configuration()
+        }
     }
 
     fn ballista_config(&self) -> BallistaConfig {
@@ -613,6 +631,32 @@ impl SessionConfigExt for SessionConfig {
             })
     }
 
+    fn ballista_coalesce_enabled(&self) -> bool {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .map(|c| c.coalesce_enabled())
+            .unwrap_or_else(|| BallistaConfig::default().coalesce_enabled())
+    }
+
+    fn with_ballista_coalesce_enabled(self, enabled: bool) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_bool(BALLISTA_COALESCE_ENABLED, enabled)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_bool(BALLISTA_COALESCE_ENABLED, enabled)
+        }
+    }
+
+    fn with_ballista_coalesce_target_partition_bytes(self, bytes: u64) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_usize(BALLISTA_COALESCE_TARGET_PARTITION_BYTES, bytes as usize)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_usize(BALLISTA_COALESCE_TARGET_PARTITION_BYTES, bytes as usize)
+        }
+    }
+
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
         let extension = BallistaGrpcMetadataInterceptor::new(metadata);
         self.with_extension(Arc::new(extension))
@@ -808,29 +852,55 @@ impl SessionConfigHelperExt for SessionConfig {
             // same like previous comment
             .set_bool("datafusion.sql_parser.map_string_types_to_utf8view", false)
             //
-            // As mentioned in https://github.com/apache/datafusion-ballista/issues/1055
-            // "Left/full outer join incorrect for CollectLeft / broadcast"
-            //
-            // In order to make correct results (decreasing performance) CollectLeft
-            // has been disabled until fixed
+            // A build side smaller than these thresholds is collected into a
+            // CollectLeft (broadcast) hash join rather than being repartitioned.
             .set_u64(
                 "datafusion.optimizer.hash_join_single_partition_threshold",
-                0,
+                10 * 1024 * 1024,
             )
             .set_u64(
                 "datafusion.optimizer.hash_join_single_partition_threshold_rows",
-                0,
+                1_000_000,
             )
-            // Uncorrelated scalar subqueries plan as a physical ScalarSubqueryExec
-            // whose expression only decodes inside that exec, so stage splitting
-            // cannot decode the stage plan (TPC-H q11/q15/q22). Disabling this
-            // rewrites them to joins, which Ballista distributes correctly.
+            //
+            // DataFusion's hash join has no spill support, so each parallel
+            // task on an executor must hold the full build side in memory.
+            // Default to sort-merge join, which spills, until DataFusion gains
+            // a spilling hash join. Users can opt back in with
+            // `SET datafusion.optimizer.prefer_hash_join = true`.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1648
+            .set_bool("datafusion.optimizer.prefer_hash_join", false)
+            //
+            // DataFusion 54 plans uncorrelated scalar subqueries as a physical
+            // `ScalarSubqueryExec` wrapping a `ScalarSubqueryExpr` that reads an
+            // in-process shared results container. That container cannot cross
+            // process or stage boundaries, and `datafusion-proto` can only
+            // deserialize the expr inside its surrounding exec, so when Ballista
+            // splits a plan into stages the expr is serialized without its exec
+            // and the executor fails to decode it. Disabling this option makes
+            // the optimizer rewrite uncorrelated scalar subqueries to joins,
+            // which Ballista distributes correctly.
             //
             // See https://github.com/apache/datafusion-ballista/issues/1909
             .set_bool(
                 "datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery",
                 false,
             )
+            //
+            // DataFusion's dynamic filters are populated at runtime by an
+            // upstream operator (a hash join build side, a TopK heap, a partial
+            // aggregate) and read by a downstream scan within the same plan.
+            // Ballista splits a plan into stages at shuffle and broadcast
+            // boundaries that run as independent tasks, so when the producing
+            // operator and the consuming scan land in different stages the
+            // filter is never populated across the boundary and the scan blocks
+            // forever. Disable dynamic filter pushdown until Ballista can carry
+            // dynamic filters across stage boundaries.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1375
+            .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false)
+
     }
 }
 
@@ -966,7 +1036,7 @@ pub trait ShuffleReadMetricsCallback: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn record_local_read(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         source_executor_id: &str,
@@ -991,7 +1061,7 @@ pub trait ShuffleReadMetricsCallback: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn record_remote_read(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         source_executor_id: &str,
@@ -1043,7 +1113,7 @@ pub trait ResultFetchMetricsCallback: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn record_result_fetch(
         &self,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         partition: usize,
         source_executor_id: &str,
@@ -1198,6 +1268,77 @@ mod test {
 
         assert!(!state.config().round_robin_repartition());
     }
+
+    // User overrides of Ballista's soft defaults must survive `upgrade_for_ballista`;
+    // re-applying the defaults would discard them. See #1901.
+    #[test]
+    fn should_preserve_user_overrides_on_upgrade() {
+        // Ballista defaults these to prefer_hash_join=false and the threshold to
+        // 10 MB. The overrides below differ from those defaults so the assertions
+        // prove the user's values survived `upgrade_for_ballista`.
+        let mut config = SessionConfig::new_with_ballista();
+        config
+            .options_mut()
+            .set("datafusion.optimizer.prefer_hash_join", "true")
+            .unwrap();
+        config
+            .options_mut()
+            .set(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                "5242880",
+            )
+            .unwrap();
+
+        let upgraded = config.upgrade_for_ballista();
+
+        assert!(upgraded.options().optimizer.prefer_hash_join);
+        assert_eq!(
+            upgraded
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold,
+            5242880
+        );
+    }
+
+    // A plain (non-Ballista) config still receives Ballista's opinionated
+    // defaults when upgraded.
+    #[test]
+    fn should_apply_defaults_when_upgrading_plain_config() {
+        let config = SessionConfig::new().upgrade_for_ballista();
+
+        assert!(!config.options().optimizer.prefer_hash_join);
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold,
+            10 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold_rows,
+            1_000_000
+        );
+    }
+
+    // Uncorrelated scalar subqueries must be rewritten to joins rather than
+    // planned as a physical `ScalarSubqueryExec`, whose `ScalarSubqueryExpr`
+    // cannot be deserialized once Ballista splits the plan into stages. See
+    // #1909.
+    #[test]
+    fn should_disable_physical_uncorrelated_scalar_subquery() {
+        let config = SessionConfig::new().upgrade_for_ballista();
+        assert!(
+            !config
+                .options()
+                .optimizer
+                .enable_physical_uncorrelated_scalar_subquery
+        );
+    }
+
     #[test]
     fn should_convert_to_key_value_pairs() {
         // key value pairs should contain datafusion and ballista values

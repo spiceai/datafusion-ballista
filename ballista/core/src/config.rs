@@ -95,6 +95,33 @@ pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
 /// Should client employ pull or push job tracking strategy
 pub const BALLISTA_CLIENT_PULL: &str = "ballista.client.pull";
+/// Configuration key to enable AQE coalesce-shuffle-partitions rule.
+pub const BALLISTA_COALESCE_ENABLED: &str = "ballista.planner.coalesce.enabled";
+/// Configuration key to enable AQE propagate empty exec rule.
+pub const BALLISTA_PROPAGATE_EMPTY_ENABLED: &str =
+    "ballista.planner.propagate_empty.enabled";
+/// Configuration key for the target post-coalesce partition byte size (bytes).
+pub const BALLISTA_COALESCE_TARGET_PARTITION_BYTES: &str =
+    "ballista.planner.coalesce.target_partition_bytes";
+/// Configuration key for the small-partition merge factor (Spark legacy semantics).
+pub const BALLISTA_COALESCE_SMALL_PARTITION_FACTOR: &str =
+    "ballista.planner.coalesce.small_partition_factor";
+/// Configuration key for the merged-partition early-flush factor (Spark legacy semantics).
+pub const BALLISTA_COALESCE_MERGED_PARTITION_FACTOR: &str =
+    "ballista.planner.coalesce.merged_partition_factor";
+/// Configuration key for enabling the AQE dynamic join-selection rule.
+pub const BALLISTA_ADAPTIVE_JOIN_ENABLED: &str = "ballista.planner.adaptive_join.enabled";
+/// Configuration key to enable chaos-monkey execution injection for robustness testing.
+pub const BALLISTA_CHAOS_EXECUTION_ENABLED: &str =
+    "ballista.testing.chaos_execution.enabled";
+/// Configuration key for the per-node failure probability used by chaos-monkey execution.
+pub const BALLISTA_CHAOS_EXECUTION_PROBABILITY: &str =
+    "ballista.testing.chaos_execution.probability";
+/// Configuration key controlling the fault type injected by chaos-monkey execution.
+pub const BALLISTA_CHAOS_EXECUTION_FAULT_TYPE: &str =
+    "ballista.testing.chaos_execution.fault_type";
+/// Configuration key for the optional RNG seed used by chaos-monkey execution.
+pub const BALLISTA_CHAOS_EXECUTION_SEED: &str = "ballista.testing.chaos_execution.seed";
 
 /// Result type for configuration parsing operations.
 pub type ParseResult<T> = result::Result<T, String>;
@@ -174,7 +201,7 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_ENABLED.to_string(),
                          "Enable sort-based shuffle which writes consolidated files with index".to_string(),
                          DataType::Boolean,
-                         Some(false.to_string())),
+                         Some(true.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE.to_string(),
                          "Per-partition buffer size in bytes for sort shuffle".to_string(),
                          DataType::UInt64,
@@ -194,7 +221,79 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
         ConfigEntry::new(BALLISTA_CLIENT_PULL.to_string(),
                          "Should client employ pull or push job tracking. In pull mode client will make a request to server in the loop, until job finishes. Pull mode is kept for legacy clients.".to_string(),
                          DataType::Boolean,
-                         Some(false.to_string()))
+                         Some(false.to_string())),
+        ConfigEntry::new(BALLISTA_COALESCE_ENABLED.to_string(),
+                         "Enables the AQE coalesce-shuffle-partitions rule. \
+                          Disabled by default — opt in when fewer/larger \
+                          downstream tasks matter more than parallelism.".to_string(),
+                         DataType::Boolean,
+                         Some(false.to_string())),
+        ConfigEntry::new(BALLISTA_PROPAGATE_EMPTY_ENABLED.to_string(),
+                        "Configuration key to enable AQE propagate empty exec rule. \
+                        This could benefit the workload by injecting EmptyExec in the plan (i.e during joins)".to_string(),
+                        DataType::Boolean,
+                        Some(true.to_string())),
+        ConfigEntry::new(
+            BALLISTA_COALESCE_TARGET_PARTITION_BYTES.to_string(),
+            "Target post-coalesce partition byte size in bytes. Mirrors Spark's \
+             advisoryPartitionSizeInBytes."
+                .to_string(),
+            DataType::UInt64,
+            Some((64 * 1024 * 1024_usize).to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_COALESCE_SMALL_PARTITION_FACTOR.to_string(),
+            "Small-partition merge factor (Spark legacy).".to_string(),
+            DataType::Float64,
+            Some("0.2".to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_COALESCE_MERGED_PARTITION_FACTOR.to_string(),
+            "Merged-partition early-flush factor (Spark legacy).".to_string(),
+            DataType::Float64,
+            Some("1.2".to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_ADAPTIVE_JOIN_ENABLED.to_string(),
+            "Enables the AQE dynamic join-selection rule (SelectJoinRule). \
+             When true (default), DynamicJoinSelectionExec nodes are resolved to \
+             concrete HashJoin or CollectLeft join implementations at runtime. \
+             Disable only for debugging.".to_string(),
+            DataType::Boolean,
+            Some(true.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_CHAOS_EXECUTION_ENABLED.to_string(),
+            "Enables chaos-monkey execution injection for robustness testing. \
+             When true, ChaosExec is inserted at a random point in the plan \
+             once per optimize call.".to_string(),
+            DataType::Boolean,
+            Some(false.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_CHAOS_EXECUTION_PROBABILITY.to_string(),
+            "Failure probability (0.0–1.0) passed to ChaosExec when \
+             chaos execution is enabled.".to_string(),
+            DataType::Float64,
+            Some("0.25".to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_CHAOS_EXECUTION_FAULT_TYPE.to_string(),
+            "Fault type injected by chaos-monkey execution. \
+             \"transient\": IoError (retryable); \"fatal\": Execution error (non-retryable); \
+             \"panic\": panics the task thread; \
+             \"delay\" or \"delay:N\": sleeps N ms per batch with no error (default N=1).".to_string(),
+            DataType::Utf8,
+            Some("transient".to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_CHAOS_EXECUTION_SEED.to_string(),
+            "Optional u64 seed for the chaos RNG. \
+             Empty string (default) means non-deterministic; set to a numeric value \
+             to get reproducible fault injection across runs.".to_string(),
+            DataType::Utf8,
+            Some("".to_string()),
+        ),
     ];
     entries
         .into_iter()
@@ -324,6 +423,11 @@ impl BallistaConfig {
             DataType::Utf8 => {
                 val.to_string();
             }
+            DataType::Float64 => {
+                val.to_string()
+                    .parse::<f64>()
+                    .map_err(|e| format!("{e:?}"))?;
+            }
             _ => {
                 return Err(format!("not support data type: {data_type}"));
             }
@@ -345,6 +449,11 @@ impl BallistaConfig {
     /// Returns the maximum message size for gRPC clients in bytes.
     pub fn default_grpc_client_max_message_size(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE)
+    }
+
+    /// Alias used by upstream Ballista 54 call sites (EXPLAIN ANALYZE, etc.).
+    pub fn grpc_client_max_message_size(&self) -> usize {
+        self.default_grpc_client_max_message_size()
     }
 
     /// Returns the standalone processing parallelism level.
@@ -482,6 +591,61 @@ impl BallistaConfig {
     /// Returns the target batch size for sort-based shuffle.
     pub fn shuffle_sort_based_batch_size(&self) -> usize {
         self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE)
+    }
+
+    /// Returns whether the AQE coalesce-shuffle-partitions rule is enabled.
+    pub fn coalesce_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_COALESCE_ENABLED)
+    }
+
+    /// Returns whether the AQE propagate empty rule is enabled.
+    pub fn propagate_empty_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_PROPAGATE_EMPTY_ENABLED)
+    }
+
+    /// Returns the target post-coalesce partition byte size in bytes.
+    pub fn coalesce_target_partition_bytes(&self) -> u64 {
+        self.get_usize_setting(BALLISTA_COALESCE_TARGET_PARTITION_BYTES) as u64
+    }
+
+    /// Returns the small-partition merge factor (Spark legacy).
+    pub fn coalesce_small_partition_factor(&self) -> f64 {
+        self.get_f64_setting(BALLISTA_COALESCE_SMALL_PARTITION_FACTOR)
+    }
+
+    /// Returns the merged-partition early-flush factor (Spark legacy).
+    pub fn coalesce_merged_partition_factor(&self) -> f64 {
+        self.get_f64_setting(BALLISTA_COALESCE_MERGED_PARTITION_FACTOR)
+    }
+
+    /// Returns whether the AQE dynamic join-selection rule is enabled.
+    pub fn adaptive_join_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_ADAPTIVE_JOIN_ENABLED)
+    }
+
+    /// Returns whether chaos-monkey execution injection is enabled.
+    pub fn chaos_execution_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_CHAOS_EXECUTION_ENABLED)
+    }
+
+    /// Returns the failure probability for chaos-monkey execution (0.0–1.0).
+    pub fn chaos_execution_probability(&self) -> f64 {
+        self.get_f64_setting(BALLISTA_CHAOS_EXECUTION_PROBABILITY)
+    }
+
+    /// Returns the fault type injected by chaos-monkey execution.
+    pub fn chaos_execution_fault_type(&self) -> String {
+        self.get_string_setting(BALLISTA_CHAOS_EXECUTION_FAULT_TYPE)
+    }
+
+    /// Returns the optional RNG seed for chaos-monkey execution.
+    pub fn chaos_execution_seed(&self) -> Option<u64> {
+        let s = self.get_string_setting(BALLISTA_CHAOS_EXECUTION_SEED);
+        if s.is_empty() {
+            None
+        } else {
+            s.parse().ok()
+        }
     }
 
     /// Should client employ pull or push job tracking strategy

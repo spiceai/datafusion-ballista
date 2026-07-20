@@ -20,6 +20,7 @@
 //! Handles writing partition buffers to disk when memory pressure is high,
 //! and reading them back during the finalization phase.
 
+use crate::JobId;
 use crate::error::{BallistaError, Result};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
@@ -65,13 +66,13 @@ impl SpillManager {
     /// * `compression` - Compression codec for spill files
     pub fn new(
         work_dir: &str,
-        job_id: &str,
+        job_id: &JobId,
         stage_id: usize,
         input_partition: usize,
         compression: CompressionType,
     ) -> Result<Self> {
         let mut spill_dir = PathBuf::from(work_dir);
-        spill_dir.push(job_id);
+        spill_dir.push(job_id.as_str());
         spill_dir.push(format!("{stage_id}"));
         spill_dir.push(format!("{input_partition}"));
         spill_dir.push("spill");
@@ -241,9 +242,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let schema = create_test_schema();
 
+        let job_id = JobId::new("job1");
         let mut manager = SpillManager::new(
             temp_dir.path().to_str().unwrap(),
-            "job1",
+            &job_id,
             1,
             0,
             CompressionType::LZ4_FRAME,
@@ -281,9 +283,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let schema = create_test_schema();
 
+        let job_id = JobId::new("job1");
         let mut manager = SpillManager::new(
             temp_dir.path().to_str().unwrap(),
-            "job1",
+            &job_id,
             1,
             0,
             CompressionType::LZ4_FRAME,
@@ -313,9 +316,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let schema = create_test_schema();
 
+        let job_id = JobId::new("job1");
         let mut manager = SpillManager::new(
             temp_dir.path().to_str().unwrap(),
-            "job1",
+            &job_id,
             1,
             0,
             CompressionType::LZ4_FRAME,
