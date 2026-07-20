@@ -81,6 +81,15 @@ jobs:
         with:
           tool: tpchgen-cli@2.0.2
 
+      - name: Free disk space before data generation
+        run: |
+          set -euo pipefail
+          df -h
+          # Keep the tpch-ci profile binaries; drop other cargo artifacts that
+          # can push the runner over the edge during SF10 parquet generation.
+          rm -rf target/debug target/release target/tmp target/*/incremental || true
+          df -h
+
       - name: Generate TPC-H SF10 data
         run: |
           mkdir -p "$RUNNER_TEMP/tpch-data"
@@ -108,14 +117,15 @@ jobs:
 
           # Spice's eager PartitionBuffer sort-shuffle writer peaks higher than
           # upstream's index-based writer under SMJ plans (prefer_hash_join=false).
-          # 4GB → ~1GiB FairSpillPool per task; 2GB OOMs TPC-H SF10 Q18.
+          # concurrent-tasks 2 → ~1GiB FairSpillPool per task at 2GB total;
+          # concurrent-tasks 4 OOMs TPC-H SF10 Q18.
           ./target/tpch-ci/ballista-executor \
             --bind-host 127.0.0.1 \
             --bind-port 50051 \
             --scheduler-host 127.0.0.1 \
             --scheduler-connect-timeout-seconds 10 \
-            --concurrent-tasks 4 \
-            --memory-pool-size 4GB \
+            --concurrent-tasks 2 \
+            --memory-pool-size 2GB \
             --work-dir "$WORK_DIR" \
             > "$EXECUTOR_LOG" 2>&1 &
           EXECUTOR_PID=$!

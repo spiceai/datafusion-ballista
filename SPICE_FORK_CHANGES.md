@@ -232,8 +232,9 @@ Not Spice patches — features the fork never absorbed because it skipped the
   path-based writer (eager `PartitionBuffer`) is retained; only the memory
   model was aligned. Deprecated config keys `buffer_size` / `spill_threshold`
   / `memory_limit` remain accepted for wire/embedder compat. TPC-H SF10 CI
-  uses `--memory-pool-size 4GB` (vs upstream's 2GB) because the Spice eager
-  `PartitionBuffer` writer peaks higher under SMJ plans.
+  uses `--concurrent-tasks 2` (vs upstream's 4) so each FairSpillPool share
+  is ~1GiB; with 4 tasks the Spice eager `PartitionBuffer` writer OOMs SF10 Q18
+  under SMJ plans. A disk-cleanup step before data gen avoids flaky ENOSPC.
 - `#1911` partition pruning — **adopted** (repair commit; active under
   `disable-stage-plan-cache`, ignored when the stage-plan cache is on)
 - `#1902` preserve user session config overrides — **adopted** (merge)
