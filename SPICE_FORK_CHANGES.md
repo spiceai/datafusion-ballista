@@ -23,10 +23,12 @@ Living inventory of intentional differences between
 [`spiceai/datafusion-ballista`](https://github.com/spiceai/datafusion-ballista)
 and [`apache/datafusion-ballista`](https://github.com/apache/datafusion-ballista).
 
-Status snapshot: **2026-07-20** (post Ballista 54 merge). Working tip:
-`phillip/merge-upstream-ballista-54` (merge of `spiceai-54` × upstream `54.0.0`
-`18566b9c`). Cross-checked against the
-[upstreaming audit](https://ember-reef-w54j.here.now/).
+Status snapshot: **2026-07-27**. Current fork tip: `spiceai-54` at
+`f3b8c4b4` (completed [fork #64](https://github.com/spiceai/datafusion-ballista/pull/64),
+which merged upstream Ballista 54.0.0 into the Spice fork). Cross-checked against
+Apache `main` at `5dc768b6`, the
+[upstreaming audit](https://ember-reef-w54j.here.now/), and the current
+[reliability screening epic](https://github.com/apache/datafusion-ballista/issues/2158).
 
 ## How to use this document
 
@@ -45,21 +47,20 @@ Status snapshot: **2026-07-20** (post Ballista 54 merge). Working tip:
 
 ## Current tip reality (important)
 
-`spiceai-54` is **not** a merge of upstream Ballista 54. It is the Spice 53-era
-tree plus a manual DataFusion 54 dependency bump (`cb3385e5`). Relative to
-upstream `54.0.0`:
+`spiceai-54` now contains the completed upstream Ballista 54 merge. The old
+`phillip/merge-upstream-ballista-54` working branch was merged by fork #64 and
+has been deleted. Future comparisons and upgrades should start from the
+`spiceai-54` bookmark, not the pre-merge Spice 53-era tree.
 
 | Fact | Value |
 |---|---|
-| Merge-base with `54.0.0` | Ballista `53.0.0` (`e0a78666`) |
-| Upstream commits not in tip | ~173 (entire 53→54 cycle) |
-| File delta vs `54.0.0` | ~327 files |
-| Published crate versions on tip | still `52.0.0` (cosmetic drift) |
-| DF / Arrow deps on tip | DataFusion 54 / Arrow 58 |
+| Current fork bookmark | `spiceai-54` (`f3b8c4b4`) |
+| Completed upgrade PR | [spiceai/datafusion-ballista#64](https://github.com/spiceai/datafusion-ballista/pull/64) |
+| Upstream release absorbed | Ballista `54.0.0` (`18566b9c`) |
+| Current dependency generation | DataFusion 54 / Arrow 58 |
+| Apache comparison point for this snapshot | `main` (`5dc768b6`) |
 
-The in-progress merge branch is `phillip/merge-upstream-ballista-54`.
-
-### Post-review repair commit (on top of the merge)
+### Merge repair commits included in `spiceai-54`
 
 The merge suffered a delete/modify pathology: files the fork had deleted
 relative to base 53.0.0 stayed deleted whenever upstream hadn't touched them
@@ -99,8 +100,8 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | `BallistaBuilder` custom object-store | #11 | present | Upstream `remote_with_state` covers most | `spice-only` / minor | `BallistaBuilder` |
 | `poll_now_notify` + `on_work_available` | #12 | present | **Open** `apache#1893` (needs rework) | keep; finish upstream PR | `poll_now_notify`, `on_work_available` |
 | Pending-tasks lock fix | #13 | present | Spice-only instrumentation fix | `spice-only` | — |
-| External executor semaphore | #14 | present | **Open** `apache#1892` (approved) | keep; finish upstream PR | `AvailableTaskSlots` |
-| Job-state event broadcast channel | #15 | present | **Open** `apache#1891` | keep; finish upstream PR | `JobStateEvent` broadcast |
+| External executor semaphore | #14 | present | **Upstreamed** `apache#1892` | `adopt-upstream` on next merge | `AvailableTaskSlots` |
+| Job-state event broadcast channel | #15 | present | Equivalent already upstream via `ClusterState::job_state_events`; `apache#1891` remains open | `adopt-upstream`; reassess whether #1891 is still needed | `JobStateEvent` broadcast |
 | Task-cancellation routing hook | #19 | present | Complementary to `apache#1903` | keep; P2 upstream | `OnCancelTasksFn` |
 | `executor_id` on `TaskInfo` + public graph | #38 #49 | present | Not upstreamed | keep; P1 upstream (merge-clobbered twice) | `executor_id` on task info / `get_job_execution_graph` |
 
@@ -109,13 +110,13 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | Change | Fork | Tip | Upstream | Disposition | Sentinel |
 |---|---|---|---|---|---|
 | None task-slot after executor lost | #23 | present | **Upstreamed** `apache#1523` | parity | — |
-| Heartbeat while all slots busy | #26 | present | Bug still live upstream | keep; P0 upstream | `HEARTBEAT_POLL_INTERVAL` (5s) |
+| Heartbeat while all slots busy | #26 | present | **Upstreamed** `apache#2159` | `adopt-upstream` on next merge | `HEARTBEAT_POLL_INTERVAL` (5s) |
 | Job-state broadcast ordering | #30 | present | Lesson for #1891 / #2037 | `spice-only` ordering detail | — |
-| Ignore stale TaskStatus for reset partitions | #53 | present | Not upstreamed | keep | — |
+| Ignore stale TaskStatus for reset partitions | #53 | present | Equivalent already upstream: append-slot `task_infos` plus late-update guard | `adopt-upstream`; do not port fork patch | — |
 | Execution-graph serde + `recover_job` + `submit_job_with_id` | #56 | present | Design-first → `apache#2030` | keep; RFC then upstream | `recover_job`, `submit_job_with_id` |
-| Buffer task statuses across failed polls + reconcile sweep + scan/subquery ports | #57 | present | Scan/subquery already upstream (`#1906`); buffer/reconcile not | keep buffer/reconcile; adopt upstream scan form on merge | `reconcile_running_jobs`, pending status buffer |
-| Persist terminal status before active-cache eviction | #59 | present | **Open / approved** `apache#2037` | keep; finish upstream PR | `persist_terminal_and_evict` |
-| Lock hygiene (persist outside lock, DashMap-across-await, sample loop) | #60 | present | Partly in #2037; residuals still live upstream | keep; follow-up upstream after #2037 | DashMap guard / `JOB_PERSIST_TIMEOUT` |
+| Buffer task statuses across failed polls + reconcile sweep + scan/subquery ports | #57 | present | Scan/subquery upstream (`#1906`); reconciliation is the main open gap in `#2158`; status buffering still unported | reproduce the current-main revival wedge before porting reconciliation; assess buffering separately | `reconcile_running_jobs`, pending status buffer |
+| Persist terminal status before active-cache eviction | #59 | present | **Upstreamed** `apache#2037` | `adopt-upstream` on next merge | `persist_terminal_and_evict` |
+| Lock hygiene (persist outside lock, DashMap-across-await, sample loop) | #60 | present | Persistence portion upstream via `#2037`; DashMap-across-await and disconnected sample-loop spin remain live | keep; next focused reliability candidate after #58 | DashMap guard / `JOB_PERSIST_TIMEOUT` |
 | Stuck-query watchdog | #39 | **lost** | Concept → `#2030` | low urgency restore or redesign | was progress-sampling loop |
 | Consistent-hash task binding restore | (restore) | present | Upstream removed policy; leans on `#1911` | keep fork-side until benchmarks justify re-proposal | consistent-hash policy |
 
@@ -127,7 +128,7 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | In-memory shuffle | #8 #17 | present | Needs MemoryPool design upstream | keep; design issue only | `memory://`, `shuffle_manager` |
 | Object-store shuffle (S3/Azure) + streaming IPC | #9 #18 #42 #43 #48 | present | RFC on `#1539` | keep; RFC not raw diff | `shuffle_storage`, `ShuffleStorage`, `PrefixStore` |
 | Env-credential / URL-strip S3 client fixes | #40 #41 | present | Fixes fork-only code | `spice-only` | — |
-| Missing partition file → empty partition | #54 | present | Debatable (`#412`/`#2027`) | keep; NotFound typing upstreamable | missing-partition → empty |
+| Missing partition file → empty partition | #54 | present | **Obsolete upstream**: sort-shuffle always writes consolidated `data.arrow`, including empty output partitions | keep only for the fork's path-based/legacy shuffle backends; do not port to current upstream | missing-partition → empty |
 
 ### Shuffle fetch / transport
 
@@ -150,7 +151,7 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | TopK executor dynamic-filter re-link | #28.2 | **lost** | Propose on `#1375` | P2 | — |
 | Parquet `metadata_size_hint` round-trip workaround | #29 | present (restored on merge) | Root bug still in DF54 proto | keep; file DF fix | `fix_parquet_metadata_size_hint` in `execution_engine.rs` |
 | HashJoin dynamic-filter strip | #33 | present (upstream default) | Upstream globally disables (`enable_dynamic_filter_pushdown=false` on `54.0.0`) | `adopt-upstream` | `enable_dynamic_filter_pushdown` false in `extension.rs` |
-| Null-aware anti-join guards | #58 | present | Gaps still live upstream (+ `#1900` demotion hazard) | keep; P0 upstream | `null_aware` guards + tests in vendored `join_selection.rs` |
+| Null-aware anti-join guards | #58 | present | **Open** `apache#2188` (tracks `#2187`); revised to run the hash join in one task after distributed validation. `#2193` tracks the default sort-merge path dropping null-aware semantics | keep until #2188 merges; #2193 remains P0 correctness for default planning | `null_aware` guards + tests in vendored `join_selection.rs` |
 
 ### Observability
 
@@ -261,14 +262,25 @@ Not Spice patches — features the fork never absorbed because it skipped the
 - Ballista crate version bump to `54.0.0` — **adopted** (merge)
 - `#1999` task duration in finished-task log — **adopted** (repair commit)
 
-## Open upstream PRs (finish first when possible)
+## Upstream work status
 
-| Apache PR | Fork source | State |
+### Open
+
+| Apache issue / PR | Fork source | State |
 |---|---|---|
-| [#2037](https://github.com/apache/datafusion-ballista/pull/2037) | #59 (+ part of #60) | Approved / mergeable |
-| [#1892](https://github.com/apache/datafusion-ballista/pull/1892) | #14 | Approved; needs small fixes |
-| [#1891](https://github.com/apache/datafusion-ballista/pull/1891) | #15 | Needs design answers |
-| [#1893](https://github.com/apache/datafusion-ballista/pull/1893) | #12 | Needs rework per review |
+| [#2188](https://github.com/apache/datafusion-ballista/pull/2188) / [#2187](https://github.com/apache/datafusion-ballista/issues/2187) | #58 | PR revised after distributed review: build is collected and probe is coalesced to one task; CI running |
+| [#2193](https://github.com/apache/datafusion-ballista/issues/2193) | Found while validating #58 | Default `prefer_hash_join=false` path selects `SortMergeJoinExec` and loses `NOT IN` null-aware semantics |
+| [#1891](https://github.com/apache/datafusion-ballista/pull/1891) | #15 | Open, but current `ClusterState::job_state_events` is already equivalent for the screened use case; reassess scope |
+| [#1893](https://github.com/apache/datafusion-ballista/pull/1893) | #12 | Open and conflicting; needs rework per review |
+| [#2158](https://github.com/apache/datafusion-ballista/issues/2158) reconciliation item | #57 | Confirm current-main wedge before implementation |
+
+### Completed since the previous snapshot
+
+| Apache PR | Fork source | Result |
+|---|---|---|
+| [#2159](https://github.com/apache/datafusion-ballista/pull/2159) | #26 | Merged: busy executors continue heartbeating |
+| [#2037](https://github.com/apache/datafusion-ballista/pull/2037) | #59 (+ part of #60) | Merged: terminal state persists before cache eviction |
+| [#1892](https://github.com/apache/datafusion-ballista/pull/1892) | #14 | Merged: external executor semaphore |
 
 ## Structural gaps to full upstream reliance
 
@@ -315,8 +327,9 @@ first-class consumer* as a design stance.
   hook PRs; #56 (graph serde / recovery) already has a path via the
   [#2030](https://github.com/apache/datafusion-ballista/issues/2030) HA RFC.
 - **Status**: not started as an umbrella; individual pieces tracked in the
-  inventory above. Next step: draft the umbrella issue, fold #1891/#1893
-  review feedback into it.
+  inventory above. `ClusterState::job_state_events` now covers the screened
+  #1891 use case; #1893 remains open and conflicting. Next step: reassess those
+  two PRs, then fold the remaining review feedback into an umbrella issue.
 
 ### Gap 3 — Catalog/UDF sync as an extension point
 
@@ -359,14 +372,19 @@ rebuilt against our DF", never "crates.io binaries".
 
 ### Burndown order
 
-1. Finish the four open upstream PRs (mechanical; deletes 4 fork patches).
-2. Batch-upstream the correctness fixes (#26, #58, #60 residuals, #53,
-   #57-buffer, #36, #24, #54 NotFound typing) — small, evidence-backed,
-   high acceptance likelihood. File the #29 root-cause fix in DataFusion.
-3. Start Gap 1 (shuffle-storage RFC) immediately — it is the long pole and
+1. Land the #58 null-aware anti-join hash-planning fix in `apache#2188`
+   (tracks `#2187`), then fix the default sort-merge planning path in `#2193`.
+2. Port #60's two residual lock-hygiene fixes. In parallel, reproduce the
+   #57 pull-scheduler revival wedge before proposing reconciliation; assess its
+   failed-poll status buffer separately. #26/#53/#59 are now upstream and #54 is
+   obsolete in upstream's current sort-shuffle path. Keep #36/#24 as lower-priority
+   focused candidates and file the #29 root-cause fix in DataFusion.
+3. Reassess #1891 against the equivalent current API and rebase/rework #1893 only
+   if its wake-up latency feature is still worth carrying.
+4. Start Gap 1 (shuffle-storage RFC) immediately — it is the long pole and
    gates the proto convergence every future merge pays for.
-4. Gap 4 benchmark next SF100 cycle (cheap, may delete a subsystem).
-5. Gap 2 umbrella proposal once #1891/#1893 conclude.
+5. Gap 4 benchmark next SF100 cycle (cheap, may delete a subsystem).
+6. Gap 2 umbrella proposal once #1891/#1893 conclude.
 
 ## Related maps
 
