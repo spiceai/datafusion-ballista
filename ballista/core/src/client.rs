@@ -29,8 +29,12 @@ use std::{
 };
 
 use crate::error::{BallistaError, Result as BResult};
-use crate::serde::scheduler::{Action, PartitionId};
-
+use crate::extension::BallistaConfigGrpcEndpoint;
+use crate::serde::protobuf;
+use crate::serde::scheduler::{
+    Action, ByteRange, PartitionId, ShuffleFileKind, ShuffleLayout,
+};
+use crate::utils::create_grpc_client_endpoint;
 use arrow_flight;
 use arrow_flight::Ticket;
 use arrow_flight::utils::flight_data_to_arrow_batch;
@@ -47,10 +51,7 @@ use datafusion::arrow::{
 use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 
-use crate::extension::BallistaConfigGrpcEndpoint;
-use crate::serde::protobuf;
-
-use crate::utils::{GrpcClientConfig, create_grpc_client_endpoint};
+use crate::utils::GrpcClientConfig;
 
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
@@ -257,6 +258,80 @@ impl BallistaClient {
         executor_id: &str,
         partition_id: &PartitionId,
         path: &str,
+        file_id: Option<u64>,
+        layout: ShuffleLayout,
+        flight_transport: bool,
+    ) -> BResult<SendableRecordBatchStream> {
+        let host = self.host.to_owned();
+        let port = self.port;
+        self.fetch_partition_proxied(
+            executor_id,
+            partition_id,
+            path,
+            file_id,
+            layout,
+            &host,
+            port,
+            flight_transport,
+        )
+        .await
+    }
+
+    /// Fetch byte ranges of a shuffle file, as absolute offsets into it.
+    ///
+    /// The executor returns exactly those bytes concatenated in request order,
+    /// having resolved nothing: a caller that knows which bytes it wants — from
+    /// an index it fetched itself — gets them without the executor reading an
+    /// index or comparing a value. Block transport only, since decoding is the
+    /// caller's business.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_byte_ranges(
+        &mut self,
+        executor_id: &str,
+        partition_id: &PartitionId,
+        file_id: Option<u64>,
+        layout: ShuffleLayout,
+        file_kind: ShuffleFileKind,
+        byte_ranges: Vec<ByteRange>,
+        header: Option<Vec<u8>>,
+    ) -> BResult<SendableRecordBatchStream> {
+        let host = self.host.to_owned();
+        let port = self.port;
+        let action = Action::FetchPartition {
+            job_id: partition_id.job_id.clone(),
+            stage_id: partition_id.stage_id,
+            partition_id: partition_id.partition_id,
+            // Byte-range fetches address by `file_id`/`layout` alone; `path`
+            // is the fork's path-based shuffle storage location and plays no
+            // role here.
+            path: String::new(),
+            host,
+            port,
+            file_id,
+            layout,
+            file_kind,
+            byte_ranges,
+        };
+        self.execute_do_action_with_header(&action, header)
+            .await
+            .map_err(|error| Self::as_fetch_failed(executor_id, partition_id, error))
+    }
+
+    /// Retrieves a partition from an executor.
+    ///
+    /// Depending on the value of the `flight_transport` parameter, this method will utilize either
+    /// the Arrow Flight protocol for compatibility, or a more efficient block-based transfer mechanism.
+    /// The block-based transfer is optimized for performance and reduces computational overhead on the server.
+    ///
+    /// This method should be used if the request may be proxied.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_partition_proxied(
+        &mut self,
+        executor_id: &str,
+        partition_id: &PartitionId,
+        path: &str,
+        file_id: Option<u64>,
+        layout: ShuffleLayout,
         host: &str,
         port: u16,
         flight_transport: bool,
@@ -277,6 +352,9 @@ impl BallistaClient {
             .await;
         }
 
+        // No ranges: asks for whatever these identifiers address, which under
+        // the sort layout is the named partition's slice and under passthrough
+        // is the whole file.
         let action = Action::FetchPartition {
             job_id: partition_id.job_id.clone(),
             stage_id: partition_id.stage_id,
@@ -284,6 +362,10 @@ impl BallistaClient {
             path: path.to_owned(),
             host: host.to_owned(),
             port,
+            file_id,
+            layout,
+            file_kind: ShuffleFileKind::Data,
+            byte_ranges: vec![],
         };
 
         let result = if flight_transport {
@@ -292,27 +374,36 @@ impl BallistaClient {
             self.execute_do_action(&action).await
         };
 
-        result
-            .map_err(|error| match error {
-                // map grpc connection error to partition fetch error.
-                BallistaError::GrpcActionError(msg) => {
-                    log::warn!(
-                        "grpc client failed to fetch partition: {partition_id:?} , message: {msg:?}"
-                    );
-                    BallistaError::FetchFailed(
-                        executor_id.to_owned(),
-                        partition_id.stage_id,
-                        partition_id.partition_id,
-                        msg,
-                    )
-                }
-                error => {
-                    log::warn!(
-                        "grpc client failed to fetch partition: {partition_id:?} , error: {error:?}"
-                    );
-                    error
-                }
-            })
+        result.map_err(|error| Self::as_fetch_failed(executor_id, partition_id, error))
+    }
+
+    /// Report a transport failure as a partition fetch failure, which is what
+    /// lets the scheduler retry the task rather than fail the query.
+    fn as_fetch_failed(
+        executor_id: &str,
+        partition_id: &PartitionId,
+        error: BallistaError,
+    ) -> BallistaError {
+        match error {
+            // map grpc connection error to partition fetch error.
+            BallistaError::GrpcActionError(msg) => {
+                log::warn!(
+                    "grpc client failed to fetch partition: {partition_id:?} , message: {msg:?}"
+                );
+                BallistaError::FetchFailed(
+                    executor_id.to_owned(),
+                    partition_id.stage_id,
+                    partition_id.partition_id,
+                    msg,
+                )
+            }
+            error => {
+                log::warn!(
+                    "grpc client failed to fetch partition: {partition_id:?} , error: {error:?}"
+                );
+                error
+            }
+        }
     }
 
     #[allow(rustdoc::private_intra_doc_links)]
@@ -424,6 +515,23 @@ impl BallistaClient {
         &mut self,
         action: &Action,
     ) -> BResult<SendableRecordBatchStream> {
+        self.execute_do_action_with_header(action, None).await
+    }
+
+    /// [`execute_do_action`](Self::execute_do_action), prefixing the returned
+    /// block stream with a caller-supplied IPC message.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - an encoded IPC schema message to prepend. A caller fetching
+    ///   byte ranges receives batch messages with no schema ahead of them,
+    ///   because the schema does not lie inside the bytes it asked for, and
+    ///   supplies the one it already knows.
+    pub async fn execute_do_action_with_header(
+        &mut self,
+        action: &Action,
+        header: Option<Vec<u8>>,
+    ) -> BResult<SendableRecordBatchStream> {
         let serialized_action: protobuf::Action = action.to_owned().try_into()?;
 
         let mut buf: Vec<u8> = Vec::with_capacity(serialized_action.encoded_len());
@@ -489,6 +597,18 @@ impl BallistaClient {
                     )
                 })
             });
+
+            // A caller fetching byte ranges gets batch messages with no schema
+            // ahead of them, because the schema is not in the bytes it asked
+            // for. It supplies the header it already knows.
+            let stream = match header.clone() {
+                Some(header) => futures::stream::once(async move {
+                    Ok(prost::bytes::Bytes::from(header))
+                })
+                .chain(stream)
+                .boxed(),
+                None => stream.boxed(),
+            };
 
             return Ok(Box::pin(InactivityTimeoutStream::new(Box::pin(
                 BlockDataStream::try_new(stream).await?,
@@ -558,6 +678,19 @@ impl RecordBatchStream for FlightDataStream {
         self.schema.clone()
     }
 }
+
+/// Decoder for shuffle bytes streamed by [`BlockDataStream`].
+///
+/// The producing executor wrote these from arrays Arrow had already validated,
+/// so re-validating on the consumer only costs a scan.
+fn new_decoder() -> StreamDecoder {
+    // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
+    unsafe {
+        StreamDecoder::new()
+            .with_skip_validation(cfg!(feature = "arrow-ipc-optimizations"))
+    }
+}
+
 #[allow(rustdoc::private_intra_doc_links)]
 /// [BlockDataStream] facilitates the transfer of original shuffle files in a block-by-block manner.
 /// This implementation utilizes a custom `do_action` method on the Arrow Flight server.
@@ -599,13 +732,12 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
 
             match ipc_stream.next().await {
                 Some(Ok(blob)) => {
-                    state_buffer =
-                        Self::combine_buffers(&state_buffer, &Buffer::from(blob));
+                    state_buffer = Self::append_block(state_buffer, blob);
 
                     match try_schema_from_ipc_buffer(state_buffer.as_slice()) {
                         Ok(schema) => {
                             return Ok(Self {
-                                decoder: StreamDecoder::new(),
+                                decoder: new_decoder(),
                                 transmitted: state_buffer.len(),
                                 state_buffer,
                                 ipc_stream,
@@ -634,10 +766,21 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
 }
 
 impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
-    fn combine_buffers(first: &Buffer, second: &Buffer) -> Buffer {
-        let mut combined = MutableBuffer::new(first.len() + second.len());
-        combined.extend_from_slice(first.as_slice());
-        combined.extend_from_slice(second.as_slice());
+    /// Appends a transport block to the bytes still waiting to be decoded.
+    ///
+    /// `Buffer::from(Bytes)` adopts the transport allocation instead of copying
+    /// it, so when nothing is pending — which is the steady state, since
+    /// [`StreamDecoder::decode`] drains `state_buffer` completely before the
+    /// stream asks for another block — the block is taken as-is. Only a partial
+    /// message straddling a block boundary needs the concatenating path.
+    fn append_block(pending: Buffer, blob: prost::bytes::Bytes) -> Buffer {
+        let incoming = Buffer::from(blob);
+        if pending.is_empty() {
+            return incoming;
+        }
+        let mut combined = MutableBuffer::new(pending.len() + incoming.len());
+        combined.extend_from_slice(pending.as_slice());
+        combined.extend_from_slice(incoming.as_slice());
         combined.into()
     }
 
@@ -650,7 +793,8 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
         //TODO: do we want to limit maximum buffer size here as well?
         //
         self.transmitted += blob.len();
-        self.state_buffer = Self::combine_buffers(&self.state_buffer, &Buffer::from(blob))
+        let pending = std::mem::take(&mut self.state_buffer);
+        self.state_buffer = Self::append_block(pending, blob);
     }
 }
 
@@ -663,52 +807,52 @@ impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> Stream
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.decode() {
-            //
-            // if there is a batch to be read from state buffer return it
-            //
-            Ok(Some(batch)) => std::task::Poll::Ready(Some(Ok(batch))),
-            //
-            // there is no batch in the state buffer, try to pull new data
-            // from remote ipc decode it try to return next batch
-            //
-            Ok(None) => match self.ipc_stream.poll_next_unpin(cx) {
-                std::task::Poll::Ready(Some(flight_data_result)) => {
-                    match flight_data_result {
-                        Ok(blob) => {
-                            self.extend_bytes(blob);
-
-                            match self.decode() {
-                                Ok(Some(batch)) => {
-                                    std::task::Poll::Ready(Some(Ok(batch)))
-                                }
-                                Ok(None) => {
-                                    cx.waker().wake_by_ref();
-                                    std::task::Poll::Pending
-                                }
-                                Err(e) => std::task::Poll::Ready(Some(Err(
-                                    ArrowError::IpcError(e.to_string()).into(),
-                                ))),
-                            }
-                        }
-                        Err(e) => std::task::Poll::Ready(Some(Err(
-                            ArrowError::IpcError(e.to_string()).into(),
-                        ))),
-                    }
+        loop {
+            match self.decode() {
+                Ok(Some(batch)) => return std::task::Poll::Ready(Some(Ok(batch))),
+                Ok(None) => {} // buffer drained, pull more bytes below
+                Err(e) if is_post_eos_error(&e) => {
+                    // Decoder reached EOS but the byte stream contains more
+                    // sub-streams (e.g. sort-shuffle's leading schema-header
+                    // stream followed by the requested partition's streams).
+                    // Reset the decoder; the schema captured at construction
+                    // time stays authoritative for downstream consumers.
+                    self.decoder = new_decoder();
+                    continue;
                 }
-                //
-                // end of IPC stream
-                //
-                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-                // its expected that underlying stream will register waker callback
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            },
-            Err(e) => std::task::Poll::Ready(Some(Err(ArrowError::IpcError(
-                e.to_string(),
-            )
-            .into()))),
+                Err(e) => {
+                    return std::task::Poll::Ready(Some(Err(ArrowError::IpcError(
+                        e.to_string(),
+                    )
+                    .into())));
+                }
+            }
+
+            match self.ipc_stream.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(Ok(blob))) => {
+                    self.extend_bytes(blob);
+                    continue;
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(ArrowError::IpcError(
+                        e.to_string(),
+                    )
+                    .into())));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
         }
     }
+}
+
+/// Detects the `ArrowError` that `arrow_ipc::reader::stream::StreamDecoder`
+/// emits when bytes arrive after a clean EOS marker (its `DecoderState::Finished`
+/// arm in `arrow-ipc/src/reader/stream.rs` returns `IpcError("Unexpected EOS")`).
+/// `should_process_concatenated_streams` will fail if that string ever changes
+/// upstream, so a future arrow-ipc bump that breaks the contract is visible.
+fn is_post_eos_error(e: &ArrowError) -> bool {
+    matches!(e, ArrowError::IpcError(msg) if msg == "Unexpected EOS")
 }
 
 impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> RecordBatchStream
@@ -819,6 +963,73 @@ mod tests {
                 .await;
 
         assert_eq!(batches, result.unwrap())
+    }
+
+    #[tokio::test]
+    async fn should_process_multi_block_payload() {
+        // Realistic transport shape: a payload spanning several whole blocks.
+        // Once the decoder has drained the previous block, the next one is
+        // adopted rather than copied; block sizes that leave a partial schema
+        // message still exercise the concatenating path in `try_new`.
+        let batches = generate_batches();
+        let ipc_blob = generate_ipc_stream(&batches);
+
+        for block_size in [8usize, 64, 512] {
+            let stream = futures::stream::iter(ipc_blob.clone())
+                .chunks(block_size)
+                .map(|b| Ok(Bytes::from(b)));
+
+            let result: datafusion::error::Result<Vec<RecordBatch>> =
+                BlockDataStream::try_new(stream)
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await;
+
+            assert_eq!(batches, result.unwrap(), "block_size={block_size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_process_concatenated_streams() {
+        let batches = generate_batches();
+
+        // Two complete IPC streams concatenated, mirroring the sort-shuffle
+        // block-IO payload `[schema-header stream][partition streams]`.
+        let mut blob = generate_ipc_stream(&batches[..1]);
+        blob.extend(generate_ipc_stream(&batches[1..]));
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(blob))]);
+
+        let result: datafusion::error::Result<Vec<RecordBatch>> =
+            BlockDataStream::try_new(stream)
+                .await
+                .unwrap()
+                .try_collect()
+                .await;
+
+        assert_eq!(batches, result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_process_schema_only_leading_stream() {
+        // Empty-partition shape: the receiver only sees the leading
+        // schema-header stream (schema + EOS, no batches), then EOF.
+        let batches = generate_batches();
+        let schema = batches[0].schema();
+        let mut header = vec![];
+        StreamWriter::try_new(&mut header, &schema)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(header))]);
+
+        let bds = BlockDataStream::try_new(stream).await.unwrap();
+        let result_schema = bds.schema.clone();
+        let collected: datafusion::error::Result<Vec<RecordBatch>> =
+            bds.try_collect().await;
+
+        assert_eq!(result_schema.as_ref(), schema.as_ref());
+        assert!(collected.unwrap().is_empty());
     }
 
     #[tokio::test]

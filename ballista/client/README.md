@@ -96,16 +96,18 @@ RUST_LOG=info ballista-scheduler
 
 The scheduler will bind to port `50050` by default.
 
-Next, start an executor processes in a new terminal session with the specified concurrency level.
+Next, start an executor process in a new terminal session with the specified number of virtual cores.
 
 ```bash
 RUST_LOG=info ballista-executor -c 4
 ```
 
-The executor will bind to port `50051` by default. Additional executors can be started by manually specifying a bind port.
+The executor will bind to port `50051` by default.
 
-For full documentation, refer to the deployment section of the
-[Ballista User Guide](https://datafusion.apache.org/ballista/user-guide/deployment/)
+To run more than one executor on a host, to deploy with Docker or Kubernetes, or for the full flag
+reference, see the
+[deployment section](https://datafusion.apache.org/ballista/user-guide/deployment/) of the Ballista
+user guide.
 
 ## Executing a Query
 
@@ -171,27 +173,3 @@ The output should look similar to the following table.
 ```
 
 More [examples](../../examples/examples/) can be found in the datafusion-ballista repository.
-
-## Performance
-
-We run some simple benchmarks comparing Ballista with Apache Spark to track progress with performance optimizations.
-
-These are benchmarks derived from TPC-H and not official TPC-H benchmarks. These results are from running individual queries at scale factor 100 (100 GB) on a single node with a single executor and 8 concurrent tasks.
-
-### Overall Speedup
-
-The overall speedup is 2.9x
-
-![benchmarks](https://github.com/apache/datafusion-ballista/blob/main/docs/source/_static/images/tpch_allqueries.png?raw=true)
-
-### Per Query Comparison
-
-![benchmarks](https://github.com/apache/datafusion-ballista/blob/main/docs/source/_static/images/tpch_queries_compare.png?raw=true)
-
-### Relative Speedup
-
-![benchmarks](https://github.com/apache/datafusion-ballista/blob/main/docs/source/_static/images/tpch_queries_speedup_rel.png?raw=true)
-
-### Absolute Speedup
-
-![benchmarks](https://github.com/apache/datafusion-ballista/blob/main/docs/source/_static/images/tpch_queries_speedup_abs.png?raw=true)

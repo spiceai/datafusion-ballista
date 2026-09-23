@@ -24,6 +24,7 @@
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::remove_job_data;
+use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
 
 use crate::{TaskExecutionTimes, as_task_status};
@@ -38,7 +39,7 @@ use ballista_core::serde::protobuf::{
     PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
-use ballista_core::serde::scheduler::{ExecutorSpecification, PartitionId};
+use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -56,11 +57,25 @@ use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
+/// Idle sleep between polls when polling is the only way to learn of new work.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Idle sleep when a `poll_now_notify` wake-up is wired and the timer is only
+/// a fallback.
+const NOTIFIED_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum time the poll loop waits for a free vcore before polling the
+/// scheduler anyway. `poll_work` doubles as the executor's heartbeat under
+/// pull-based scheduling, so a fully-busy executor must keep polling (reporting
+/// zero free vcores) or the scheduler times it out and resets its tasks. Kept
+/// well below the scheduler's executor timeout.
+const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Main execution loop that polls the scheduler for available tasks.
 ///
-/// This function runs indefinitely, periodically asking the scheduler for
-/// work. When tasks are received, they are executed on a dedicated thread
-/// pool and results are reported back to the scheduler.
+/// Runs indefinitely, periodically asking the scheduler for work. When tasks
+/// are received they are executed concurrently and results are reported back
+/// to the scheduler.
 ///
 /// The loop respects the executor's concurrent task limit via a semaphore,
 /// ensuring no more than the configured number of tasks run simultaneously.
@@ -124,7 +139,7 @@ where
     );
 
     let dedicated_executor =
-        DedicatedExecutor::new("task_runner", executor_specification.task_slots as usize);
+        DedicatedExecutor::new("task_runner", executor_specification.vcores as usize);
 
     let report_ready = LazyCell::new(|| {
         if let Some(chan) = readiness {
@@ -226,9 +241,11 @@ where
                 for task in tasks {
                     let task_status_sender = task_status_sender.clone();
 
-                    // Acquire a permit/slot for the task
+                    // Acquire a vcore permit for the task.
                     let permit =
-                        available_task_slots.clone().acquire_owned().await.unwrap();
+                        free_vcores.clone().acquire_owned().await.map_err(|_| {
+                            BallistaError::Internal("vcore semaphore closed".to_string())
+                        })?;
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -252,14 +269,14 @@ where
                             // as scheduler expects notification.
                             //
 
-                            let partition_id = PartitionId {
+                            let task_key = TaskKey {
                                 job_id: task.job_id.clone().into(),
                                 stage_id: task.stage_id as usize,
-                                partition_id: task.partition_id as usize,
+                                task_id: task.task_id as usize,
                             };
 
                             warn!(
-                                "Executor failed to run task: {partition_id:?}, error: {e:?}"
+                                "Executor failed to run task: {task_key:?}, error: {e:?}"
                             );
 
                             let end_exec_time = SystemTime::now()
@@ -278,11 +295,10 @@ where
                             if let Err(error) = task_status_sender.send(as_task_status(
                                 Err(e),
                                 executor.metadata.id.clone(),
-                                task.task_id as usize,
                                 task.task_attempt_num as usize,
-                                partition_id,
-                                None,
+                                task_key,
                                 task_execution_times,
+                                TaskCompletionExtras::default(),
                             )) {
                                 warn!("failed to send task status: {error:?}");
                             };
@@ -366,13 +382,12 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let stage_id = task.stage_id;
     let stage_attempt_num = task.stage_attempt_num;
     let task_launch_time = task.launch_time;
-    let partition_id = task.partition_id;
     let start_exec_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     let task_identity = format!(
-        "TID {task_id} {job_id}/{stage_id}.{stage_attempt_num}/{partition_id}.{task_attempt_num}"
+        "TID {job_id}/{stage_id}.{stage_attempt_num}/{task_id}.{task_attempt_num}"
     );
     info!("Received task: [{task_identity}]");
 
@@ -388,8 +403,11 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let task_aggregate_functions = executor.function_registry.aggregate_functions.clone();
     let task_window_functions = executor.function_registry.window_functions.clone();
 
-    let runtime =
-        executor.produce_runtime_for_session(&task.session_id, &session_config)?;
+    let runtime = executor.produce_runtime_for_session(
+        &task.session_id,
+        &session_config,
+        task.vcores_consumed,
+    )?;
 
     let session_id = task.session_id.clone();
     let task_context = Arc::new(TaskContext::new(
@@ -408,10 +426,17 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
 
+    let global_output_partition_ids: Vec<usize> = task
+        .global_output_partition_ids
+        .iter()
+        .map(|p| *p as usize)
+        .collect();
+
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),
         stage_id as usize,
-        partition_id as usize,
+        task_id as usize,
+        global_output_partition_ids,
         plan,
         &executor.work_dir,
     )?;
@@ -421,8 +446,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
 
         let task_start = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
-            task_id as usize,
-            part.clone(),
+            key.clone(),
             query_stage_exec.clone(),
             task_context,
         ))
@@ -449,6 +473,19 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             .map(|m| m.try_into())
             .collect::<Result<Vec<_>, BallistaError>>()
             .ok();
+        let runtime_stats = query_stage_exec.collect_runtime_stats_reports();
+        // Collect only when the task otherwise succeeded: a failed task's
+        // partial state is meaningless, and its own error is the useful one.
+        // A collection failure fails the task — these are load-bearing for the
+        // downstream stage's prefix merge, so continuing without them would
+        // ship a wrong answer that nothing later detects.
+        let (execution_result, window_state) = match execution_result {
+            Ok(partitions) => match query_stage_exec.collect_window_state_reports() {
+                Ok(reports) => (Ok(partitions), reports),
+                Err(e) => (Err(e.into()), Vec::new()),
+            },
+            Err(e) => (Err(e), Vec::new()),
+        };
 
         let end_exec_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -464,11 +501,14 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         let _ = task_status_sender.send(as_task_status(
             execution_result,
             executor.metadata.id.clone(),
-            task_id as usize,
             stage_attempt_num as usize,
-            part,
-            operator_metrics,
+            key,
             task_execution_times,
+            TaskCompletionExtras {
+                operator_metrics,
+                runtime_stats,
+                window_state,
+            },
         ));
 
         // Release the permit after the work is done

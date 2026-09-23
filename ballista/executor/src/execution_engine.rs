@@ -32,10 +32,17 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
 };
-use datafusion::datasource::source::DataSourceExec;
+use ballista_core::serde::protobuf::ShuffleWritePartition;
+use ballista_core::serde::scheduler::PartitionStats;
+use ballista_core::{JobId, utils};
+use datafusion::arrow::array::{
+    Array, StringArray, StructArray, UInt32Array, UInt64Array,
+};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
 use std::fmt::{Debug, Display};
@@ -52,11 +59,13 @@ pub trait ExecutionEngine: Sync + Send {
     ///
     /// The returned executor will be responsible for executing the given
     /// plan partition and writing shuffle output to the specified work directory.
+    #[allow(clippy::too_many_arguments)]
     fn create_query_stage_exec(
         &self,
         job_id: JobId,
         stage_id: usize,
-        partition_id: usize,
+        task_id: usize,
+        global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
     ) -> Result<Arc<dyn QueryStageExecutor>>;
@@ -159,13 +168,13 @@ fn fix_parquet_metadata_size_hint(
 /// Arrow IPC format. Subsequent stages read these results via ShuffleReaderExec.
 #[async_trait]
 pub trait QueryStageExecutor: Sync + Send + Debug + Display {
-    /// Executes a single partition of this query stage.
+    /// Executes this query stage's assigned partition slice.
     ///
     /// Returns metadata about the shuffle partitions written to disk,
     /// including file paths and statistics.
     async fn execute_query_stage(
         &self,
-        input_partition: usize,
+        task_id: usize,
         context: Arc<TaskContext>,
     ) -> Result<Vec<ShuffleWritePartition>>;
 
@@ -206,7 +215,8 @@ impl ExecutionEngine for DefaultExecutionEngine {
         &self,
         job_id: JobId,
         stage_id: usize,
-        partition_id: usize,
+        task_id: usize,
+        global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
@@ -243,10 +253,22 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 stage_id,
                 restrict_scans(plan.children()[0].clone(), partition_id)?,
                 work_dir.to_string(),
-                shuffle_writer.shuffle_output_partitioning().cloned(),
-            )?;
+            )?
+            .with_task_id(task_id)
+            .with_global_output_partition_ids(global_output_partition_ids);
             Ok(Arc::new(DefaultQueryStageExec::new(
-                ShuffleWriterVariant::Hash(exec),
+                ShuffleWriterVariant::Passthrough(exec),
+            )))
+        } else if plan.downcast_ref::<RangeShuffleWriterExec>().is_some() {
+            let exec = RangeShuffleWriterExec::try_new(
+                job_id,
+                stage_id,
+                plan.children()[0].clone(),
+                work_dir.to_string(),
+            )?
+            .with_task_id(task_id);
+            Ok(Arc::new(DefaultQueryStageExec::new(
+                ShuffleWriterVariant::Range(exec),
             )))
         } else if let Some(sort_shuffle_writer) =
             plan.downcast_ref::<SortShuffleWriterExec>()
@@ -260,13 +282,16 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 work_dir.to_string(),
                 sort_shuffle_writer.shuffle_output_partitioning().clone(),
                 sort_shuffle_writer.config().clone(),
-            )?;
+            )?
+            .with_task_id(task_id)
+            .with_global_output_partition_ids(global_output_partition_ids);
             Ok(Arc::new(DefaultQueryStageExec::new(
                 ShuffleWriterVariant::Sort(exec),
             )))
         } else {
             Err(DataFusionError::Internal(
-                "Plan passed to new_query_stage_exec is not a ShuffleWriterExec or SortShuffleWriterExec"
+                "Plan passed to new_query_stage_exec is not a ShuffleWriterExec, \
+                 RangeShuffleWriterExec, or SortShuffleWriterExec"
                     .to_string(),
             ))
         }
@@ -276,8 +301,12 @@ impl ExecutionEngine for DefaultExecutionEngine {
 /// Enum representing the different shuffle writer implementations.
 #[derive(Debug, Clone)]
 pub enum ShuffleWriterVariant {
-    /// Hash-based shuffle writer (original implementation).
-    Hash(ShuffleWriterExec),
+    /// Passthrough shuffle writer: preserves its input partitioning,
+    /// one file per output partition.
+    Passthrough(ShuffleWriterExec),
+    /// Passthrough shuffle writer emitting the seekable Arrow IPC file
+    /// format, for stages read back in value-range order.
+    Range(RangeShuffleWriterExec),
     /// Sort-based shuffle writer.
     Sort(SortShuffleWriterExec),
 }
@@ -302,7 +331,7 @@ impl DefaultQueryStageExec {
 impl Display for DefaultQueryStageExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.shuffle_writer {
-            ShuffleWriterVariant::Hash(writer) => {
+            ShuffleWriterVariant::Passthrough(writer) => {
                 let stage_metrics: Vec<String> = writer
                     .metrics()
                     .unwrap_or_default()
@@ -311,7 +340,21 @@ impl Display for DefaultQueryStageExec {
                     .collect();
                 write!(
                     f,
-                    "DefaultQueryStageExec(Hash): ({})\n{}",
+                    "DefaultQueryStageExec(Passthrough): ({})\n{}",
+                    stage_metrics.join(", "),
+                    writer
+                )
+            }
+            ShuffleWriterVariant::Range(writer) => {
+                let stage_metrics: Vec<String> = writer
+                    .metrics()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect();
+                write!(
+                    f,
+                    "DefaultQueryStageExec(Range): ({})\n{}",
                     stage_metrics.join(", "),
                     writer
                 )
@@ -338,28 +381,43 @@ impl Display for DefaultQueryStageExec {
 impl QueryStageExecutor for DefaultQueryStageExec {
     async fn execute_query_stage(
         &self,
-        input_partition: usize,
+        task_id: usize,
         context: Arc<TaskContext>,
     ) -> Result<Vec<ShuffleWritePartition>> {
-        match &self.shuffle_writer {
-            ShuffleWriterVariant::Hash(writer) => {
-                writer
-                    .clone()
-                    .execute_shuffle_write(input_partition, context)
-                    .await
-            }
-            ShuffleWriterVariant::Sort(writer) => {
-                writer
-                    .clone()
-                    .execute_shuffle_write(input_partition, context)
-                    .await
-            }
-        }
+        let (plan_arc, is_sort_shuffle): (Arc<dyn ExecutionPlan>, bool) =
+            match &self.shuffle_writer {
+                ShuffleWriterVariant::Passthrough(writer) => {
+                    (Arc::new(writer.clone()), false)
+                }
+                ShuffleWriterVariant::Range(writer) => (Arc::new(writer.clone()), false),
+                ShuffleWriterVariant::Sort(writer) => (Arc::new(writer.clone()), true),
+            };
+        debug!(
+            "executor plan pre-run (task_id={task_id}):\n{}",
+            DisplayableExecutionPlan::new(plan_arc.as_ref()).indent(true)
+        );
+
+        // Both variants share the same coordinator+oneshot handoff shape via
+        // `execute(N)` — drive K parallel calls so every oneshot receiver is
+        // taken concurrently and each output partition's summaries flow out
+        // as soon as its files are closed.
+        let result =
+            drive_shuffle_writer_stage(plan_arc.clone(), context, is_sort_shuffle).await;
+
+        debug!(
+            "executor plan post-run (task_id={task_id}, ok={}):\n{}",
+            result.is_ok(),
+            DisplayableExecutionPlan::with_metrics(plan_arc.as_ref()).indent(true)
+        );
+        result
     }
 
     fn collect_plan_metrics(&self) -> Vec<MetricsSet> {
         match &self.shuffle_writer {
-            ShuffleWriterVariant::Hash(writer) => utils::collect_plan_metrics(writer),
+            ShuffleWriterVariant::Passthrough(writer) => {
+                utils::collect_plan_metrics(writer)
+            }
+            ShuffleWriterVariant::Range(writer) => utils::collect_plan_metrics(writer),
             ShuffleWriterVariant::Sort(writer) => utils::collect_plan_metrics(writer),
         }
     }
@@ -372,29 +430,30 @@ impl QueryStageExecutor for DefaultQueryStageExec {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::ParquetSource;
-    use datafusion::execution::object_store::ObjectStoreUrl;
-    use datafusion::physical_plan::empty::EmptyExec;
-
-    /// Build a `DataSourceExec` over `n` file groups, one file each.
-    fn scan_with_file_groups(n: usize) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let source = Arc::new(ParquetSource::new(schema));
-        let mut builder =
-            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source);
-        for i in 0..n {
-            builder =
-                builder.with_file_group(FileGroup::new(vec![PartitionedFile::new(
-                    format!("file{i}.parquet"),
-                    100,
-                )]));
+    fn collect_runtime_stats_reports(
+        &self,
+    ) -> Vec<ballista_core::serde::protobuf::RuntimeStatsReport> {
+        // Walk from the shuffle writer's plan through the whitelist. If
+        // no `RuntimeStatsExec` sits within reach, we return an empty
+        // Vec — the majority of plans (anything not on the parallel-
+        // window path today). Serialization errors are logged and the
+        // report dropped rather than failing the task; the task's data
+        // was already produced correctly, telemetry loss shouldn't tank
+        // the query.
+        let plan: Arc<dyn ExecutionPlan> = match &self.shuffle_writer {
+            ShuffleWriterVariant::Passthrough(writer) => Arc::new(writer.clone()),
+            ShuffleWriterVariant::Range(writer) => Arc::new(writer.clone()),
+            ShuffleWriterVariant::Sort(writer) => Arc::new(writer.clone()),
+        };
+        match ballista_core::execution_plans::collect_runtime_stats_reports(&plan) {
+            Ok(reports) => reports,
+            Err(e) => {
+                log::warn!(
+                    "collect_runtime_stats_reports failed, task will report empty stats: {e}"
+                );
+                Vec::new()
+            }
         }
-        DataSourceExec::from_data_source(builder.build())
     }
 
     /// Number of files in each file group of a `DataSourceExec`.
@@ -425,3 +484,156 @@ mod tests {
         assert!(restrict_scan_to_partition(&plan, 0).is_none());
     }
 }
+
+/// Spawn K parallel `plan.execute(N, ctx)` calls against a shuffle writer,
+/// collect metadata batches from each, and turn them back into
+/// `Vec<ShuffleWritePartition>`. All K streams must be driven concurrently
+/// so the writer's internal coordinator sees every oneshot receiver taken.
+///
+/// `is_sort_shuffle` is stamped onto every summary produced from the batches
+/// — the metadata schema doesn't carry the flag (it's a handoff-only shape),
+/// but the reader side needs it in `PartitionLocation` to pick the right
+/// on-disk layout. The caller knows the variant from `ShuffleWriterVariant`.
+async fn drive_shuffle_writer_stage(
+    plan: Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+    is_sort_shuffle: bool,
+) -> Result<Vec<ShuffleWritePartition>> {
+    let k = plan.properties().output_partitioning().partition_count();
+
+    let mut stream_futures = Vec::with_capacity(k);
+    for n in 0..k {
+        let plan = plan.clone();
+        let ctx = context.clone();
+        stream_futures.push(tokio::spawn(async move {
+            let mut stream = plan.execute(n, ctx)?;
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.try_next().await? {
+                batches.push(batch);
+            }
+            metadata_batches_to_summaries(batches, is_sort_shuffle)
+        }));
+    }
+
+    let mut summaries = Vec::with_capacity(k);
+    for handle in stream_futures {
+        let per_partition = handle.await.map_err(|e| {
+            DataFusionError::Execution(format!("shuffle writer drain panicked: {e}"))
+        })??;
+        summaries.extend(per_partition);
+    }
+    // Drop summaries for output slots that produced no data. The coordinator
+    // uses zero-content entries as sentinels so `execute(N)` streams don't
+    // stall on an unfilled oneshot; those must not become PartitionLocations
+    // the scheduler tries to fetch.
+    summaries.retain(|s| s.num_bytes > 0);
+    Ok(summaries)
+}
+
+/// Convert the writer's metadata batches (one per output partition, each
+/// with a single row) back into `ShuffleWritePartition` summaries.
+fn metadata_batches_to_summaries(
+    batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    is_sort_shuffle: bool,
+) -> Result<Vec<ShuffleWritePartition>> {
+    let stats_fields = PartitionStats::default().arrow_struct_fields();
+    let num_rows_idx = stats_fields
+        .iter()
+        .position(|f| f.name() == "num_rows")
+        .expect("num_rows field present in PartitionStats");
+    let num_batches_idx = stats_fields
+        .iter()
+        .position(|f| f.name() == "num_batches")
+        .expect("num_batches field present in PartitionStats");
+    let num_bytes_idx = stats_fields
+        .iter()
+        .position(|f| f.name() == "num_bytes")
+        .expect("num_bytes field present in PartitionStats");
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let partition_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata batch: partition column not UInt32".into(),
+                )
+            })?;
+        let _path_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata batch: path column not Utf8".into(),
+                )
+            })?;
+        let file_id_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata batch: file_id column not UInt64".into(),
+                )
+            })?;
+        let stats_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata batch: stats column not Struct".into(),
+                )
+            })?;
+        let num_rows_arr = stats_col
+            .column(num_rows_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata stats.num_rows not UInt64".into(),
+                )
+            })?;
+        let num_batches_arr = stats_col
+            .column(num_batches_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata stats.num_batches not UInt64".into(),
+                )
+            })?;
+        let num_bytes_arr = stats_col
+            .column(num_bytes_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shuffle metadata stats.num_bytes not UInt64".into(),
+                )
+            })?;
+
+        for row in 0..batch.num_rows() {
+            let file_id = if file_id_col.is_null(row) {
+                None
+            } else {
+                Some(file_id_col.value(row))
+            };
+            out.push(ShuffleWritePartition {
+                partition_id: partition_col.value(row) as u64,
+                num_batches: num_batches_arr.value(row),
+                num_rows: num_rows_arr.value(row),
+                num_bytes: num_bytes_arr.value(row),
+                file_id,
+                is_sort_shuffle,
+            });
+        }
+    }
+    Ok(out)
+}
+
+// TODO: port these tests to scheduler/src/state/task_builder.rs (they used
+// to cover the executor-side restrict function that has moved scheduler-side).

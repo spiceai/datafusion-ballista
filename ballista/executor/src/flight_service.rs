@@ -45,7 +45,7 @@ use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::arrow::{error::ArrowError, record_batch::RecordBatch};
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::{debug, info};
-use std::io::{BufReader, Read, Seek};
+use std::io::BufReader;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::error::SendError;
 use tokio::{sync::mpsc::Sender, task};
@@ -608,7 +608,7 @@ fn read_arrow_ipc_batches<T>(
     tx: Sender<Result<RecordBatch, FlightError>>,
 ) -> Result<(), FlightError>
 where
-    T: Read + Seek,
+    R: Iterator<Item = Result<RecordBatch, ArrowError>>,
 {
     if tx.is_closed() {
         return Err(FlightError::Tonic(Box::new(Status::internal(

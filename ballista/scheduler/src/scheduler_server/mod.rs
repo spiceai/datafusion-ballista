@@ -31,17 +31,20 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
+use ferroid::base32::Base32SnowExt;
+use ferroid::futures::SnowflakeGeneratorAsyncTokioExt;
+use ferroid::generator::AtomicSnowflakeGenerator;
+use ferroid::id::SnowflakeMastodonId;
+use ferroid::time::MonotonicClock;
 
-use crate::cluster::BallistaCluster;
+use crate::cluster::{BallistaCluster, ClusterStateEventStream, JobStateEventStream};
 use crate::config::SchedulerConfig;
 use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
-use log::{debug, error, warn};
+use log::{debug, warn};
 
 use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
-
-use crate::state::executor_manager::ExecutorManager;
 
 use crate::state::SchedulerState;
 use crate::state::task_manager::TaskLauncher;
@@ -56,6 +59,13 @@ pub mod externalscaler {
 
 /// Events for the scheduler event loop.
 pub mod event;
+/// Builds `HistoryEvent`s emitted from the event loop into the event log.
+///
+/// Depends on `crate::api::dto_build`, which is only compiled with the
+/// `rest-api` feature (the default), so this module and the event-log wiring
+/// into `QueryStageScheduler` are gated the same way.
+#[cfg(feature = "rest-api")]
+mod event_log;
 #[cfg(feature = "keda-scaler")]
 mod external_scaler;
 mod grpc;
@@ -66,6 +76,50 @@ pub(crate) mod query_stage_scheduler;
 /// Function type for building DataFusion session states from configuration.
 pub type SessionBuilder =
     Arc<dyn Fn(SessionConfig) -> datafusion::common::Result<SessionState> + Send + Sync>;
+
+/// Generates unique identifiers for submitted jobs.
+///
+/// Schedulers use one `JobIdGenerator` instance for their lifetime, calling
+/// [`next_id`](JobIdGenerator::next_id) once per job submission.
+/// Implementations must be safe to call concurrently from multiple tasks and
+/// must never return the same id twice, since job ids are used to key
+/// scheduler-wide state.
+///
+/// A default snowflake-based generator is used unless a
+/// custom implementation is supplied via
+/// [`SchedulerConfig::job_id_generator`](crate::config::SchedulerConfig::job_id_generator).
+#[async_trait::async_trait]
+pub trait JobIdGenerator: Sync + Send {
+    /// Returns a new, globally unique job id.
+    async fn next_id(&self) -> String;
+}
+
+/// A monotonically increasing sortable snowflake job id generator
+/// which does not capture machine id as part result.
+struct DefaultJobGenerator {
+    generator: AtomicSnowflakeGenerator<SnowflakeMastodonId, MonotonicClock>,
+}
+
+impl Default for DefaultJobGenerator {
+    fn default() -> Self {
+        // default implementation does not support multi machine
+        // setups
+        let generator = AtomicSnowflakeGenerator::new(
+            0, // machine id is hard-coded to 0
+            MonotonicClock::<1>::default(),
+        );
+
+        Self { generator }
+    }
+}
+
+#[async_trait::async_trait]
+impl JobIdGenerator for DefaultJobGenerator {
+    async fn next_id(&self) -> String {
+        let id = self.generator.next_id_async().await;
+        id.encode().to_string()
+    }
+}
 
 /// The main scheduler server that coordinates distributed query execution.
 ///
@@ -173,6 +227,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             config.event_loop_buffer_size as usize,
             query_stage_scheduler.clone(),
         );
+
+        let generator = config
+            .job_id_generator
+            .clone()
+            .unwrap_or_else(|| Arc::new(DefaultJobGenerator::default()));
 
         Self {
             scheduler_name,
@@ -444,7 +503,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
                     // If executor is expired, remove it immediately
                     Self::remove_executor(
-                        state.executor_manager.clone(),
+                        state.clone(),
                         sender_clone,
                         state.metrics_collector.clone(),
                         &executor_id,
@@ -597,7 +656,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     }
 
     pub(crate) fn remove_executor(
-        executor_manager: ExecutorManager,
+        state: Arc<SchedulerState<T, U>>,
         event_sender: EventSender<QueryStageSchedulerEvent>,
         metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         executor_id: &str,
@@ -688,6 +747,7 @@ pub fn timestamp_millis() -> u64 {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use ballista_core::JobId;
     use ballista_core::extension::SessionConfigExt;
@@ -700,6 +760,7 @@ mod test {
     use datafusion::test_util::scan_empty_with_partitions;
     use datafusion_proto::protobuf::LogicalPlanNode;
     use datafusion_proto::protobuf::PhysicalPlanNode;
+    use futures::StreamExt;
 
     use crate::scheduler_server::event::SubmitPlan;
     use ballista_core::config::TaskSchedulingPolicy;
@@ -721,21 +782,46 @@ mod test {
     use crate::scheduler_server::{SchedulerServer, timestamp_millis};
 
     use crate::test_utils::{
-        ExplodingTableProvider, SchedulerTest, TaskRunnerFn, TestMetricsCollector,
-        assert_completed_event, assert_failed_event, assert_no_submitted_event,
-        assert_submitted_event, test_cluster_context,
+        ExplodingTableProvider, RejectingTaskLauncher, SchedulerTest, TaskRunnerFn,
+        TestMetricsCollector, assert_completed_event, assert_failed_event,
+        assert_no_submitted_event, assert_submitted_event, test_cluster_context,
     };
+
+    #[tokio::test]
+    async fn test_scheduler_exposes_cluster_state_events() -> Result<()> {
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PushStaged).await?;
+        let mut events = scheduler.cluster_state_events().await?;
+        let (executor_metadata, executor_data) =
+            test_executors(2).into_iter().next().unwrap();
+        let executor_id = executor_metadata.id.clone();
+
+        scheduler
+            .state
+            .executor_manager
+            .register_executor(executor_metadata, executor_data)
+            .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("cluster state event should arrive");
+        assert_eq!(
+            event,
+            Some(ClusterStateEvent::RegisteredExecutor { executor_id })
+        );
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_pull_scheduling() -> Result<()> {
         let plan = test_plan();
         // this test will fail when AQE scheduling is used.
         // as AQE will fold plan due to empty scan
-        let task_slots = 4;
+        let total_vcores = 4;
 
         let scheduler = test_scheduler(TaskSchedulingPolicy::PullStaged).await?;
 
-        let executors = test_executors(task_slots);
+        let executors = test_executors(total_vcores);
         for (executor_metadata, executor_data) in executors {
             scheduler
                 .state
@@ -744,8 +830,10 @@ mod test {
                 .await?;
         }
 
-        let config =
-            SessionConfig::new_with_ballista().with_target_partitions(task_slots);
+        let config = SessionConfig::new_with_ballista()
+            .with_target_partitions(total_vcores)
+            // Asserts the static planner's stage/partition layout.
+            .with_ballista_adaptive_query_planner(false);
 
         let ctx = scheduler
             .state
@@ -795,11 +883,10 @@ mod test {
 
                 // Complete the task
                 let task_status = TaskStatus {
-                    task_id: task.task_id as u32,
-                    job_id: task.partition.job_id.clone().into(),
-                    stage_id: task.partition.stage_id as u32,
+                    task_id: task.key.task_id as u32,
+                    job_id: task.key.job_id.clone().into(),
+                    stage_id: task.key.stage_id as u32,
                     stage_attempt_num: task.stage_attempt_num as u32,
-                    partition_id: task.partition.partition_id as u32,
                     launch_time: 0,
                     start_exec_time: 0,
                     end_exec_time: 0,
@@ -807,6 +894,8 @@ mod test {
                     status: Some(task_status::Status::Successful(SuccessfulTask {
                         executor_id: "executor-1".to_owned(),
                         partitions,
+                        runtime_stats: vec![],
+                        window_state: vec![],
                     })),
                 };
 
@@ -833,6 +922,62 @@ mod test {
             assert_eq!(output_location.path, "some/path".to_owned());
             assert_eq!(output_location.executor_meta.host, "localhost1".to_owned())
         }
+
+        Ok(())
+    }
+
+    // Verify a job can be submitted as an already-built physical plan.
+    #[tokio::test]
+    async fn test_submit_physical_plan() -> Result<()> {
+        let logical_plan = test_plan();
+        let total_vcores = 4;
+
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PullStaged).await?;
+
+        let executors = test_executors(total_vcores);
+        for (executor_metadata, executor_data) in executors {
+            scheduler
+                .state
+                .executor_manager
+                .register_executor(executor_metadata, executor_data)
+                .await?;
+        }
+
+        let config = SessionConfig::new_with_ballista()
+            .with_target_partitions(total_vcores)
+            // Asserts the static planner's stage/partition layout.
+            .with_ballista_adaptive_query_planner(false);
+
+        let ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session("session_id", &config)
+            .await?;
+
+        // Plan the logical plan into a physical plan and submit it directly.
+        let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
+
+        let job_id: JobId = "physical_job".into();
+
+        scheduler
+            .state
+            .task_manager
+            .queue_job(&job_id, "", timestamp_millis())?;
+
+        scheduler
+            .state
+            .task_manager
+            .submit_physical_plan(&job_id, "", ctx, physical_plan, 0, None)
+            .await
+            .expect("submitting physical plan");
+
+        assert!(
+            scheduler
+                .state
+                .task_manager
+                .get_active_execution_graph(&job_id)
+                .is_some()
+        );
 
         Ok(())
     }
@@ -941,19 +1086,13 @@ mod test {
             |_executor_id: String, task: MultiTaskDefinition| {
                 let mut statuses = vec![];
 
-                for TaskId {
-                    task_id,
-                    partition_id,
-                    ..
-                } in task.task_ids
-                {
+                for TaskId { task_id, .. } in task.task_ids {
                     let timestamp = timestamp_millis();
                     statuses.push(TaskStatus {
                         task_id,
                         job_id: task.job_id.clone(),
                         stage_id: task.stage_id,
                         stage_attempt_num: task.stage_attempt_num,
-                        partition_id,
                         launch_time: timestamp,
                         start_exec_time: timestamp,
                         end_exec_time: timestamp,
@@ -1017,19 +1156,13 @@ mod test {
             |_executor_id: String, task: MultiTaskDefinition| {
                 let mut statuses = vec![];
 
-                for TaskId {
-                    task_id,
-                    partition_id,
-                    ..
-                } in task.task_ids
-                {
+                for TaskId { task_id, .. } in task.task_ids {
                     let timestamp = timestamp_millis();
                     statuses.push(TaskStatus {
                         task_id,
                         job_id: task.job_id.clone(),
                         stage_id: task.stage_id,
                         stage_attempt_num: task.stage_attempt_num,
-                        partition_id,
                         launch_time: timestamp,
                         start_exec_time: timestamp,
                         end_exec_time: timestamp,
@@ -1210,6 +1343,49 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deterministic_launch_rejection_fails_job() -> Result<()> {
+        // A launcher that always rejects with gRPC InvalidArgument (an executor that
+        // cannot decode the task). The job must fail fast instead of hanging (#1908).
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+        let mut test = SchedulerTest::new_with_launcher(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector,
+            1,
+            1,
+            None,
+            Arc::new(RejectingTaskLauncher::default()),
+        )
+        .await?;
+
+        let plan = test_plan();
+
+        // `run` submits the job and polls until it reaches a terminal state.
+        // Hard wall-clock bound so a stuck job fails the test instead of hanging.
+        let (status, _job_id) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            test.run("", &plan),
+        )
+        .await
+        .expect(
+            "job did not reach a terminal state within 10s — likely not being failed",
+        )?;
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "expected job to fail on task rejection, got {status:?}"
+        );
+
+        Ok(())
+    }
+
     async fn test_scheduler(
         scheduling_policy: TaskSchedulingPolicy,
     ) -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
@@ -1230,7 +1406,7 @@ mod test {
     }
 
     fn test_executors(num_partitions: usize) -> Vec<(ExecutorMetadata, ExecutorData)> {
-        let task_slots = (num_partitions as u32).div_ceil(2);
+        let vcores = (num_partitions as u32).div_ceil(2);
 
         vec![
             (
@@ -1239,13 +1415,13 @@ mod test {
                     host: "localhost1".to_string(),
                     port: 8080,
                     grpc_port: 9090,
-                    specification: ExecutorSpecification { task_slots },
+                    specification: ExecutorSpecification { vcores: task_slots },
                     os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 ExecutorData {
                     executor_id: "executor-1".to_owned(),
-                    total_task_slots: task_slots,
-                    available_task_slots: task_slots,
+                    total_vcores: vcores,
+                    available_vcores: vcores,
                 },
             ),
             (
@@ -1261,8 +1437,8 @@ mod test {
                 },
                 ExecutorData {
                     executor_id: "executor-2".to_owned(),
-                    total_task_slots: num_partitions as u32 - task_slots,
-                    available_task_slots: num_partitions as u32 - task_slots,
+                    total_vcores: num_partitions as u32 - vcores,
+                    available_vcores: num_partitions as u32 - vcores,
                 },
             ),
         ]

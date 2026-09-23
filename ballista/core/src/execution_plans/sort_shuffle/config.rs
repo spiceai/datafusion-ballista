@@ -17,8 +17,6 @@
 
 //! Configuration for sort-based shuffle.
 
-use datafusion::arrow::ipc::CompressionType;
-
 /// Configuration for sort-based shuffle.
 ///
 /// Matches upstream Ballista 54's shape: spill decisions are driven by
@@ -30,13 +28,14 @@ pub struct SortShuffleConfig {
     /// Whether sort-based shuffle is enabled (default: false in the struct;
     /// the Ballista session config entry defaults to true).
     pub enabled: bool,
-    /// Compression codec for shuffle data (default: LZ4_FRAME).
-    pub compression: CompressionType,
-    /// Target batch size in rows when coalescing small batches (default: 8192).
+    /// Target batch size in rows when materializing buffered indices via
+    /// `interleave_record_batch` (default: 8192).
     pub batch_size: usize,
     /// Per-task buffered-bytes budget at which the writer spills its in-memory
     /// batches to disk. Counted independently of the runtime `MemoryPool`, so
-    /// spilling kicks in even when the pool is unbounded.
+    /// spilling kicks in even when the pool is unbounded. A value of 0 disables
+    /// the per-task budget, leaving the runtime `MemoryPool` as the sole spill
+    /// trigger.
     pub memory_limit_per_task_bytes: usize,
 }
 
@@ -44,7 +43,6 @@ impl Default for SortShuffleConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            compression: CompressionType::LZ4_FRAME,
             batch_size: 8192,
             memory_limit_per_task_bytes: 256 * 1024 * 1024,
         }
@@ -53,10 +51,9 @@ impl Default for SortShuffleConfig {
 
 impl SortShuffleConfig {
     /// Creates a new configuration with the default per-task memory limit.
-    pub fn new(enabled: bool, compression: CompressionType, batch_size: usize) -> Self {
+    pub fn new(enabled: bool, batch_size: usize) -> Self {
         Self {
             enabled,
-            compression,
             batch_size,
             memory_limit_per_task_bytes: Self::default().memory_limit_per_task_bytes,
         }
@@ -77,16 +74,14 @@ mod tests {
     fn test_default_config() {
         let config = SortShuffleConfig::default();
         assert!(!config.enabled);
-        assert!(matches!(config.compression, CompressionType::LZ4_FRAME));
         assert_eq!(config.batch_size, 8192);
         assert_eq!(config.memory_limit_per_task_bytes, 256 * 1024 * 1024);
     }
 
     #[test]
     fn test_new() {
-        let config = SortShuffleConfig::new(true, CompressionType::LZ4_FRAME, 4096);
+        let config = SortShuffleConfig::new(true, 4096);
         assert!(config.enabled);
-        assert!(matches!(config.compression, CompressionType::LZ4_FRAME));
         assert_eq!(config.batch_size, 4096);
         assert_eq!(config.memory_limit_per_task_bytes, 256 * 1024 * 1024);
     }

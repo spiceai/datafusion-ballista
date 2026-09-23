@@ -49,13 +49,15 @@ use ballista_core::serde::protobuf::{
     executor_metric, executor_status,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
-use ballista_core::serde::scheduler::PartitionId;
 use ballista_core::serde::scheduler::TaskDefinition;
+use ballista_core::serde::scheduler::TaskKey;
 
 use ballista_core::serde::scheduler::from_proto::{
     get_task_definition, get_task_definition_vec,
 };
-use ballista_core::utils::{create_grpc_client_endpoint, create_grpc_server};
+use ballista_core::utils::{
+    create_grpc_client_endpoint, create_grpc_server, create_grpc_server_incoming,
+};
 
 use dashmap::DashMap;
 use datafusion::execution::TaskContext;
@@ -66,9 +68,17 @@ use tokio::task::JoinHandle;
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
 use crate::executor_process::{ExecutorProcessConfig, remove_job_data};
+use crate::health::ExecutorHealth;
 use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::shutdown::ShutdownNotifier;
-use crate::{TaskExecutionTimes, as_task_status};
+use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
+
+/// Number of consecutive heartbeat failures after which the executor
+/// initiates its own shutdown, letting k8s (or the operator) restart the
+/// pod. The typical trigger is a `FailedPrecondition` from a newer
+/// scheduler on a bumped `BALLISTA_PROTOCOL_VERSION`; a restart will keep
+/// crash-looping until the executor image is bumped to match.
+const HEARTBEAT_FAILURE_TERMINATION_THRESHOLD: u32 = 5;
 
 type ServerHandle = JoinHandle<Result<(), BallistaError>>;
 type SchedulerClients = Arc<DashMap<String, SchedulerGrpcClient<Channel>>>;
@@ -103,8 +113,9 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     codec: BallistaCodec<T, U>,
     stop_send: mpsc::Sender<bool>,
     shutdown_noti: &ShutdownNotifier,
+    health: ExecutorHealth,
 ) -> Result<ServerHandle, BallistaError> {
-    let channel_buf_size = executor.concurrent_tasks * 50;
+    let channel_buf_size = executor.vcores * 50;
     let (tx_task, rx_task) = mpsc::channel::<CuratorTaskDefinition>(channel_buf_size);
     let (tx_task_status, rx_task_status) =
         mpsc::channel::<CuratorTaskStatus>(channel_buf_size);
@@ -122,15 +133,23 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         config.grpc_max_decoding_message_size as usize,
         config.override_create_grpc_client_endpoint.clone(),
         config.metric_collection_policy,
+        health,
     );
 
     // 1. Start executor grpc service
+    //
+    // The listening socket is bound here rather than inside the spawned task,
+    // because step 2 registers with the scheduler and the scheduler dials this
+    // port back to check connectivity. Binding lazily inside the server future
+    // let that callback lose the race and get ECONNREFUSED, which fails
+    // registration and takes the executor down with it.
     let server = {
         let executor_meta = executor.metadata.clone();
         let addr = format!("{}:{}", config.bind_host, executor_meta.grpc_port);
         let addr = addr.parse().unwrap();
         let grpc_server_config = config.grpc_server_config.clone();
 
+        let incoming = create_grpc_server_incoming(addr, &grpc_server_config)?;
         info!(
             "Ballista v{BALLISTA_VERSION} Rust Executor Grpc Server listening on {addr:?}"
         );
@@ -142,7 +161,7 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
             let shutdown_signal = grpc_shutdown.recv();
             let grpc_server_future = create_grpc_server(&grpc_server_config)
                 .add_service(server)
-                .serve_with_shutdown(addr, shutdown_signal);
+                .serve_with_incoming_shutdown(incoming, shutdown_signal);
             grpc_server_future.await.map_err(|e| {
                 error!("Tonic error, Could not start Executor Grpc Server.");
                 BallistaError::TonicError(e)
@@ -151,7 +170,6 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     };
 
     // 2. Do executor registration
-    // TODO the executor registration should happen only after the executor grpc server started.
     let executor_server = Arc::new(executor_server);
     match register_executor(&mut scheduler, executor.clone()).await {
         Ok(_) => {
@@ -224,6 +242,8 @@ pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     /// Metric collection policy for this executor.
     metric_collection_policy: ExecutorMetricCollectionPolicy,
     override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// Shared readiness signal reflected by the /readyz probe.
+    health: ExecutorHealth,
 }
 
 #[derive(Clone)]
@@ -253,6 +273,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         grpc_max_decoding_message_size: usize,
         override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
         metric_collection_policy: ExecutorMetricCollectionPolicy,
+        health: ExecutorHealth,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
@@ -307,7 +328,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
 
     /// 1. First Heartbeat to its registration scheduler, if successful then return; else go next.
     /// 2. Heartbeat to schedulers which has launching tasks to this executor until one succeeds
-    async fn heartbeat(&self) {
+    ///
+    /// Returns `true` iff any scheduler acknowledged the heartbeat.
+    async fn heartbeat(&self) -> bool {
         let status = if TERMINATING.load(Ordering::Acquire) {
             executor_status::Status::Terminating(String::default())
         } else {
@@ -338,7 +361,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             .await
         {
             Ok(_) => {
-                return;
+                self.health.mark_heartbeat_ok();
+                return true;
             }
             Err(e) => {
                 warn!(
@@ -356,7 +380,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 .await
             {
                 Ok(_) => {
-                    break;
+                    self.health.mark_heartbeat_ok();
+                    return true;
                 }
                 Err(e) => {
                     warn!(
@@ -365,6 +390,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 }
             }
         }
+        self.health.mark_heartbeat_failed();
+        false
     }
 
     /// This method should not return Err. If task fails, a failure task status should be sent
@@ -381,13 +408,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let job_id = task.job_id;
         let stage_id = task.stage_id;
         let stage_attempt_num = task.stage_attempt_num;
-        let partition_id = task.partition_id;
+        let global_output_partition_ids = task.global_output_partition_ids;
         let plan = task.plan;
 
-        let part = PartitionId {
+        let key = TaskKey {
             job_id: job_id.clone(),
             stage_id,
-            partition_id,
+            task_id,
         };
 
         let query_stage_exec = self
@@ -612,11 +639,27 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> Heartbeater<T, U>
         let executor_server = self.executor_server.clone();
         let mut heartbeat_shutdown = shutdown_noti.subscribe_for_shutdown();
         let heartbeat_complete = shutdown_noti.shutdown_complete_tx.clone();
+        let notify_shutdown = shutdown_noti.notify_shutdown.clone();
         tokio::spawn(async move {
             info!("Starting heartbeater to send heartbeat the scheduler periodically");
+            let mut consecutive_failures: u32 = 0;
             // As long as the shutdown notification has not been received
             while !heartbeat_shutdown.is_shutdown() {
-                executor_server.heartbeat().await;
+                if executor_server.heartbeat().await {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= HEARTBEAT_FAILURE_TERMINATION_THRESHOLD {
+                        error!(
+                            "Heartbeat failed {consecutive_failures} consecutive times; \
+                             initiating executor shutdown. Check for scheduler outage \
+                             or BALLISTA_PROTOCOL_VERSION mismatch."
+                        );
+                        let _ = notify_shutdown.send(());
+                        drop(heartbeat_complete);
+                        return;
+                    }
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(executor_heartbeat_interval_seconds)) => {},
                     _ = heartbeat_shutdown.recv() => {
@@ -744,10 +787,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
 
             // Use a dedicated executor for CPU bound tasks so that the main tokio
             // executor can still answer requests even when under load
-            let dedicated_executor = DedicatedExecutor::new(
-                "task_runner",
-                executor_server.executor.concurrent_tasks,
-            );
+            let dedicated_executor =
+                DedicatedExecutor::new("task_runner", executor_server.executor.vcores);
 
             // As long as the shutdown notification has not been received
             while !task_runner_shutdown.is_shutdown() {
@@ -761,12 +802,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
                 };
                 if let Some(curator_task) = maybe_task {
                     let task_identity = format!(
-                        "TID {} {}/{}.{}/{}.{}",
-                        curator_task.task.task_id,
+                        "TID {}/{}.{}/{}.{}",
                         curator_task.task.job_id,
                         curator_task.task.stage_id,
                         curator_task.task.stage_attempt_num,
-                        curator_task.task.partition_id,
+                        curator_task.task.task_id,
                         curator_task.task.task_attempt_num,
                     );
                     info!("Received task {:?}", task_identity);
@@ -830,8 +870,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
             scheduler_id,
         } = request.into_inner();
         let task_sender = self.executor_env.tx_task.clone();
+        let mut failed_jobs: HashSet<String> = HashSet::new();
         for multi_task in multi_tasks {
-            let multi_task: Vec<TaskDefinition> = get_task_definition_vec(
+            let job_id = multi_task.job_id.clone();
+            let multi_task: Vec<TaskDefinition> = match get_task_definition_vec(
                 multi_task,
                 self.executor.runtime_producer.clone(),
                 self.executor.produce_config(),
@@ -839,8 +881,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                 self.executor.function_registry.aggregate_functions.clone(),
                 self.executor.function_registry.window_functions.clone(),
                 self.codec.clone(),
-            )
-            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+            ) {
+                Ok(tasks) => tasks,
+                Err(e) => {
+                    error!("failed to decode tasks for {job_id} : {e}");
+                    failed_jobs.insert(job_id);
+                    continue;
+                }
+            };
+
             for task in multi_task {
                 task_sender
                     .send(CuratorTaskDefinition {
@@ -851,7 +900,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                     .unwrap();
             }
         }
-        Ok(Response::new(LaunchMultiTaskResult { success: true }))
+        Ok(Response::new(LaunchMultiTaskResult {
+            failed_jobs: failed_jobs.into_iter().collect(),
+        }))
     }
 
     async fn stop_executor(
@@ -893,7 +944,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                     task.task_id as usize,
                     JobId::from(task.job_id),
                     task.stage_id as usize,
-                    task.partition_id as usize,
+                    task.task_id as usize,
                 )
                 .await
             {

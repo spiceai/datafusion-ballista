@@ -37,6 +37,7 @@ Table of content
 
    Deployment <user-guide/deployment/index>
    Scheduler <user-guide/scheduler>
+   History Server <user-guide/history-server>
 
 .. toctree::
    :maxdepth: 1
@@ -77,8 +78,11 @@ Table of content
    :caption: Contributors Guide
 
    contributors-guide/architecture
+   contributors-guide/shuffle
    contributors-guide/code-organization
+   contributors-guide/user-personas
    contributors-guide/development
+   contributors-guide/benchmarking
    Source code <https://github.com/apache/datafusion-ballista/>
 
 .. _toc.community:

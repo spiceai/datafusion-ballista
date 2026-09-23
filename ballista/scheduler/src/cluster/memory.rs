@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use ballista_core::JobId;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::serde::protobuf::{
-    AvailableTaskSlots, ExecutorHeartbeat, ExecutorStatus, FailedJob, QueuedJob,
+    AvailableVcores, ExecutorHeartbeat, ExecutorStatus, FailedJob, QueuedJob,
     executor_status,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
@@ -53,13 +53,13 @@ use super::{ClusterStateEvent, ClusterStateEventStream};
 
 /// In-memory implementation of cluster state.
 ///
-/// This stores all cluster state (executor registration, task slots, heartbeats)
+/// This stores all cluster state (executor registration, free vcores, heartbeats)
 /// in memory without persistence. Suitable for single-scheduler deployments
 /// or testing scenarios.
 #[derive(Default)]
 pub struct InMemoryClusterState {
-    /// Current available task slots for each executor.
-    task_slots: Mutex<HashMap<String, AvailableTaskSlots>>,
+    /// Current free vcores for each executor.
+    available_vcores: Mutex<HashMap<String, AvailableVcores>>,
     /// Current executors and their metadata.
     executors: DashMap<String, ExecutorMetadata>,
     /// Last heartbeat received for each executor.
@@ -116,10 +116,10 @@ impl ClusterState for InMemoryClusterState {
     ) -> Result<BindingResult> {
         let mut guard = self.task_slots.lock().await;
 
-        let available_slots: Vec<&mut AvailableTaskSlots> = guard
+        let budgets: Vec<&mut AvailableVcores> = guard
             .values_mut()
             .filter_map(|data| {
-                (data.slots > 0
+                (data.vcores > 0
                     && executors
                         .as_ref()
                         .map(|executors| executors.contains(&data.executor_id))
@@ -130,10 +130,10 @@ impl ClusterState for InMemoryClusterState {
 
         let result = match distribution {
             TaskDistributionPolicy::Bias => {
-                bind_task_bias(available_slots, active_jobs, |_| false).await
+                bind_task_bias(budgets, active_jobs, |_| false).await
             }
             TaskDistributionPolicy::RoundRobin => {
-                bind_task_round_robin(available_slots, active_jobs, |_| false).await
+                bind_task_round_robin(budgets, active_jobs, |_| false).await
             }
             TaskDistributionPolicy::ConsistentHash {
                 num_replicas,
@@ -195,16 +195,16 @@ impl ClusterState for InMemoryClusterState {
 
     async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
         let mut increments = HashMap::new();
-        for (executor_id, num_slots) in executor_slots {
+        for (executor_id, num_vcores) in executor_slots {
             let v = increments.entry(executor_id).or_insert_with(|| 0);
-            *v += num_slots;
+            *v += num_vcores;
         }
 
-        let mut guard = self.task_slots.lock().await;
+        let mut guard = self.available_vcores.lock().await;
 
-        for (executor_id, num_slots) in increments {
+        for (executor_id, num_vcores) in increments {
             if let Some(data) = guard.get_mut(&executor_id) {
-                data.slots += num_slots;
+                data.vcores += num_vcores;
             }
         }
 
@@ -232,13 +232,13 @@ impl ClusterState for InMemoryClusterState {
         })
         .await?;
 
-        let mut guard = self.task_slots.lock().await;
+        let mut guard = self.available_vcores.lock().await;
 
         guard.insert(
             executor_id.clone(),
-            AvailableTaskSlots {
+            AvailableVcores {
                 executor_id: executor_id.clone(),
-                slots: spec.available_task_slots,
+                vcores: spec.available_vcores,
             },
         );
 
@@ -318,7 +318,7 @@ impl ClusterState for InMemoryClusterState {
     async fn remove_executor(&self, executor_id: &str) -> Result<()> {
         log::debug!("removing executor: {}", executor_id);
         {
-            let mut guard = self.task_slots.lock().await;
+            let mut guard = self.available_vcores.lock().await;
 
             guard.remove(executor_id);
         }
@@ -627,6 +627,7 @@ mod test {
     use crate::test_utils::{
         test_aggregation_plan, test_join_plan, test_two_aggregations_plan,
     };
+    use ballista_core::JobId;
     use ballista_core::error::Result;
     use ballista_core::serde::protobuf::JobStatus;
     use ballista_core::serde::scheduler::{
@@ -704,6 +705,41 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_in_memory_job_planning_failure_notification() -> Result<()> {
+        let state = InMemoryJobState::new(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        );
+        let mut events = state.job_state_events().await?;
+        let job_id = JobId::from("job-1");
+
+        state.accept_job(&job_id, "", 0)?;
+        state
+            .fail_unscheduled_job(&job_id, "failed planning".to_owned())
+            .await?;
+
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+                .await
+                .expect("job state event should arrive")
+                .expect("job state event stream should remain open");
+
+        assert!(matches!(
+            event,
+            JobStateEvent::JobUpdated {
+                job_id: event_job_id,
+                status: JobStatus {
+                    status: Some(ballista_core::serde::protobuf::job_status::Status::Failed(_)),
+                    ..
+                },
+            } if event_job_id == job_id
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_in_memory_job_notification() -> Result<()> {
         let state = InMemoryJobState::new(
             "",
@@ -752,7 +788,7 @@ mod test {
             host: "".to_string(),
             port: 50055,
             grpc_port: 50050,
-            specification: ExecutorSpecification { task_slots: 2 },
+            specification: ExecutorSpecification { vcores: 2 },
             os_info: ExecutorOperatingSystemSpecification::default(),
         };
 

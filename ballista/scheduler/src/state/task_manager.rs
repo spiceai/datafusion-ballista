@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::cluster::{JobState, JobStateEventStream};
+use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
 
 use crate::scheduler_server::event::SubmitPlan;
@@ -29,8 +31,7 @@ use ballista_core::JobId;
 use ballista_core::JobStatusSubscriber;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
-#[cfg(feature = "disable-stage-plan-cache")]
-use ballista_core::execution_plans::ShuffleReaderExec;
+use ballista_core::execution_plans::compute_global_output_partition_ids;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use rand::distr::Alphanumeric;
 use rand::distr::Distribution;
@@ -59,6 +60,7 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use log::{debug, error, info, trace, warn};
 use rand::rng;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,12 +81,16 @@ pub const STAGE_MAX_FAILURES: usize = 4;
 #[async_trait::async_trait]
 pub trait TaskLauncher: Send + Sync + 'static {
     /// Launches the given tasks on the specified executor.
+    ///
+    /// `Ok` means the RPC was dispatched; the returned set holds job IDs the
+    /// executor rejected and failed individually. `Err` is only for a
+    /// transport-level failure of the whole RPC.
     async fn launch_tasks(
         &self,
         executor: &ExecutorMetadata,
         tasks: Vec<MultiTaskDefinition>,
         executor_manager: &ExecutorManager,
-    ) -> Result<()>;
+    ) -> Result<HashSet<JobId>>;
 }
 
 struct DefaultTaskLauncher {
@@ -104,7 +110,7 @@ impl TaskLauncher for DefaultTaskLauncher {
         executor: &ExecutorMetadata,
         tasks: Vec<MultiTaskDefinition>,
         executor_manager: &ExecutorManager,
-    ) -> Result<()> {
+    ) -> Result<HashSet<JobId>> {
         if log::max_level() >= log::Level::Info {
             let tasks_ids: Vec<String> = tasks
                 .iter()
@@ -112,7 +118,7 @@ impl TaskLauncher for DefaultTaskLauncher {
                     let task_ids: Vec<u32> = task
                         .task_ids
                         .iter()
-                        .map(|task_id| task_id.partition_id)
+                        .map(|task_id| task_id.task_id)
                         .collect();
                     format!("{}/{}/{:?}", task.job_id, task.stage_id, task_ids)
                 })
@@ -122,10 +128,10 @@ impl TaskLauncher for DefaultTaskLauncher {
                 executor.id, tasks_ids
             );
         }
-        executor_manager
+        let res = executor_manager
             .launch_multi_task(&executor.id, tasks, self.scheduler_id.clone())
             .await?;
-        Ok(())
+        Ok(res)
     }
 }
 
@@ -158,8 +164,6 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     launcher: Arc<dyn TaskLauncher>,
 }
 
-/// Cache for active job information managed by this scheduler.
-///
 /// Contains the execution graph and cached data to improve performance
 /// when scheduling tasks for the job.
 #[derive(Clone)]
@@ -168,9 +172,6 @@ pub struct JobInfoCache {
     pub execution_graph: Arc<RwLock<ExecutionGraphBox>>,
     /// Cached job status for quick access.
     pub status: Option<job_status::Status>,
-    #[cfg(not(feature = "disable-stage-plan-cache"))]
-    /// Cache for encoded execution stage plans to avoid redundant serialization.
-    encoded_stage_plans: HashMap<usize, Vec<u8>>,
 }
 
 impl JobInfoCache {
@@ -181,8 +182,6 @@ impl JobInfoCache {
         Self {
             execution_graph: Arc::new(RwLock::new(graph)),
             status,
-            #[cfg(not(feature = "disable-stage-plan-cache"))]
-            encoded_stage_plans: HashMap::new(),
         }
     }
 
@@ -325,7 +324,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Get the number of running jobs.
     pub fn running_job_number(&self) -> usize {
-        self.active_job_cache.len()
+        self.active_job_cache
+            .iter()
+            .filter(|job_info| {
+                matches!(job_info.status, Some(job_status::Status::Running(_)))
+            })
+            .count()
+    }
+
+    /// Returns a stream of job state events from the configured state backend.
+    pub async fn job_state_events(&self) -> Result<JobStateEventStream> {
+        self.state.job_state_events().await
     }
 
     /// Get the total number of pending tasks across all active jobs.
@@ -391,9 +400,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             SubmitPlan::Logical(logical_plan) => {
                 if session_config.ballista_adaptive_query_planner_enabled() {
                     debug!("Using adaptive query planner (AQE) for job planning");
-                    warn!(
-                        "Adaptive Query Planning is EXPERIMENTAL, should be used for testing purposes only!"
-                    );
                     Box::new(
                         AdaptiveExecutionGraph::try_new(
                             &self.scheduler_id,
@@ -429,11 +435,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 }
             }
             SubmitPlan::Physical(physical_plan) => {
-                if session_config.ballista_adaptive_query_planner_enabled() {
-                    return Err(BallistaError::NotImplemented(
-                        "Adaptive query planning (AQE) does not support jobs submitted as an already-built physical plan; disable AQE for this session or submit a logical plan instead.".to_string(),
-                    ));
-                }
+                // AQE plans from the logical plan, so an already-built
+                // physical plan always uses the static planner, including when
+                // AQE is on (the default).
                 debug!("Using static query planner for physical-plan job submission");
                 let session_config = Arc::new(ctx.copied_config());
 
@@ -749,16 +753,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
     }
 
-    /// Cancel the job and return a Vec of running tasks need to cancel
-    pub(crate) async fn cancel_job(
-        &self,
-        job_id: &JobId,
-    ) -> Result<(Vec<RunningTaskInfo>, usize)> {
-        self.abort_job(job_id, "Cancelled".to_owned()).await
-    }
-
-    /// Abort the job and return a Vec of running tasks need to cancel
-    pub(crate) async fn abort_job(
+    /// Mark a job as failed, cancel its running tasks, and persist terminal state.
+    ///
+    /// Task cancellation is invoked before persistence so executor work is
+    /// stopped even when all terminal-state save attempts fail.
+    pub(crate) async fn abort_job<F, Fut>(
         &self,
         job_id: &JobId,
         failure_reason: String,
@@ -793,10 +792,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             warn!(
                 "Fail to find job {job_id} in the cache, unable to cancel tasks for job, fail the job state only."
             );
-            (vec![], 0)
+            return Ok(0);
         };
 
-        Ok((tasks_to_cancel, pending_tasks))
+        let (running_tasks, pending_tasks, snapshot) = {
+            let mut guard = graph.write().await;
+            let pending_tasks = guard.available_tasks();
+            let running_tasks = guard.abort_running(failure_reason);
+            let snapshot = guard.cloned();
+            if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
+                job_info.status = snapshot.status().status.clone();
+            }
+            (running_tasks, pending_tasks, snapshot)
+        };
+
+        info!(
+            "Cancelling {} running tasks for job {}",
+            running_tasks.len(),
+            job_id
+        );
+
+        let cancel_result = cancel_tasks(running_tasks).await;
+        let persist_result = self.persist_terminal_and_evict(job_id, &snapshot).await;
+        match (cancel_result, persist_result) {
+            (Ok(()), Ok(())) => Ok(pending_tasks),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(cancel_error), Err(persist_error)) => {
+                Err(BallistaError::General(format!(
+                    "Failed to cancel tasks for job {job_id}: {cancel_error}; failed to persist terminal state: {persist_error}"
+                )))
+            }
+        }
     }
 
     /// Mark a unscheduled job as failed. This will create a key under the FailedJobs keyspace
@@ -903,6 +929,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     }
 
     /// Prepares a task definition for a single task to be sent to an executor.
+    ///
+    /// The task's plan is rewritten to restrict leaves (Scan file_groups,
+    /// ShuffleReader partitions) to this task's assigned slice, then encoded
+    /// fresh. No shared-plan cache — each task gets its own bytes because
+    /// each task's plan is different.
     #[allow(dead_code)]
     pub fn prepare_task_definition(
         &self,
@@ -910,8 +941,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     ) -> Result<TaskDefinition> {
         debug!("Preparing task definition for {task:?}");
 
-        let job_id = task.partition.job_id.clone();
-        let stage_id = task.partition.stage_id;
+        let job_id = task.key.job_id.clone();
+        let stage_id = task.key.stage_id;
 
         let plan = self.encoded_stage_plan(
             &job_id,
@@ -1017,7 +1048,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         executor: &ExecutorMetadata,
         tasks: Vec<Vec<TaskDescription>>,
         executor_manager: &ExecutorManager,
-    ) -> Result<()> {
+    ) -> Result<HashSet<JobId>> {
         let mut multi_tasks = vec![];
         for stage_tasks in tasks {
             match self.prepare_multi_task_definition(stage_tasks) {
@@ -1031,12 +1062,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 .launch_tasks(executor, multi_tasks, executor_manager)
                 .await
         } else {
-            Ok(())
+            Ok(HashSet::new())
         }
     }
 
     #[allow(dead_code)]
-    /// Prepare a MultiTaskDefinition with multiple tasks belonging to the same job stage
+    /// Emit one `MultiTaskDefinition` per task. Previously grouped multiple
+    /// tasks under one shared plan; now each task's plan is uniquely restricted
+    /// to its assigned partition slice so we can't share encoding.
     fn prepare_multi_task_definition(
         &self,
         tasks: Vec<TaskDescription>,
@@ -1101,8 +1134,68 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         } else {
             Err(BallistaError::General(
                 "Cannot prepare multi task definition for an empty vec".to_string(),
-            ))
+            ));
+        };
+        let session_id = first_task.session_id.clone();
+        let job_id = first_task.key.job_id.clone();
+        let stage_id = first_task.key.stage_id;
+        let stage_attempt_num = first_task.stage_attempt_num;
+
+        if log::max_level() >= log::Level::Debug {
+            let task_ids: Vec<usize> =
+                tasks.iter().map(|task| task.key.task_id).collect();
+            debug!(
+                "Preparing multi task definition for tasks {task_ids:?} belonging to job stage {job_id}/{stage_id}"
+            );
+            trace!("With task details {tasks:?}");
         }
+
+        if self.active_job_cache.get(&job_id).is_none() {
+            return Err(BallistaError::General(format!(
+                "Cannot prepare multi task definition for job {job_id} which is not in active cache"
+            )));
+        }
+
+        let launch_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let codec = self.codec.physical_extension_codec();
+
+        let props = first_task.session_config.to_key_value_pairs();
+        let mut multi_tasks = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let restricted = restrict_plan_to_partitions(
+                task.plan.clone(),
+                &task.global_input_partition_ids,
+            )?;
+            let mut plan_buf: Vec<u8> = vec![];
+            let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
+            plan_proto.try_encode(&mut plan_buf)?;
+            let task_ids = vec![TaskId {
+                task_id: task.key.task_id as u32,
+                task_attempt_num: task.task_attempt as u32,
+                global_output_partition_ids: compute_global_output_partition_ids(
+                    &task.plan,
+                    &task.global_input_partition_ids,
+                )
+                .into_iter()
+                .map(|p| p as u32)
+                .collect(),
+                vcores_consumed: task.vcores_consumed,
+            }];
+            multi_tasks.push(MultiTaskDefinition {
+                task_ids,
+                job_id: job_id.clone().into(),
+                stage_id: stage_id as u32,
+                stage_attempt_num: stage_attempt_num as u32,
+                plan: plan_buf,
+                session_id: session_id.clone(),
+                launch_time,
+                props: props.clone(),
+            });
+        }
+        Ok(multi_tasks)
     }
 
     /// Get the `ExecutionGraph` for the given job ID from cache
@@ -1191,20 +1284,52 @@ impl From<&ExecutionGraphBox> for JobOverview {
     }
 }
 
-#[cfg(all(test, feature = "disable-stage-plan-cache"))]
-mod prune_partition_tests {
-    use crate::state::task_manager::JobInfoCache;
-    use ballista_core::JobId;
-    use ballista_core::execution_plans::{
-        CoalescePlan, PartitionGroup, ShuffleReaderExec,
+/// Log any `RuntimeStatsReport`s that arrived with this task status. For
+/// now this is proof-of-life for the wire — the reports flow from
+/// executor to scheduler and land here observably. The per-stage
+/// accumulator + merged-quantile-cut logging comes in a follow-up commit;
+/// this hook is what verifies the plumbing works against a live cluster.
+fn log_runtime_stats_arrival(
+    executor: &ExecutorMetadata,
+    status: &ballista_core::serde::protobuf::TaskStatus,
+) {
+    use ballista_core::serde::protobuf::task_status::Status;
+    let Some(Status::Successful(successful)) = status.status.as_ref() else {
+        return;
     };
-    use ballista_core::serde::scheduler::{
-        ExecutorMetadata, PartitionId, PartitionLocation,
-    };
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_expr::Partitioning;
-    use datafusion::physical_plan::ExecutionPlan;
-    use std::sync::Arc;
+    if successful.runtime_stats.is_empty() {
+        return;
+    }
+    for (report_idx, report) in successful.runtime_stats.iter().enumerate() {
+        let non_empty_partitions =
+            report.partitions.iter().filter(|p| p.row_count > 0).count();
+        let total_rows: u64 = report.partitions.iter().map(|p| p.row_count).sum();
+        let ranged_partitions = report
+            .partitions
+            .iter()
+            .filter(|p| !p.key_min.is_empty() && !p.key_max.is_empty())
+            .count();
+        // Counted rather than assumed: an entry whose range never got filled
+        // in would route no files, and nothing else here would say so.
+        debug!(
+            "RuntimeStats arrival: executor={} job={} stage={} task={} \
+             report[{}] order_by_len={} partitions={} non_empty={} \
+             total_rows={} key_ranges={}/{} sort_key_sketch={}",
+            executor.id,
+            status.job_id,
+            status.stage_id,
+            status.task_id,
+            report_idx,
+            report.order_by.len(),
+            report.partitions.len(),
+            non_empty_partitions,
+            total_rows,
+            ranged_partitions,
+            report.partitions.len(),
+            describe_sort_key_sketch(report),
+        );
+    }
+}
 
     fn create_partition(partition: usize) -> PartitionLocation {
         PartitionLocation {
@@ -1224,126 +1349,354 @@ mod prune_partition_tests {
             },
             partition_stats: Default::default(),
             path: String::default(),
+            file_id: None,
+            is_sort_shuffle: false,
         }
     }
 
-    #[test]
-    fn check_prune_unwanted_partitions() {
-        let partitions = (0..4).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(4),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert!(r.partition[0].is_empty());
-        assert_eq!(r.partition[1].len(), 1);
-        assert_eq!(r.partition[1][0].partition_id.partition_id, 1);
-        assert!(r.partition[2].is_empty());
-        assert!(r.partition[3].is_empty());
+    #[async_trait::async_trait]
+    impl JobState for BlockingJobState {
+        fn accept_job(
+            &self,
+            job_id: &JobId,
+            job_name: &str,
+            queued_at: u64,
+        ) -> Result<()> {
+            self.inner.accept_job(job_id, job_name, queued_at)
+        }
+
+        fn pending_job_number(&self) -> usize {
+            self.inner.pending_job_number()
+        }
+
+        async fn submit_job(
+            &self,
+            job_id: JobId,
+            graph: &ExecutionGraphBox,
+            subscriber: Option<JobStatusSubscriber>,
+        ) -> Result<()> {
+            self.inner.submit_job(job_id, graph, subscriber).await
+        }
+
+        async fn get_jobs(&self) -> Result<HashSet<JobId>> {
+            self.inner.get_jobs().await
+        }
+
+        async fn get_all_jobs(&self) -> Result<HashSet<JobId>> {
+            self.inner.get_all_jobs().await
+        }
+
+        async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>> {
+            self.inner.get_job_status(job_id).await
+        }
+
+        async fn get_execution_graph(
+            &self,
+            job_id: &JobId,
+        ) -> Result<Option<ExecutionGraphBox>> {
+            self.inner.get_execution_graph(job_id).await
+        }
+
+        async fn save_job(
+            &self,
+            job_id: &JobId,
+            graph: &ExecutionGraphBox,
+        ) -> Result<()> {
+            let attempt = self.save_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.save_started.notify_one();
+                self.allow_save.notified().await;
+            }
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(BallistaError::General("injected save failure".to_string()));
+            }
+            self.inner.save_job(job_id, graph).await
+        }
+
+        async fn fail_unscheduled_job(
+            &self,
+            job_id: &JobId,
+            reason: String,
+        ) -> Result<()> {
+            self.inner.fail_unscheduled_job(job_id, reason).await
+        }
+
+        async fn remove_job(&self, job_id: &JobId) -> Result<()> {
+            self.inner.remove_job(job_id).await
+        }
+
+        async fn try_acquire_job(
+            &self,
+            job_id: &JobId,
+        ) -> Result<Option<ExecutionGraphBox>> {
+            self.inner.try_acquire_job(job_id).await
+        }
+
+        async fn job_state_events(&self) -> Result<JobStateEventStream> {
+            self.inner.job_state_events().await
+        }
+
+        async fn create_or_update_session(
+            &self,
+            session_id: &str,
+            config: &SessionConfig,
+        ) -> Result<Arc<SessionContext>> {
+            self.inner
+                .create_or_update_session(session_id, config)
+                .await
+        }
+
+        async fn remove_session(&self, session_id: &str) -> Result<()> {
+            self.inner.remove_session(session_id).await
+        }
+
+        fn produce_config(&self) -> SessionConfig {
+            self.inner.produce_config()
+        }
     }
 
-    #[test]
-    fn check_keeps_multiple_wanted_partitions() {
-        let partitions = (0..4).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(4),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[0, 3], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert_eq!(r.partition[0].len(), 1);
-        assert!(r.partition[1].is_empty());
-        assert!(r.partition[2].is_empty());
-        assert_eq!(r.partition[3].len(), 1);
+    type TestTaskManager = TaskManager<LogicalPlanNode, PhysicalPlanNode>;
+
+    async fn setup_job(
+        successful: bool,
+    ) -> Result<(
+        TestTaskManager,
+        Arc<BlockingJobState>,
+        JobId,
+        Arc<RwLock<ExecutionGraphBox>>,
+    )> {
+        let state = Arc::new(BlockingJobState::new());
+        let job_state: Arc<dyn JobState> = state.clone();
+        let manager = TaskManager::new(
+            job_state,
+            BallistaCodec::default(),
+            "test-scheduler".to_string(),
+            Arc::new(SchedulerConfig::default()),
+        );
+
+        let graph: ExecutionGraphBox = Box::new(test_aggregation_plan(2).await);
+        let job_id = graph.job_id().to_owned();
+        state.accept_job(&job_id, graph.job_name(), 0)?;
+        state.submit_job(job_id.clone(), &graph, None).await?;
+
+        manager
+            .active_job_cache
+            .insert(job_id.clone(), JobInfoCache::new(graph));
+        let active_graph = manager
+            .get_active_execution_graph(&job_id)
+            .expect("job should be active");
+
+        if successful {
+            // Complete the graph after it is cached. `JobInfoCache::status` still
+            // contains Running until terminal persistence updates it.
+            let mut graph = active_graph.write().await;
+            let executor = mock_executor("executor-1".to_string());
+            while let Some(task) = graph.pop_next_task(&executor.id)? {
+                graph.update_task_status(
+                    &executor,
+                    vec![mock_completed_task(task, &executor.id)],
+                    1,
+                    1,
+                )?;
+            }
+            graph.succeed_job()?;
+        }
+
+        Ok((manager, state, job_id, active_graph))
     }
 
-    #[test]
-    fn check_broadcast_reader_not_pruned() {
-        // Broadcast readers serve partition[0] for every index, so pruning must be a no-op.
-        let reader = ShuffleReaderExec::try_new_broadcast(
-            1,
-            (0..4).map(create_partition).collect(),
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            4,
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        // Broadcast keeps all locations flattened into partition[0]; nothing pruned.
-        assert!(r.broadcast);
-        assert_eq!(r.partition.len(), 1);
-        assert_eq!(r.partition[0].len(), 4);
+    #[tokio::test]
+    async fn successful_job_stays_visible_and_unlocked_until_persisted() -> Result<()> {
+        let (manager, state, job_id, active_graph) = setup_job(true).await?;
+        let manager_for_save = manager.clone();
+        let job_id_for_save = job_id.clone();
+        let save =
+            tokio::spawn(
+                async move { manager_for_save.succeed_job(&job_id_for_save).await },
+            );
+
+        timeout(Duration::from_secs(1), state.save_started.notified())
+            .await
+            .expect("terminal save should start");
+
+        let status = manager
+            .get_job_status(&job_id)
+            .await?
+            .expect("successful job should remain visible during persistence");
+        assert!(matches!(status.status, Some(Status::Successful(_))));
+        assert!(!manager.get_running_job_cache().contains_key(&job_id));
+        assert_eq!(manager.running_job_number(), 0);
+
+        let graph_guard = timeout(Duration::from_secs(1), active_graph.write())
+            .await
+            .expect("graph lock must not be held across persistence");
+        drop(graph_guard);
+
+        state.allow_save.notify_one();
+        save.await.expect("succeed_job task should not panic")?;
+
+        assert!(manager.get_active_execution_graph(&job_id).is_none());
+        let persisted = state
+            .get_job_status(&job_id)
+            .await?
+            .expect("successful status should be persisted");
+        assert!(matches!(persisted.status, Some(Status::Successful(_))));
+        Ok(())
     }
 
-    #[test]
-    fn check_coalesced_reader_pruned_and_stays_coalesced() {
-        // K = 2 coalesce groups, each folding two upstream partitions.
-        let coalesce = CoalescePlan {
-            upstream_partition_count: 4,
-            groups: vec![
-                PartitionGroup {
-                    upstream_indices: vec![0, 1],
-                },
-                PartitionGroup {
-                    upstream_indices: vec![2, 3],
-                },
-            ],
-        };
-        let reader = ShuffleReaderExec::try_new_coalesced(
-            1,
-            vec![
-                vec![create_partition(0), create_partition(1)],
-                vec![create_partition(2), create_partition(3)],
-            ],
-            coalesce,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(2),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert!(r.coalesce.is_some());
-        assert!(r.partition[0].is_empty());
-        assert_eq!(r.partition[1].len(), 2);
+    #[tokio::test]
+    async fn failed_terminal_save_is_not_retried_and_evicts_local_cache() -> Result<()> {
+        let (manager, state, job_id, active_graph) = setup_job(true).await?;
+        state.failures_remaining.store(1, Ordering::SeqCst);
+        let manager_for_save = manager.clone();
+        let job_id_for_save = job_id.clone();
+        let save =
+            tokio::spawn(
+                async move { manager_for_save.succeed_job(&job_id_for_save).await },
+            );
+
+        timeout(Duration::from_secs(1), state.save_started.notified())
+            .await
+            .expect("terminal save should start");
+        assert!(manager.get_active_execution_graph(&job_id).is_some());
+        assert_eq!(manager.running_job_number(), 0);
+        state.allow_save.notify_one();
+        assert!(
+            save.await
+                .expect("succeed_job task should not panic")
+                .is_err()
+        );
+
+        assert_eq!(state.save_attempts.load(Ordering::SeqCst), 1);
+        assert!(manager.get_active_execution_graph(&job_id).is_none());
+        assert_eq!(manager.running_job_number(), 0);
+        let authoritative_status = manager
+            .get_job_status(&job_id)
+            .await?
+            .expect("shared status should remain available after local eviction");
+        assert!(matches!(
+            authoritative_status.status,
+            Some(Status::Running(_))
+        ));
+
+        let graph_guard = timeout(Duration::from_secs(1), active_graph.write())
+            .await
+            .expect("graph lock must be released after a failed save");
+        drop(graph_guard);
+        Ok(())
     }
 
-    #[test]
-    fn check_no_op_when_all_partitions_wanted() {
-        let partitions = (0..3).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(3),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[0, 1, 2], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        // Task consumes every partition, so nothing is emptied.
-        assert_eq!(r.partition[0].len(), 1);
-        assert_eq!(r.partition[1].len(), 1);
-        assert_eq!(r.partition[2].len(), 1);
+    #[tokio::test]
+    async fn aborted_tasks_are_cancelled_before_terminal_persistence() -> Result<()> {
+        let (manager, state, job_id, active_graph) = setup_job(false).await?;
+        let executor = mock_executor("executor-1".to_string());
+        active_graph
+            .write()
+            .await
+            .pop_next_task(&executor.id)?
+            .expect("job should have a task to assign");
+
+        let cancelled_tasks = Arc::new(AtomicUsize::new(0));
+        let cancelled_tasks_for_abort = cancelled_tasks.clone();
+        let manager_for_abort = manager.clone();
+        let job_id_for_abort = job_id.clone();
+        let abort = tokio::spawn(async move {
+            let manager_for_cancel = manager_for_abort.clone();
+            let job_id_for_cancel = job_id_for_abort.clone();
+            manager_for_abort
+                .abort_job(
+                    &job_id_for_abort,
+                    "test failure".to_string(),
+                    move |tasks| async move {
+                        let status = manager_for_cancel
+                            .get_job_status(&job_id_for_cancel)
+                            .await?
+                            .expect(
+                                "aborted job should remain visible during cancellation",
+                            );
+                        assert!(
+                            matches!(status.status, Some(Status::Failed(_))),
+                            "job must be terminal before executor tasks are cancelled"
+                        );
+                        cancelled_tasks_for_abort.store(tasks.len(), Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        });
+
+        timeout(Duration::from_secs(1), state.save_started.notified())
+            .await
+            .expect("terminal save should start");
+        assert_eq!(cancelled_tasks.load(Ordering::SeqCst), 1);
+        assert_eq!(state.save_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.running_job_number(), 0);
+
+        let status = manager
+            .get_job_status(&job_id)
+            .await?
+            .expect("failed job should remain visible during persistence");
+        assert!(matches!(status.status, Some(Status::Failed(_))));
+        let graph_guard = timeout(Duration::from_secs(1), active_graph.write())
+            .await
+            .expect("graph lock must not be held across persistence");
+        drop(graph_guard);
+
+        state.allow_save.notify_one();
+        abort.await.expect("abort_job task should not panic")?;
+        assert!(manager.get_active_execution_graph(&job_id).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_tasks_are_cancelled_when_terminal_save_fails() -> Result<()> {
+        let (manager, state, job_id, active_graph) = setup_job(false).await?;
+        let executor = mock_executor("executor-1".to_string());
+        active_graph
+            .write()
+            .await
+            .pop_next_task(&executor.id)?
+            .expect("job should have a task to assign");
+        state.failures_remaining.store(1, Ordering::SeqCst);
+
+        let cancelled_tasks = Arc::new(AtomicUsize::new(0));
+        let cancelled_tasks_for_abort = cancelled_tasks.clone();
+        let manager_for_abort = manager.clone();
+        let job_id_for_abort = job_id.clone();
+        let abort = tokio::spawn(async move {
+            manager_for_abort
+                .abort_job(
+                    &job_id_for_abort,
+                    "test failure".to_string(),
+                    move |tasks| async move {
+                        cancelled_tasks_for_abort.store(tasks.len(), Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), state.save_started.notified())
+            .await
+            .expect("terminal save should start");
+        assert_eq!(cancelled_tasks.load(Ordering::SeqCst), 1);
+        state.allow_save.notify_one();
+        assert!(
+            abort
+                .await
+                .expect("abort_job task should not panic")
+                .is_err()
+        );
+
+        assert_eq!(cancelled_tasks.load(Ordering::SeqCst), 1);
+        assert_eq!(state.save_attempts.load(Ordering::SeqCst), 1);
+        assert!(manager.get_active_execution_graph(&job_id).is_none());
+        assert_eq!(manager.running_job_number(), 0);
+        Ok(())
     }
 }

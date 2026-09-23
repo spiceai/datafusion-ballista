@@ -42,7 +42,7 @@ pub trait ExecutorMetricsCollector: Send + Sync {
         &self,
         job_id: &JobId,
         stage_id: usize,
-        partition: usize,
+        task_id: usize,
         plan: Arc<dyn QueryStageExecutor>,
         duration_ms: u64,
     );

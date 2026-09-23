@@ -73,6 +73,10 @@ use log::{debug, info};
 
 use super::shuffle_writer_trait::ShuffleWriter;
 
+/// Default bounded-channel capacity for the async-to-blocking I/O bridge used
+/// by [`crate::utils::write_stream_to_disk`].
+pub const DEFAULT_SHUFFLE_CHANNEL_CAPACITY: usize = 8;
+
 /// ShuffleWriterExec represents a section of a query plan that has consistent partitioning and
 /// can be executed as one unit with each partition being executed in parallel. The output of each
 /// partition is re-partitioned and streamed to disk in Arrow IPC format. Future stages of the query

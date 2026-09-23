@@ -59,7 +59,7 @@ type ExecutorClients = Arc<DashMap<String, ExecutorGrpcClient<Channel>>>;
 /// - Cleaning up job data on executors
 #[derive(Clone)]
 pub struct ExecutorManager {
-    /// Cluster state for tracking executor registration and task slots.
+    /// Cluster state for tracking executor registration and vcores.
     cluster_state: Arc<dyn ClusterState>,
     /// Scheduler configuration.
     config: Arc<SchedulerConfig>,
@@ -76,6 +76,23 @@ impl ExecutorManager {
         cluster_state: Arc<dyn ClusterState>,
         config: Arc<SchedulerConfig>,
     ) -> Self {
+        // Prefer an explicit override_config_producer if the embedder wired one,
+        // so a full BallistaConfig (with all its grpc-client knobs) still takes
+        // precedence. Otherwise, use `default()` but override
+        // `max_message_size` from the scheduler's `grpc_client_max_message_size`
+        // CLI flag so users can raise the ceiling for outbound task-assignment
+        // RPCs without having to write a config-producer in Rust.
+        let grpc_client_config =
+            if let Some(config_producer) = &config.override_config_producer {
+                let session_config = config_producer();
+                let ballista_config = session_config.ballista_config();
+                GrpcClientConfig::from(&ballista_config)
+            } else {
+                GrpcClientConfig {
+                    max_message_size: config.grpc_client_max_message_size as usize,
+                    ..GrpcClientConfig::default()
+                }
+            };
         Self {
             cluster_state,
             config,
@@ -89,6 +106,11 @@ impl ExecutorManager {
         self.cluster_state.init().await?;
 
         Ok(())
+    }
+
+    /// Returns a stream of cluster state events from the configured state backend.
+    pub async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
+        self.cluster_state.cluster_state_events().await
     }
 
     /// Binds ready-to-run tasks from active jobs to available executor slots.
@@ -116,7 +138,7 @@ impl ExecutorManager {
             .await
     }
 
-    /// Returns reserved task slots to the pool of available slots.
+    /// Returns reserved vcores to the pool of available slots.
     ///
     /// This operation is atomic: either all slots are returned or none are.
     pub async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
@@ -339,15 +361,15 @@ impl ExecutorManager {
     /// For push-based scheduling, use [`Self::register_executor`] instead.
     pub async fn save_executor_metadata(&self, metadata: ExecutorMetadata) -> Result<()> {
         trace!(
-            "save executor metadata {} with {} task slots (pull-based registration)",
-            metadata.id, metadata.specification.task_slots
+            "save executor metadata {} with {} vcores (pull-based registration)",
+            metadata.id, metadata.specification.vcores
         );
         self.cluster_state.save_executor_metadata(metadata).await
     }
 
     /// Registers the executor with the scheduler for push-based task scheduling.
     ///
-    /// This saves both the executor metadata and available task slots to persistent state.
+    /// This saves both the executor metadata and vcore inventory to persistent state.
     /// For pull-based scheduling, use [`Self::save_executor_metadata`] instead.
     pub async fn register_executor(
         &self,
@@ -355,8 +377,8 @@ impl ExecutorManager {
         specification: ExecutorData,
     ) -> Result<()> {
         debug!(
-            "registering executor {} with {} task slots (push-based registration)",
-            metadata.id, specification.total_task_slots
+            "registering executor {} with {} vcores (push-based registration)",
+            metadata.id, specification.total_vcores
         );
 
         ExecutorManager::test_connectivity(&metadata).await?;
@@ -375,6 +397,8 @@ impl ExecutorManager {
         reason: Option<String>,
     ) -> Result<()> {
         info!("Removing executor {executor_id}: {reason:?}");
+        // Drop the cached client
+        self.clients.remove(executor_id);
         self.cluster_state.remove_executor(executor_id).await
     }
 
@@ -408,6 +432,10 @@ impl ExecutorManager {
     }
 
     /// Launches multiple tasks on the specified executor.
+    ///
+    /// `Ok` means the RPC was dispatched; the returned set holds job IDs the
+    /// executor rejected (could not decode) and failed individually. `Err` is
+    /// only returned for a transport-level failure of the whole RPC.
     pub async fn launch_multi_task(
         &self,
         executor_id: &str,
@@ -420,14 +448,10 @@ impl ExecutorManager {
                 multi_tasks,
                 scheduler_id,
             })
-            .await
-            .map_err(|e| {
-                BallistaError::Internal(format!(
-                    "Failed to connect to executor {executor_id}: {e:?}"
-                ))
-            })?;
+            .await?
+            .into_inner();
 
-        Ok(())
+        Ok(res.failed_jobs.into_iter().map(JobId::from).collect())
     }
 
     pub(crate) fn drain_pending_cleanup_jobs(
@@ -553,7 +577,13 @@ impl ExecutorManager {
             }
 
             let connection = endpoint.connect().await?;
-            let client = ExecutorGrpcClient::new(connection);
+            // Message-size limits are tonic codec settings, not `Endpoint`
+            // settings, so `create_grpc_client_endpoint` cannot apply them.
+            // Without this the configured `max_message_size` is silently
+            // ignored and task assignment falls back to tonic's own defaults.
+            let client = ExecutorGrpcClient::new(connection)
+                .max_encoding_message_size(grpc_client_config.max_message_size)
+                .max_decoding_message_size(grpc_client_config.max_message_size);
 
             {
                 self.clients.insert(executor_id.to_owned(), client.clone());

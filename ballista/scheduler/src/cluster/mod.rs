@@ -32,10 +32,11 @@ use log::debug;
 
 use ballista_core::consistent_hash::ConsistentHash;
 use ballista_core::error::Result;
+use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
 use ballista_core::serde::protobuf::{
-    AvailableTaskSlots, ExecutorHeartbeat, JobStatus, job_status,
+    AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
 };
-use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, PartitionId};
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, TaskKey};
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber, consistent_hash};
 
@@ -221,7 +222,7 @@ pub trait ClusterState: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Binds ready-to-run tasks from active jobs to available executor slots.
+    /// Binds ready-to-run tasks from active jobs to executor vcores.
     ///
     /// If `executors` is provided, only bind slots from the specified executor IDs.
     /// Returns both the bound tasks and shuffle affinity information for metrics.
@@ -232,9 +233,9 @@ pub trait ClusterState: Send + Sync + 'static {
         executors: Option<HashSet<String>>,
     ) -> Result<BindingResult>;
 
-    /// Unbinds executor slots when tasks finish or fail.
+    /// Releases reserved vcores when tasks finish or fail.
     ///
-    /// This operation is atomic: either all slots are released or none are.
+    /// This operation is atomic: either all vcores are released or none are.
     async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()>;
 
     /// Registers a new executor in the cluster.
@@ -376,6 +377,9 @@ pub trait JobState: Send + Sync {
 
     /// Persists the current state of an owned job.
     ///
+    /// Implementations are responsible for applying any backend-specific retry policy.
+    /// Callers must not assume that this operation is safe to retry.
+    ///
     /// Returns an error if the job is not owned by the caller.
     async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()>;
 
@@ -437,7 +441,7 @@ fn get_executors_with_local_shuffle_data(
 }
 
 pub(crate) async fn bind_task_bias(
-    mut slots: Vec<&mut AvailableTaskSlots>,
+    mut budgets: Vec<&mut AvailableVcores>,
     running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
 ) -> BindingResult {
@@ -449,11 +453,12 @@ pub(crate) async fn bind_task_bias(
         return result;
     }
 
-    // Sort the slots by descending order
-    slots.sort_by(|a, b| Ord::cmp(&b.slots, &a.slots));
+    // Bias: give each stage the biggest exec available. Sort descending
+    // so bind_one keeps packing tasks onto the largest executor until its
+    // vcore budget is drained.
+    budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
-    let mut idx_slot = 0usize;
-    let mut slot = &mut slots[idx_slot];
+    let mut idx = 0usize;
     for (job_id, job_info) in running_jobs.iter() {
         if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
             debug!("Job {job_id} is not in running status and will be skipped");
@@ -463,9 +468,7 @@ pub(crate) async fn bind_task_bias(
 
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
-        while let Some((running_stage, task_id_gen)) =
-            graph.fetch_running_stage(&black_list)
-        {
+        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
             if if_skip(running_stage.plan.clone()) {
                 debug!(
                     "Will skip stage {}/{} for bias task binding",
@@ -539,7 +542,7 @@ pub(crate) async fn bind_task_bias(
 }
 
 pub(crate) async fn bind_task_round_robin(
-    mut slots: Vec<&mut AvailableTaskSlots>,
+    mut budgets: Vec<&mut AvailableVcores>,
     running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
 ) -> BindingResult {
@@ -550,12 +553,13 @@ pub(crate) async fn bind_task_round_robin(
         debug!("Not enough available executor slots for task running!!!");
         return result;
     }
-    debug!("Total slot number is {total_slots}");
 
-    // Sort the slots by descending order
-    slots.sort_by(|a, b| Ord::cmp(&b.slots, &a.slots));
+    // Round-robin across execs so multiple running stages each get one
+    // exec per rotation. Order by vcores desc so the largest exec goes
+    // first in the rotation.
+    budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
-    let mut idx_slot = 0usize;
+    let mut idx = 0usize;
     for (job_id, job_info) in running_jobs.iter() {
         if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
             debug!("Job {job_id} is not in running status and will be skipped");
@@ -565,9 +569,7 @@ pub(crate) async fn bind_task_round_robin(
 
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
-        while let Some((running_stage, task_id_gen)) =
-            graph.fetch_running_stage(&black_list)
-        {
+        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
             if if_skip(running_stage.plan.clone()) {
                 debug!(
                     "Will skip stage {}/{} for round robin task binding",
@@ -668,7 +670,7 @@ pub trait DistributionPolicy: std::fmt::Debug + Send + Sync {
     ///
     /// # Parameters
     ///
-    /// * `slots` - vector of available executor slots, there may not be available slots
+    /// * `budgets` - per-executor free-vcore budgets (may be empty)
     /// * `running_jobs` - (JobId -> JobInfoCache) cache must contain only running jobs
     ///
     /// # Returns
@@ -677,7 +679,7 @@ pub trait DistributionPolicy: std::fmt::Debug + Send + Sync {
     ///
     async fn bind_tasks(
         &self,
-        mut slots: Vec<&mut AvailableTaskSlots>,
+        mut budgets: Vec<&mut AvailableVcores>,
         running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     ) -> datafusion::error::Result<Vec<BoundTask>>;
 
@@ -892,7 +894,7 @@ mod test {
 
     use ballista_core::JobId;
     use ballista_core::error::Result;
-    use ballista_core::serde::protobuf::AvailableTaskSlots;
+    use ballista_core::serde::protobuf::AvailableVcores;
     use ballista_core::serde::scheduler::{
         ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
     };
@@ -905,8 +907,11 @@ mod test {
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
         mock_completed_task, revive_graph_and_complete_next_stage,
-        test_aggregation_plan_with_job_id,
+        test_aggregation_plan_with_config,
     };
+    use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
+    use ballista_core::extension::SessionConfigExt;
+    use datafusion::prelude::SessionConfig;
 
     #[tokio::test]
     async fn test_bind_task_bias() -> Result<()> {
@@ -921,6 +926,10 @@ mod test {
 
         let result = get_result(binding_result.bound_tasks);
 
+        // Multi-partition-task binding: each bind consumes slice.len() vcores,
+        // so an executor with leftover vcores keeps taking work under the bias
+        // policy (largest exec stays hot). Distribution depends on HashMap
+        // iteration order across jobs.
         let mut expected = Vec::new();
         {
             let mut expected0 = HashMap::new();
@@ -977,8 +986,7 @@ mod test {
             let mut expected0 = HashMap::new();
 
             let mut entry_a = HashMap::new();
-            entry_a.insert("executor_3".to_string(), 1);
-            entry_a.insert("executor_2".to_string(), 1);
+            entry_a.insert("executor_3".to_string(), 2);
             let mut entry_b = HashMap::new();
             entry_b.insert("executor_1".to_string(), 3);
             entry_b.insert("executor_3".to_string(), 2);
@@ -993,9 +1001,7 @@ mod test {
             let mut expected0 = HashMap::new();
 
             let mut entry_b = HashMap::new();
-            entry_b.insert("executor_3".to_string(), 3);
-            entry_b.insert("executor_2".to_string(), 2);
-            entry_b.insert("executor_1".to_string(), 2);
+            entry_b.insert("executor_3".to_string(), 7);
             let mut entry_a = HashMap::new();
             entry_a.insert("executor_2".to_string(), 1);
             entry_a.insert("executor_1".to_string(), 1);
@@ -1118,10 +1124,20 @@ mod test {
                 .entry(bound_task.1.partition.job_id.to_string())
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
-            *n += 1;
+            *n += bound_task.1.global_input_partition_ids.len();
         }
 
         result
+    }
+
+    /// Total partitions covered across every bound task — the multi-partition
+    /// analogue of "how many tasks did we bind" for tests that used to assert
+    /// on `bound_tasks.len()`.
+    fn total_partitions_covered(bound_tasks: &[BoundTask]) -> usize {
+        bound_tasks
+            .iter()
+            .map(|(_, task)| task.global_input_partition_ids.len())
+            .sum()
     }
 
     async fn mock_active_jobs(
@@ -1149,14 +1165,27 @@ mod test {
         num_target_partitions: usize,
         num_pending_task: usize,
     ) -> Result<StaticExecutionGraph> {
-        let mut graph =
-            test_aggregation_plan_with_job_id(num_target_partitions, job_id).await;
+        // These tests validate the *multi-partition* binding path: expected
+        // task distributions include slice sizes up to 7. That requires an
+        // unbounded `max_partitions_per_task`, which is also the default —
+        // set explicitly here so the mock keeps exercising that path even if
+        // the default changes again.
+        let session_config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "0"),
+        );
+        let mut graph = test_aggregation_plan_with_config(
+            num_target_partitions,
+            job_id,
+            session_config,
+        )
+        .await;
         let executor = ExecutorMetadata {
             id: "executor_0".to_string(),
             host: "localhost".to_string(),
             port: 50051,
             grpc_port: 50052,
-            specification: ExecutorSpecification { task_slots: 32 },
+            specification: ExecutorSpecification { vcores: 32 },
             os_info: ExecutorOperatingSystemSpecification::default(),
         };
 
@@ -1173,19 +1202,19 @@ mod test {
         Ok(graph)
     }
 
-    fn mock_available_slots() -> Vec<AvailableTaskSlots> {
+    fn mock_budgets() -> Vec<AvailableVcores> {
         vec![
-            AvailableTaskSlots {
+            AvailableVcores {
                 executor_id: "executor_1".to_string(),
-                slots: 3,
+                vcores: 3,
             },
-            AvailableTaskSlots {
+            AvailableVcores {
                 executor_id: "executor_2".to_string(),
-                slots: 5,
+                vcores: 5,
             },
-            AvailableTaskSlots {
+            AvailableVcores {
                 executor_id: "executor_3".to_string(),
-                slots: 7,
+                vcores: 7,
             },
         ]
     }
