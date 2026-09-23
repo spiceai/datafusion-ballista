@@ -312,10 +312,13 @@ message SortShuffleWriterExecNode {
   uint32 stage_id = 2;
   datafusion.PhysicalPlanNode input = 3;
   datafusion.PhysicalHashRepartition output_partitioning = 4;
-  // Configuration for sort shuffle
+  // Deprecated: superseded by memory_limit_per_task_bytes. Kept so an older
+  // scheduler/executor speaking this wire format still decodes a sensible
+  // value; the writer ignores buffer_size and spill_threshold.
   uint64 buffer_size = 5;
   uint64 memory_limit = 6;
   double spill_threshold = 7;
+  // Target batch size in rows when materializing buffered shuffle data.
   uint64 batch_size = 8;
   // Per-task buffered-bytes budget at which the writer spills its in-memory
   // batches to disk. A value of 0 disables the per-task budget so spilling is
@@ -339,6 +342,7 @@ message UnresolvedShuffleExecNode {
   datafusion.Partitioning partitioning = 5;
   bool broadcast = 6;
   uint32 upstream_partition_count = 7;
+  // Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
   optional CoalescePlan coalesce = 8;
 }
 
@@ -350,6 +354,7 @@ message ShuffleReaderExecNode {
   datafusion.Partitioning partitioning = 4;
   bool broadcast = 5;
   uint32 upstream_partition_count = 6;
+  // Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
   optional CoalescePlan coalesce = 7;
 }
 
@@ -380,10 +385,14 @@ message RangeShuffleReaderExecNode {
 // CoalescePartitionsRule output: groups upstream partitions into coalesced output partitions.
 // Empty when no coalesce is applied (the optional field on the parent message is absent).
 message CoalescePlan {
+  // Original number of upstream partitions (M) before coalescing. Required for EXPLAIN's "K of M" rendering.
   uint32 upstream_partition_count = 1;
+  // Coalesced output groups. Length is K (the post-coalesce partition count).
   repeated PartitionGroup groups = 2;
 }
 
+// One coalesced output partition's source list: a set of upstream partition indices in [0, upstream_partition_count).
+// Default algorithm produces only contiguous indices, but proto allows arbitrary index sets for future strategies.
 message PartitionGroup {
   repeated uint32 upstream_indices = 1;
 }
@@ -549,7 +558,6 @@ message FetchPartition {
   string job_id = 1;
   uint32 stage_id = 2;
   uint32 partition_id = 3;
-  string path = 4;
   string host = 5;
   uint32 port = 6;
   optional uint64 file_id = 7;
@@ -572,11 +580,16 @@ message FetchPartition {
   // and it is why the range shuffle's index carries byte offsets at all.
   repeated ByteRange byte_ranges = 11;
 
-  // `path` (Spice fork): the shuffle storage location — local disk, `memory://`,
-  // or an object-store URL (S3/Azure) — resolved by the shuffle storage
-  // abstraction rather than by `file_id`/`layout` alone. Kept alongside
-  // upstream's fields rather than reserved, since the object-store and
-  // in-memory shuffle backends are addressed by this path.
+  // Fork-only addressing for the memory://, object-store (S3/Azure), and
+  // Vortex shuffle backends, which key partitions by an opaque location
+  // string rather than a local-disk file_id. Empty for a partition produced
+  // by the upstream file_id/layout writers; when set, it takes precedence
+  // and `layout`/`file_kind`/`byte_ranges` do not apply.
+  string path = 4;
+  // reserved after `is_sort_shuffle` became `layout`: the bool selected a path
+  // shape, which reads as data-vs-index once a file_kind exists beside it.
+  reserved 8;
+  reserved "is_sort_shuffle";
 }
 
 message PartitionLocation {
@@ -586,9 +599,12 @@ message PartitionLocation {
   PartitionId partition_id = 2;
   ExecutorMetadata executor_meta = 3;
   PartitionStats partition_stats = 4;
-  string path = 5;
   optional uint64 file_id = 6;
   bool is_sort_shuffle = 7;
+
+  // Fork-only addressing for the memory://, object-store, and Vortex shuffle
+  // backends. See `FetchPartition.path`.
+  string path = 5;
 }
 
 // Unique identifier for a materialized partition of data
@@ -763,7 +779,6 @@ message ExecutorSpecification {
 // One task per executor drives this many DataFusion partitions in parallel
 // through one plan-Arc.
 message ExecutorResource {
-  // TODO add more resources
   oneof resource {
     uint32 vcores = 1;
   }
@@ -937,6 +952,8 @@ message TaskKilled {
 
 message ShuffleWritePartition {
   uint64 partition_id = 1;
+  // Fork-only addressing for the memory://, object-store, and Vortex shuffle
+  // backends. See `FetchPartition.path`.
   string path = 2;
   uint64 num_batches = 3;
   uint64 num_rows = 4;

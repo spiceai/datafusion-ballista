@@ -608,7 +608,7 @@ fn read_arrow_ipc_batches<T>(
     tx: Sender<Result<RecordBatch, FlightError>>,
 ) -> Result<(), FlightError>
 where
-    R: Iterator<Item = Result<RecordBatch, ArrowError>>,
+    T: std::io::Read,
 {
     if tx.is_closed() {
         return Err(FlightError::Tonic(Box::new(Status::internal(

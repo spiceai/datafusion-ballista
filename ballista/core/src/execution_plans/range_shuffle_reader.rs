@@ -527,6 +527,7 @@ mod tests {
             partition_stats: PartitionStats::default(),
             file_id: None,
             is_sort_shuffle: false,
+            path: String::new(),
         }
     }
 

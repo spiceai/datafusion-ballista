@@ -17,6 +17,7 @@
 
 use crate::JobId;
 use crate::error::BallistaError;
+use crate::execution_plans::create_shuffle_path;
 use crate::registry::BallistaFunctionRegistry;
 use crate::serde::protobuf;
 use datafusion::arrow::array::{
@@ -28,6 +29,7 @@ use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::SessionConfig;
 use serde::Serialize;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::{collections::HashMap, fmt, sync::Arc};
 
 /// Conversions from protobuf types to Ballista types.
@@ -46,8 +48,6 @@ pub enum Action {
         stage_id: usize,
         /// The partition identifier within the stage.
         partition_id: usize,
-        /// File path to the partition data.
-        path: String,
         /// Hostname or IP address of the executor hosting this partition.
         host: String,
         /// Port number for data transfer.
@@ -61,6 +61,11 @@ pub enum Action {
         /// byte ranges of that file to return, concatenated in order. Empty
         /// asks for whatever the identifiers above address.
         byte_ranges: Vec<ByteRange>,
+        /// Fork-only addressing for the memory://, object-store, and Vortex
+        /// shuffle backends. Empty for a partition produced by the upstream
+        /// file_id/layout writers; when non-empty it takes precedence and
+        /// `file_id`/`layout`/`file_kind`/`byte_ranges` do not apply.
+        path: String,
     },
 }
 
@@ -165,14 +170,37 @@ pub struct PartitionLocation {
     pub executor_meta: ExecutorMetadata,
     /// Statistics about the partition data.
     pub partition_stats: PartitionStats,
-    /// File path to the partition data.
-    pub path: String,
-    /// Shuffle file block id, when the file is addressed by id rather than
-    /// solely by `path` (range-shuffle / adaptive execution consumers).
+    /// shuffle file id
     pub file_id: Option<u64>,
-    /// Whether the producing writer used the sort-based shuffle layout.
-    /// See [`Self::layout`].
+    /// whether this partition uses sort shuffle
     pub is_sort_shuffle: bool,
+    /// Fork-only addressing for the memory://, object-store, and Vortex
+    /// shuffle backends. Empty for a partition produced by the upstream
+    /// file_id/layout writers.
+    pub path: String,
+}
+
+impl PartitionLocation {
+    /// Resolves this partition's actual file location.
+    ///
+    /// The fork's memory://, object-store, and Vortex shuffle backends key
+    /// partitions by an opaque location string rather than a local-disk
+    /// file_id; when one produced this partition, `path` carries it and takes
+    /// precedence. Otherwise this falls through to upstream's file_id/layout
+    /// addressing scheme.
+    pub fn path(&self, work_dir: &str) -> datafusion::error::Result<PathBuf> {
+        if !self.path.is_empty() {
+            return Ok(PathBuf::from(&self.path));
+        }
+        create_shuffle_path(
+            work_dir,
+            &self.partition_id.job_id,
+            self.partition_id.stage_id,
+            self.partition_id.partition_id,
+            self.file_id,
+            self.is_sort_shuffle,
+        )
+    }
 }
 
 /// Meta-data for an executor, used when fetching shuffle partitions from other executors.
@@ -188,12 +216,12 @@ pub struct ExecutorMetadata {
     pub grpc_port: u16,
     /// Resource specification for this executor.
     pub specification: ExecutorSpecification,
-    /// OS and hardware info for this executor.
+    /// OS and hardware info for this executor
     pub os_info: ExecutorOperatingSystemSpecification,
 }
 
 /// Specification of an executor, indicating its runtime-assigned vcore count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ExecutorSpecification {
     /// Virtual cores assigned to this executor at runtime — analogous to YARN
@@ -230,27 +258,27 @@ impl ExecutorSpecification {
     }
 }
 
-/// Operating system level specification of an executor.
+/// Operating system level specification of an executor
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ExecutorOperatingSystemSpecification {
-    /// System name.
+    /// System name
     pub system_name: String,
-    /// Kernel version.
+    /// Kernel version
     pub kernel_ver: String,
-    /// OS version.
+    /// OS version
     pub os_ver: String,
-    /// OS version (long).
+    /// OS version (long)
     pub os_ver_long: String,
-    /// Number of physical cores available on this executor.
+    /// Number of physical cores available on this executor
     pub physical_cores: u32,
-    /// Number of physical disks available on this executor.
+    /// Number of physical disks available on this executor
     pub num_disks: u32,
-    /// Total disk space on this executor, in bytes.
+    /// Total disk space on this executor, in bytes
     pub total_disk_space: u64,
-    /// Total available disk space on this executor, in bytes.
+    /// Total available disk space on this executor, in bytes
     pub total_available_disk_space: u64,
-    /// Open files limit on this executor.
+    /// Open files limit on this executor
     pub open_files_limit: u64,
 }
 
@@ -378,6 +406,9 @@ impl ExecutorDataChange {
 pub struct PartitionStats {
     pub(crate) num_rows: Option<u64>,
     pub(crate) num_batches: Option<u64>,
+    /// Per-partition byte size reported by the shuffle writer. Read by the
+    /// AQE coalesce rule (in `ballista-scheduler`) to bin-pack alignment
+    /// groups, so this field is `pub` rather than `pub(crate)`.
     pub(crate) num_bytes: Option<u64>,
 }
 
@@ -405,19 +436,14 @@ impl PartitionStats {
         }
     }
 
-    /// Returns the number of rows in the partition, if known.
-    pub fn num_rows(&self) -> Option<u64> {
-        self.num_rows
-    }
-
-    /// Returns the number of batches in the partition, if known.
-    pub fn num_batches(&self) -> Option<u64> {
-        self.num_batches
-    }
-
-    /// Returns the number of bytes in the partition, if known.
+    /// Returns the per-partition byte size, if populated by the writer.
     pub fn num_bytes(&self) -> Option<u64> {
         self.num_bytes
+    }
+
+    /// Returns the per-partition row count, if populated by the writer.
+    pub fn num_rows(&self) -> Option<u64> {
+        self.num_rows
     }
 
     /// Returns the Arrow struct field representation of these statistics.

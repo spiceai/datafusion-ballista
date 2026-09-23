@@ -26,6 +26,7 @@ use ballista_core::JobId;
 use ballista_core::assert_plan;
 use ballista_core::execution_plans::SortShuffleWriterExec;
 use ballista_core::extension::SessionConfigExt;
+use ballista_core::serde::protobuf::job_status::Status;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ColumnStatistics;
 use datafusion::execution::SessionStateBuilder;

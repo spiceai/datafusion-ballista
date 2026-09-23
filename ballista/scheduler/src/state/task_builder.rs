@@ -430,6 +430,7 @@ mod tests {
                 os_info: Default::default(),
             },
             partition_stats: Default::default(),
+            path: String::new(),
             file_id: None,
             is_sort_shuffle: false,
         }

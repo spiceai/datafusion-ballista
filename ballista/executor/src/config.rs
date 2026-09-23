@@ -284,7 +284,6 @@ impl TryFrom<Config> for ExecutorProcessConfig {
             override_physical_codec: None,
             override_arrow_flight_service: None,
             override_create_grpc_client_endpoint: None,
-            client_ttl: opt.client_ttl,
             health: crate::health::ExecutorHealth::new(),
         })
     }

@@ -1863,6 +1863,7 @@ mod overlap_remap_tests {
             partition_stats: PartitionStats::new(Some(0), None, None),
             file_id: Some(producer_task_id as u64),
             is_sort_shuffle: false,
+            path: String::new(),
         }
     }
 

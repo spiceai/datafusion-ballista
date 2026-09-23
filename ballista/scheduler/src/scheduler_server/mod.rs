@@ -41,7 +41,7 @@ use crate::cluster::{BallistaCluster, ClusterStateEventStream, JobStateEventStre
 use crate::config::SchedulerConfig;
 use crate::metrics::SchedulerMetricsCollector;
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
-use log::{debug, warn};
+use log::{debug, error, warn};
 
 use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
@@ -173,11 +173,20 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             metrics_collector.clone(),
         ));
         let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
+        #[cfg(feature = "rest-api")]
+        let event_log = config.event_log_dir.as_ref().map(|dir| {
+            ballista_history::writer::EventLogWriter::new(
+                std::path::PathBuf::from(dir),
+                config.event_loop_buffer_size as usize,
+            )
+        });
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
             state.clone(),
             metrics_collector,
             config.clone(),
             job_state_sender.clone(),
+            #[cfg(feature = "rest-api")]
+            event_log,
         ));
         let query_stage_event_loop = EventLoop::new(
             "query_stage".to_owned(),
@@ -216,11 +225,20 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             task_launcher,
         ));
         let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
+        #[cfg(feature = "rest-api")]
+        let event_log = config.event_log_dir.as_ref().map(|dir| {
+            ballista_history::writer::EventLogWriter::new(
+                std::path::PathBuf::from(dir),
+                config.event_loop_buffer_size as usize,
+            )
+        });
         let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
             state.clone(),
             metrics_collector,
             config.clone(),
             job_state_sender.clone(),
+            #[cfg(feature = "rest-api")]
+            event_log,
         ));
         let query_stage_event_loop = EventLoop::new(
             "query_stage".to_owned(),
@@ -264,6 +282,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     /// Returns the number of currently running jobs.
     pub fn running_job_number(&self) -> usize {
         self.state.task_manager.running_job_number()
+    }
+
+    pub async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
+        self.state.executor_manager.cluster_state_events().await
+    }
+
+    /// Returns a stream of job state events from the configured state backend.
+    pub async fn job_state_events(&self) -> Result<JobStateEventStream> {
+        self.state.task_manager.job_state_events().await
+    }
+
+    /// True when at least `min_ready_executors` executors currently have
+    /// live heartbeats. Embedders can call this from their own health/readiness
+    /// handler and AND it with whatever app-specific state they track. The
+    /// built-in `/readyz` endpoint (see `api::health`) reports the same value.
+    pub fn is_ready(&self) -> bool {
+        let alive = self.state.executor_manager.get_alive_executors().len();
+        alive >= self.state.config.min_ready_executors
     }
 
     /// Subscribes to job state change notifications.
@@ -665,6 +701,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     ) {
         debug!("remove executor: {executor_id}");
         let executor_id = executor_id.to_owned();
+        let executor_manager = state.executor_manager.clone();
         tokio::spawn(async move {
             // Wait for `wait_secs` before removing executor
             tokio::time::sleep(Duration::from_secs(wait_secs)).await;
@@ -697,8 +734,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         let executor_id = metadata.id.clone();
         let executor_data = ExecutorData {
             executor_id: executor_id.clone(),
-            total_task_slots: metadata.specification.task_slots,
-            available_task_slots: metadata.specification.task_slots,
+            total_vcores: metadata.specification.vcores,
+            available_vcores: metadata.specification.vcores,
         };
 
         // Save the executor to state
@@ -762,6 +799,7 @@ mod test {
     use datafusion_proto::protobuf::PhysicalPlanNode;
     use futures::StreamExt;
 
+    use crate::cluster::ClusterStateEvent;
     use crate::scheduler_server::event::SubmitPlan;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
@@ -878,6 +916,8 @@ mod test {
                         num_batches: 1,
                         num_rows: 1,
                         num_bytes: 1,
+                        file_id: None,
+                        is_sort_shuffle: false,
                     })
                 }
 
@@ -1415,7 +1455,7 @@ mod test {
                     host: "localhost1".to_string(),
                     port: 8080,
                     grpc_port: 9090,
-                    specification: ExecutorSpecification { vcores: task_slots },
+                    specification: ExecutorSpecification { vcores },
                     os_info: ExecutorOperatingSystemSpecification::default(),
                 },
                 ExecutorData {
@@ -1431,7 +1471,7 @@ mod test {
                     port: 8080,
                     grpc_port: 9090,
                     specification: ExecutorSpecification {
-                        task_slots: num_partitions as u32 - task_slots,
+                        vcores: num_partitions as u32 - vcores,
                     },
                     os_info: ExecutorOperatingSystemSpecification::default(),
                 },

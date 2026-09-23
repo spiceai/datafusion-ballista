@@ -21,16 +21,10 @@
 //! query stages in a distributed setting. The execution engine is responsible
 //! for creating query stage executors from physical plans.
 
-use async_trait::async_trait;
-use ballista_core::JobId;
 use ballista_core::client_pool::BallistaClientPool;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleWriterExec;
-use ballista_core::execution_plans::{ShuffleReaderExec, ShuffleWriterExec};
-use ballista_core::serde::protobuf::ShuffleWritePartition;
-use ballista_core::utils;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
+use ballista_core::execution_plans::{
+    RangeShuffleReaderExec, RangeShuffleWriterExec, ShuffleReaderExec, ShuffleWriterExec,
 };
 use ballista_core::serde::protobuf::ShuffleWritePartition;
 use ballista_core::serde::scheduler::PartitionStats;
@@ -39,88 +33,18 @@ use datafusion::arrow::array::{
     Array, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
-use std::any::Any;
+use datafusion::prelude::SessionConfig;
+use futures::stream::TryStreamExt;
+use log::debug;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
-
-/// Extension point for customizing query stage execution.
-///
-/// Implement this trait to provide a custom execution engine that can
-/// transform physical plans into query stage executors. This allows
-/// for custom execution strategies beyond the default DataFusion-based
-/// execution.
-pub trait ExecutionEngine: Sync + Send {
-    /// Creates a query stage executor from a physical plan.
-    ///
-    /// The returned executor will be responsible for executing the given
-    /// plan partition and writing shuffle output to the specified work directory.
-    #[allow(clippy::too_many_arguments)]
-    fn create_query_stage_exec(
-        &self,
-        job_id: JobId,
-        stage_id: usize,
-        task_id: usize,
-        global_output_partition_ids: Vec<usize>,
-        plan: Arc<dyn ExecutionPlan>,
-        work_dir: &str,
-    ) -> Result<Arc<dyn QueryStageExecutor>>;
-}
-
-/// Restrict a file-backed `DataSourceExec` to the file group for `partition_id`,
-/// emptying the others (partition count preserved). Ballista runs one partition
-/// per task on its own plan instance, so without this the task's lone stream
-/// drains the scan's shared work-queue and reads the whole table. Returns `None`
-/// for non-file scans or a `partition_id` outside the source's file groups.
-/// See apache/datafusion-ballista#1907.
-fn restrict_scan_to_partition(
-    plan: &Arc<dyn ExecutionPlan>,
-    partition_id: usize,
-) -> Option<Arc<dyn ExecutionPlan>> {
-    let exec = plan.downcast_ref::<DataSourceExec>()?;
-    let source: &dyn Any = exec.data_source().as_ref();
-    let config = source.downcast_ref::<FileScanConfig>()?;
-    if partition_id >= config.file_groups.len() {
-        return None;
-    }
-    // Empty (not dropped) for the other partitions so the source's partition count is
-    // preserved and `execute(partition_id)` still maps to its own group.
-    let file_groups: Vec<FileGroup> = config
-        .file_groups
-        .iter()
-        .enumerate()
-        .map(|(i, group)| {
-            if i == partition_id {
-                group.clone()
-            } else {
-                FileGroup::new(vec![])
-            }
-        })
-        .collect();
-    let config = FileScanConfigBuilder::from(config.clone())
-        .with_file_groups(file_groups)
-        .build();
-    Some(DataSourceExec::from_data_source(config))
-}
-
-/// Restrict every file scan in `plan` to `partition_id`'s file group.
-fn restrict_scans(
-    plan: Arc<dyn ExecutionPlan>,
-    partition_id: usize,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    Ok(plan
-        .transform_down(|node| {
-            Ok(match restrict_scan_to_partition(&node, partition_id) {
-                Some(rewritten) => Transformed::yes(rewritten),
-                None => Transformed::no(node),
-            })
-        })?
-        .data)
-}
 
 /// Fix ParquetSource metadata_size_hint that is lost during protobuf
 /// serialization. The hint is preserved in TableParquetOptions but not
@@ -160,13 +84,37 @@ fn fix_parquet_metadata_size_hint(
     .map(|t| t.data)
 }
 
+/// Extension point for customizing query stage execution.
+///
+/// Implement this trait to provide a custom execution engine that can
+/// transform physical plans into query stage executors. This allows
+/// for custom execution strategies beyond the default DataFusion-based
+/// execution.
+pub trait ExecutionEngine: Sync + Send {
+    /// Creates a query stage executor from a physical plan.
+    ///
+    /// The returned executor will be responsible for executing the given
+    /// plan partition and writing shuffle output to the specified work directory.
+    #[allow(clippy::too_many_arguments)]
+    fn create_query_stage_exec(
+        &self,
+        job_id: JobId,
+        stage_id: usize,
+        task_id: usize,
+        global_output_partition_ids: Vec<usize>,
+        plan: Arc<dyn ExecutionPlan>,
+        work_dir: &str,
+        config: &SessionConfig,
+    ) -> Result<Arc<dyn QueryStageExecutor>>;
+}
+
 /// Executor for a single query stage in a distributed query.
 ///
 /// A query stage is a section of a query plan that has consistent partitioning
 /// and can be executed as one unit with each partition running in parallel.
 /// The output of each partition is re-partitioned and written to disk in
 /// Arrow IPC format. Subsequent stages read these results via ShuffleReaderExec.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait QueryStageExecutor: Sync + Send + Debug + Display {
     /// Executes this query stage's assigned partition slice.
     ///
@@ -183,9 +131,40 @@ pub trait QueryStageExecutor: Sync + Send + Debug + Display {
 
     /// Returns a reference to the underlying execution plan.
     ///
-    /// This is used to walk the plan tree and extract metrics from specific
-    /// operators like ShuffleReaderExec.
+    /// Used to walk the plan tree and extract metrics from specific
+    /// operators like `ShuffleReaderExec`.
     fn plan(&self) -> &dyn ExecutionPlan;
+
+    /// Collect runtime-stats reports for every `RuntimeStatsExec` still
+    /// valid at the plan's output (walked through the distribution-
+    /// preserving whitelist). Called at task completion; whatever comes
+    /// back rides along in the task's `SuccessfulTask` message to the
+    /// scheduler. Default returns empty — implementers with real plans
+    /// override to walk their operator tree.
+    fn collect_runtime_stats_reports(
+        &self,
+    ) -> Vec<ballista_core::serde::protobuf::RuntimeStatsReport> {
+        Vec::new()
+    }
+
+    /// Drain finalized window-aggregate state captured during this task,
+    /// already stamped with the global partition each capture belongs to.
+    /// Called at task completion, like
+    /// [`Self::collect_runtime_stats_reports`], and rides the same
+    /// `SuccessfulTask` message.
+    ///
+    /// Empty for every plan without an ever-expanding-frame window, which is
+    /// nearly all of them. Default returns empty — implementers with real
+    /// plans override to drain their writer.
+    ///
+    /// Errors fail the task. This state is load-bearing for the downstream
+    /// stage's prefix merge, so losing a report yields a wrong answer rather
+    /// than a degraded one.
+    fn collect_window_state_reports(
+        &self,
+    ) -> Result<Vec<ballista_core::serde::protobuf::WindowStateReport>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Default execution engine using DataFusion's ShuffleWriterExec.
@@ -219,39 +198,56 @@ impl ExecutionEngine for DefaultExecutionEngine {
         global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
+        _config: &SessionConfig,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
-        // Fix ParquetSource metadata_size_hint lost during serialization
+        // Fix ParquetSource metadata_size_hint lost during serialization.
         let plan = fix_parquet_metadata_size_hint(plan)?;
 
-        // Route remote shuffle fetches through the executor's client pool when
-        // one is configured (upstream #1951); without a pool, readers connect
-        // per fetch.
-        let plan = match &self.client_pool {
-            Some(client_pool) => {
-                plan.transform(|p| {
-                    if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
-                        Ok(Transformed::yes(Arc::new(
-                            reader.with_client_pool(client_pool.clone()),
-                        )
-                            as Arc<dyn ExecutionPlan>))
-                    } else {
-                        Ok(Transformed::no(p))
+        let plan = plan
+            .transform(|p| {
+                if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
+                    match &self.client_pool {
+                        Some(client_pool) => Ok(Transformed::yes(Arc::new(
+                            reader
+                                .with_work_dir(work_dir.to_string())
+                                .with_client_pool(client_pool.clone()),
+                        ))),
+                        None => Ok(Transformed::yes(Arc::new(
+                            reader.with_work_dir(work_dir.to_string()),
+                        ))),
                     }
-                })?
-                .data
-            }
-            None => plan,
-        };
+                } else if let Some(reader) = p.downcast_ref::<RangeShuffleReaderExec>() {
+                    match &self.client_pool {
+                        Some(client_pool) => Ok(Transformed::yes(Arc::new(
+                            reader
+                                .with_work_dir(work_dir.to_string())
+                                .with_client_pool(client_pool.clone()),
+                        ))),
+                        None => Ok(Transformed::yes(Arc::new(
+                            reader.with_work_dir(work_dir.to_string()),
+                        ))),
+                    }
+                } else {
+                    // Scan restriction is scheduler-side (see
+                    // ballista/scheduler/src/state/task_builder.rs). The plan
+                    // arriving here is shrink-restricted to slice.len()
+                    // partitions; the writer walks its child plan to attach
+                    // global identity, using `global_output_partition_ids` for the
+                    // pass-through case and detecting plan-level partitioning
+                    // resets (SPM, RepartitionExec::Hash) for the rest.
+                    Ok(Transformed::no(p))
+                }
+            })?
+            .data;
 
-        // the query plan created by the scheduler always starts with a shuffle writer
-        // (either ShuffleWriterExec or SortShuffleWriterExec)
-        if let Some(shuffle_writer) = plan.downcast_ref::<ShuffleWriterExec>() {
-            // recreate the shuffle writer with the correct working directory,
-            // restricting any file scan to this task's partition
+        // the query plan created by the scheduler always starts with a shuffle
+        // writer (ShuffleWriterExec, RangeShuffleWriterExec, or
+        // SortShuffleWriterExec)
+        if plan.downcast_ref::<ShuffleWriterExec>().is_some() {
             let exec = ShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
-                restrict_scans(plan.children()[0].clone(), partition_id)?,
+                plan.children()[0].clone(),
                 work_dir.to_string(),
             )?
             .with_task_id(task_id)
@@ -273,12 +269,10 @@ impl ExecutionEngine for DefaultExecutionEngine {
         } else if let Some(sort_shuffle_writer) =
             plan.downcast_ref::<SortShuffleWriterExec>()
         {
-            // recreate the sort shuffle writer with the correct working directory,
-            // restricting any file scan to this task's partition
             let exec = SortShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
-                restrict_scans(plan.children()[0].clone(), partition_id)?,
+                plan.children()[0].clone(),
                 work_dir.to_string(),
                 sort_shuffle_writer.shuffle_output_partitioning().clone(),
                 sort_shuffle_writer.config().clone(),
@@ -377,7 +371,7 @@ impl Display for DefaultQueryStageExec {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl QueryStageExecutor for DefaultQueryStageExec {
     async fn execute_query_stage(
         &self,
@@ -424,11 +418,11 @@ impl QueryStageExecutor for DefaultQueryStageExec {
 
     fn plan(&self) -> &dyn ExecutionPlan {
         match &self.shuffle_writer {
-            ShuffleWriterVariant::Hash(writer) => writer,
+            ShuffleWriterVariant::Passthrough(writer) => writer,
+            ShuffleWriterVariant::Range(writer) => writer,
             ShuffleWriterVariant::Sort(writer) => writer,
         }
     }
-}
 
     fn collect_runtime_stats_reports(
         &self,
@@ -456,32 +450,26 @@ impl QueryStageExecutor for DefaultQueryStageExec {
         }
     }
 
-    /// Number of files in each file group of a `DataSourceExec`.
-    fn group_file_counts(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
-        let exec = plan.downcast_ref::<DataSourceExec>().unwrap();
-        let source: &dyn Any = exec.data_source().as_ref();
-        let config = source.downcast_ref::<FileScanConfig>().unwrap();
-        config.file_groups.iter().map(|g| g.len()).collect()
-    }
-
-    #[test]
-    fn restrict_scan_keeps_only_its_own_group() {
-        let plan = scan_with_file_groups(4);
-        let restricted = restrict_scan_to_partition(&plan, 2).expect("scan rewritten");
-        assert_eq!(group_file_counts(&restricted), vec![0, 0, 1, 0]);
-    }
-
-    #[test]
-    fn restrict_scan_partition_out_of_range_is_left_untouched() {
-        let plan = scan_with_file_groups(3);
-        assert!(restrict_scan_to_partition(&plan, 3).is_none());
-    }
-
-    #[test]
-    fn restrict_scan_ignores_non_file_scans() {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        assert!(restrict_scan_to_partition(&plan, 0).is_none());
+    fn collect_window_state_reports(
+        &self,
+    ) -> Result<Vec<ballista_core::serde::protobuf::WindowStateReport>> {
+        // Both partitioning-preserving writers can sit over a window; the sort
+        // writer is Hash-partitioned by construction, which the prefix rewrite
+        // never plants.
+        let captured = match &self.shuffle_writer {
+            ShuffleWriterVariant::Passthrough(writer) => writer.collect_window_state()?,
+            ShuffleWriterVariant::Range(writer) => writer.collect_window_state(),
+            ShuffleWriterVariant::Sort(_) => return Ok(Vec::new()),
+        };
+        captured
+            .iter()
+            .map(|(global_partition, observed)| {
+                ballista_core::execution_plans::window_state_to_proto(
+                    *global_partition,
+                    observed,
+                )
+            })
+            .collect()
     }
 }
 
@@ -561,7 +549,7 @@ fn metadata_batches_to_summaries(
                     "shuffle metadata batch: partition column not UInt32".into(),
                 )
             })?;
-        let _path_col = batch
+        let path_col = batch
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
@@ -624,6 +612,7 @@ fn metadata_batches_to_summaries(
             };
             out.push(ShuffleWritePartition {
                 partition_id: partition_col.value(row) as u64,
+                path: path_col.value(row).to_owned(),
                 num_batches: num_batches_arr.value(row),
                 num_rows: num_rows_arr.value(row),
                 num_bytes: num_bytes_arr.value(row),

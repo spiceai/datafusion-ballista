@@ -18,6 +18,7 @@
 use crate::cluster::{JobState, JobStateEventStream};
 use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
+use crate::state::task_builder::restrict_plan_to_partitions;
 
 use crate::scheduler_server::event::SubmitPlan;
 use crate::state::distributed_explain::handle_explain_plan;
@@ -36,7 +37,6 @@ use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use rand::distr::Alphanumeric;
 use rand::distr::Distribution;
 
-use crate::cluster::JobState;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
@@ -185,75 +185,6 @@ impl JobInfoCache {
         }
     }
 
-    #[cfg(feature = "disable-stage-plan-cache")]
-    fn partition_prune_helper(
-        partition_ids: &[usize],
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let n = plan.output_partitioning().partition_count();
-        let wanted: HashSet<usize> = partition_ids.iter().copied().collect();
-        Ok(plan
-            .clone()
-            .transform_up(|node| {
-                let Some(r) = node.downcast_ref::<ShuffleReaderExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                // Skip broadcast readers (serve partition[0] for every index) and readers
-                // whose partition count differs from the stage output `n`, since pruning by
-                // index is only valid when reader partition `i` feeds output partition `i`.
-                if r.broadcast || r.partition.len() != n {
-                    return Ok(Transformed::no(node));
-                }
-                // Nothing to prune when this task consumes every partition.
-                if wanted.len() == r.partition.len() {
-                    return Ok(Transformed::no(node));
-                }
-
-                // Every requested id must index a real reader partition, else we'd
-                // silently prune away locations the task needs.
-                debug_assert!(wanted.iter().all(|&p| p < r.partition.len()));
-
-                let partition = r
-                    .partition
-                    .iter()
-                    .enumerate()
-                    .map(|(i, loc)| {
-                        if wanted.contains(&i) {
-                            loc.clone()
-                        } else {
-                            vec![]
-                        }
-                    })
-                    .collect();
-
-                let reader = match r.coalesce.clone() {
-                    Some(c) => ShuffleReaderExec::try_new_coalesced(
-                        r.stage_id,
-                        partition,
-                        c,
-                        r.schema(),
-                        r.properties().output_partitioning().clone(),
-                    )?,
-                    None => ShuffleReaderExec::try_new(
-                        r.stage_id,
-                        partition,
-                        r.schema(),
-                        r.properties().output_partitioning().clone(),
-                    )?,
-                };
-                Ok(Transformed::yes(Arc::new(reader) as Arc<dyn ExecutionPlan>))
-            })?
-            .data)
-    }
-    #[cfg(not(feature = "disable-stage-plan-cache"))]
-    fn cached_stage_plan(&self, stage_id: usize) -> Option<Vec<u8>> {
-        self.encoded_stage_plans.get(&stage_id).cloned()
-    }
-
-    #[cfg(not(feature = "disable-stage-plan-cache"))]
-    fn insert_stage_plan(&mut self, stage_id: usize, plan: Vec<u8>) {
-        self.encoded_stage_plans.insert(stage_id, plan);
-    }
 }
 
 /// Tracks stage state changes during task status updates.
@@ -629,6 +560,39 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
     }
 
+    /// Sum the vcores consumed by the given task statuses at their original
+    /// bind time. Used to refund the executor's vcore budget when tasks
+    /// complete: refunding `statuses.len()` (one per task) would drop
+    /// leftover vcores forever, because `bind_one` consumes `slice.len()`
+    /// vcores per task under the multi-partition-task model.
+    ///
+    /// Statuses whose (job, stage, task_id) can no longer be resolved
+    /// (e.g. the job's graph has been evicted) contribute 0.
+    pub(crate) async fn sum_vcores_for_statuses(&self, statuses: &[TaskStatus]) -> u32 {
+        let mut statuses_by_job: HashMap<String, Vec<&TaskStatus>> = HashMap::new();
+        for status in statuses {
+            statuses_by_job
+                .entry(status.job_id.clone())
+                .or_default()
+                .push(status);
+        }
+        let mut total_vcores: u32 = 0;
+        for (job_id, job_statuses) in statuses_by_job {
+            let Some(graph_arc) = self.get_active_execution_graph(&job_id.into()) else {
+                continue;
+            };
+            let graph = graph_arc.read().await;
+            for status in job_statuses {
+                if let Some(vcores) =
+                    graph.task_vcores(status.stage_id as usize, status.task_id as usize)
+                {
+                    total_vcores += vcores;
+                }
+            }
+        }
+        total_vcores
+    }
+
     /// Update given task statuses in the respective job and return a `TaskStatusUpdateResult`
     /// containing:
     /// 1. A list of `QueryStageSchedulerEvent` to publish.
@@ -678,26 +642,31 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Persist the job state, bounded by [`JOB_PERSIST_TIMEOUT`] so a stalled
     /// object-store operation cannot hang the scheduler event loop (which
-    /// awaits these persists). Returns whether the persist completed; failures
-    /// and timeouts are logged and the shared state is left to a later persist.
-    async fn try_save_job(&self, job_id: &JobId, snapshot: &ExecutionGraphBox) -> bool {
+    /// awaits these persists). Failures and timeouts are logged and returned
+    /// to the caller; the shared state is left to a later persist.
+    async fn try_save_job(
+        &self,
+        job_id: &JobId,
+        snapshot: &ExecutionGraphBox,
+    ) -> Result<()> {
         match tokio::time::timeout(
             JOB_PERSIST_TIMEOUT,
             self.state.save_job(job_id, snapshot),
         )
         .await
         {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 warn!("save_job for {job_id} failed: {e}");
-                false
+                Err(e)
             }
             Err(_) => {
-                warn!(
+                let msg = format!(
                     "save_job for {job_id} timed out after {}s",
                     JOB_PERSIST_TIMEOUT.as_secs()
                 );
-                false
+                warn!("{msg}");
+                Err(BallistaError::General(msg))
             }
         }
     }
@@ -712,8 +681,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         &self,
         job_id: &JobId,
         snapshot: &ExecutionGraphBox,
-    ) {
-        if self.try_save_job(job_id, snapshot).await {
+    ) -> Result<()> {
+        let save_result = self.try_save_job(job_id, snapshot).await;
+        if save_result.is_ok() {
             self.remove_active_execution_graph(job_id);
         } else if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
             // The cached status is what get_running_job_cache() filters on; a
@@ -721,6 +691,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             // appearing in every task-binding snapshot until restart.
             job_info.status = snapshot.status().status.clone();
         }
+        save_result
     }
 
     /// Mark a job to success. This will create a key under the CompletedJobs keyspace
@@ -745,7 +716,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 }
                 graph.cloned()
             };
-            self.persist_terminal_and_evict(job_id, &snapshot).await;
+            self.persist_terminal_and_evict(job_id, &snapshot).await?;
             Ok(snapshot.intermediate_stage_ids())
         } else {
             warn!("Fail to find job {job_id} in the cache");
@@ -761,33 +732,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         &self,
         job_id: &JobId,
         failure_reason: String,
-    ) -> Result<(Vec<RunningTaskInfo>, usize)> {
-        let (tasks_to_cancel, pending_tasks) = if let Some(graph) =
-            self.get_active_execution_graph(job_id)
-        {
-            // Mutate and snapshot under the lock, persist outside it: holding
-            // the graph lock across object-store I/O blocks any task still
-            // updating this graph for the duration of a stall.
-            let (running_tasks, pending_tasks, snapshot) = {
-                let mut guard = graph.write().await;
-
-                let pending_tasks = guard.available_tasks();
-                let running_tasks = guard.running_tasks();
-
-                info!(
-                    "Cancelling {} running tasks for job {}",
-                    running_tasks.len(),
-                    job_id
-                );
-
-                guard.fail_job(failure_reason);
-                (running_tasks, pending_tasks, guard.cloned())
-            };
-
-            self.persist_terminal_and_evict(job_id, &snapshot).await;
-
-            (running_tasks, pending_tasks)
-        } else {
+        cancel_tasks: F,
+    ) -> Result<usize>
+    where
+        F: FnOnce(Vec<RunningTaskInfo>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let Some(graph) = self.get_active_execution_graph(job_id) else {
             // TODO listen the job state update event and fix task cancelling
             warn!(
                 "Fail to find job {job_id} in the cache, unable to cancel tasks for job, fail the job state only."
@@ -876,7 +827,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 // Best-effort intermediate persist: on failure/timeout the next
                 // event-driven update re-persists (the reconciliation sweep
                 // deliberately revives WITHOUT persisting).
-                self.try_save_job(job_id, &snapshot).await;
+                let _ = self.try_save_job(job_id, &snapshot).await;
             }
 
             Ok(new_tasks)
@@ -944,102 +895,46 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let job_id = task.key.job_id.clone();
         let stage_id = task.key.stage_id;
 
-        let plan = self.encoded_stage_plan(
-            &job_id,
-            stage_id,
-            &task.plan,
-            &[task.partition.partition_id],
-        )?;
+        if self.active_job_cache.get(&job_id).is_some() {
+            let restricted = restrict_plan_to_partitions(
+                task.plan.clone(),
+                &task.global_input_partition_ids,
+            )?;
+            let mut plan_buf: Vec<u8> = vec![];
+            let plan_proto = PhysicalPlanNode::try_from_physical_plan(
+                restricted,
+                self.codec.physical_extension_codec(),
+            )?;
+            plan_proto.try_encode(&mut plan_buf)?;
 
-        let task_definition = TaskDefinition {
-            task_id: task.task_id as u32,
-            task_attempt_num: task.task_attempt as u32,
-            job_id: job_id.into(),
-            stage_id: stage_id as u32,
-            stage_attempt_num: task.stage_attempt_num as u32,
-            partition_id: task.partition.partition_id as u32,
-            plan,
-            session_id: task.session_id,
-            launch_time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            props: task.session_config.to_key_value_pairs(),
-        };
-        Ok(task_definition)
-    }
-
-    /// Returns the protobuf-encoded plan for the given stage, using the
-    /// per-job stage-plan cache. The CPU-heavy encode runs WITHOUT holding any
-    /// cache guard: a DashMap write guard blocks every other task touching the
-    /// shard (task binding in poll_work handlers, status updates) on its OS
-    /// worker thread for the encode duration, which under contention can
-    /// exhaust the runtime's workers.
-    /// `partition_ids` are the output partitions the receiving task(s) will
-    /// execute; with the stage-plan cache disabled, shuffle-reader locations
-    /// for other partitions are pruned from the encoded plan (upstream #1911).
-    /// With the cache enabled the encoded plan is shared across tasks, so no
-    /// pruning is possible and the ids are ignored.
-    #[expect(unused_variables)]
-    fn encoded_stage_plan(
-        &self,
-        job_id: &JobId,
-        stage_id: usize,
-        plan: &Arc<dyn ExecutionPlan>,
-        partition_ids: &[usize],
-    ) -> Result<Vec<u8>> {
-        #[cfg(not(feature = "disable-stage-plan-cache"))]
-        if let Some(cached) = self
-            .active_job_cache
-            .get(job_id)
-            .and_then(|job_info| job_info.cached_stage_plan(stage_id))
-        {
-            return Ok(cached);
-        }
-
-        if !self.active_job_cache.contains_key(job_id) {
-            return Err(BallistaError::General(format!(
+            let task_definition = TaskDefinition {
+                task_id: task.key.task_id as u32,
+                task_attempt_num: task.task_attempt as u32,
+                job_id: job_id.into(),
+                stage_id: stage_id as u32,
+                stage_attempt_num: task.stage_attempt_num as u32,
+                plan: plan_buf,
+                session_id: task.session_id,
+                launch_time: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                props: task.session_config.to_key_value_pairs(),
+                global_output_partition_ids: compute_global_output_partition_ids(
+                    &task.plan,
+                    &task.global_input_partition_ids,
+                )
+                .into_iter()
+                .map(|pid| pid as u32)
+                .collect(),
+                vcores_consumed: task.vcores_consumed,
+            };
+            Ok(task_definition)
+        } else {
+            Err(BallistaError::General(format!(
                 "Cannot prepare task definition for job {job_id} which is not in active cache"
-            )));
+            )))
         }
-
-        let plan_to_encode = {
-            #[cfg(feature = "disable-stage-plan-cache")]
-            {
-                JobInfoCache::partition_prune_helper(partition_ids, plan)?
-            }
-            #[cfg(not(feature = "disable-stage-plan-cache"))]
-            {
-                plan.clone()
-            }
-        };
-        let mut plan_buf: Vec<u8> = vec![];
-        let plan_proto = PhysicalPlanNode::try_from_physical_plan(
-            plan_to_encode,
-            self.codec.physical_extension_codec(),
-        )?;
-        plan_proto.try_encode(&mut plan_buf)?;
-
-        // Re-check after the guard-free encode: the job may have been removed
-        // (completed/aborted) meanwhile, and a plan must not be returned for a
-        // job that is no longer active.
-        #[cfg(not(feature = "disable-stage-plan-cache"))]
-        match self.active_job_cache.get_mut(job_id) {
-            Some(mut job_info) => job_info.insert_stage_plan(stage_id, plan_buf.clone()),
-            None => {
-                return Err(BallistaError::General(format!(
-                    "Cannot prepare task definition for job {job_id} which is not in active cache"
-                )));
-            }
-        }
-        #[cfg(feature = "disable-stage-plan-cache")]
-        if !self.active_job_cache.contains_key(job_id) {
-            return Err(BallistaError::General(format!(
-                "Cannot prepare task definition for job {job_id} which is not in active cache"
-            )));
-        }
-
-        Ok(plan_buf)
     }
 
     /// Launch the given tasks on the specified executor
@@ -1074,65 +969,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         &self,
         tasks: Vec<TaskDescription>,
     ) -> Result<Vec<MultiTaskDefinition>> {
-        let partition_ids: Vec<usize> = tasks
-            .iter()
-            .map(|task| task.partition.partition_id)
-            .collect();
-        if let Some(task) = tasks.first() {
-            let session_id = task.session_id.clone();
-            let job_id = task.partition.job_id.clone();
-            let stage_id = task.partition.stage_id;
-            let stage_attempt_num = task.stage_attempt_num;
-
-            if log::max_level() >= log::Level::Debug {
-                let task_ids: Vec<usize> = tasks
-                    .iter()
-                    .map(|task| task.partition.partition_id)
-                    .collect();
-                debug!(
-                    "Preparing multi task definition for tasks {task_ids:?} belonging to job stage {job_id}/{stage_id}"
-                );
-                trace!("With task details {tasks:?}");
-            }
-
-            {
-                let plan = self.encoded_stage_plan(
-                    &job_id,
-                    stage_id,
-                    &task.plan,
-                    &partition_ids,
-                )?;
-
-                let launch_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-
-                let mut multi_tasks = vec![];
-                let props = task.session_config.to_key_value_pairs();
-                let task_ids = tasks
-                    .into_iter()
-                    .map(|task| TaskId {
-                        task_id: task.task_id as u32,
-                        task_attempt_num: task.task_attempt as u32,
-                        partition_id: task.partition.partition_id as u32,
-                    })
-                    .collect();
-                multi_tasks.push(MultiTaskDefinition {
-                    task_ids,
-                    job_id: job_id.into(),
-                    stage_id: stage_id as u32,
-                    stage_attempt_num: stage_attempt_num as u32,
-                    plan,
-                    session_id,
-                    launch_time,
-                    props,
-                });
-
-                Ok(multi_tasks)
-            }
-        } else {
-            Err(BallistaError::General(
+        let [first_task, ..] = tasks.as_slice() else {
+            return Err(BallistaError::General(
                 "Cannot prepare multi task definition for an empty vec".to_string(),
             ));
         };
@@ -1331,6 +1169,83 @@ fn log_runtime_stats_arrival(
     }
 }
 
+/// Decode the report's merged [`SortKeySketch`] far enough to say what
+/// arrived. Rebuilding it here is the point: a byte count proves the field
+/// crossed, where a decoded count and range prove it survived.
+///
+/// Any failure is described rather than propagated — this is a log line, and
+/// the query's data was already produced correctly.
+///
+/// [`SortKeySketch`]: ballista_core::sort_key::SortKeySketch
+fn describe_sort_key_sketch(
+    report: &ballista_core::serde::protobuf::RuntimeStatsReport,
+) -> String {
+    use ballista_core::sort_key::SortKeySketch;
+    use datafusion::arrow::compute::SortOptions;
+
+    let Some(state) = report.sketch.as_ref() else {
+        return "none".to_string();
+    };
+    // The key's direction and NULL placement are not in the sketch — they
+    // live once here, in the tag that says which expression it describes.
+    let Some(first) = report.order_by.first() else {
+        return "undescribable (sketch present with an empty order_by tag)".to_string();
+    };
+    let options = SortOptions {
+        descending: !first.asc,
+        nulls_first: first.nulls_first,
+    };
+    match SortKeySketch::try_from_proto(state, options) {
+        Ok(sketch) => format!(
+            "{{bytes={} k={} count={} nulls={} min={:?} max={:?}}}",
+            state.levels.len(),
+            state.k,
+            sketch.count(),
+            sketch.null_count(),
+            sketch.value_min(),
+            sketch.value_max(),
+        ),
+        Err(e) => format!("undecodable ({e})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::memory::InMemoryJobState;
+    use crate::test_utils::{mock_completed_task, mock_executor, test_aggregation_plan};
+    use ballista_core::serde::protobuf::job_status::Status;
+    use ballista_core::serde::scheduler::{PartitionId, PartitionLocation};
+    use ballista_core::utils::{default_config_producer, default_session_builder};
+    use datafusion_proto::protobuf::LogicalPlanNode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
+
+    struct BlockingJobState {
+        inner: InMemoryJobState,
+        save_started: Notify,
+        allow_save: Notify,
+        failures_remaining: AtomicUsize,
+        save_attempts: AtomicUsize,
+    }
+
+    impl BlockingJobState {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryJobState::new(
+                    "test-scheduler",
+                    Arc::new(default_session_builder),
+                    Arc::new(default_config_producer),
+                ),
+                save_started: Notify::new(),
+                allow_save: Notify::new(),
+                failures_remaining: AtomicUsize::new(0),
+                save_attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
     fn create_partition(partition: usize) -> PartitionLocation {
         PartitionLocation {
             map_partition_id: 0,
@@ -1477,7 +1392,6 @@ fn log_runtime_stats_arrival(
             job_state,
             BallistaCodec::default(),
             "test-scheduler".to_string(),
-            Arc::new(SchedulerConfig::default()),
         );
 
         let graph: ExecutionGraphBox = Box::new(test_aggregation_plan(2).await);

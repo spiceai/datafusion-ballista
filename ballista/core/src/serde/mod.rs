@@ -77,6 +77,13 @@ pub mod generated;
 /// Scheduler-specific serialization types and conversions.
 pub mod scheduler;
 
+// ============================ CoalescePlan codec ============================
+//
+// Native ↔ proto conversions for `CoalescePlan` and `PartitionGroup`. Borrow-
+// based on the encode side because the call site only has a borrow
+// (`exec.coalesce.as_ref()`); the `Vec<u32>` clone is intentional and cheap
+// for typical K (small post-coalesce partition counts).
+
 impl From<&protobuf::PartitionGroup> for PartitionGroup {
     fn from(p: &protobuf::PartitionGroup) -> Self {
         Self {
@@ -586,26 +593,28 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     "Could not deserialize BallistaPhysicalPlanNode because it's physical_plan_type is none".to_string()
                 )
             })?;
-
-        let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self.default_codec.as_ref());
-
+        let converter = DefaultPhysicalProtoConverter {};
+        let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
         match ballista_plan {
             PhysicalPlanType::ShuffleWriter(shuffle_writer) => {
                 let input = inputs[0].clone();
 
-                let shuffle_output_partitioning = parse_protobuf_hash_partitioning(
-                    shuffle_writer.output_partitioning.as_ref(),
-                    &decode_ctx,
-                    input.schema().as_ref(),
-                    &DefaultPhysicalProtoConverter {},
-                )?;
+                // ShuffleWriterExec never repartitions. A plan that still
+                // carries an output partitioning is a legacy hash-shuffle
+                // plan, which this writer no longer implements.
+                if shuffle_writer.output_partitioning.is_some() {
+                    return Err(DataFusionError::Internal(
+                        "hash-partitioned ShuffleWriterExec is no longer supported; \
+                         hash-repartition stages use SortShuffleWriterExec"
+                            .to_string(),
+                    ));
+                }
 
                 Ok(Arc::new(ShuffleWriterExec::try_new(
                     shuffle_writer.job_id.clone().into(),
                     shuffle_writer.stage_id as usize,
                     input,
                     "".to_string(), // this is intentional but hacky - the executor will fill this in
-                    shuffle_output_partitioning,
                 )?))
             }
             PhysicalPlanType::RangeShuffleWriter(range_shuffle_writer) => {
@@ -625,7 +634,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     sort_shuffle_writer.output_partitioning.as_ref(),
                     &decode_ctx,
                     input.schema().as_ref(),
-                    &DefaultPhysicalProtoConverter {},
+                    &converter,
                 )?;
 
                 let partitioning = shuffle_output_partitioning.ok_or_else(|| {
@@ -637,23 +646,20 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 let batch_size = if sort_shuffle_writer.batch_size > 0 {
                     sort_shuffle_writer.batch_size as usize
                 } else {
-                    8192 // default for backwards compatibility
-                };
-                let memory_limit = if sort_shuffle_writer.memory_limit > 0 {
-                    sort_shuffle_writer.memory_limit as usize
-                } else {
-                    SortShuffleConfig::default().memory_limit_per_task_bytes
+                    8192
                 };
                 let mut config = SortShuffleConfig::new(true, batch_size);
                 // Absent (legacy plan) keeps the built-in default; a present
                 // value — including 0, which disables the per-task budget —
                 // is applied verbatim so the session override reaches the
-                // executor where the writer actually runs.
+                // executor where the writer actually runs. Fall back to the
+                // deprecated `memory_limit` field for a peer still speaking
+                // the pre-memory_limit_per_task_bytes wire format.
                 if let Some(bytes) = sort_shuffle_writer.memory_limit_per_task_bytes {
                     config = config.with_memory_limit_per_task_bytes(bytes as usize);
-                } else if memory_limit != SortShuffleConfig::default().memory_limit_per_task_bytes
-                {
-                    config = config.with_memory_limit_per_task_bytes(memory_limit);
+                } else if sort_shuffle_writer.memory_limit > 0 {
+                    config = config
+                        .with_memory_limit_per_task_bytes(sort_shuffle_writer.memory_limit as usize);
                 }
 
                 Ok(Arc::new(SortShuffleWriterExec::try_new(
@@ -689,7 +695,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     shuffle_reader.partitioning.as_ref(),
                     &decode_ctx,
                     schema.as_ref(),
-                    &DefaultPhysicalProtoConverter {},
+                    &converter,
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
@@ -702,13 +708,12 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         partitioning,
                     )?
                 } else if shuffle_reader.broadcast {
-                    let all_locations = partition_location.into_iter().next().ok_or_else(
-                        || {
-                            proto_error(
-                                "broadcast ShuffleReaderExec: expected exactly one partition in proto",
-                            )
-                        },
-                    )?;
+                    let all_locations = partition_location
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| proto_error(
+                            "broadcast ShuffleReaderExec: expected exactly one partition in proto"
+                        ))?;
                     ShuffleReaderExec::try_new_broadcast(
                         stage_id,
                         all_locations,
@@ -794,7 +799,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     unresolved_shuffle.partitioning.as_ref(),
                     &decode_ctx,
                     schema.as_ref(),
-                    &DefaultPhysicalProtoConverter {},
+                    &converter,
                 )?;
                 let partitioning = partitioning
                     .ok_or_else(|| proto_error("missing required partitioning field"))?;
@@ -1123,9 +1128,10 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         stage_id: exec.stage_id() as u32,
                         input: None,
                         output_partitioning,
-                        // Deprecated proto fields retained for wire compat with
-                        // older schedulers/executors; writer ignores buffer_size
-                        // and spill_threshold.
+                        // Deprecated fields, kept so an older scheduler/executor
+                        // speaking this wire format still decodes a sensible
+                        // memory budget; the writer ignores buffer_size and
+                        // spill_threshold. See from_proto below.
                         buffer_size: 1024 * 1024,
                         memory_limit: config.memory_limit_per_task_bytes as u64,
                         spill_threshold: 0.8,
@@ -1161,10 +1167,11 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                         .collect::<Result<Vec<_>, _>>()?,
                 });
             }
+            let converter = DefaultPhysicalProtoConverter {};
             let partitioning = serialize_partitioning(
                 &exec.properties().partitioning,
                 self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter {},
+                &converter,
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ShuffleReader(
@@ -1238,10 +1245,11 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
 
             Ok(())
         } else if let Some(exec) = node.downcast_ref::<UnresolvedShuffleExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
             let partitioning = serialize_partitioning(
                 &exec.properties().partitioning,
                 self.default_codec.as_ref(),
-                &DefaultPhysicalProtoConverter {},
+                &converter,
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::UnresolvedShuffle(
@@ -1481,7 +1489,8 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             Ok(())
         } else {
             Err(DataFusionError::Internal(format!(
-                "unsupported plan type: {node:?}"
+                "Unsupported plan node, name: [{}] ",
+                node.name()
             )))
         }
     }
@@ -1509,6 +1518,7 @@ struct FileFormatProto {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::execution_plans::PartitionGroup;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::expressions::col;
@@ -1680,6 +1690,10 @@ mod test {
         assert_eq!(decoded_exec.stage_id, 1);
         assert_eq!(decoded_exec.schema().as_ref(), schema.as_ref());
         assert_eq!(&decoded_exec.properties().partitioning, &partitioning);
+        assert!(
+            decoded_exec.coalesce.is_none(),
+            "absent coalesce field must decode to None (codec inertness)"
+        );
     }
 
     #[tokio::test]

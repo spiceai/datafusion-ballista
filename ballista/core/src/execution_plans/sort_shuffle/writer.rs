@@ -1203,6 +1203,7 @@ async fn run_coordinator(
                     if num_rows > 0 && part_id < k {
                         grouped[part_id].push(ShuffleWritePartition {
                             partition_id: part_id as u64,
+                            path: String::new(),
                             num_batches,
                             num_rows,
                             num_bytes,

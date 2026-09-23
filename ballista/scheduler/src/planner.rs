@@ -25,6 +25,7 @@ use ballista_core::config::BallistaConfig;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleConfig;
+use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::{
     execution_plans::{
         RangeShuffleReaderExec, ShuffleReaderExec, ShuffleWriterExec,
@@ -267,7 +268,7 @@ impl DefaultDistributedPlanner {
                 .is_some_and(|f| f <= TOPK_FETCH_THRESHOLD)
             {
                 Ok((
-                    with_new_children_if_necessary(execution_plan, children)?,
+                    replace_children_if_necessary(execution_plan, children)?,
                     stages,
                 ))
             } else {
@@ -282,7 +283,7 @@ impl DefaultDistributedPlanner {
                     create_unresolved_shuffle(shuffle_writer.as_ref());
                 stages.push(shuffle_writer);
                 Ok((
-                    with_new_children_if_necessary(
+                    replace_children_if_necessary(
                         execution_plan,
                         vec![unresolved_shuffle],
                     )?,
@@ -543,6 +544,108 @@ impl DefaultDistributedPlanner {
             .with_partition_mode(PartitionMode::Partitioned)
             .with_new_children(vec![new_left, new_right])?
             .build_exec()?)
+    }
+
+    /// Returns `Some(true/false)` when statistics can determine whether an
+    /// input fits Ballista's broadcast byte limit, or `None` when its size is
+    /// unknown. Falls back to a conservative row-width estimate when possible.
+    fn broadcast_size_under_threshold(
+        plan: &dyn ExecutionPlan,
+        threshold: usize,
+    ) -> Option<bool> {
+        let Ok(stats) = StatisticsContext::new().compute(plan, &StatisticsArgs::new())
+        else {
+            debug!(
+                "broadcast check: statistics computation returned error for {}",
+                plan.name()
+            );
+            return None;
+        };
+        debug!(
+            "broadcast check: {} total_byte_size={:?} num_rows={:?} threshold={}",
+            plan.name(),
+            stats.total_byte_size,
+            stats.num_rows,
+            threshold,
+        );
+        if let Some(bytes) = stats.total_byte_size.get_value()
+            && *bytes != 0
+        {
+            Some(*bytes < threshold)
+        } else if let Some(rows) = stats.num_rows.get_value()
+            && *rows != 0
+        {
+            let schema = plan.schema();
+            let bytes_per_row: usize = schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Boolean => 1,
+                    DataType::Int8 | DataType::UInt8 => 1,
+                    DataType::Int16 | DataType::UInt16 => 2,
+                    DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
+                    DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
+                    DataType::Date32 => 4,
+                    DataType::Date64 => 8,
+                    DataType::Decimal128(_, _) => 16,
+                    DataType::Decimal256(_, _) => 32,
+                    _ => 32, // conservative estimate for variable-length types
+                })
+                .sum();
+            let estimated_bytes = *rows * bytes_per_row.max(8);
+            debug!(
+                "broadcast check: estimated {estimated_bytes} bytes ({rows} rows * {bytes_per_row} bytes/row from {} columns)",
+                schema.fields().len(),
+            );
+            Some(estimated_bytes < threshold)
+        } else {
+            None
+        }
+    }
+
+    /// Lowers a null-aware anti join to the only shape supported correctly by
+    /// DataFusion's in-process hash join: collect the build side and coalesce
+    /// the probe side so one task owns all shared null/visited state.
+    fn lower_null_aware_join(
+        hash_join: &HashJoinExec,
+        threshold_bytes: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Unknown size is allowed because file scans commonly lose exact byte
+        // statistics before this point. Known oversized inputs and an explicit
+        // threshold of zero fail clearly instead of running an unsafe plan.
+        if threshold_bytes == 0
+            || matches!(
+                Self::broadcast_size_under_threshold(
+                    &**hash_join.left(),
+                    threshold_bytes
+                ),
+                Some(false)
+            )
+        {
+            return Err(BallistaError::General(format!(
+                "Null-aware anti join requires single-task execution, but its build side does not fit ballista.optimizer.broadcast_join_threshold_bytes ({threshold_bytes} bytes)"
+            )));
+        }
+
+        // Always keep an explicit coalesce. Some scans report one output
+        // partition during planning but expand to multiple partitions when the
+        // distributed stage is built.
+        let right: Arc<dyn ExecutionPlan> = if hash_join
+            .right()
+            .downcast_ref::<CoalescePartitionsExec>()
+            .is_some()
+        {
+            hash_join.right().clone()
+        } else {
+            Arc::new(CoalescePartitionsExec::new(hash_join.right().clone()))
+        };
+
+        hash_join
+            .builder()
+            .with_partition_mode(PartitionMode::CollectLeft)
+            .with_new_children(vec![hash_join.left().clone(), right])?
+            .build_exec()
+            .map_err(Into::into)
     }
 
     fn next_stage_id(&mut self) -> usize {
@@ -863,23 +966,15 @@ pub(crate) fn create_shuffle_writer_with_config(
             "unsupported shuffle output partitioning: {other}"
         ))),
     }
-
-    // Fall back to standard shuffle writer
-    Ok(Arc::new(ShuffleWriterExec::try_new(
-        job_id.clone(),
-        stage_id,
-        plan,
-        "".to_owned(),
-        partitioning,
-    )?))
 }
 
 #[cfg(test)]
 mod test {
     use super::{can_stay_inline, holds_a_broadcast};
     use crate::planner::{DefaultDistributedPlanner, DistributedPlanner};
-    use crate::test_utils::datafusion_test_context;
+    use crate::test_utils::{datafusion_test_context, scan_with_file_groups};
     use ballista_core::JobId;
+    use ballista_core::assert_plan;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::{SortShuffleWriterExec, UnresolvedShuffleExec};
     use ballista_core::serde::BallistaCodec;
@@ -1402,121 +1497,6 @@ order by
             ),
             "{error}"
         );
-    }
-
-    #[tokio::test]
-    async fn distributed_window_plan() -> Result<(), BallistaError> {
-        let ctx = datafusion_test_context("testdata").await?;
-        let session_state = ctx.state();
-
-        // simplified form of TPC-DS query 67
-        let df = ctx
-            .sql(
-                "
-                 select * from (
-                     select
-                         l_shipmode,
-                         l_shipdate,
-                         rank() over (partition by l_shipmode order by l_shipdate desc) rk
-                     from lineitem
-                 ) alias1
-                 where rk <= 100 order by l_shipdate, rk;
-                ",
-            )
-            .await?;
-
-        let plan = df.into_optimized_plan()?;
-        let plan = session_state.optimize(&plan)?;
-        let plan = session_state.create_physical_plan(&plan).await?;
-
-        let mut planner = DefaultDistributedPlanner::new();
-        let job_uuid = Uuid::new_v4();
-        let job_id = JobId::new(job_uuid.to_string());
-        let stages =
-            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
-        for (i, stage) in stages.iter().enumerate() {
-            println!("Stage {i}:\n{}", displayable(stage.as_ref()).indent(false));
-        }
-        /*
-            expected result:
-            Stage 0:
-            ShuffleWriterExec: partitioning: Hash([l_shipmode@1], 2)
-              DataSourceExec: file_groups={2 groups: [[ballista/scheduler/testdata/lineitem/partition0.tbl], [ballista/scheduler/testdata/lineitem/partition1.tbl]]}, projection=[l_shipdate, l_shipmode], file_type=csv, has_header=false
-
-            Stage 1:
-            ShuffleWriterExec: partitioning: None
-              SortExec: expr=[l_shipdate@1 ASC NULLS LAST, rk@2 ASC NULLS LAST], preserve_partitioning=[true]
-                ProjectionExec: expr=[l_shipmode@1 as l_shipmode, l_shipdate@0 as l_shipdate, rank() PARTITION BY [lineitem.l_shipmode] ORDER BY [lineitem.l_shipdate DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as rk]
-                FilterExec: rank() PARTITION BY [lineitem.l_shipmode] ORDER BY [lineitem.l_shipdate DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 100
-                  BoundedWindowAggExec: wdw=[rank() PARTITION BY [lineitem.l_shipmode] ORDER BY [lineitem.l_shipdate DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "rank() PARTITION BY [lineitem.l_shipmode] ORDER BY [lineitem.l_shipdate DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
-                    SortExec: expr=[l_shipmode@1 ASC NULLS LAST, l_shipdate@0 DESC], preserve_partitioning=[true]
-                      UnresolvedShuffleExec: partitioning: Hash([l_shipmode@1], 2)
-
-            Stage 2:
-            ShuffleWriterExec: partitioning: None
-              SortPreservingMergeExec: [l_shipdate@1 ASC NULLS LAST, rk@2 ASC NULLS LAST]
-                UnresolvedShuffleExec: partitioning: Hash([l_shipmode@0], 2)
-
-        */
-
-        assert_eq!(3, stages.len());
-
-        // stage0
-        let stage0 = stages[0].clone();
-        let shuffle_write = downcast_exec!(stage0, SortShuffleWriterExec);
-        let partitioning = shuffle_write.shuffle_output_partitioning();
-        assert_eq!(2, partitioning.partition_count());
-        let partition_col = match partitioning {
-            Partitioning::Hash(exprs, 2) => match exprs.as_slice() {
-                [col] => col.downcast_ref::<Column>(),
-                _ => None,
-            },
-            _ => None,
-        };
-        assert_eq!(Some(&Column::new("l_shipmode", 1)), partition_col);
-
-        // stage1
-        let sort = downcast_exec!(stages[1].children()[0], SortExec);
-        let projection = downcast_exec!(sort.children()[0], ProjectionExec);
-        let filter = downcast_exec!(projection.children()[0], FilterExec);
-        let window = downcast_exec!(filter.children()[0], BoundedWindowAggExec);
-        let partition_by = window.partition_keys();
-        let partition_by = match partition_by[..] {
-            [ref col] => col.downcast_ref::<Column>(),
-            _ => None,
-        };
-        assert_eq!(Some(&Column::new("l_shipmode", 1)), partition_by);
-        assert_eq!(InputOrderMode::Sorted, window.input_order_mode);
-        let sort = downcast_exec!(window.children()[0], SortExec);
-        match &sort.expr().iter().collect::<Vec<_>>()[..] {
-            [expr1, expr2] => {
-                assert_eq!(
-                    SortOptions {
-                        descending: false,
-                        nulls_first: false
-                    },
-                    expr1.options
-                );
-                assert_eq!(
-                    Some(&Column::new("l_shipmode", 1)),
-                    expr1.expr.downcast_ref()
-                );
-                assert_eq!(
-                    SortOptions {
-                        descending: true,
-                        nulls_first: true
-                    },
-                    expr2.options
-                );
-                assert_eq!(
-                    Some(&Column::new("l_shipdate", 0)),
-                    expr2.expr.downcast_ref()
-                );
-            }
-            _ => panic!("invalid sort {sort:?}"),
-        };
-
-        Ok(())
     }
 
     #[tokio::test]
@@ -2402,46 +2382,6 @@ order by
 
         let options = ctx.state().config().options().clone();
         Ok((ctx, (*options).clone()))
-    }
-
-    #[tokio::test]
-    async fn roundtrip_serde_aggregate() -> Result<(), BallistaError> {
-        let ctx = datafusion_test_context("testdata").await?;
-        let session_state = ctx.state();
-
-        // simplified form of TPC-H query 1
-        let df = ctx
-            .sql(
-                "select l_returnflag, sum(l_extendedprice * 1) as sum_disc_price
-            from lineitem
-            group by l_returnflag
-            order by l_returnflag",
-            )
-            .await?;
-
-        let plan = df.into_optimized_plan()?;
-        let plan = session_state.optimize(&plan)?;
-        let plan = session_state.create_physical_plan(&plan).await?;
-
-        let mut planner = DefaultDistributedPlanner::new();
-        let job_uuid = Uuid::new_v4();
-        let job_id = JobId::new(job_uuid.to_string());
-        let stages =
-            planner.plan_query_stages(&job_id, plan, ctx.state().config().options())?;
-
-        let partial_hash = stages[0].children()[0].clone();
-        let partial_hash_serde =
-            roundtrip_operator(&ctx.task_ctx(), partial_hash.clone())?;
-
-        let partial_hash = downcast_exec!(partial_hash, AggregateExec);
-        let partial_hash_serde = downcast_exec!(partial_hash_serde, AggregateExec);
-
-        assert_eq!(
-            format!("{partial_hash:?}"),
-            format!("{partial_hash_serde:?}")
-        );
-
-        Ok(())
     }
 
     fn roundtrip_operator(

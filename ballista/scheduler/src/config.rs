@@ -28,6 +28,7 @@
 use crate::SessionBuilder;
 use crate::cluster::DistributionPolicy;
 use crate::metrics::SchedulerMetricsCollector;
+use crate::scheduler_server::JobIdGenerator;
 use ballista_core::extension::EndpointOverrideFn;
 use ballista_core::{ConfigProducer, JobId, config::TaskSchedulingPolicy};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
@@ -36,15 +37,36 @@ use log::{info, warn};
 use std::fmt::Display;
 use std::sync::Arc;
 
-/// Callback invoked when new work becomes available for executors.
+/// Why the scheduler believes new work has become available for executors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkAvailableReason {
+    /// A job was submitted and its initial tasks are ready to be scheduled.
+    JobSubmitted {
+        /// Identifier of the submitted job.
+        job_id: JobId,
+    },
+    /// Completed tasks resolved downstream stages of a job, and the tasks of
+    /// those stages are now schedulable.
+    NewStagesRunnable {
+        /// Identifier of the job that gained schedulable tasks.
+        job_id: JobId,
+    },
+}
+
+/// Callback invoked when new work becomes available for executors, e.g. to
+/// wake idle pull-based executors via the poll loop's `poll_now_notify`.
 ///
-/// This is called after:
-/// - A job is submitted and tasks are ready to be scheduled
-/// - Tasks complete and new stages become runnable
+/// It fires only after the work is visible to a polling executor, so waking
+/// one cannot race the scheduler's internal event processing.
 ///
-/// This allows external systems to notify executors to poll immediately
-/// rather than waiting for their next poll interval.
-pub type OnWorkAvailableFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// # Warning
+///
+/// The callback runs synchronously inside the scheduler's main event loop.
+/// Implementations **must be non-blocking**; offload blocking or long-running
+/// work (such as network I/O) to a separate task or thread.
+///
+/// `Arc` rather than `Box` so [`SchedulerConfig`] remains [`Clone`].
+pub type OnWorkAvailableFn = Arc<dyn Fn(WorkAvailableReason) + Send + Sync>;
 
 /// Callback invoked when running tasks should be cancelled on an executor.
 ///
@@ -409,9 +431,6 @@ pub struct SchedulerConfig {
     #[cfg(feature = "rest-api")]
     /// The HTTP path that will redirect to the WebTUI app at `https://nightlies.apache.org`
     pub web_tui_route: String,
-    /// Callback invoked when new work becomes available for executors.
-    /// See [`OnWorkAvailableFn`].
-    pub on_work_available: Option<OnWorkAvailableFn>,
     /// Job id generator to be used by this scheduler
     pub job_id_generator: Option<Arc<dyn JobIdGenerator>>,
 }
@@ -462,7 +481,6 @@ impl Default for SchedulerConfig {
             event_log_dir: None,
             #[cfg(feature = "rest-api")]
             web_tui_route: String::from("/"),
-            on_work_available: None,
             job_id_generator: None,
         }
     }
@@ -865,7 +883,6 @@ impl TryFrom<Config> for SchedulerConfig {
             event_log_dir: opt.event_log_dir,
             #[cfg(feature = "rest-api")]
             web_tui_route: opt.web_tui_route,
-            on_work_available: None,
             job_id_generator: None,
         };
 

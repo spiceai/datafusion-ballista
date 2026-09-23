@@ -845,7 +845,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
                         let operator_metrics = task_status.metrics.clone();
                         let status = task_status.status.clone();
-                        if !running_stage.update_task_info(partition_id, task_status) {
+                        if !running_stage.update_task_info(task_id, task_status) {
                             continue;
                         }
                         //
@@ -1468,20 +1468,10 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 let task_id = stage.task_infos.len();
                 let task_attempt = input_partition_ids
                     .iter()
-                    .enumerate()
-                    .find(|(_partition, info)| info.is_none())
-                    .ok_or_else(|| {
-                        BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
-                    })?;
-
-                let partition = PartitionId {
-                    job_id,
-                    stage_id: *stage_id,
-                    partition_id,
-                };
-
-                let task_id = next_task_id.unwrap();
-                let task_attempt = stage.task_failure_numbers[partition_id];
+                    .map(|pid| stage.task_failure_numbers[*pid])
+                    .max()
+                    .unwrap_or(0);
+                let vcores_consumed = input_partition_ids.len() as u32;
                 let task_info = crate::state::execution_stage::TaskInfo {
                     task_id,
                     executor_id: executor_id.to_owned(),
@@ -1497,7 +1487,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         executor_id: executor_id.to_owned()
                     }),
                     global_input_partition_ids: input_partition_ids.clone(),
-                    vcores_consumed: input_partition_ids.len() as u32,
+                    vcores_consumed,
                 };
                 stage.task_infos.push(task_info);
 
@@ -1507,7 +1497,6 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     task_id,
                 };
 
-                let vcores_consumed = input_partition_ids.len() as u32;
                 Ok(crate::state::execution_graph::TaskDescription {
                     session_id,
                     key,

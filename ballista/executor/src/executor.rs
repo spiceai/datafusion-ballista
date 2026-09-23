@@ -39,8 +39,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use futures::future::AbortHandle;
 use futures::task::AtomicWaker;
-use log::error;
-use log::warn;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -280,7 +278,7 @@ impl Executor {
             config_producer,
             Arc::new(BallistaFunctionRegistry::default()),
             Arc::new(LoggingMetricsCollector::default()),
-            concurrent_tasks,
+            vcores,
             None,
         )
     }
@@ -305,8 +303,9 @@ impl Executor {
             runtime_producer,
             config_producer,
             metrics_collector,
-            vcores,
+            vcores: concurrent_tasks,
             abort_handles: Default::default(),
+            tasks_drained_waker: Default::default(),
             execution_engine: execution_engine
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
@@ -374,9 +373,9 @@ impl Executor {
 
         // Record task start for metrics tracking
         self.metrics_collector.record_task_started(
-            &partition.job_id,
-            partition.stage_id,
-            partition.partition_id,
+            &key.job_id,
+            key.stage_id,
+            key.task_id,
         );
 
         let (task, abort_handle) = futures::future::abortable(
@@ -399,9 +398,9 @@ impl Executor {
                     extract_shuffle_write_metrics(&query_stage_exec);
                 if let Some((bytes, rows, write_time_ms)) = shuffle_write_metrics {
                     self.metrics_collector.record_shuffle_write(
-                        &partition.job_id,
-                        partition.stage_id,
-                        partition.partition_id,
+                        &key.job_id,
+                        key.stage_id,
+                        key.task_id,
                         bytes,
                         rows,
                         write_time_ms,
@@ -420,9 +419,9 @@ impl Executor {
                         .map(|(_, _, write_ms)| duration_ms.saturating_sub(write_ms))
                         .unwrap_or(0);
                     self.metrics_collector.record_shuffle_read(
-                        &partition.job_id,
-                        partition.stage_id,
-                        partition.partition_id,
+                        &key.job_id,
+                        key.stage_id,
+                        key.task_id,
                         bytes,
                         rows,
                         read_duration_ms,
@@ -430,9 +429,9 @@ impl Executor {
                 }
 
                 self.metrics_collector.record_stage(
-                    &partition.job_id,
-                    partition.stage_id,
-                    partition.partition_id,
+                    &key.job_id,
+                    key.stage_id,
+                    key.task_id,
                     query_stage_exec,
                     duration_ms,
                 );
@@ -440,9 +439,9 @@ impl Executor {
             }
             Ok(Err(e)) => {
                 self.metrics_collector.record_task_failed(
-                    &partition.job_id,
-                    partition.stage_id,
-                    partition.partition_id,
+                    &key.job_id,
+                    key.stage_id,
+                    key.task_id,
                     &categorize_datafusion_error(&e),
                 );
                 Err(BallistaError::from(e))
@@ -494,14 +493,13 @@ mod test {
     use crate::runtime_cache::{
         DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
     };
-    use ballista_core::JobId;
     use ballista_core::RuntimeProducer;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::ShuffleWriterExec;
     use ballista_core::serde::protobuf::{
         ExecutorOperatingSystemSpecification, ExecutorRegistration,
     };
-    use ballista_core::serde::scheduler::PartitionId;
+    use ballista_core::serde::scheduler::TaskKey;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -640,23 +638,8 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_task_cancellation() {
-        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
-
-        let job_id = JobId::new("job-id");
-        let cancel_job_id = job_id.clone();
-        let shuffle_write = ShuffleWriterExec::try_new(
-            job_id.clone(),
-            1,
-            Arc::new(NeverendingOperator::new()),
-            work_dir.clone(),
-            None,
-        )
-        .expect("creating shuffle writer");
-
-        let query_stage_exec =
-            DefaultQueryStageExec::new(ShuffleWriterVariant::Hash(shuffle_write));
+    /// The result `execute_query_stage` hands back once a spawned task unwinds.
+    type TaskOutcome = Result<Vec<ballista_core::serde::protobuf::ShuffleWritePartition>, BallistaError>;
 
     /// Builds an executor over `work_dir`, along with the session context whose
     /// runtime its tasks run on.
@@ -668,6 +651,7 @@ mod test {
             specification: None,
             host: None,
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: ballista_core::BALLISTA_PROTOCOL_VERSION,
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();
@@ -709,13 +693,8 @@ mod test {
         let executor = executor.clone();
         let task_ctx = ctx.task_ctx();
         tokio::task::spawn(async move {
-            let part = PartitionId {
-                job_id: job_id.clone(),
-                stage_id: 1,
-                partition_id: 0,
-            };
-            let task_result = executor_clone
-                .execute_query_stage(1, part, Arc::new(query_stage_exec), ctx.task_ctx())
+            let task_result = executor
+                .execute_query_stage(key, Arc::new(query_stage_exec), task_ctx)
                 .await;
             sender.send(task_result).expect("sending result");
         });
@@ -727,11 +706,7 @@ mod test {
     /// executor reports the count the test is waiting on.
     async fn await_active_task_count(executor: &Executor, expected: usize) {
         for _ in 0..20 {
-            if executor
-                .cancel_task(1, cancel_job_id.clone(), 1, 0)
-                .await
-                .expect("cancelling task")
-            {
+            if executor.active_task_count() == expected {
                 break;
             } else {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -856,6 +831,7 @@ mod test {
             specification: None,
             host: None,
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: ballista_core::BALLISTA_PROTOCOL_VERSION,
         };
         let config_producer = Arc::new(default_config_producer);
 
@@ -895,6 +871,7 @@ mod test {
             specification: None,
             host: None,
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: ballista_core::BALLISTA_PROTOCOL_VERSION,
         };
         let config_producer = Arc::new(default_config_producer);
         let base_producer: RuntimeProducer =

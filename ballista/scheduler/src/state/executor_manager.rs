@@ -20,12 +20,15 @@ use std::time::Duration;
 use ballista_core::JobId;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf;
 use ballista_core::serde::protobuf::ExecutorMetric;
 use ballista_core::serde::protobuf::executor_metric::Metric;
 use log::trace;
 
-use crate::cluster::{BindingResult, ClusterState, ExecutorSlot};
+use crate::cluster::{
+    BindingResult, ClusterState, ClusterStateEventStream, ExecutorSlot,
+};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;
@@ -68,6 +71,9 @@ pub struct ExecutorManager {
     /// Per-executor pending cleanups: job id -> stage ids to remove
     /// (empty stage ids ⇒ remove the whole job dir).
     pending_cleanup_jobs: Arc<DashMap<String, HashMap<JobId, Vec<u32>>>>,
+    /// gRPC client settings (e.g. message-size limits) for outbound
+    /// task-assignment RPCs to executors.
+    grpc_client_config: GrpcClientConfig,
 }
 
 impl ExecutorManager {
@@ -98,6 +104,7 @@ impl ExecutorManager {
             config,
             clients: Default::default(),
             pending_cleanup_jobs: Default::default(),
+            grpc_client_config,
         }
     }
 
@@ -176,7 +183,6 @@ impl ExecutorManager {
                         task_id: task_info.task_id as u32,
                         job_id: task_info.job_id.into(),
                         stage_id: task_info.stage_id as u32,
-                        partition_id: task_info.partition_id as u32,
                     })
                     .collect(),
             );
@@ -441,9 +447,9 @@ impl ExecutorManager {
         executor_id: &str,
         multi_tasks: Vec<MultiTaskDefinition>,
         scheduler_id: String,
-    ) -> Result<()> {
+    ) -> Result<HashSet<JobId>> {
         let mut client = self.get_client(executor_id).await?;
-        client
+        let res = client
             .launch_multi_task(protobuf::LaunchMultiTaskParams {
                 multi_tasks,
                 scheduler_id,
@@ -582,8 +588,8 @@ impl ExecutorManager {
             // Without this the configured `max_message_size` is silently
             // ignored and task assignment falls back to tonic's own defaults.
             let client = ExecutorGrpcClient::new(connection)
-                .max_encoding_message_size(grpc_client_config.max_message_size)
-                .max_decoding_message_size(grpc_client_config.max_message_size);
+                .max_encoding_message_size(self.grpc_client_config.max_message_size)
+                .max_decoding_message_size(self.grpc_client_config.max_message_size);
 
             {
                 self.clients.insert(executor_id.to_owned(), client.clone());
@@ -644,21 +650,18 @@ mod tests {
                 task_id: 1,
                 job_id: JobId::new("job-1"),
                 stage_id: 1,
-                partition_id: 0,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 2,
                 job_id: JobId::new("job-1"),
                 stage_id: 1,
-                partition_id: 1,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 3,
                 job_id: JobId::new("job-2"),
                 stage_id: 2,
-                partition_id: 0,
                 executor_id: "executor-b".to_string(),
             },
         ];

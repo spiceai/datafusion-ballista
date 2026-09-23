@@ -77,21 +77,6 @@ use ballista_core::{
     BALLISTA_PROTOCOL_VERSION, BALLISTA_VERSION, ConfigProducer, JobId, RuntimeProducer,
 };
 
-use crate::client_pool::DefaultBallistaClientPool;
-use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
-use crate::executor::{Executor, TasksDrainedFuture};
-use crate::executor_server::TERMINATING;
-use crate::flight_service::BallistaFlightService;
-use crate::metrics::ExecutorMetricCollectionPolicy;
-use crate::metrics::LoggingMetricsCollector;
-use crate::runtime_cache::{
-    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
-};
-use crate::shutdown::Shutdown;
-use crate::shutdown::ShutdownNotifier;
-use crate::{ArrowFlightServerProvider, terminate};
-use crate::{execution_loop, executor_server};
-
 /// Default fraction of the detected memory limit handed to the pool when
 /// `--memory-pool-fraction` is not set. The `FairSpillPool` only bounds memory
 /// operators register with it, so the remaining budget absorbs untracked
@@ -454,7 +439,7 @@ pub async fn start_executor_process(
     info!("Executor starting ... (Datafusion Ballista {BALLISTA_VERSION})");
     info!("Executor id: {executor_id}");
     info!("Executor working directory: {work_dir}");
-    info!("Executor number of concurrent tasks: {concurrent_tasks}");
+    info!("Executor number of concurrent tasks: {vcores}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
     let executor_meta = structure_executor_metadata(&executor_id, &opt, vcores as u32);
@@ -561,7 +546,7 @@ pub async fn start_executor_process(
             config_producer,
             opt.override_function_registry.clone().unwrap_or_default(),
             metrics_collector,
-            concurrent_tasks,
+            vcores,
             Some(opt.override_execution_engine.clone().unwrap_or_else(|| {
                 if opt.client_ttl > 0 {
                     let client_pool =
@@ -807,7 +792,7 @@ pub async fn start_executor_process(
                 metadata: Some(structure_executor_metadata(
                     &executor_id,
                     &opt,
-                    concurrent_tasks as u32,
+                    vcores as u32,
                 )),
             })
             .await

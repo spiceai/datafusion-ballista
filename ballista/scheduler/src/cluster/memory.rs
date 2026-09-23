@@ -72,7 +72,7 @@ impl InMemoryClusterState {
     /// Get the topology nodes of the cluster for consistent hashing
     fn get_topology_nodes(
         &self,
-        guard: &MutexGuard<HashMap<String, AvailableTaskSlots>>,
+        guard: &MutexGuard<HashMap<String, AvailableVcores>>,
         executors: Option<HashSet<String>>,
     ) -> HashMap<String, TopologyNode> {
         let mut nodes: HashMap<String, TopologyNode> = HashMap::new();
@@ -91,7 +91,7 @@ impl InMemoryClusterState {
                         .get(&executor.id)
                         .map(|heartbeat| heartbeat.timestamp)
                         .unwrap_or(0),
-                    slots.slots,
+                    slots.vcores,
                 );
                 if let Some(existing_node) = nodes.get(node.name()) {
                     if existing_node.last_seen_ts < node.last_seen_ts {
@@ -114,7 +114,7 @@ impl ClusterState for InMemoryClusterState {
         active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
         executors: Option<HashSet<String>>,
     ) -> Result<BindingResult> {
-        let mut guard = self.task_slots.lock().await;
+        let mut guard = self.available_vcores.lock().await;
 
         let budgets: Vec<&mut AvailableVcores> = guard
             .values_mut()
@@ -140,7 +140,7 @@ impl ClusterState for InMemoryClusterState {
                 tolerance,
             } => {
                 let mut result = bind_task_round_robin(
-                    available_slots,
+                    budgets,
                     active_jobs.clone(),
                     |stage_plan: Arc<dyn ExecutionPlan>| {
                         if let Ok(scan_files) = get_scan_files(stage_plan) {
@@ -174,7 +174,7 @@ impl ClusterState for InMemoryClusterState {
                     let ch_topology = ch_topology.unwrap();
                     for node in ch_topology.nodes() {
                         if let Some(data) = guard.get_mut(&node.id) {
-                            data.slots = node.available_slots;
+                            data.vcores = node.available_slots;
                         } else {
                             error!("Fail to find executor data for {}", node.id);
                         }
@@ -185,7 +185,7 @@ impl ClusterState for InMemoryClusterState {
             TaskDistributionPolicy::Custom(ref policy) => {
                 // Custom policies don't support affinity tracking yet
                 BindingResult::from_tasks(
-                    policy.bind_tasks(available_slots, active_jobs).await?,
+                    policy.bind_tasks(budgets, active_jobs).await?,
                 )
             }
         };

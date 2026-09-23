@@ -30,6 +30,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::Stream;
 use log::debug;
 
+use ballista_core::config::BallistaConfig;
 use ballista_core::consistent_hash::ConsistentHash;
 use ballista_core::error::Result;
 use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
@@ -440,6 +441,148 @@ fn get_executors_with_local_shuffle_data(
     Some(executors_with_local_data)
 }
 
+/// Whether this stage's plan contains a collapse — any operator whose
+/// `output_partitioning().partition_count() == 1` (`CoalescePartitionsExec`,
+/// `SortPreservingMergeExec`, `AggregateExec(Final, gby=[])`,
+/// `SortExec(preserve_partitioning=false)`, …). Downstream of a collapse
+/// expects the *combined* input; splitting across tasks would give each
+/// task's local collapse only a slice, producing partial results.
+///
+/// Walks past *any* single-child operator: today's writers that bake
+/// partitioning into the shuffle write itself (`SortShuffleWriterExec::Hash`),
+/// and future partition operators that separate partitioning from writing
+/// (e.g. `UnorderedRangeRepartitionExec`). Stops at leaves, multi-child
+/// operators (fan-in / joins), and stage boundaries.
+///
+/// The stage-boundary stop enumerates the leaf readers that terminate a
+/// resolved stage plan: `ShuffleReaderExec` (regular / broadcast / coalesced)
+/// and `RangeShuffleReaderExec` (ordering-preserving). The *general* rule is
+/// "stop at any stage boundary"; if new stage-boundary operators appear, add
+/// them here (or, better, get `ExecutionPlan` upstream to expose an
+/// `is_stage_boundary()` property so we don't keep enumerating).
+fn stage_has_input_collapse(plan_root: &Arc<dyn ExecutionPlan>) -> bool {
+    fn walk(node: &Arc<dyn ExecutionPlan>) -> bool {
+        if node.downcast_ref::<ShuffleReaderExec>().is_some()
+            || node.downcast_ref::<RangeShuffleReaderExec>().is_some()
+        {
+            return false;
+        }
+        if node.properties().output_partitioning().partition_count() == 1 {
+            return true;
+        }
+        match node.children().as_slice() {
+            [child] => walk(child),
+            _ => false,
+        }
+    }
+    let result = match plan_root.children().as_slice() {
+        [child] => walk(child),
+        _ => false,
+    };
+    debug!(
+        "stage_has_input_collapse: root={} root_partitions={} → {result}",
+        plan_root.name(),
+        plan_root
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+    );
+    result
+}
+
+/// Binds one runnable slice of `running_stage`'s pending partitions to
+/// `budget`'s executor, consuming as many vcores as the slice needs (see
+/// [`crate::state::execution_stage::RunningStage::pending`]).  Returns `None`
+/// once the stage has no more pending partitions to bind.
+fn bind_one(
+    running_stage: &mut crate::state::execution_stage::RunningStage,
+    session_id: &str,
+    job_id: &JobId,
+    budget: &mut AvailableVcores,
+) -> Option<BoundTask> {
+    let is_collapse = stage_has_input_collapse(&running_stage.plan);
+    // Cap non-collapse slices at the configured `max_partitions_per_task`.
+    // Collapse stages must still pack their full pending queue into a single
+    // task for correctness — a split collapse would produce partial results
+    // downstream can't merge.
+    let cap = running_stage
+        .session_config
+        .options()
+        .extensions
+        .get::<BallistaConfig>()
+        .map(|bc| bc.max_partitions_per_task())
+        .filter(|&n| n > 0)
+        .unwrap_or(usize::MAX);
+    let max_partitions = if is_collapse {
+        usize::MAX
+    } else {
+        (budget.vcores as usize).min(cap)
+    };
+    let input_partition_ids = running_stage.pending.next_slice(max_partitions);
+    if input_partition_ids.is_empty() {
+        return None;
+    }
+    // Non-collapse: DataFusion's volcano/pull model drives one tokio task per
+    // root output partition, so N input partitions bundled into a task need
+    // N vcores of concurrent execution. Collapse: the plan's root has a
+    // single output partition, so only 1 thread is ever active for the
+    // whole pipeline no matter how many inputs the task packs — reserve
+    // one vcore and leave the rest for other stages' tasks on this executor.
+    let vcores_consumed = if is_collapse {
+        1
+    } else {
+        input_partition_ids.len() as u32
+    };
+    debug!(
+        "bind_one: job={} stage={} exec={} vcores={} max={} slice_len={} consumed={} partitions={:?} collapse={}",
+        job_id,
+        running_stage.stage_id,
+        budget.executor_id,
+        budget.vcores,
+        if max_partitions == usize::MAX {
+            -1i64
+        } else {
+            max_partitions as i64
+        },
+        input_partition_ids.len(),
+        vcores_consumed,
+        input_partition_ids,
+        is_collapse,
+    );
+    let executor_id = budget.executor_id.clone();
+    // task_id is the append-order slot in `task_infos` — since we're
+    // about to push, that's `task_infos.len()`. `(job_id, stage_id,
+    // task_id)` is globally unique.
+    let task_id = running_stage.task_infos.len();
+    let task_attempt = input_partition_ids
+        .iter()
+        .map(|pid| running_stage.task_failure_numbers[*pid])
+        .max()
+        .unwrap_or(0);
+    let mut task_info = create_task_info(executor_id.clone(), task_id);
+    task_info.global_input_partition_ids = input_partition_ids.clone();
+    task_info.vcores_consumed = vcores_consumed;
+    running_stage.task_infos.push(task_info);
+    let key = TaskKey {
+        job_id: job_id.clone(),
+        stage_id: running_stage.stage_id,
+        task_id,
+    };
+    let task_desc = TaskDescription {
+        session_id: session_id.to_string(),
+        key,
+        stage_attempt_num: running_stage.stage_attempt_num,
+        task_attempt,
+        global_input_partition_ids: input_partition_ids,
+        vcores_consumed,
+        plan: running_stage.plan.clone(),
+        session_config: running_stage.session_config.clone(),
+        schedulable_time_millis: running_stage.stage_running_time,
+    };
+    budget.vcores -= vcores_consumed;
+    Some((executor_id, task_desc))
+}
+
 pub(crate) async fn bind_task_bias(
     mut budgets: Vec<&mut AvailableVcores>,
     running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
@@ -447,9 +590,8 @@ pub(crate) async fn bind_task_bias(
 ) -> BindingResult {
     let mut result = BindingResult::new();
 
-    let total_slots = slots.iter().fold(0, |acc, s| acc + s.slots);
-    if total_slots == 0 {
-        debug!("Not enough available executor slots for task running!!!");
+    if budgets.iter().all(|b| b.vcores == 0) {
+        debug!("No executor vcores available for task binding");
         return result;
     }
 
@@ -465,7 +607,6 @@ pub(crate) async fn bind_task_bias(
             continue;
         }
         let mut graph = job_info.execution_graph.write().await;
-
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
         while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
@@ -483,57 +624,28 @@ pub(crate) async fn bind_task_bias(
                 get_executors_with_local_shuffle_data(running_stage);
             let stage_id = running_stage.stage_id;
 
-            // We are sure that it will at least bind one task by going through the following logic.
-            // It will not go into a dead loop.
-            let runnable_tasks = running_stage
-                .task_infos
-                .iter_mut()
-                .enumerate()
-                .filter(|(_partition, info)| info.is_none())
-                .take(total_slots as usize)
-                .collect::<Vec<_>>();
-            for (partition_id, task_info) in runnable_tasks {
-                // Assign [`slot`] with a slot available slot number larger than 0
-                while slot.slots == 0 {
-                    idx_slot += 1;
-                    if idx_slot >= slots.len() {
-                        return result;
+            while idx < budgets.len() {
+                while idx < budgets.len() && budgets[idx].vcores == 0 {
+                    idx += 1;
+                }
+                if idx >= budgets.len() {
+                    return result;
+                }
+                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
+                    Some((executor_id, task_desc)) => {
+                        // Record shuffle affinity for this task if it has shuffle inputs
+                        if let Some(ref local_executors) = executors_with_local_data {
+                            result.shuffle_affinity.push(ShuffleAffinityInfo {
+                                job_id: job_id.clone(),
+                                stage_id,
+                                executor_id: executor_id.clone(),
+                                has_local_data: local_executors.contains(&executor_id),
+                            });
+                        }
+                        result.bound_tasks.push((executor_id, task_desc));
                     }
-                    slot = &mut slots[idx_slot];
+                    None => break, // stage's pending is drained
                 }
-                let executor_id = slot.executor_id.clone();
-                let task_id = *task_id_gen;
-                *task_id_gen += 1;
-                *task_info = Some(create_task_info(executor_id.clone(), task_id));
-
-                // Record shuffle affinity for this task if it has shuffle inputs
-                if let Some(ref local_executors) = executors_with_local_data {
-                    result.shuffle_affinity.push(ShuffleAffinityInfo {
-                        job_id: job_id.clone(),
-                        stage_id,
-                        executor_id: executor_id.clone(),
-                        has_local_data: local_executors.contains(&executor_id),
-                    });
-                }
-
-                let partition = PartitionId {
-                    job_id: job_id.clone(),
-                    stage_id,
-                    partition_id,
-                };
-                let task_desc = TaskDescription {
-                    session_id: session_id.clone(),
-                    partition,
-                    stage_attempt_num: running_stage.stage_attempt_num,
-                    task_id,
-                    task_attempt: running_stage.task_failure_numbers[partition_id],
-                    plan: running_stage.plan.clone(),
-                    session_config: running_stage.session_config.clone(),
-                    schedulable_time_millis: running_stage.stage_running_time,
-                };
-                result.bound_tasks.push((executor_id, task_desc));
-
-                slot.slots -= 1;
             }
         }
     }
@@ -548,9 +660,8 @@ pub(crate) async fn bind_task_round_robin(
 ) -> BindingResult {
     let mut result = BindingResult::new();
 
-    let mut total_slots = slots.iter().fold(0, |acc, s| acc + s.slots);
-    if total_slots == 0 {
-        debug!("Not enough available executor slots for task running!!!");
+    if budgets.iter().all(|b| b.vcores == 0) {
+        debug!("No executor vcores available for task binding");
         return result;
     }
 
@@ -566,7 +677,6 @@ pub(crate) async fn bind_task_round_robin(
             continue;
         }
         let mut graph = job_info.execution_graph.write().await;
-
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
         while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
@@ -584,63 +694,30 @@ pub(crate) async fn bind_task_round_robin(
                 get_executors_with_local_shuffle_data(running_stage);
             let stage_id = running_stage.stage_id;
 
-            // We are sure that it will at least bind one task by going through the following logic.
-            // It will not go into a dead loop.
-            let runnable_tasks = running_stage
-                .task_infos
-                .iter_mut()
-                .enumerate()
-                .filter(|(_partition, info)| info.is_none())
-                .take(total_slots as usize)
-                .collect::<Vec<_>>();
-            for (partition_id, task_info) in runnable_tasks {
-                // Move to the index which has available slots
-                if idx_slot >= slots.len() {
-                    idx_slot = 0;
+            loop {
+                let mut scanned = 0usize;
+                while budgets[idx].vcores == 0 {
+                    idx = (idx + 1) % budgets.len();
+                    scanned += 1;
+                    if scanned >= budgets.len() {
+                        return result;
+                    }
                 }
-                if slots[idx_slot].slots == 0 {
-                    idx_slot = 0;
-                }
-                // Since the slots is a vector with descending order, and the total available slots is larger than 0,
-                // we are sure the available slot number at idx_slot is larger than 1
-                let slot = &mut slots[idx_slot];
-                let executor_id = slot.executor_id.clone();
-                let task_id = *task_id_gen;
-                *task_id_gen += 1;
-                *task_info = Some(create_task_info(executor_id.clone(), task_id));
-
-                // Record shuffle affinity for this task if it has shuffle inputs
-                if let Some(ref local_executors) = executors_with_local_data {
-                    result.shuffle_affinity.push(ShuffleAffinityInfo {
-                        job_id: job_id.clone(),
-                        stage_id,
-                        executor_id: executor_id.clone(),
-                        has_local_data: local_executors.contains(&executor_id),
-                    });
-                }
-
-                let partition = PartitionId {
-                    job_id: job_id.clone(),
-                    stage_id,
-                    partition_id,
-                };
-                let task_desc = TaskDescription {
-                    session_id: session_id.clone(),
-                    partition,
-                    stage_attempt_num: running_stage.stage_attempt_num,
-                    task_id,
-                    task_attempt: running_stage.task_failure_numbers[partition_id],
-                    plan: running_stage.plan.clone(),
-                    session_config: running_stage.session_config.clone(),
-                    schedulable_time_millis: running_stage.stage_running_time,
-                };
-                result.bound_tasks.push((executor_id, task_desc));
-
-                idx_slot += 1;
-                slot.slots -= 1;
-                total_slots -= 1;
-                if total_slots == 0 {
-                    return result;
+                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
+                    Some((executor_id, task_desc)) => {
+                        // Record shuffle affinity for this task if it has shuffle inputs
+                        if let Some(ref local_executors) = executors_with_local_data {
+                            result.shuffle_affinity.push(ShuffleAffinityInfo {
+                                job_id: job_id.clone(),
+                                stage_id,
+                                executor_id: executor_id.clone(),
+                                has_local_data: local_executors.contains(&executor_id),
+                            });
+                        }
+                        result.bound_tasks.push((executor_id, task_desc));
+                        idx = (idx + 1) % budgets.len();
+                    }
+                    None => break, // stage's pending is drained
                 }
             }
         }
@@ -722,9 +799,7 @@ pub(crate) async fn bind_task_consistent_hash(
         let mut graph = job_info.execution_graph.write().await;
         let session_id = graph.session_id().to_string();
         let mut black_list = vec![];
-        while let Some((running_stage, task_id_gen)) =
-            graph.fetch_running_stage(&black_list)
-        {
+        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
             let scan_files = get_scan_files(job_id, running_stage.plan.clone())?;
             if is_skip_consistent_hash(&scan_files) {
                 debug!(
@@ -740,14 +815,13 @@ pub(crate) async fn bind_task_consistent_hash(
             // First round with 0 tolerance consistent hashing policy
             // Second round with [`tolerance`] tolerance consistent hashing policy
             for tolerance in tolerance_list {
-                let runnable_tasks = running_stage
-                    .task_infos
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(_partition, info)| info.is_none())
+                let runnable_partitions: Vec<usize> = running_stage
+                    .pending
+                    .pending_ids()
+                    .into_iter()
                     .take(total_slots)
-                    .collect::<Vec<_>>();
-                for (partition_id, task_info) in runnable_tasks {
+                    .collect();
+                for partition_id in runnable_partitions {
                     let partition_files = &scan_files[partition_id];
                     assert!(!partition_files.is_empty());
                     // Currently we choose the first file for a task for consistent hash.
@@ -759,26 +833,32 @@ pub(crate) async fn bind_task_consistent_hash(
                         tolerance,
                     ) {
                         let executor_id = node.id.clone();
-                        let task_id = *task_id_gen;
-                        *task_id_gen += 1;
-                        *task_info = Some(create_task_info(executor_id.clone(), task_id));
+                        // task_id is the append-order slot in `task_infos` — since
+                        // we're about to push, that's `task_infos.len()`.
+                        let task_id = running_stage.task_infos.len();
+                        running_stage.pending.take(partition_id);
+                        let mut task_info = create_task_info(executor_id.clone(), task_id);
+                        task_info.global_input_partition_ids = vec![partition_id];
+                        task_info.vcores_consumed = 1;
+                        running_stage.task_infos.push(task_info);
 
                         // Note: Consistent hash is used for scan (leaf) stages, not shuffle stages,
                         // so we don't track shuffle affinity here. The stage has scan files,
                         // meaning it's a leaf stage without shuffle inputs.
 
-                        let partition = PartitionId {
+                        let key = TaskKey {
                             job_id: job_id.clone(),
                             stage_id: running_stage.stage_id,
-                            partition_id,
+                            task_id,
                         };
                         let task_desc = TaskDescription {
                             session_id: session_id.clone(),
-                            partition,
+                            key,
                             stage_attempt_num: running_stage.stage_attempt_num,
-                            task_id,
                             task_attempt: running_stage.task_failure_numbers
                                 [partition_id],
+                            global_input_partition_ids: vec![partition_id],
+                            vcores_consumed: 1,
                             plan: running_stage.plan.clone(),
                             session_config: running_stage.session_config.clone(),
                             schedulable_time_millis: running_stage.stage_running_time,
@@ -917,8 +997,8 @@ mod test {
     async fn test_bind_task_bias() -> Result<()> {
         let num_partition = 8usize;
         let active_jobs = mock_active_jobs(num_partition).await?;
-        let mut available_slots = mock_available_slots();
-        let available_slots_ref: Vec<&mut AvailableTaskSlots> =
+        let mut available_slots = mock_budgets();
+        let available_slots_ref: Vec<&mut AvailableVcores> =
             available_slots.iter_mut().collect();
         let binding_result =
             bind_task_bias(available_slots_ref, Arc::new(active_jobs), |_| false).await;
@@ -971,8 +1051,8 @@ mod test {
     async fn test_bind_task_round_robin() -> Result<()> {
         let num_partition = 8usize;
         let active_jobs = mock_active_jobs(num_partition).await?;
-        let mut available_slots = mock_available_slots();
-        let available_slots_ref: Vec<&mut AvailableTaskSlots> =
+        let mut available_slots = mock_budgets();
+        let available_slots_ref: Vec<&mut AvailableVcores> =
             available_slots.iter_mut().collect();
         let binding_result =
             bind_task_round_robin(available_slots_ref, Arc::new(active_jobs), |_| false)
@@ -1121,7 +1201,7 @@ mod test {
 
         for bound_task in bound_tasks {
             let entry = result
-                .entry(bound_task.1.partition.job_id.to_string())
+                .entry(bound_task.1.key.job_id.to_string())
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
             *n += bound_task.1.global_input_partition_ids.len();
@@ -1266,6 +1346,7 @@ mod test {
                 ordering: None,
                 metadata_size_hint: None,
                 table_reference: None,
+                arrow_schema: None,
             }]);
         }
         vec![scan_files]

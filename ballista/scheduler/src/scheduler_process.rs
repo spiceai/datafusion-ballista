@@ -21,6 +21,7 @@ use crate::flight_proxy_service::BallistaFlightProxyService;
 use crate::api::get_routes;
 use crate::api::health_routes;
 use crate::api::route_disabled;
+use crate::api::SchedulerErrorResponse;
 use crate::cluster::BallistaCluster;
 use crate::config::SchedulerConfig;
 use crate::metrics::default_metrics_collector;
@@ -35,6 +36,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
+use datafusion::DATAFUSION_VERSION;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
@@ -42,18 +44,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use log::info;
 use std::{net::SocketAddr, sync::Arc};
 use tonic::service::RoutesBuilder;
-
-use crate::api::SchedulerErrorResponse;
-#[cfg(feature = "rest-api")]
-use crate::api::get_routes;
-use crate::api::route_disabled;
-use crate::cluster::BallistaCluster;
-use crate::config::SchedulerConfig;
-
-use crate::metrics::default_metrics_collector;
-use crate::scheduler_server::SchedulerServer;
-#[cfg(feature = "keda-scaler")]
-use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Creates as initialized scheduler service
 /// without exposing it as a grpc service

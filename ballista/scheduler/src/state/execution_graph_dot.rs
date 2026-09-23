@@ -215,6 +215,15 @@ fn sanitize(str: &str, max_len: Option<usize>) -> String {
     sanitized
 }
 
+/// Renders a single operator the way `EXPLAIN` would, without its children
+struct ExplainText<'a>(&'a dyn ExecutionPlan);
+
+impl fmt::Display for ExplainText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt_as(DisplayFormatType::Default, f)
+    }
+}
+
 #[allow(deprecated)]
 fn get_operator_name(plan: &dyn ExecutionPlan) -> String {
     let detail = get_operator_detail(plan);

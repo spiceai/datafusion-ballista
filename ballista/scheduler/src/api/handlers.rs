@@ -684,17 +684,21 @@ pub async fn get_job_config<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::execution_stage::TaskInfo;
+    use ballista_core::serde::protobuf::task_status;
 
     fn make_task_info(start: u128, end: u128) -> TaskInfo {
         TaskInfo {
             task_id: 0,
+            executor_id: String::new(),
             scheduled_time: 0,
             launch_time: 0,
             start_exec_time: start,
             end_exec_time: end,
             finish_time: 0,
             task_status: task_status::Status::Running(Default::default()),
-            executor_id: String::new(),
+            global_input_partition_ids: vec![0],
+            vcores_consumed: 1,
         }
     }
 }

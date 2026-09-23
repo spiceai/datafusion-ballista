@@ -537,6 +537,7 @@ mod tests {
     fn make_task_info(start: u128, end: u128) -> TaskInfo {
         TaskInfo {
             task_id: 0,
+            executor_id: String::new(),
             scheduled_time: 0,
             launch_time: 0,
             start_exec_time: start,

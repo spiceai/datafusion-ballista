@@ -38,8 +38,8 @@ use ballista_core::execution_plans::{
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
-    FailedTask, GraphStageInput, OperatorMetricsSet, ResultLost, SuccessfulTask,
-    TaskKilled, TaskStatus, task_info,
+    FailedTask, GraphStageInput, OperatorMetricsSet, ResultLost, RuntimeStatsReport,
+    SuccessfulTask, TaskKilled, TaskStatus, WindowStateReport, task_info,
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::PartitionLocation;
@@ -354,9 +354,29 @@ impl PendingPartitions {
         }
     }
 
+    /// Removes a specific partition from the queue, wherever it sits,
+    /// returning whether it was still pending. Used by binding policies
+    /// (e.g. consistent-hash) that pick a partition by criteria other than
+    /// queue order.
+    pub fn take(&mut self, partition_id: usize) -> bool {
+        if let Some(pos) = self.queue.iter().position(|&p| p == partition_id) {
+            self.queue.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// True when there are no more partitions to hand out.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// Snapshot of the partitions still pending, in queue order. Used by
+    /// binding policies (e.g. consistent-hash) that pick a partition by
+    /// criteria other than queue order and remove it via [`Self::take`].
+    pub fn pending_ids(&self) -> Vec<usize> {
+        self.queue.iter().copied().collect()
     }
 
     /// Total partitions still unassigned.
@@ -904,32 +924,38 @@ impl RunningStage {
         self.pending.remaining()
     }
 
-    /// Update the TaskInfo for task partition
-    pub fn update_task_info(&mut self, partition_id: usize, status: TaskStatus) -> bool {
-        debug!("Updating TaskInfo for partition {partition_id}");
-        // The task info for a partition can be `None` if the task was reset
-        // (e.g. after its executor was lost / heartbeat-timed-out) before a
-        // late, in-flight status update arrived from that executor. Ignore the
-        // stale update instead of unwrapping: panicking here kills the scheduler
-        // event-loop worker, which closes the event channel and wedges the whole
-        // scheduler ("Fail to send event due to channel closed").
-        let Some(task_info) = self.task_infos[partition_id].as_ref() else {
+    /// Update the TaskInfo for a task, keyed by its `task_id` (append slot
+    /// in `task_infos`, not a partition id — one task may cover several
+    /// partitions under `global_input_partition_ids`).
+    ///
+    /// Rejects (returns false) if the task's status is already terminal
+    /// Failed with a lost/killed reason (i.e., `reset_task_info` moved its
+    /// partitions back to pending because the executor died) — a late
+    /// status from that attempt should be ignored instead of overwriting a
+    /// newer attempt's record. Panicking here would kill the scheduler
+    /// event-loop worker, which closes the event channel and wedges the
+    /// whole scheduler ("Fail to send event due to channel closed").
+    ///
+    /// On success, updates the task's status and adjusts per-partition
+    /// failure counters using the task's `global_input_partition_ids`.
+    pub fn update_task_info(&mut self, task_id: usize, status: TaskStatus) -> bool {
+        debug!("Updating TaskInfo for task_id {task_id}");
+        let task_info = &self.task_infos[task_id];
+        if let task_status::Status::Failed(FailedTask {
+            failed_reason:
+                Some(FailedReason::TaskKilled(_)) | Some(FailedReason::ResultLost(_)),
+            ..
+        }) = &task_info.task_status
+        {
             warn!(
-                "Ignoring TaskStatus update with TID {} for partition {partition_id} because no task is currently scheduled there (task was reset or not yet scheduled)",
-                status.task_id
-            );
-            return false;
-        };
-        let task_id = task_info.task_id;
-        if (status.task_id as usize) < task_id {
-            warn!(
-                "Ignore TaskStatus update with TID {} because there is more recent task attempt with TID {} running for partition {}",
-                status.task_id, task_id, partition_id
+                "Ignore TaskStatus update for task_id {task_id} because it was already reset (executor lost)"
             );
             return false;
         }
         let scheduled_time = task_info.scheduled_time;
         let executor_id = task_info.executor_id.clone();
+        let global_input_partition_ids = task_info.global_input_partition_ids.clone();
+        let vcores_consumed = task_info.vcores_consumed;
         let task_status = status.status.unwrap();
         let updated_task_info = TaskInfo {
             task_id,
@@ -964,6 +990,48 @@ impl RunningStage {
         true
     }
 
+    /// Accumulate runtime-stats reports as tasks in this stage attempt
+    /// complete, tagging each with the task that produced it so a later
+    /// reset (`reset_task_info`) can drop its contribution.
+    pub fn append_runtime_stats_reports(
+        &mut self,
+        producer_task_id: usize,
+        reports: Vec<RuntimeStatsReport>,
+    ) {
+        if reports.is_empty() {
+            return;
+        }
+        self.runtime_stats_reports
+            .extend(reports.into_iter().map(|report| TaskRuntimeStats {
+                producer_task_id,
+                report,
+            }));
+    }
+
+    /// Accumulate window-state reports as tasks in this stage attempt
+    /// complete. No producer tag: each report is already addressed by its
+    /// stage-global partition id.
+    pub fn append_window_state_reports(
+        &mut self,
+        producer_task_id: usize,
+        reports: Vec<WindowStateReport>,
+    ) {
+        for report in &reports {
+            debug!(
+                "stage {} window state arrived: global partition {} expr {} state {:?}",
+                self.stage_id,
+                report.global_partition_id,
+                report.window_expr_index,
+                report.state,
+            );
+        }
+        self.window_state_reports
+            .extend(reports.into_iter().map(|report| TaskWindowState {
+                producer_task_id,
+                report,
+            }));
+    }
+
     /// update and combine the task metrics to the stage metrics
     pub fn update_task_metrics(
         &mut self,
@@ -991,25 +1059,24 @@ impl RunningStage {
             }
             let metrics_values_array = metrics
                 .into_iter()
-                .map(|ms| {
-                    ms.metrics
-                        .into_iter()
-                        .map(|m| m.try_into())
-                        .collect::<Result<Vec<_>>>()
-                })
+                .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
                 .collect::<Result<Vec<_>>>()?;
 
             combined_metrics
                 .iter_mut()
                 .zip(metrics_values_array)
-                .map(|(first, second)| {
-                    Self::combine_metrics_set(first, second, partition)
+                .map(|(existing_metrics, new_task_metrics)| {
+                    Self::upsert_metrics_set_for_task(
+                        existing_metrics,
+                        new_task_metrics,
+                        &global_partitions,
+                    )
                 })
                 .collect()
         } else {
             metrics
                 .into_iter()
-                .map(|ms| ms.try_into())
+                .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
                 .collect::<Result<Vec<_>>>()?
         };
         self.stage_metrics = Some(new_metrics_set);
@@ -1017,18 +1084,76 @@ impl RunningStage {
         Ok(())
     }
 
-    /// Combines metrics from a completed task into the stage's aggregate metrics.
-    pub fn combine_metrics_set(
-        first: &mut MetricsSet,
-        second: Vec<MetricValue>,
-        partition: usize,
-    ) -> MetricsSet {
-        for metric_value in second {
-            // TODO recheck the lable logic
-            let new_metric = Arc::new(Metric::new(metric_value, Some(partition)));
-            first.push(new_metric);
+    /// Convert a task's operator-metrics snapshot into a `MetricsSet`, mapping
+    /// each metric's local partition index to a stage-global partition id via
+    /// `global_partitions` (the task's slice of stage-global partition ids).
+    ///
+    /// Three cases, keyed on the local partition value the executor put on
+    /// the wire:
+    ///
+    /// 1. `local < global_partitions.len()` — restricted-arm metric. Local
+    ///    index maps 1:1 to `global_partitions[local]`.
+    /// 2. `global_partitions.len() == 1` — collapse task; all metrics
+    ///    belong to the single output partition.
+    /// 3. `local >= global_partitions.len()` — under-collect arm. The
+    ///    plan's subtree below a `CoalescePartitionsExec` /
+    ///    `SortPreservingMergeExec` / single-partition join-build side
+    ///    keeps the full upstream partition count, so operators there
+    ///    stamp metrics with local indices unrelated to the task's slice.
+    ///    Cross-product the metric against every slice member so the
+    ///    aggregate has one bucket per stage-global partition.
+    fn metrics_set_from_task_metrics(
+        metrics: OperatorMetricsSet,
+        global_partitions: &[usize],
+    ) -> Result<MetricsSet> {
+        let mut metrics_set = MetricsSet::new();
+        for proto_metric in metrics.metrics {
+            let local_partition = proto_metric.partition.map(|p| p as usize);
+            let inner = proto_metric.metric.ok_or_else(|| {
+                BallistaError::Internal(
+                    "OperatorMetric.metric is None while folding task metrics".into(),
+                )
+            })?;
+            let metric_value: MetricValue = inner.try_into()?;
+            let tags: Vec<Option<usize>> = match local_partition {
+                Some(local) if local < global_partitions.len() => {
+                    vec![Some(global_partitions[local])]
+                }
+                Some(_) if global_partitions.len() == 1 => {
+                    vec![Some(global_partitions[0])]
+                }
+                Some(_) => global_partitions.iter().map(|&p| Some(p)).collect(),
+                None => vec![None],
+            };
+            for tag in tags {
+                metrics_set.push(Arc::new(Metric::new(metric_value.clone(), tag)));
+            }
         }
-        first.aggregate_by_name()
+        Ok(metrics_set)
+    }
+
+    /// Upsert a task's raw metrics into the stage metrics. Task metrics are
+    /// snapshots, so any prior entry for one of the task's global partitions
+    /// is replaced by the new snapshot (avoids double-counting on retry).
+    pub fn upsert_metrics_set_for_task(
+        existing_metrics: &mut MetricsSet,
+        new_task_metrics: MetricsSet,
+        global_partitions: &[usize],
+    ) -> MetricsSet {
+        let mut updated_metrics = MetricsSet::new();
+        for metric in existing_metrics.iter() {
+            let owned_by_task = metric
+                .partition()
+                .map(|p| global_partitions.contains(&p))
+                .unwrap_or(false);
+            if !owned_by_task {
+                updated_metrics.push(metric.clone());
+            }
+        }
+        for metric in new_task_metrics.iter() {
+            updated_metrics.push(metric.clone());
+        }
+        updated_metrics
     }
 
     /// Returns the highest per-partition failure count across the
@@ -1216,41 +1341,32 @@ impl SuccessfulStage {
         }
     }
 
-    /// Mark successful tasks on a lost executor as `Failed(ResultLost)` so
-    /// `to_running` will reschedule their partitions on the next attempt.
-    /// Returns the number of tasks reset.
+    /// Mark successful tasks on a lost executor as `Failed(ResultLost)`.
+    /// Unlike `RunningStage::reset_tasks`, a successful stage has no
+    /// `pending` queue to reschedule into — `to_running` rebuilds one from
+    /// the reset tasks' partitions when the stage is revived. Returns the
+    /// number of tasks reset.
     pub fn reset_tasks(&mut self, executor: &str) -> usize {
         let mut reset = 0;
         let failure_reason = format!("Task failure due to Executor {executor} lost");
         for task in self.task_infos.iter_mut() {
-            match task {
-                TaskInfo {
-                    task_id,
-                    scheduled_time,
-                    task_status:
-                        task_status::Status::Successful(SuccessfulTask {
-                            executor_id, ..
-                        }),
-                    ..
-                } if *executor == *executor_id => {
-                    *task = TaskInfo {
-                        task_id: *task_id,
-                        executor_id: executor_id.clone(),
-                        scheduled_time: *scheduled_time,
-                        launch_time: 0,
-                        start_exec_time: 0,
-                        end_exec_time: 0,
-                        finish_time: 0,
-                        task_status: task_status::Status::Failed(FailedTask {
-                            error: failure_reason.clone(),
-                            retryable: true,
-                            count_to_failures: false,
-                            failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
-                        }),
-                    };
-                    reset += 1;
-                }
-                _ => {}
+            let hit = matches!(
+                &task.task_status,
+                task_status::Status::Successful(SuccessfulTask { executor_id, .. })
+                    if executor == executor_id
+            );
+            if hit {
+                task.launch_time = 0;
+                task.start_exec_time = 0;
+                task.end_exec_time = 0;
+                task.finish_time = 0;
+                task.task_status = task_status::Status::Failed(FailedTask {
+                    error: failure_reason.clone(),
+                    retryable: true,
+                    count_to_failures: false,
+                    failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
+                });
+                reset += 1;
             }
         }
         reset
@@ -1264,36 +1380,13 @@ impl SuccessfulStage {
     ) -> Result<SuccessfulStage> {
         let plan = decode_plan(&stage.plan, codec, session_ctx)?;
         let inputs = decode_inputs(stage.inputs)?;
-        // Reconstruct by `partition_id` (rather than trusting the on-the-wire
-        // order) and validate against `partitions`, returning an error instead
-        // of panicking on corrupt or version-skewed persisted state.
-        let stage_id = stage.stage_id;
-        let partitions = stage.partitions as usize;
-        let mut slots: Vec<Option<TaskInfo>> = vec![None; partitions];
-        for info in stage.task_infos {
-            let partition_id = info.partition_id as usize;
-            if partition_id >= partitions {
-                return Err(BallistaError::Internal(format!(
-                    "protobuf::SuccessfulStage {stage_id} task_info partition_id {partition_id} out of range (partitions={partitions})"
-                )));
-            }
-            if slots[partition_id].is_some() {
-                return Err(BallistaError::Internal(format!(
-                    "protobuf::SuccessfulStage {stage_id} has duplicate task_info for partition {partition_id}"
-                )));
-            }
-            slots[partition_id] = Some(decode_taskinfo(info)?);
-        }
-        let task_infos = slots
+        // Append-order (task_id), not `partition_id`-indexed: a multi-partition
+        // task covers several partitions in one entry, so the wire list's
+        // length no longer matches `partitions` one-to-one.
+        let task_infos: Vec<TaskInfo> = stage
+            .task_infos
             .into_iter()
-            .enumerate()
-            .map(|(partition, info)| {
-                info.ok_or_else(|| {
-                    BallistaError::Internal(format!(
-                        "protobuf::SuccessfulStage {stage_id} is missing task_info for partition {partition}"
-                    ))
-                })
-            })
+            .map(decode_taskinfo)
             .collect::<Result<Vec<_>>>()?;
         let stage_metrics = stage
             .stage_metrics
@@ -1332,8 +1425,11 @@ impl SuccessfulStage {
         let task_infos = stage
             .task_infos
             .into_iter()
-            .enumerate()
-            .map(|(partition, task_info)| encode_taskinfo(task_info, partition))
+            .map(|task_info| {
+                let partition_id =
+                    task_info.global_input_partition_ids.first().copied().unwrap_or(0);
+                encode_taskinfo(task_info, partition_id)
+            })
             .collect();
         let stage_metrics = stage
             .stage_metrics
@@ -1396,18 +1492,11 @@ impl FailedStage {
     ) -> Result<FailedStage> {
         let plan = decode_plan(&stage.plan, codec, session_ctx)?;
 
-        let stage_id = stage.stage_id;
-        let partitions = stage.partitions as usize;
-        let mut task_infos: Vec<Option<TaskInfo>> = vec![None; partitions];
-        for info in stage.task_infos {
-            let partition_id = info.partition_id as usize;
-            if partition_id >= partitions {
-                return Err(BallistaError::Internal(format!(
-                    "protobuf::FailedStage {stage_id} task_info partition_id {partition_id} out of range (partitions={partitions})"
-                )));
-            }
-            task_infos[partition_id] = Some(decode_taskinfo(info)?);
-        }
+        let task_infos: Vec<TaskInfo> = stage
+            .task_infos
+            .into_iter()
+            .map(decode_taskinfo)
+            .collect::<Result<Vec<_>>>()?;
 
         let stage_metrics = if stage.stage_metrics.is_empty() {
             None
@@ -1442,9 +1531,10 @@ impl FailedStage {
         let task_infos: Vec<protobuf::TaskInfo> = stage
             .task_infos
             .into_iter()
-            .enumerate()
-            .filter_map(|(partition, task_info)| {
-                task_info.map(|info| encode_taskinfo(info, partition))
+            .map(|task_info| {
+                let partition_id =
+                    task_info.global_input_partition_ids.first().copied().unwrap_or(0);
+                encode_taskinfo(task_info, partition_id)
             })
             .collect();
 
@@ -1657,6 +1747,13 @@ fn encode_inputs(
     Ok(inputs)
 }
 
+// NOTE: `partition_id` on the wire is a single slot index (the pre-multi-
+// partition-task wire shape); a decoded entry is treated as covering exactly
+// that one partition. A persisted task that actually covered multiple
+// partitions (bound under the multi-partition-task model) does not
+// round-trip its full `global_input_partition_ids` through this format —
+// unverified whether anything reads it back post-recovery. Flagged for
+// follow-up rather than silently assumed correct.
 fn decode_taskinfo(task_info: protobuf::TaskInfo) -> Result<TaskInfo> {
     // These protobufs are persisted (object store) and may come from an older
     // version or be corrupt; return an error rather than panicking so a single
@@ -1690,6 +1787,8 @@ fn decode_taskinfo(task_info: protobuf::TaskInfo) -> Result<TaskInfo> {
         end_exec_time: task_info.end_exec_time as u128,
         finish_time: task_info.finish_time as u128,
         task_status: task_info_status,
+        global_input_partition_ids: vec![task_info.partition_id as usize],
+        vcores_consumed: 1,
     })
 }
 
@@ -1710,6 +1809,52 @@ fn encode_taskinfo(task_info: TaskInfo, partition_id: usize) -> protobuf::TaskIn
         end_exec_time: task_info.end_exec_time as u64,
         finish_time: task_info.finish_time as u64,
         status: Some(task_info_status),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ballista_core::serde::protobuf::{OperatorMetric, operator_metric};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    fn make_running_stage(partitions: usize) -> RunningStage {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        RunningStage::new(
+            1,
+            0,
+            plan,
+            partitions,
+            vec![],
+            HashMap::new(),
+            Arc::new(SessionConfig::default()),
+        )
+    }
+
+    /// Push one Running task_info covering the given partitions onto the
+    /// stage (test helper mirroring what a real bind would do).
+    fn append_running_task(
+        stage: &mut RunningStage,
+        task_id: usize,
+        executor: &str,
+        partitions: Vec<usize>,
+    ) {
+        let vcores_consumed = partitions.len() as u32;
+        stage.task_infos.push(TaskInfo {
+            task_id,
+            executor_id: executor.to_string(),
+            scheduled_time: 50,
+            launch_time: 100,
+            start_exec_time: 200,
+            end_exec_time: 0,
+            finish_time: 0,
+            task_status: task_status::Status::Running(RunningTask {
+                executor_id: executor.to_string(),
+            }),
+            global_input_partition_ids: partitions,
+            vcores_consumed,
+        });
     }
 
     /// A task that covers multiple global partitions must file each partition's

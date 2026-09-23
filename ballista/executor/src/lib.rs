@@ -143,8 +143,8 @@ pub fn as_task_status(
             );
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id.clone().into(),
-                stage_id: partition_id.stage_id as u32,
+                job_id: key.job_id.clone().into(),
+                stage_id: key.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 launch_time: execution_times.launch_time,
                 start_exec_time: execution_times.start_exec_time,
@@ -164,8 +164,8 @@ pub fn as_task_status(
 
             TaskStatus {
                 task_id: task_id as u32,
-                job_id: partition_id.job_id.clone().into(),
-                stage_id: partition_id.stage_id as u32,
+                job_id: key.job_id.clone().into(),
+                stage_id: key.stage_id as u32,
                 stage_attempt_num: stage_attempt_num as u32,
                 launch_time: execution_times.launch_time,
                 start_exec_time: execution_times.start_exec_time,

@@ -18,7 +18,6 @@
 use crate::JobId;
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
-use crate::error::BallistaError;
 use crate::extension::{
     BallistaConfigGrpcEndpoint, ResultFetchMetricsCallback, SessionConfigExt,
 };
@@ -971,7 +970,9 @@ async fn fetch_partition(
 
 #[cfg(test)]
 mod test {
-    use crate::execution_plans::distributed_query::get_client_host_port;
+    use super::{DistributedQueryExec, get_client_host_port};
+    use crate::JobId;
+    use crate::config::BallistaConfig;
     use crate::serde::protobuf::get_job_status_result::FlightProxy;
     use crate::serde::protobuf::{
         ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,

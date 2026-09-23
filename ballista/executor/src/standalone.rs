@@ -109,11 +109,12 @@ pub async fn new_standalone_executor_from_builder(
         grpc_port: 50020,
         specification: Some(
             ExecutorSpecification {
-                task_slots: concurrent_tasks as u32,
+                vcores: vcores as u32,
             }
             .into(),
         ),
         os_info: Some(ExecutorOperatingSystemSpecification::default()),
+        ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
     };
 
     let config = config_producer();
@@ -130,7 +131,7 @@ pub async fn new_standalone_executor_from_builder(
         config_producer,
         Arc::new(function_registry),
         Arc::new(LoggingMetricsCollector::default()),
-        concurrent_tasks,
+        vcores,
         None,
     ));
 

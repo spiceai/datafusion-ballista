@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ballista_core::serde::protobuf::{FailedJob, JobStatus};
+use ballista_core::JobId;
+use ballista_core::serde::protobuf::{FailedJob, JobStatus, job_status};
 use log::{error, info, trace, warn};
 use tokio::sync::broadcast;
 
@@ -52,6 +53,15 @@ pub(crate) struct QueryStageScheduler<
     config: Arc<SchedulerConfig>,
     /// Broadcast sender for job state change notifications.
     job_state_sender: broadcast::Sender<JobStateEvent>,
+    /// Guards against arming more than one "all executors lost" grace timer at a
+    /// time. When a whole cluster dies at once the reaper posts an `ExecutorLost`
+    /// per executor, and each would otherwise arm its own timer and fail every
+    /// running job again. See <https://github.com/apache/datafusion-ballista/issues/2029>
+    no_executor_check_pending: Arc<AtomicBool>,
+    /// Tees scheduler events into a durable per-job event log. `None` unless
+    /// `event_log_dir` is configured.
+    #[cfg(feature = "rest-api")]
+    event_log: Option<ballista_history::writer::EventLogWriter>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryStageScheduler<T, U> {
@@ -60,10 +70,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryStageSchedul
         metrics_collector: Arc<dyn SchedulerMetricsCollector>,
         config: Arc<SchedulerConfig>,
         job_state_sender: broadcast::Sender<JobStateEvent>,
+        #[cfg(feature = "rest-api")] event_log: Option<
+            ballista_history::writer::EventLogWriter,
+        >,
     ) -> Self {
         Self {
             state,
             metrics_collector,
+            no_executor_check_pending: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "rest-api")]
+            event_log,
             config,
             job_state_sender,
         }
@@ -75,10 +91,58 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryStageSchedul
         let _ = self.job_state_sender.send(event);
     }
 
+    /// Fetches a job's execution graph for the event log, reporting rather than
+    /// swallowing the cases where it is unavailable. Returning `None` costs the
+    /// job its event, not its execution: event logging is never allowed to fail
+    /// scheduling.
+    #[cfg(feature = "rest-api")]
+    async fn event_log_graph(
+        &self,
+        job_id: &ballista_core::JobId,
+    ) -> Option<crate::state::execution_graph::ExecutionGraphBox> {
+        match self
+            .state
+            .task_manager
+            .get_job_execution_graph(job_id)
+            .await
+        {
+            Ok(Some(graph)) => Some(graph),
+            Ok(None) => {
+                warn!("event log: no execution graph for job {job_id}, skipping event");
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "event log: failed to read execution graph for job {job_id}: {e:?}"
+                );
+                None
+            }
+        }
+    }
+
     #[cfg(feature = "rest-api")]
     pub(crate) fn metrics_collector(&self) -> &dyn SchedulerMetricsCollector {
         self.metrics_collector.as_ref()
     }
+}
+
+/// Groups task status updates by job id, so a single `TaskUpdating` batch
+/// (which can span multiple jobs) can be appended to each job's own event log.
+#[cfg(feature = "rest-api")]
+fn group_by_job(
+    statuses: &[ballista_core::serde::protobuf::TaskStatus],
+) -> std::collections::HashMap<String, Vec<ballista_core::serde::protobuf::TaskStatus>> {
+    let mut by_job: std::collections::HashMap<
+        String,
+        Vec<ballista_core::serde::protobuf::TaskStatus>,
+    > = std::collections::HashMap::new();
+    for status in statuses {
+        by_job
+            .entry(status.job_id.clone())
+            .or_default()
+            .push(status.clone());
+    }
+    by_job
 }
 
 #[async_trait]
@@ -322,7 +386,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
                 // Notify external systems that new work is available
                 if let Some(ref callback) = self.config.on_work_available {
-                    callback(&format!("job_submitted:{job_id}"));
+                    callback(WorkAvailableReason::JobSubmitted {
+                        job_id: job_id.clone(),
+                    });
                 }
             }
             QueryStageSchedulerEvent::JobPlanningFailed {
@@ -396,31 +462,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                     &fail_message,
                 ));
 
-                match self
+                let executor_manager = self.state.executor_manager.clone();
+                if let Err(e) = self
                     .state
                     .task_manager
-                    .abort_job(&job_id, fail_message)
+                    .abort_job(&job_id, fail_message, move |running_tasks| async move {
+                        if running_tasks.is_empty() {
+                            return Ok(());
+                        }
+                        executor_manager.cancel_running_tasks(running_tasks).await
+                    })
                     .await
                 {
-                    Ok((running_tasks, _pending_tasks)) => {
-                        if !running_tasks.is_empty() {
-                            event_sender
-                                .post_event(QueryStageSchedulerEvent::CancelTasks(
-                                    running_tasks,
-                                ))
-                                .await?;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Fail to invoke abort_job for job {job_id} due to {e:?}");
-                    }
+                    error!("Fail to invoke abort_job for job {job_id} due to {e:?}");
                 }
                 self.state.clean_up_failed_job(job_id);
             }
             QueryStageSchedulerEvent::JobUpdated(job_id) => {
                 info!("Job {job_id} Updated");
-                if let Err(e) = self.state.task_manager.update_job(&job_id).await {
-                    error!("Fail to invoke update_job for job {job_id} due to {e:?}");
+                match self.state.task_manager.update_job(&job_id).await {
+                    Ok(new_tasks) => {
+                        // update_job revived the graph: the new tasks are
+                        // already visible to polling executors.
+                        if new_tasks > 0
+                            && let Some(callback) = &self.config.on_work_available
+                        {
+                            callback(WorkAvailableReason::NewStagesRunnable { job_id });
+                        }
+                    }
+                    Err(e) => {
+                        error!("Fail to invoke update_job for job {job_id} due to {e:?}");
+                    }
                 }
             }
             QueryStageSchedulerEvent::JobCancel(job_id) => {
@@ -431,17 +503,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 // Broadcast job cancelled state
                 self.broadcast_job_state(JobStateEvent::cancelled(job_id.clone()));
 
-                match self.state.task_manager.cancel_job(&job_id).await {
-                    Ok((running_tasks, _pending_tasks)) => {
-                        event_sender
-                            .post_event(QueryStageSchedulerEvent::CancelTasks(
-                                running_tasks,
-                            ))
-                            .await?;
-                    }
-                    Err(e) => {
-                        error!("Fail to invoke cancel_job for job {job_id} due to {e:?}");
-                    }
+                let executor_manager = self.state.executor_manager.clone();
+                if let Err(e) = self
+                    .state
+                    .task_manager
+                    .abort_job(&job_id, "Cancelled".to_owned(), move |running_tasks| async move {
+                        if running_tasks.is_empty() {
+                            return Ok(());
+                        }
+                        executor_manager.cancel_running_tasks(running_tasks).await
+                    })
+                    .await
+                {
+                    error!("Fail to invoke cancel_job for job {job_id} due to {e:?}");
                 }
                 self.state.clean_up_failed_job(job_id);
             }
@@ -477,13 +551,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                             event_sender
                                 .post_event(QueryStageSchedulerEvent::ReviveOffers)
                                 .await?;
-                        }
-
-                        // Notify external systems when new stages become runnable
-                        if !stage_events.is_empty()
-                            && let Some(ref callback) = self.config.on_work_available
-                        {
-                            callback("tasks_completed:new_stages_runnable");
                         }
 
                         for stage_event in stage_events {
@@ -653,6 +720,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 mod tests {
     use crate::cluster::JobStateEvent;
     use crate::config::{SchedulerConfig, WorkAvailableReason};
+    use ballista_core::JobId;
     use crate::scheduler_server::SchedulerServer;
     use crate::test_utils::{
         SchedulerTest, TestMetricsCollector, await_condition, test_cluster_context,
@@ -752,6 +820,7 @@ mod tests {
 
         let mut events = test.job_state_events().await?;
         let (_, job_id) = test.run("", &plan).await?;
+        let job_id: JobId = job_id.into();
         let received_success = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events.next().await {
                 if matches!(
@@ -814,7 +883,7 @@ mod tests {
                     .with_ballista_adaptive_query_planner(false),
             )
             .await?;
-        let job_id = scheduler.submit_job("", ctx, &test_plan(2), None).await?;
+        let job_id: JobId = scheduler.submit_job("", ctx, &test_plan(2), None).await?.into();
 
         // Job submission runs asynchronously through the event loop.
         let submitted = await_condition(Duration::from_millis(10), 100, || {
@@ -873,6 +942,7 @@ mod tests {
                     partitions: (0..2)
                         .map(|partition_id| ShuffleWritePartition {
                             partition_id,
+                            path: String::new(),
                             num_batches: 1,
                             num_rows: 1,
                             num_bytes: 1,
@@ -931,7 +1001,7 @@ mod tests {
         )
         .await?;
 
-        let job_id = test.submit("", &plan).await?;
+        let job_id: JobId = test.submit("", &plan).await?.into();
 
         // Wait until the job is actually running with tasks in flight. We
         // deliberately never `tick()`, so its tasks never complete.
@@ -998,7 +1068,7 @@ mod tests {
         // from an expired heartbeat.
         test.make_launches_fail("virtual-executor-0");
 
-        let job_id = test.submit("", &plan).await?;
+        let job_id: JobId = test.submit("", &plan).await?.into();
 
         let job_id_ref = &job_id;
         let test_ref = &test;
@@ -1036,7 +1106,7 @@ mod tests {
         )
         .await?;
 
-        let job_id = test.submit("", &plan).await?;
+        let job_id: JobId = test.submit("", &plan).await?.into();
 
         let job_id_ref = &job_id;
         let test_ref = &test;

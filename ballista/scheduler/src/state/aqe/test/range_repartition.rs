@@ -113,6 +113,7 @@ fn location(sub_part_id: usize, producer_task_id: usize, rows: u64) -> Partition
             os_info: ExecutorOperatingSystemSpecification::default(),
         },
         partition_stats: PartitionStats::new(Some(rows), None, None),
+        path: String::new(),
         file_id: Some(producer_task_id as u64),
         is_sort_shuffle: false,
     }

@@ -27,8 +27,6 @@ use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
 
-use crate::{TaskExecutionTimes, as_task_status};
-
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 
@@ -82,13 +80,6 @@ const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Number of consecutive failures before reducing log level from WARN to DEBUG.
 const QUIET_AFTER_FAILURES: u32 = 5;
 
-/// Maximum time the poll loop will wait for a free task slot before polling the
-/// scheduler anyway. `poll_work` doubles as the executor's heartbeat under
-/// pull-based scheduling, so a fully-busy executor must keep polling (reporting
-/// zero free slots) or the scheduler times it out and resets its tasks. Kept
-/// well below the scheduler's executor timeout.
-const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-
 /// Main polling loop for executor task execution.
 ///
 /// This function polls the scheduler for new tasks to execute and runs them,
@@ -124,7 +115,7 @@ where
         .clone()
         .into();
     let available_task_slots = available_task_slots.unwrap_or_else(|| {
-        Arc::new(Semaphore::new(executor_specification.task_slots as usize))
+        Arc::new(Semaphore::new(executor_specification.vcores as usize))
     });
 
     let (task_status_sender, mut task_status_receiver) =
@@ -193,7 +184,7 @@ where
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_slots: available_task_slots.available_permits() as u32,
+                    num_free_vcores: available_task_slots.available_permits() as u32,
                     task_status: task_status.clone(),
                 })
                 .await;
@@ -241,11 +232,14 @@ where
                 for task in tasks {
                     let task_status_sender = task_status_sender.clone();
 
-                    // Acquire a vcore permit for the task.
-                    let permit =
-                        free_vcores.clone().acquire_owned().await.map_err(|_| {
-                            BallistaError::Internal("vcore semaphore closed".to_string())
-                        })?;
+                    // Acquire a task-slot permit for the task.
+                    let permit = available_task_slots.clone().acquire_owned().await.map_err(
+                        |_| {
+                            BallistaError::Internal(
+                                "task-slot semaphore closed".to_string(),
+                            )
+                        },
+                    )?;
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -439,10 +433,15 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         global_output_partition_ids,
         plan,
         &executor.work_dir,
+        &session_config,
     )?;
+    let key = TaskKey {
+        job_id: job_id.clone(),
+        stage_id: stage_id as usize,
+        task_id: task_id as usize,
+    };
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
-        let part = PartitionId::new(&job_id, stage_id as usize, partition_id as usize);
 
         let task_start = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(

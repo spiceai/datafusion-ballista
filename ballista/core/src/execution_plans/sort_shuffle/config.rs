@@ -18,15 +18,9 @@
 //! Configuration for sort-based shuffle.
 
 /// Configuration for sort-based shuffle.
-///
-/// Matches upstream Ballista 54's shape: spill decisions are driven by
-/// [`Self::memory_limit_per_task_bytes`], counted independently of the runtime
-/// [`datafusion::execution::memory_pool::MemoryPool`]. The writer still
-/// registers a best-effort reservation so other operators see the RSS.
 #[derive(Debug, Clone)]
 pub struct SortShuffleConfig {
-    /// Whether sort-based shuffle is enabled (default: false in the struct;
-    /// the Ballista session config entry defaults to true).
+    /// Whether sort-based shuffle is enabled (default: false).
     pub enabled: bool,
     /// Target batch size in rows when materializing buffered indices via
     /// `interleave_record_batch` (default: 8192).

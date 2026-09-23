@@ -293,6 +293,8 @@ pub fn default_task_runner() -> impl TaskRunner {
                 num_batches: 1,
                 num_rows: 1,
                 num_bytes: 1,
+                file_id: None,
+                is_sort_shuffle: false,
             })
             .collect();
 
@@ -1418,15 +1420,12 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
-            path: format!(
-                "/{}/{}/{}",
-                task.partition.job_id,
-                task.partition.stage_id,
-                task.partition.partition_id
-            ),
+            path: format!("/{}/{}/{}", task.key.job_id, task.key.stage_id, partition_id),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,
+            file_id: None,
+            is_sort_shuffle: false,
         })
     }
 
@@ -1458,15 +1457,12 @@ pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskS
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
-            path: format!(
-                "/{}/{}/{}",
-                task.partition.job_id,
-                task.partition.stage_id,
-                task.partition.partition_id
-            ),
+            path: format!("/{}/{}/{}", task.key.job_id, task.key.stage_id, partition_id),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,
+            file_id: None,
+            is_sort_shuffle: false,
         })
     }
 

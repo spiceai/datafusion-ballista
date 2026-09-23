@@ -27,15 +27,16 @@ use ballista_core::serde::protobuf::{
     AvailableVcores, CancelJobParams, CancelJobResult, CleanJobDataParams,
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
-    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
-    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
+    ExecutorStoppedParams, ExecutorStoppedResult, GetCatalogParams, GetCatalogResult,
+    GetJobMetricsParams, GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
     GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
     JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
     RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
     UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
     execute_query_result,
 };
+use ballista_core::BALLISTA_PROTOCOL_VERSION;
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, ExecutorOperatingSystemSpecification,
 };
@@ -70,7 +71,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
 use crate::metrics::record_protocol_mismatch;
-use crate::scheduler_server::SchedulerServer;
 
 /// Rejects an executor RPC whose `ballista_protocol_version` does not match
 /// the scheduler's compiled-in `BALLISTA_PROTOCOL_VERSION`. See the constant
@@ -177,7 +177,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
                 TaskDistributionPolicy::Custom(ref policy) => BindingResult::from_tasks(
                     policy
-                        .bind_tasks(available_slots, running_jobs)
+                        .bind_tasks(budgets, running_jobs)
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?,
                 ),
@@ -211,8 +211,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .as_millis();
 
             for (_, task) in binding_result.bound_tasks {
-                let job_id = task.partition.job_id.clone();
-                let stage_id = task.partition.stage_id;
+                let job_id = task.key.job_id.clone();
+                let stage_id = task.key.stage_id;
 
                 // Record task scheduling metric with actual latency
                 let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
@@ -797,7 +797,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             executor_id, reason
         );
 
-        let executor_manager = self.state.executor_manager.clone();
         let metrics_collector = self.state.metrics_collector.clone();
         let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
             let msg = format!("Get query stage event loop error due to {e:?}");
@@ -1056,6 +1055,7 @@ mod test {
             grpc_port: 0,
             specification: Some(ExecutorSpecification { vcores: 2 }.into()),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
@@ -1147,6 +1147,7 @@ mod test {
             grpc_port: 0,
             specification: Some(ExecutorSpecification { vcores: 2 }.into()),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1233,6 +1234,7 @@ mod test {
             grpc_port: 0,
             specification: Some(ExecutorSpecification { vcores: 2 }.into()),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -1407,6 +1409,7 @@ mod test {
             grpc_port: 0,
             specification: Some(ExecutorSpecification { vcores: 2 }.into()),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1552,6 +1555,7 @@ mod test {
             grpc_port: 0,
             specification: Some(ExecutorSpecification { vcores: 2 }.into()),
             os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =

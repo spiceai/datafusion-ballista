@@ -22,7 +22,7 @@ use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::datasource::source_as_provider;
 use datafusion::error::DataFusionError;
 use std::any::type_name;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,6 @@ use crate::state::task_manager::{TaskLauncher, TaskManager};
 use crate::cluster::{BallistaCluster, BoundTask, ExecutorSlot};
 use crate::config::SchedulerConfig;
 use crate::metrics::SchedulerMetricsCollector;
-use crate::state::execution_graph::TaskDescription;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::event_loop::EventSender;
 use ballista_core::serde::BallistaCodec;
@@ -47,10 +46,6 @@ use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use log::{debug, error, info, warn};
 use prost::Message;
-use std::any::type_name;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
 
 mod aqe;
 mod distributed_explain;
@@ -325,7 +320,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
     async fn launch_tasks(
         &self,
         bound_tasks: Vec<BoundTask>,
-    ) -> Result<Vec<ExecutorSlot>> {
+        sender: &EventSender<QueryStageSchedulerEvent>,
+    ) -> Result<(Vec<ExecutorSlot>, HashSet<JobId>)> {
         // Get current time once for all latency calculations
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -337,8 +333,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             // Calculate scheduling latency: time from when task became schedulable to now
             let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
             self.metrics_collector.record_task_scheduled(
-                &task.partition.job_id,
-                task.partition.stage_id,
+                &task.key.job_id,
+                task.key.stage_id,
                 executor_id,
                 latency_ms as u64,
             );

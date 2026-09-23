@@ -1638,6 +1638,7 @@ mod tests {
                         None,
                         Some(bytes as u64),
                     ),
+                    path: String::new(),
                     file_id: None,
                     is_sort_shuffle: false,
                 }]

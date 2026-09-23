@@ -22,7 +22,7 @@
 //! heartbeat communication, and status reporting.
 
 use ballista_core::BALLISTA_VERSION;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,6 +289,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             grpc_max_decoding_message_size,
             metric_collection_policy,
             override_create_grpc_client_endpoint,
+            health,
         }
     }
 
@@ -417,15 +418,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             task_id,
         };
 
+        let session_config = self.executor.produce_config();
         let query_stage_exec = self
             .executor
             .execution_engine
             .create_query_stage_exec(
                 job_id.clone(),
                 stage_id,
-                partition_id,
+                task_id,
+                global_output_partition_ids,
                 plan,
                 &self.executor.work_dir,
+                &session_config,
             )
             .unwrap();
 
@@ -433,7 +437,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             let function_registry = task.function_registry;
             let runtime = self
                 .executor
-                .produce_runtime_for_session(&task.session_id, &task.session_config)
+                .produce_runtime_for_session(
+                    &task.session_id,
+                    &task.session_config,
+                    task.vcores_consumed,
+                )
                 .unwrap();
 
             Arc::new(TaskContext::new(
@@ -453,12 +461,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let task_start = Instant::now();
         let execution_result = self
             .executor
-            .execute_query_stage(
-                task_id,
-                part.clone(),
-                query_stage_exec.clone(),
-                task_context,
-            )
+            .execute_query_stage(key.clone(), query_stage_exec.clone(), task_context)
             .await;
         info!(
             "Done with task {task_identity} in {:?}",
@@ -472,6 +475,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             .map(|m| m.try_into())
             .collect::<Result<Vec<_>, BallistaError>>()
             .ok();
+        let runtime_stats = query_stage_exec.collect_runtime_stats_reports();
+        // Collect only when the task otherwise succeeded: a failed task's
+        // partial state is meaningless, and its own error is the useful one.
+        let (execution_result, window_state) = match execution_result {
+            Ok(partitions) => match query_stage_exec.collect_window_state_reports() {
+                Ok(reports) => (Ok(partitions), reports),
+                Err(e) => (Err(e.into()), Vec::new()),
+            },
+            Err(e) => (Err(e), Vec::new()),
+        };
         let executor_id = &self.executor.metadata.id;
 
         let end_exec_time = SystemTime::now()
@@ -487,11 +500,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let task_status = as_task_status(
             execution_result,
             executor_id.clone(),
-            task_id,
             stage_attempt_num,
-            part,
-            operator_metrics,
+            key,
             task_execution_times,
+            TaskCompletionExtras {
+                operator_metrics,
+                runtime_stats,
+                window_state,
+            },
         );
 
         let scheduler_id = curator_task.scheduler_id;
@@ -849,6 +865,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                         self.executor.function_registry.scalar_functions.clone(),
                         self.executor.function_registry.aggregate_functions.clone(),
                         self.executor.function_registry.window_functions.clone(),
+                        self.executor.function_registry.higher_order_functions.clone(),
                         self.codec.clone(),
                     )
                     .map_err(|e| Status::invalid_argument(format!("{e}")))?,
@@ -880,6 +897,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                 self.executor.function_registry.scalar_functions.clone(),
                 self.executor.function_registry.aggregate_functions.clone(),
                 self.executor.function_registry.window_functions.clone(),
+                self.executor.function_registry.higher_order_functions.clone(),
                 self.codec.clone(),
             ) {
                 Ok(tasks) => tasks,
@@ -941,7 +959,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
             if let Err(e) = self
                 .executor
                 .cancel_task(
-                    task.task_id as usize,
                     JobId::from(task.job_id),
                     task.stage_id as usize,
                     task.task_id as usize,

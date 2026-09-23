@@ -390,13 +390,16 @@ pub struct SortShuffleWriterExecNode {
     pub output_partitioning: ::core::option::Option<
         ::datafusion_proto::protobuf::PhysicalHashRepartition,
     >,
-    /// Configuration for sort shuffle
+    /// Deprecated: superseded by memory_limit_per_task_bytes. Kept so an older
+    /// scheduler/executor speaking this wire format still decodes a sensible
+    /// value; the writer ignores buffer_size and spill_threshold.
     #[prost(uint64, tag = "5")]
     pub buffer_size: u64,
     #[prost(uint64, tag = "6")]
     pub memory_limit: u64,
     #[prost(double, tag = "7")]
     pub spill_threshold: f64,
+    /// Target batch size in rows when materializing buffered shuffle data.
     #[prost(uint64, tag = "8")]
     pub batch_size: u64,
     /// Per-task buffered-bytes budget at which the writer spills its in-memory
@@ -430,6 +433,7 @@ pub struct UnresolvedShuffleExecNode {
     pub broadcast: bool,
     #[prost(uint32, tag = "7")]
     pub upstream_partition_count: u32,
+    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
     #[prost(message, optional, tag = "8")]
     pub coalesce: ::core::option::Option<CoalescePlan>,
 }
@@ -448,6 +452,7 @@ pub struct ShuffleReaderExecNode {
     pub broadcast: bool,
     #[prost(uint32, tag = "6")]
     pub upstream_partition_count: u32,
+    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
     #[prost(message, optional, tag = "7")]
     pub coalesce: ::core::option::Option<CoalescePlan>,
 }
@@ -488,11 +493,15 @@ pub struct RangeShuffleReaderExecNode {
 /// Empty when no coalesce is applied (the optional field on the parent message is absent).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoalescePlan {
+    /// Original number of upstream partitions (M) before coalescing. Required for EXPLAIN's "K of M" rendering.
     #[prost(uint32, tag = "1")]
     pub upstream_partition_count: u32,
+    /// Coalesced output groups. Length is K (the post-coalesce partition count).
     #[prost(message, repeated, tag = "2")]
     pub groups: ::prost::alloc::vec::Vec<PartitionGroup>,
 }
+/// One coalesced output partition's source list: a set of upstream partition indices in \[0, upstream_partition_count).
+/// Default algorithm produces only contiguous indices, but proto allows arbitrary index sets for future strategies.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PartitionGroup {
     #[prost(uint32, repeated, tag = "1")]
@@ -739,8 +748,6 @@ pub struct FetchPartition {
     pub stage_id: u32,
     #[prost(uint32, tag = "3")]
     pub partition_id: u32,
-    #[prost(string, tag = "4")]
-    pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub host: ::prost::alloc::string::String,
     #[prost(uint32, tag = "6")]
@@ -768,6 +775,13 @@ pub struct FetchPartition {
     /// and it is why the range shuffle's index carries byte offsets at all.
     #[prost(message, repeated, tag = "11")]
     pub byte_ranges: ::prost::alloc::vec::Vec<ByteRange>,
+    /// Fork-only addressing for the memory://, object-store (S3/Azure), and
+    /// Vortex shuffle backends, which key partitions by an opaque location
+    /// string rather than a local-disk file_id. Empty for a partition produced
+    /// by the upstream file_id/layout writers; when set, it takes precedence
+    /// and `layout`/`file_kind`/`byte_ranges` do not apply.
+    #[prost(string, tag = "4")]
+    pub path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionLocation {
@@ -781,12 +795,14 @@ pub struct PartitionLocation {
     pub executor_meta: ::core::option::Option<ExecutorMetadata>,
     #[prost(message, optional, tag = "4")]
     pub partition_stats: ::core::option::Option<PartitionStats>,
-    #[prost(string, tag = "5")]
-    pub path: ::prost::alloc::string::String,
     #[prost(uint64, optional, tag = "6")]
     pub file_id: ::core::option::Option<u64>,
     #[prost(bool, tag = "7")]
     pub is_sort_shuffle: bool,
+    /// Fork-only addressing for the memory://, object-store, and Vortex shuffle
+    /// backends. See `FetchPartition.path`.
+    #[prost(string, tag = "5")]
+    pub path: ::prost::alloc::string::String,
 }
 /// Unique identifier for a materialized partition of data
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1056,13 +1072,11 @@ pub struct ExecutorSpecification {
 /// through one plan-Arc.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutorResource {
-    /// TODO add more resources
     #[prost(oneof = "executor_resource::Resource", tags = "1")]
     pub resource: ::core::option::Option<executor_resource::Resource>,
 }
 /// Nested message and enum types in `ExecutorResource`.
 pub mod executor_resource {
-    /// TODO add more resources
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Resource {
         #[prost(uint32, tag = "1")]
@@ -1285,6 +1299,8 @@ pub struct TaskKilled {}
 pub struct ShuffleWritePartition {
     #[prost(uint64, tag = "1")]
     pub partition_id: u64,
+    /// Fork-only addressing for the memory://, object-store, and Vortex shuffle
+    /// backends. See `FetchPartition.path`.
     #[prost(string, tag = "2")]
     pub path: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]

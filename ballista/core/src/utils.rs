@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::config::{BallistaConfig, ShuffleFormat};
+use crate::config::BallistaConfig;
 use crate::error::{BallistaError, Result};
 use crate::extension::SessionConfigExt;
 use crate::serde::scheduler::PartitionStats;
@@ -34,6 +34,7 @@ use futures::StreamExt;
 use log::error;
 use std::io::BufWriter;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
@@ -83,13 +84,11 @@ pub struct GrpcClientConfig {
 impl From<&BallistaConfig> for GrpcClientConfig {
     fn from(config: &BallistaConfig) -> Self {
         Self {
-            connect_timeout_seconds: config.default_grpc_client_connect_timeout_seconds()
-                as u64,
-            timeout_seconds: config.default_grpc_client_timeout_seconds() as u64,
-            tcp_keepalive_seconds: config.default_grpc_client_tcp_keepalive_seconds()
-                as u64,
+            connect_timeout_seconds: config.grpc_client_connect_timeout_seconds() as u64,
+            timeout_seconds: config.grpc_client_timeout_seconds() as u64,
+            tcp_keepalive_seconds: config.grpc_client_tcp_keepalive_seconds() as u64,
             http2_keepalive_interval_seconds: config
-                .default_grpc_client_http2_keepalive_interval_seconds()
+                .grpc_client_http2_keepalive_interval_seconds()
                 as u64,
             use_tls: config.use_tls(),
             max_message_size: config.grpc_client_max_message_size(),
@@ -200,7 +199,7 @@ pub fn create_write_options(
 /// keeping the tokio worker thread unblocked.
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-    path: &str,
+    path: &Path,
     disk_write_metric: &metrics::Time,
     channel_capacity: usize,
     compression_type: Option<CompressionType>,
@@ -213,7 +212,7 @@ pub async fn write_stream_to_disk(
 
     let handle = tokio::task::spawn_blocking(move || -> Result<u64> {
         let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
-            error!("Failed to create partition file at {path_owned}: {e:?}");
+            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
             BallistaError::IoError(e)
         })?);
 
@@ -270,6 +269,14 @@ pub async fn write_stream_to_disk(
     ))
 }
 
+/// Get the file extension for the given shuffle format.
+pub fn shuffle_file_extension(format: crate::config::ShuffleFormat) -> &'static str {
+    match format {
+        crate::config::ShuffleFormat::ArrowIpc => "arrow",
+        crate::config::ShuffleFormat::Vortex => "vortex",
+    }
+}
+
 /// Collects all record batches from a stream into a vector.
 pub async fn collect_stream(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
@@ -279,48 +286,6 @@ pub async fn collect_stream(
         batches.push(batch?);
     }
     Ok(batches)
-}
-
-/// Write stream to disk using the specified shuffle format
-///
-/// This function dispatches to the appropriate writer based on the format:
-/// - ArrowIpc: Uses Arrow IPC streaming format with LZ4 compression
-/// - Vortex: Uses Vortex columnar format (requires 'vortex' feature)
-pub async fn write_stream_to_disk_with_format(
-    stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-    path: &str,
-    disk_write_metric: &metrics::Time,
-    format: ShuffleFormat,
-) -> Result<PartitionStats> {
-    match format {
-        ShuffleFormat::ArrowIpc => {
-            write_stream_to_disk(
-                stream,
-                path,
-                disk_write_metric,
-                crate::execution_plans::DEFAULT_SHUFFLE_CHANNEL_CAPACITY,
-                Some(CompressionType::LZ4_FRAME),
-            )
-            .await
-        }
-        #[cfg(feature = "vortex")]
-        ShuffleFormat::Vortex => {
-            crate::execution_plans::write_stream_to_disk_vortex(stream, path, disk_write_metric)
-                .await
-        }
-        #[cfg(not(feature = "vortex"))]
-        ShuffleFormat::Vortex => Err(BallistaError::General(
-            "Vortex format is not available. Enable the 'vortex' feature to use Vortex shuffle format.".to_string(),
-        )),
-    }
-}
-
-/// Get the file extension for the given shuffle format
-pub fn shuffle_file_extension(format: ShuffleFormat) -> &'static str {
-    match format {
-        ShuffleFormat::ArrowIpc => "arrow",
-        ShuffleFormat::Vortex => "vortex",
-    }
 }
 
 /// Creates a gRPC client connection with the specified configuration.
@@ -361,7 +326,7 @@ where
 {
     let endpoint = tonic::transport::Endpoint::new(dst)?;
     if let Some(config) = config {
-        Ok(endpoint
+        let mut endpoint = endpoint
             .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
             .timeout(Duration::from_secs(config.timeout_seconds))
             .tcp_nodelay(true)
@@ -370,7 +335,17 @@ where
                 config.http2_keepalive_interval_seconds,
             ))
             .keep_alive_timeout(Duration::from_secs(20))
-            .keep_alive_while_idle(true))
+            .keep_alive_while_idle(true);
+        if config.initial_connection_window_size > 0 {
+            endpoint = endpoint.initial_connection_window_size(Some(
+                config.initial_connection_window_size,
+            ));
+        }
+        if config.initial_stream_window_size > 0 {
+            endpoint = endpoint
+                .initial_stream_window_size(Some(config.initial_stream_window_size));
+        }
+        Ok(endpoint)
     } else {
         Ok(endpoint)
     }
@@ -460,19 +435,19 @@ mod tests {
         // Verify the conversion picks up the right values
         assert_eq!(
             grpc_config.connect_timeout_seconds,
-            ballista_config.default_grpc_client_connect_timeout_seconds() as u64
+            ballista_config.grpc_client_connect_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.timeout_seconds,
-            ballista_config.default_grpc_client_timeout_seconds() as u64
+            ballista_config.grpc_client_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.tcp_keepalive_seconds,
-            ballista_config.default_grpc_client_tcp_keepalive_seconds() as u64
+            ballista_config.grpc_client_tcp_keepalive_seconds() as u64
         );
         assert_eq!(
             grpc_config.http2_keepalive_interval_seconds,
-            ballista_config.default_grpc_client_http2_keepalive_interval_seconds() as u64
+            ballista_config.grpc_client_http2_keepalive_interval_seconds() as u64
         );
     }
 
@@ -483,7 +458,12 @@ mod tests {
             timeout_seconds: 30,
             tcp_keepalive_seconds: 1800,
             http2_keepalive_interval_seconds: 150,
-            ..Default::default()
+            use_tls: false,
+            max_message_size: 16 * 1024 * 1024,
+            io_retries_times: 3,
+            io_retry_wait_time_ms: 3000,
+            initial_connection_window_size: 67108864,
+            initial_stream_window_size: 16777216,
         };
         let result = create_grpc_client_endpoint("http://localhost:50051", Some(&config));
         assert!(result.is_ok());

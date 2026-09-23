@@ -339,6 +339,7 @@ impl RangeShuffleWriterExec {
                     global_partition,
                     ShuffleWritePartition {
                         partition_id: global_partition as u64,
+                        path: String::new(),
                         num_batches: stats.num_batches.unwrap_or(0),
                         num_rows: stats.num_rows.unwrap_or(0),
                         num_bytes: stats.num_bytes.unwrap_or(0),
@@ -624,6 +625,7 @@ mod tests {
             partition_stats: PartitionStats::default(),
             file_id: Some(0),
             is_sort_shuffle: false,
+            path: String::new(),
         }
     }
 

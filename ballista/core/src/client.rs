@@ -17,17 +17,6 @@
 
 //! Client API for sending requests to executors.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use std::{
-    convert::{TryFrom, TryInto},
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
-
 use crate::error::{BallistaError, Result as BResult};
 use crate::extension::BallistaConfigGrpcEndpoint;
 use crate::serde::protobuf;
@@ -50,100 +39,26 @@ use datafusion::arrow::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::error::Result;
-
-use crate::utils::GrpcClientConfig;
-
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
 use log::{debug, warn};
 use prost::Message;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::{
+    convert::{TryFrom, TryInto},
+    task::{Context, Poll},
+};
 use tonic::{Code, Streaming};
 
 /// Client for interacting with Ballista executors.
 #[derive(Clone)]
 pub struct BallistaClient {
+    host: String,
+    port: u16,
     flight_client: FlightServiceClient<tonic::transport::channel::Channel>,
     io_retries_times: u8,
     io_retry_wait_time_ms: u64,
-}
-
-/// True when the status says the pooled channel itself is unusable — tonic
-/// surfaces a failed channel as `Code::Unknown` with a transport-error message
-/// ("Service was not ready: transport error"), meaning the request never
-/// reached the peer. Retrying on the same channel cannot succeed, so fail
-/// fast and let the caller evict the pooled client and reconnect instead of
-/// burning the IO-retry budget on a dead connection.
-fn is_dead_channel_error(status: &tonic::Status) -> bool {
-    status.code() == Code::Unknown && {
-        let msg = status.message();
-        msg.contains("Service was not ready") || msg.contains("transport error")
-    }
-}
-/// Read-inactivity bound for shuffle data streams. The endpoint's request
-/// timeout only bounds time-to-response-headers, not the streaming body, so a
-/// peer stream that stalls mid-transfer otherwise hangs the reducer task
-/// forever — pinning its task slot until process restart. If no data arrives
-/// for this long while the consumer is actively waiting, fail the stream so
-/// the task fails and can be retried. Generous, because the timer also
-/// accumulates while the consumer itself pauses between polls.
-const STREAM_READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Wraps a record-batch stream and errors out if the underlying stream stays
-/// pending past [`STREAM_READ_INACTIVITY_TIMEOUT`] without yielding anything.
-/// The deadline resets on every yielded item.
-struct InactivityTimeoutStream {
-    inner: SendableRecordBatchStream,
-    deadline: Pin<Box<tokio::time::Sleep>>,
-    timed_out: bool,
-}
-
-impl InactivityTimeoutStream {
-    fn new(inner: SendableRecordBatchStream) -> Self {
-        Self {
-            inner,
-            deadline: Box::pin(tokio::time::sleep(STREAM_READ_INACTIVITY_TIMEOUT)),
-            timed_out: false,
-        }
-    }
-}
-
-impl Stream for InactivityTimeoutStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        // The timeout is terminal: yield the error once, then end the stream,
-        // so a caller that keeps polling doesn't receive the same error forever.
-        if self.timed_out {
-            return Poll::Ready(None);
-        }
-        match self.inner.poll_next_unpin(cx) {
-            Poll::Ready(item) => {
-                self.deadline
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + STREAM_READ_INACTIVITY_TIMEOUT);
-                Poll::Ready(item)
-            }
-            Poll::Pending => match self.deadline.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    self.timed_out = true;
-                    Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "shuffle stream stalled: no data received for {}s",
-                        STREAM_READ_INACTIVITY_TIMEOUT.as_secs()
-                    )))))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-        }
-    }
-}
-
-impl RecordBatchStream for InactivityTimeoutStream {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
 }
 
 impl BallistaClient {
@@ -166,41 +81,20 @@ impl BallistaClient {
         let addr = format!("{scheme}://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
 
-        // This connection is pooled and reused per peer for shuffle fetches, so a
-        // dead or stalled peer must be detected: without it the fetch RPC hangs
-        // forever and every subsequent fetch to that peer stalls behind it. Enable
-        // HTTP/2 keepalive (driven by the transport task, independent of any blocked
-        // request future) so a broken connection is closed and the fetch fails,
-        // letting the caller evict the pooled client and retry. The request timeout
-        // is kept large because partition transfers stream at the consumer's pace.
-        let grpc_config = GrpcClientConfig {
-            connect_timeout_seconds: 20,
-            timeout_seconds: 3600,
-            tcp_keepalive_seconds: 3600,
-            http2_keepalive_interval_seconds: 60,
-            ..Default::default()
-        };
-        let mut endpoint = create_grpc_client_endpoint(addr.clone(), Some(&grpc_config))
+        let mut endpoint = create_grpc_client_endpoint(addr.clone(), None)
             .map_err(|e| {
                 BallistaError::GrpcConnectionError(format!(
                     "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
                 ))
-            })?
-            // Override the default 20s keepalive-ack timeout: PONG processing
-            // happens on the connection driver task, and under heavy load a
-            // delayed poll past the timeout makes hyper abort the connection,
-            // failing every multiplexed fetch at once. 60s tolerates scheduling
-            // delay while dead-path detection (interval + timeout ~2min) stays
-            // well inside the stream-inactivity bound.
-            .keep_alive_timeout(std::time::Duration::from_secs(60));
+            })?;
 
-        if initial_stream_window_size > 0 {
-            endpoint =
-                endpoint.initial_stream_window_size(Some(initial_stream_window_size));
-        }
         if initial_connection_window_size > 0 {
             endpoint = endpoint
                 .initial_connection_window_size(Some(initial_connection_window_size));
+        }
+        if initial_stream_window_size > 0 {
+            endpoint =
+                endpoint.initial_stream_window_size(Some(initial_stream_window_size));
         }
 
         if let Some(customize) = customize_endpoint {
@@ -227,6 +121,8 @@ impl BallistaClient {
 
         Ok(Self {
             flight_client,
+            host: host.to_string(),
+            port,
             io_retries_times,
             io_retry_wait_time_ms,
         })
@@ -242,9 +138,11 @@ impl BallistaClient {
             .expect("valid address")
             .connect_lazy();
         Self {
-            flight_client: FlightServiceClient::new(channel),
             io_retries_times: 3,
             io_retry_wait_time_ms: 250,
+            host: host.to_string(),
+            port,
+            flight_client: FlightServiceClient::new(channel),
         }
     }
 
@@ -253,11 +151,13 @@ impl BallistaClient {
     /// Depending on the value of the `flight_transport` parameter, this method will utilize either
     /// the Arrow Flight protocol for compatibility, or a more efficient block-based transfer mechanism.
     /// The block-based transfer is optimized for performance and reduces computational overhead on the server.
+    ///
+    /// This method is to be used for direct connection to the executor holding the required shuffle partition.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_partition(
         &mut self,
         executor_id: &str,
         partition_id: &PartitionId,
-        path: &str,
         file_id: Option<u64>,
         layout: ShuffleLayout,
         flight_transport: bool,
@@ -267,7 +167,7 @@ impl BallistaClient {
         self.fetch_partition_proxied(
             executor_id,
             partition_id,
-            path,
+            "",
             file_id,
             layout,
             &host,
@@ -301,16 +201,13 @@ impl BallistaClient {
             job_id: partition_id.job_id.clone(),
             stage_id: partition_id.stage_id,
             partition_id: partition_id.partition_id,
-            // Byte-range fetches address by `file_id`/`layout` alone; `path`
-            // is the fork's path-based shuffle storage location and plays no
-            // role here.
-            path: String::new(),
             host,
             port,
             file_id,
             layout,
             file_kind,
             byte_ranges,
+            path: String::new(),
         };
         self.execute_do_action_with_header(&action, header)
             .await
@@ -336,36 +233,21 @@ impl BallistaClient {
         port: u16,
         flight_transport: bool,
     ) -> BResult<SendableRecordBatchStream> {
-        // When the writer-side stored this partition in object store (currently `s3://`
-        // only — see `path_is_object_store`; broaden there if other schemes gain direct
-        // routing), skip the gRPC FetchPartition path entirely — the executor's handler
-        // only knows local paths and `memory://` and would
-        // `tokio::fs::File::open("s3://...")`, failing with `No such file or directory`.
-        // Read straight from object store instead.
-        if crate::execution_plans::shuffle_reader::path_is_object_store(path) {
-            return crate::execution_plans::shuffle_reader::fetch_object_store_partition_stream(
-                path,
-                executor_id,
-                partition_id.stage_id,
-                partition_id.partition_id,
-            )
-            .await;
-        }
-
         // No ranges: asks for whatever these identifiers address, which under
         // the sort layout is the named partition's slice and under passthrough
-        // is the whole file.
+        // is the whole file. `path` addresses the fork's memory:// / object-store
+        // shuffle backends instead, when non-empty (see `Action::FetchPartition`).
         let action = Action::FetchPartition {
             job_id: partition_id.job_id.clone(),
             stage_id: partition_id.stage_id,
             partition_id: partition_id.partition_id,
-            path: path.to_owned(),
             host: host.to_owned(),
             port,
             file_id,
             layout,
             file_kind: ShuffleFileKind::Data,
             byte_ranges: vec![],
+            path: path.to_owned(),
         };
 
         let result = if flight_transport {
@@ -424,7 +306,7 @@ impl BallistaClient {
             .encode(&mut buf)
             .map_err(|e| BallistaError::GrpcActionError(format!("{e:?}")))?;
 
-        let io_retries_times = self.io_retries_times.max(1);
+        let io_retries_times = self.io_retries_times;
         let io_retry_wait_time_ms = self.io_retry_wait_time_ms;
         for i in 0..io_retries_times {
             if i > 0 {
@@ -444,22 +326,9 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
-                    // Preserve NotFound (e.g. a missing shuffle partition file) as a
-                    // typed gRPC status so the shuffle reader can decide whether it
-                    // means an empty partition (disk-backed, 0 rows) or genuinely lost
-                    // data (retry/fail). Don't blanket-map it to an empty stream here.
-                    if err.code() == Code::NotFound {
-                        return BallistaError::GrpcError(Box::new(result.unwrap_err()))
-                            .into();
-                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
-                    // This means IO related error will retry. A dead pooled
-                    // channel also reports Code::Unknown but can never recover
-                    // by retrying on the same channel; fail fast instead.
-                    if i == io_retries_times - 1
-                        || err.code() != Code::Unknown
-                        || is_dead_channel_error(err)
-                    {
+                    // This means IO related error will retry.
+                    if i == io_retries_times - 1 || err.code() != Code::Unknown {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             result.unwrap_err()
@@ -480,9 +349,7 @@ impl BallistaClient {
                             let schema = Arc::new(Schema::try_from(&flight_data)?);
 
                             // all the remaining stream messages should be dictionary and record batches
-                            Ok(Box::pin(InactivityTimeoutStream::new(Box::pin(
-                                FlightDataStream::new(stream, schema),
-                            ))))
+                            Ok(Box::pin(FlightDataStream::new(stream, schema)))
                         }
                         None => Err(BallistaError::GrpcActionError(
                             "Did not receive schema batch from flight server".to_string(),
@@ -490,10 +357,7 @@ impl BallistaClient {
                     };
                 }
                 Err(e) => {
-                    if i == io_retries_times - 1
-                        || e.code() != Code::Unknown
-                        || is_dead_channel_error(&e)
-                    {
+                    if i == io_retries_times - 1 || e.code() != Code::Unknown {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             e.to_string()
@@ -540,7 +404,7 @@ impl BallistaClient {
             .encode(&mut buf)
             .map_err(|e| BallistaError::GrpcActionError(format!("{e:?}")))?;
 
-        let io_retries_times = self.io_retries_times.max(1);
+        let io_retries_times = self.io_retries_times;
         let io_retry_wait_time_ms = self.io_retry_wait_time_ms;
         for i in 0..io_retries_times {
             if i > 0 {
@@ -561,22 +425,9 @@ impl BallistaClient {
             let res = match result {
                 Ok(res) => res,
                 Err(ref err) => {
-                    // Preserve NotFound (e.g. a missing shuffle partition file) as a
-                    // typed gRPC status so the shuffle reader can decide whether it
-                    // means an empty partition (disk-backed, 0 rows) or genuinely lost
-                    // data (retry/fail). Don't blanket-map it to an empty stream here.
-                    if err.code() == Code::NotFound {
-                        return BallistaError::GrpcError(Box::new(result.unwrap_err()))
-                            .into();
-                    }
                     // IO related error like connection timeout, reset... will warp with Code::Unknown
-                    // This means IO related error will retry. A dead pooled
-                    // channel also reports Code::Unknown but can never recover
-                    // by retrying on the same channel; fail fast instead.
-                    if i == io_retries_times - 1
-                        || err.code() != Code::Unknown
-                        || is_dead_channel_error(err)
-                    {
+                    // This means IO related error will retry.
+                    if i == io_retries_times - 1 || err.code() != Code::Unknown {
                         return BallistaError::GrpcActionError(format!(
                             "{:?}",
                             result.unwrap_err()
@@ -601,18 +452,17 @@ impl BallistaClient {
             // A caller fetching byte ranges gets batch messages with no schema
             // ahead of them, because the schema is not in the bytes it asked
             // for. It supplies the header it already knows.
-            let stream = match header.clone() {
-                Some(header) => futures::stream::once(async move {
-                    Ok(prost::bytes::Bytes::from(header))
-                })
-                .chain(stream)
-                .boxed(),
-                None => stream.boxed(),
-            };
+            let stream =
+                match header.clone() {
+                    Some(header) => futures::stream::once(async move {
+                        Ok(prost::bytes::Bytes::from(header))
+                    })
+                    .chain(stream)
+                    .boxed(),
+                    None => stream.boxed(),
+                };
 
-            return Ok(Box::pin(InactivityTimeoutStream::new(Box::pin(
-                BlockDataStream::try_new(stream).await?,
-            ))));
+            return Ok(Box::pin(BlockDataStream::try_new(stream).await?));
         }
         unreachable!("Did not receive schema batch from flight server");
     }
@@ -875,12 +725,7 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use prost::bytes::Bytes;
 
-    use crate::client::{
-        BlockDataStream, InactivityTimeoutStream, STREAM_READ_INACTIVITY_TIMEOUT,
-    };
-    use datafusion::arrow::datatypes::Schema;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use std::time::Duration;
+    use crate::client::BlockDataStream;
 
     fn generate_batches() -> Vec<RecordBatch> {
         let batch0 = RecordBatch::try_from_iter([
@@ -1049,50 +894,5 @@ mod tests {
                 .await;
 
         assert_eq!(batches, result.unwrap())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inactivity_timeout_fires_and_is_terminal() {
-        let schema = Arc::new(Schema::empty());
-        let inner =
-            RecordBatchStreamAdapter::new(schema.clone(), futures::stream::pending());
-        let mut stream = InactivityTimeoutStream::new(Box::pin(inner));
-
-        // The paused clock auto-advances to the inactivity deadline while the
-        // inner stream stays pending, so the timeout error is yielded.
-        let item = stream.next().await.expect("timeout should yield an error");
-        let err = item.expect_err("item should be the timeout error");
-        assert!(
-            err.to_string().contains("shuffle stream stalled"),
-            "unexpected error: {err}"
-        );
-
-        // The timeout is terminal: the stream ends instead of repeating the error.
-        assert!(stream.next().await.is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inactivity_deadline_resets_after_yielding_an_item() {
-        let schema = Arc::new(Schema::empty());
-        let batch = RecordBatch::new_empty(schema.clone());
-        let inner = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(vec![Ok(batch)]).chain(futures::stream::pending()),
-        );
-        let mut stream = InactivityTimeoutStream::new(Box::pin(inner));
-
-        // Consume the item just before the original deadline would fire.
-        tokio::time::advance(STREAM_READ_INACTIVITY_TIMEOUT - Duration::from_secs(1))
-            .await;
-        let first = stream.next().await.expect("one batch");
-        assert!(first.is_ok());
-
-        // Past the ORIGINAL deadline: the yielded item must have reset it.
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(futures::poll!(stream.next()).is_pending());
-
-        // The reset deadline eventually fires (auto-advance under paused time).
-        let item = stream.next().await.expect("timeout should yield an error");
-        assert!(item.is_err());
     }
 }

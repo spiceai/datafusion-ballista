@@ -21,7 +21,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::{
-    HashJoinExec, HashJoinExecBuilder, PartitionMode,
+    HashJoinExec, HashJoinExecBuilder, MinMaxLeftAccumulator, PartitionMode,
 };
 use log::debug;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl PhysicalOptimizerRule for DemoteUnsafeBroadcastJoinRule {
                     "demoting broadcast-unsafe CollectLeft {:?} join to Partitioned",
                     join.join_type()
                 );
-                let demoted = HashJoinExecBuilder::new(
+                let demoted = HashJoinExecBuilder::<MinMaxLeftAccumulator>::new(
                     Arc::clone(&join.left),
                     Arc::clone(&join.right),
                     join.on.clone(),

@@ -19,7 +19,7 @@ use chrono::{TimeZone, Utc};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use datafusion::physical_plan::metrics::{
     Count, Gauge, MetricValue, MetricsSet, PruningMetrics, RatioMetrics, Time, Timestamp,
 };
@@ -41,9 +41,8 @@ use crate::serde::scheduler::{
     PartitionLocation, PartitionStats, TaskDefinition,
 };
 
-use crate::JobId;
-use crate::RuntimeProducer;
 use crate::serde::{BallistaCodec, protobuf};
+use crate::{JobId, RuntimeProducer};
 use protobuf::{NamedCount, NamedGauge, NamedTime, operator_metric};
 
 impl TryInto<Action> for protobuf::Action {
@@ -56,10 +55,9 @@ impl TryInto<Action> for protobuf::Action {
                     job_id: fetch.job_id.into(),
                     stage_id: fetch.stage_id as usize,
                     partition_id: fetch.partition_id as usize,
-                    path: fetch.path,
+                    file_id: fetch.file_id,
                     host: fetch.host,
                     port: fetch.port as u16,
-                    file_id: fetch.file_id,
                     layout: protobuf::ShuffleLayout::try_from(fetch.layout)
                         .map_err(|_| {
                             BallistaError::General(format!(
@@ -84,6 +82,7 @@ impl TryInto<Action> for protobuf::Action {
                             length: range.length,
                         })
                         .collect(),
+                    path: fetch.path,
                 })
             }
             _ => Err(BallistaError::General(
@@ -97,7 +96,7 @@ impl TryInto<Action> for protobuf::Action {
 impl Into<PartitionId> for protobuf::PartitionId {
     fn into(self) -> PartitionId {
         PartitionId::new(
-            &JobId::from(self.job_id),
+            &self.job_id.into(),
             self.stage_id as usize,
             self.partition_id as usize,
         )
@@ -149,9 +148,9 @@ impl TryInto<PartitionLocation> for protobuf::PartitionLocation {
                     )
                 })?
                 .into(),
-            path: self.path,
             file_id: self.file_id,
             is_sort_shuffle: self.is_sort_shuffle,
+            path: self.path,
         })
     }
 }
@@ -289,7 +288,7 @@ impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
             port: self.port as u16,
             grpc_port: self.grpc_port as u16,
             specification: self.specification.unwrap().into(),
-            os_info: self.os_info.map(Into::into).unwrap_or_default(),
+            os_info: self.os_info.unwrap().into(),
         }
     }
 }
@@ -361,6 +360,7 @@ impl Into<ExecutorData> for protobuf::ExecutorData {
 ///
 /// This function deserializes the execution plan from the protobuf representation
 /// and constructs a complete task definition with the provided runtime configuration.
+#[allow(clippy::too_many_arguments)]
 pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     task: protobuf::TaskDefinition,
     produce_runtime: RuntimeProducer,
@@ -368,6 +368,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     window_functions: HashMap<String, Arc<WindowUDF>>,
+    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
     codec: BallistaCodec<T, U>,
 ) -> Result<TaskDefinition, BallistaError> {
     let session_config = session_config.update_from_key_value_pair(&task.props);
@@ -377,7 +378,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         scalar_functions: scalar_functions.clone(),
         aggregate_functions: aggregate_functions.clone(),
         window_functions: window_functions.clone(),
-        higher_order_functions: HashMap::new(),
+        higher_order_functions: higher_order_functions.clone(),
     });
 
     let ctx = TaskContext::new(
@@ -385,7 +386,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         task.session_id.clone(),
         session_config.clone(),
         scalar_functions,
-        HashMap::new(),
+        higher_order_functions,
         aggregate_functions,
         window_functions,
         runtime.clone(),
@@ -429,6 +430,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
 ///
 /// This function handles batch task definitions where multiple partitions share
 /// the same execution plan, creating individual task definitions for each partition.
+#[allow(clippy::too_many_arguments)]
 pub fn get_task_definition_vec<
     T: 'static + AsLogicalPlan,
     U: 'static + AsExecutionPlan,
@@ -439,6 +441,7 @@ pub fn get_task_definition_vec<
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     window_functions: HashMap<String, Arc<WindowUDF>>,
+    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
     codec: BallistaCodec<T, U>,
 ) -> Result<Vec<TaskDefinition>, BallistaError> {
     let session_config = session_config.update_from_key_value_pair(&multi_task.props);
@@ -448,7 +451,7 @@ pub fn get_task_definition_vec<
         scalar_functions: scalar_functions.clone(),
         aggregate_functions: aggregate_functions.clone(),
         window_functions: window_functions.clone(),
-        higher_order_functions: HashMap::new(),
+        higher_order_functions: higher_order_functions.clone(),
     });
 
     let ctx = TaskContext::new(
@@ -456,7 +459,7 @@ pub fn get_task_definition_vec<
         uuid::Uuid::new_v4().to_string(),
         session_config.clone(),
         scalar_functions,
-        HashMap::new(),
+        higher_order_functions,
         aggregate_functions,
         window_functions,
         runtime.clone(),
