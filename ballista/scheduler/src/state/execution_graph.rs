@@ -2296,11 +2296,12 @@ mod test {
         mock_completed_task, mock_executor, mock_failed_task,
         revive_graph_and_complete_next_stage,
         revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
-        test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
-        test_union_all_plan, test_union_plan,
+        test_coalesce_plan, test_join_plan, test_join_plan_with_ballista_config,
+        test_two_aggregations_plan, test_union_all_plan, test_union_plan,
     };
+    use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::BallistaCodec;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
 
     #[tokio::test]
     async fn test_execution_graph_proto_round_trip() -> Result<()> {
@@ -2723,13 +2724,15 @@ mod test {
         // Complete the first stage
         assert_eq!(revive_graph_and_complete_next_stage(&mut join_graph)?, 2);
 
-        // Complete the second stage
+        // Complete the second stage. The build (left) side is broadcast via
+        // CollectLeft; the probe (right) side has 2 partitions, so the join
+        // stage runs one task per probe partition.
         assert_eq!(
             revive_graph_and_complete_next_stage_with_executor(
                 &mut join_graph,
                 &executor2
             )?,
-            1
+            2
         );
 
         // There are 0 tasks pending schedule now
@@ -2943,7 +2946,20 @@ mod test {
     async fn test_abort_running_cancels_stages_and_returns_inflight_tasks() -> Result<()>
     {
         let executor = mock_executor("executor-id1".to_string());
-        let mut graph = test_join_plan(2).await;
+        // Disable broadcast promotion so the join stays `Partitioned`: both
+        // sides are then hash-repartitioned into their own leaf stage, giving
+        // two independent running stages for `abort_running` to cancel. With
+        // broadcast promotion on (the default), the tiny build side is
+        // broadcast via `CollectLeft` and the probe side is inlined into the
+        // join's own stage, leaving only one leaf stage.
+        let mut graph = test_join_plan_with_ballista_config(
+            2,
+            Arc::new(
+                SessionConfig::new_with_ballista()
+                    .with_ballista_broadcast_join_threshold_bytes(0),
+            ),
+        )
+        .await;
 
         // Call revive to move the two leaf Resolved stages to Running
         graph.revive();

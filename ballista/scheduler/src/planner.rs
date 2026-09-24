@@ -464,6 +464,17 @@ impl DefaultDistributedPlanner {
                 );
                 return Ok(plan);
             }
+            // A join that already carries a dynamic filter (attached by DataFusion's
+            // `FilterPushdown::new_post_optimization()`, which runs before this
+            // distributed planner ever sees the plan) can no longer have its inputs
+            // swapped; `HashJoinExec::swap_inputs` enforces this. Skip the promotion
+            // rather than erroring: the plan stays correct, just not broadcast.
+            if !hash_join.dynamic_expressions_produced().is_empty() {
+                debug!(
+                    "broadcast check: join already carries a dynamic filter, cannot swap inputs safely, skipping promotion"
+                );
+                return Ok(plan);
+            }
             hash_join.swap_inputs(PartitionMode::CollectLeft)?
         } else {
             Arc::new(
@@ -568,13 +579,9 @@ impl DefaultDistributedPlanner {
             stats.num_rows,
             threshold,
         );
-        if let Some(bytes) = stats.total_byte_size.get_value()
-            && *bytes != 0
-        {
+        if let Some(bytes) = stats.total_byte_size.get_value() {
             Some(*bytes < threshold)
-        } else if let Some(rows) = stats.num_rows.get_value()
-            && *rows != 0
-        {
+        } else if let Some(rows) = stats.num_rows.get_value() {
             let schema = plan.schema();
             let bytes_per_row: usize = schema
                 .fields()

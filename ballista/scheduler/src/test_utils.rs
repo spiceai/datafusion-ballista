@@ -1250,6 +1250,22 @@ pub async fn test_coalesce_plan(partition: usize) -> StaticExecutionGraph {
 
 /// Creates a test execution graph with a join operation.
 pub async fn test_join_plan(partition: usize) -> StaticExecutionGraph {
+    test_join_plan_with_ballista_config(
+        partition,
+        Arc::new(SessionConfig::new_with_ballista()),
+    )
+    .await
+}
+
+/// Same as `test_join_plan`, but the caller supplies the Ballista `SessionConfig`
+/// used by the resulting graph. Use this when a test needs to override a
+/// distributed-planner knob (e.g. `broadcast_join_threshold_bytes`) that
+/// changes whether the join is lowered as `CollectLeft` (one leaf stage, the
+/// probe side inlined) or `Partitioned` (two independent leaf stages).
+pub async fn test_join_plan_with_ballista_config(
+    partition: usize,
+    ballista_session_config: Arc<SessionConfig>,
+) -> StaticExecutionGraph {
     let mut config = SessionConfig::new().with_target_partitions(partition);
     config
         .options_mut()
@@ -1302,7 +1318,7 @@ pub async fn test_join_plan(partition: usize) -> StaticExecutionGraph {
         "session",
         plan,
         0,
-        Arc::new(SessionConfig::new_with_ballista()),
+        ballista_session_config,
         &mut planner,
         None,
     )

@@ -255,8 +255,14 @@ pub(crate) fn try_collect_left(
     match (left_can_collect, right_can_collect) {
         (true, true) => {
             // Null-aware anti joins have specific side requirements and must not be swapped.
+            // A join that already carries a dynamic filter (built by DataFusion's
+            // `FilterPushdown::new_post_optimization()`, which runs before Ballista's
+            // distributed planner ever sees the plan) can no longer have its inputs
+            // swapped; `HashJoinExec::swap_inputs` enforces this. Leave the build side
+            // as-is rather than erroring: correct, just not necessarily optimal.
             if hash_join.join_type().supports_swap()
                 && !hash_join.null_aware
+                && hash_join.dynamic_expressions_produced().is_empty()
                 && should_swap_join_order(&**left, &**right)?
             {
                 Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
@@ -287,7 +293,11 @@ pub(crate) fn try_collect_left(
         )?))),
         (false, true) => {
             // Null-aware anti joins have specific side requirements and must not be swapped.
-            if hash_join.join_type().supports_swap() && !hash_join.null_aware {
+            // See the (true, true) arm above for why a dynamic filter blocks the swap.
+            if hash_join.join_type().supports_swap()
+                && !hash_join.null_aware
+                && hash_join.dynamic_expressions_produced().is_empty()
+            {
                 hash_join.swap_inputs(PartitionMode::CollectLeft).map(Some)
             } else {
                 Ok(None)
@@ -308,8 +318,10 @@ pub(crate) fn partitioned_hash_join(
     let left = hash_join.left();
     let right = hash_join.right();
     // Null-aware anti joins have specific side requirements and must not be swapped.
+    // See the (true, true) arm of `try_collect_left` for why a dynamic filter blocks the swap.
     if hash_join.join_type().supports_swap()
         && !hash_join.null_aware
+        && hash_join.dynamic_expressions_produced().is_empty()
         && should_swap_join_order(&**left, &**right)?
     {
         hash_join.swap_inputs(PartitionMode::Partitioned)
@@ -369,6 +381,7 @@ fn statistical_join_selection_subrule(
                     // that reached this arm already partitioned.
                     Some(partitioned_hash_join(hash_join)?)
                 } else if hash_join.join_type().supports_swap()
+                    && hash_join.dynamic_expressions_produced().is_empty()
                     && should_swap_join_order(&**left, &**right)?
                 {
                     hash_join
