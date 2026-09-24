@@ -120,9 +120,9 @@ async fn stages_the_build_side_then_broadcasts_the_measured_result() {
         .unwrap();
 
     // Pass two: decided against the measurement, not the guess.
-    assert_plan!(planner.current_plan(), @ "
+    assert_plan!(planner.current_plan(), @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[val@1]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[val@1]
         ExchangeExec: partitioning=None, plan_id=3, stage_id=0, stage_resolved=true, broadcast=true
           CooperativeExec
             StatsExec: partitions=4, rows=Inexact(1000000), bytes=Inexact(209715200)

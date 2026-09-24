@@ -175,7 +175,7 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
     let join = create_plan_with_hash_join()?;
 
     assert_plan!(join.as_ref(),  @ r"
-    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
+    HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)]
       RepartitionExec: partitioning=Hash([big_col@0], 2), input_partitions=2
         MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
       RepartitionExec: partitioning=Hash([big_col@0], 2), input_partitions=2
@@ -187,7 +187,7 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
 
     assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=pending, stage_resolved=false
           MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=pending, stage_resolved=false
@@ -199,7 +199,7 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
 
     assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=0, stage_id=0, stage_resolved=false
           MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=false
@@ -213,9 +213,9 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
 
     // join ordering changes as build side is bigger than probe side
     // after exchange statistic updated.
-    assert_plan!(planner.current_plan(),  @ "
+    assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
           CooperativeExec
             MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
@@ -227,9 +227,9 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
 
-    assert_plan!(planner.current_plan(),  @ "
+    assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=true, plan_id=2, stage_id=2, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
           CooperativeExec
             MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
@@ -240,9 +240,9 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
 
     planner.finalise_stage_internal(2, small_statistics_exchange())?;
 
-    assert_plan!(planner.current_plan(),  @ "
+    assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=true, plan_id=2, stage_id=2, stage_resolved=true
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(big_col@0, big_col@0)], projection=[big_col@1, big_col@0]
         ExchangeExec: partitioning=Hash([big_col@0], 2), plan_id=1, stage_id=1, stage_resolved=true
           CooperativeExec
             MockPartitionedScan: num_partitions=2, statistics=[Rows=Exact(262144), Bytes=Exact(2097152), [(Col[0]:)]]
@@ -388,7 +388,7 @@ async fn should_cancel_the_stage() -> datafusion::error::Result<()> {
 
     assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)], projection=[a@1, b@2, c@3]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(a@0, a@0)], projection=[a@1, b@2, c@3]
         ExchangeExec: partitioning=Hash([a@0], 2), plan_id=0, stage_id=0, stage_resolved=false
           FilterExec: b@1 = 42, projection=[a@0]
             DataSourceExec: partitions=1, partition_sizes=[1]

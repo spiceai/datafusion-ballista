@@ -1208,7 +1208,6 @@ mod tests {
     use crate::cluster::memory::InMemoryJobState;
     use crate::test_utils::{mock_completed_task, mock_executor, test_aggregation_plan};
     use ballista_core::serde::protobuf::job_status::Status;
-    use ballista_core::serde::scheduler::{PartitionId, PartitionLocation};
     use ballista_core::utils::{default_config_producer, default_session_builder};
     use datafusion_proto::protobuf::LogicalPlanNode;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1236,29 +1235,6 @@ mod tests {
                 failures_remaining: AtomicUsize::new(0),
                 save_attempts: AtomicUsize::new(0),
             }
-        }
-    }
-
-    fn create_partition(partition: usize) -> PartitionLocation {
-        PartitionLocation {
-            map_partition_id: 0,
-            partition_id: PartitionId {
-                job_id: JobId::new("demo".to_string()),
-                stage_id: 0,
-                partition_id: partition,
-            },
-            executor_meta: ExecutorMetadata {
-                id: "1".to_string(),
-                host: "1.1.1.1".to_string(),
-                port: 0,
-                grpc_port: 0,
-                specification: Default::default(),
-                os_info: Default::default(),
-            },
-            partition_stats: Default::default(),
-            path: String::default(),
-            file_id: None,
-            is_sort_shuffle: false,
         }
     }
 

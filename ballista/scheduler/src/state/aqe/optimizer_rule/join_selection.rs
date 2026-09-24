@@ -575,7 +575,7 @@ mod tests {
 
         assert_plan!(plan.as_ref(), @ r"
         ProjectionExec: expr=[id@0 as id, val@2 as val]
-          HashJoinExec: mode=Auto, join_type=Inner, on=[(id@0, id@0)]
+          HashJoinExec: mode=Auto, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
             DataSourceExec: partitions=1, partition_sizes=[1]
             DataSourceExec: partitions=1, partition_sizes=[1]
         ");
@@ -669,7 +669,7 @@ mod tests {
 
         assert_plan!(resolved.as_ref(), @ r"
         ProjectionExec: expr=[id@0 as id, val@2 as val]
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
             DataSourceExec: partitions=1, partition_sizes=[1]
             DataSourceExec: partitions=1, partition_sizes=[1]
         ");
@@ -718,9 +718,9 @@ mod tests {
 
         assert_plan!(resolved.as_ref(), @ r"
         ProjectionExec: expr=[id@0 as id]
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
             ProjectionExec: expr=[id@0 as id]
-              HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+              HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
                 DataSourceExec: partitions=1, partition_sizes=[1]
                 DataSourceExec: partitions=1, partition_sizes=[1]
             DataSourceExec: partitions=1, partition_sizes=[1]
@@ -940,7 +940,7 @@ mod tests {
 
         assert_plan!(resolve_plan.as_ref(), @ r"
         ProjectionExec: expr=[id@0 as id, val@2 as val]
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
             DataSourceExec: partitions=1, partition_sizes=[1]
             DataSourceExec: partitions=1, partition_sizes=[1]
         ");
@@ -970,7 +970,7 @@ mod tests {
 
         assert_plan!(dynamic_plan.as_ref(), @ r"
         ProjectionExec: expr=[id@0 as id, val@2 as val]
-          HashJoinExec: mode=Auto, join_type=Inner, on=[(id@0, id@0)]
+          HashJoinExec: mode=Auto, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)]
             DataSourceExec: partitions=1, partition_sizes=[1]
             DataSourceExec: partitions=1, partition_sizes=[1]
         ");

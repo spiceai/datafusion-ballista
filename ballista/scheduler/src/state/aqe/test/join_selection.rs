@@ -159,7 +159,7 @@ async fn test_hash_join_two_tables_coalesce() -> datafusion::common::Result<()> 
     // TODO: we could probably push datasource to read single partition
     assert_plan!(plan, @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=2, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, val@2]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, val@2]
         ExchangeExec: partitioning=None, plan_id=1, stage_id=pending, stage_resolved=false, broadcast=true
           DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
         DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
@@ -235,7 +235,7 @@ async fn test_hash_join_two_tables_repartition() -> datafusion::common::Result<(
     let plan = planner.current_plan();
     assert_plan!(plan, @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, val@2]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, val@2]
         ExchangeExec: partitioning=Hash([id@0], 4), plan_id=1, stage_id=0, stage_resolved=true
           DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
         ExchangeExec: partitioning=Hash([id@0], 4), plan_id=2, stage_id=1, stage_resolved=true
@@ -250,7 +250,7 @@ async fn test_hash_join_two_tables_repartition() -> datafusion::common::Result<(
     let plan = planner.current_plan();
     assert_plan!(plan, @ r"
     AdaptiveDatafusionExec: is_final=true, plan_id=3, stage_id=2, stage_resolved=false
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, val@2]
+      HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, val@2]
         ExchangeExec: partitioning=Hash([id@0], 4), plan_id=1, stage_id=0, stage_resolved=true
           DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
         ExchangeExec: partitioning=Hash([id@0], 4), plan_id=2, stage_id=1, stage_resolved=true
@@ -345,7 +345,7 @@ async fn test_hash_join_three_tables_collect_left() -> datafusion::common::Resul
     AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
       ProjectionExec: expr=[id@0 as id]
         DynamicJoinSelectionExec: plan_id=1, join_type=Inner, on=[(id@0, id@0)] repartitioned=false
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0]
             ExchangeExec: partitioning=None, plan_id=2, stage_id=pending, stage_resolved=false, broadcast=true
               DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
             DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
@@ -362,7 +362,7 @@ async fn test_hash_join_three_tables_collect_left() -> datafusion::common::Resul
     AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
       ProjectionExec: expr=[id@0 as id]
         DynamicJoinSelectionExec: plan_id=1, join_type=Inner, on=[(id@0, id@0)] repartitioned=false
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0]
             ExchangeExec: partitioning=None, plan_id=2, stage_id=0, stage_resolved=false, broadcast=true
               DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
             DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
@@ -386,9 +386,9 @@ async fn test_hash_join_three_tables_collect_left() -> datafusion::common::Resul
 
     assert_plan!(planner.current_plan(),  @ r"
     AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0]
         ExchangeExec: partitioning=None, plan_id=4, stage_id=1, stage_resolved=false, broadcast=true
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+          HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0]
             ExchangeExec: partitioning=None, plan_id=2, stage_id=0, stage_resolved=true, broadcast=true
               DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
             DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]

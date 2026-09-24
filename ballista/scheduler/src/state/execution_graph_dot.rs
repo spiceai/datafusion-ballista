@@ -345,7 +345,7 @@ Memory [2 partitions]"]
 		stage_3_0 [shape=box, label="SortShuffleWriterExec
 partitioning=Hash([b@3], 48)"]
 		stage_3_0_0 [shape=box, label="HashJoinExec
-mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]"]
+mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(a@0, a@0)]"]
 		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec
 stage=1, partitioning: Hash([a@0], 48)"]
 		stage_3_0_0_0 -> stage_3_0_0
@@ -367,7 +367,7 @@ Memory [2 partitions]"]
 		stage_5_0 [shape=box, label="ShuffleWriterExec
 48 partitions"]
 		stage_5_0_0 [shape=box, label="HashJoinExec
-mode=Partitioned, join_type=Inner, on=[(b@3, b@1)]"]
+mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(b@3, b@1)]"]
 		stage_5_0_0_0 [shape=box, label="UnresolvedShuffleExec
 stage=3, partitioning: Hash([b@3], 48)"]
 		stage_5_0_0_0 -> stage_5_0_0
@@ -396,7 +396,7 @@ stage=4, partitioning: Hash([b@1], 48)"]
 		stage_3_0 [shape=box, label="SortShuffleWriterExec
 partitioning=Hash([b@3], 48)"]
 		stage_3_0_0 [shape=box, label="HashJoinExec
-mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]"]
+mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(a@0, a@0)]"]
 		stage_3_0_0_0 [shape=box, label="UnresolvedShuffleExec
 stage=1, partitioning: Hash([a@0], 48)"]
 		stage_3_0_0_0 -> stage_3_0_0
@@ -446,9 +446,9 @@ Memory [2 partitions]"]
 		stage_4_0 [shape=box, label="ShuffleWriterExec
 48 partitions"]
 		stage_4_0_0 [shape=box, label="HashJoinExec
-mode=Partitioned, join_type=Inner, on=[(a@1, a@0)]"]
+mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(a@1, a@0)]"]
 		stage_4_0_0_0 [shape=box, label="HashJoinExec
-mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]"]
+mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(a@0, a@0)]"]
 		stage_4_0_0_0_0 [shape=box, label="UnresolvedShuffleExec
 stage=1, partitioning: Hash([a@0], 48)"]
 		stage_4_0_0_0_0 -> stage_4_0_0_0
@@ -573,7 +573,13 @@ Memory [2 partitions]"]
             "session_id",
             plan,
             0,
-            Arc::new(SessionConfig::new_with_ballista()),
+            // Keep the joins partitioned: these tests render the shuffle-join
+            // stage layout, which broadcast promotion of the empty tables
+            // would collapse.
+            Arc::new(
+                SessionConfig::new_with_ballista()
+                    .with_ballista_broadcast_join_threshold_bytes(0),
+            ),
             &mut planner,
             None,
         )
@@ -618,7 +624,13 @@ Memory [2 partitions]"]
             "session_id",
             plan,
             0,
-            Arc::new(SessionConfig::new_with_ballista()),
+            // Keep the joins partitioned: these tests render the shuffle-join
+            // stage layout, which broadcast promotion of the empty tables
+            // would collapse.
+            Arc::new(
+                SessionConfig::new_with_ballista()
+                    .with_ballista_broadcast_join_threshold_bytes(0),
+            ),
             &mut planner,
             None,
         )
