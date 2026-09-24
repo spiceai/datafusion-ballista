@@ -510,7 +510,9 @@ fn create_big_and_small_statistic_scan()
 fn small_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
     let (threshold_num_rows, threshold_byte_size) = get_thresholds();
 
-    let location = PartitionLocation { file_id: None, is_sort_shuffle: false,
+    let location = PartitionLocation {
+        file_id: None,
+        is_sort_shuffle: false,
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
@@ -541,7 +543,9 @@ fn small_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
 fn big_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
     let (threshold_num_rows, threshold_byte_size) = get_thresholds();
 
-    let location = PartitionLocation { file_id: None, is_sort_shuffle: false,
+    let location = PartitionLocation {
+        file_id: None,
+        is_sort_shuffle: false,
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {

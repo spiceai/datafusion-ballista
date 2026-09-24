@@ -20,12 +20,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::JobId;
 use ballista_core::config::BallistaConfig;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleConfig;
-use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::{
     execution_plans::{
         RangeShuffleReaderExec, ShuffleReaderExec, ShuffleWriterExec,
@@ -959,7 +959,7 @@ pub(crate) fn create_shuffle_writer_with_config(
                 "".to_owned(),
                 Partitioning::Hash(exprs, partition_count),
                 sort_config,
-            )?))
+            )?));
         }
         // Stages that don't repartition write their input partitioning
         // through: one file per output partition.
@@ -2033,7 +2033,9 @@ order by
             Arc::new(UnresolvedShuffleExec::new_broadcast(42, schema.clone(), 3))
                 as Arc<dyn ExecutionPlan>;
 
-        let make_loc = |partition_id: usize| PartitionLocation { file_id: None, is_sort_shuffle: false,
+        let make_loc = |partition_id: usize| PartitionLocation {
+            file_id: None,
+            is_sort_shuffle: false,
             map_partition_id: partition_id,
             partition_id: PartitionId {
                 job_id: "job".into(),

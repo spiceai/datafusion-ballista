@@ -658,8 +658,9 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 if let Some(bytes) = sort_shuffle_writer.memory_limit_per_task_bytes {
                     config = config.with_memory_limit_per_task_bytes(bytes as usize);
                 } else if sort_shuffle_writer.memory_limit > 0 {
-                    config = config
-                        .with_memory_limit_per_task_bytes(sort_shuffle_writer.memory_limit as usize);
+                    config = config.with_memory_limit_per_task_bytes(
+                        sort_shuffle_writer.memory_limit as usize,
+                    );
                 }
 
                 Ok(Arc::new(SortShuffleWriterExec::try_new(

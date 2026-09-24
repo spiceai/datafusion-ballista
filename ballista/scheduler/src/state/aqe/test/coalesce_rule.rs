@@ -95,7 +95,9 @@ fn partitions_with_byte_sizes(
         .iter()
         .enumerate()
         .map(|(idx, &bytes)| {
-            vec![PartitionLocation { file_id: None, is_sort_shuffle: false,
+            vec![PartitionLocation {
+                file_id: None,
+                is_sort_shuffle: false,
                 map_partition_id: 0,
                 partition_id: PartitionId {
                     job_id: "".into(),

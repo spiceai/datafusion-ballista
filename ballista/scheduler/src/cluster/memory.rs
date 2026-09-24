@@ -184,9 +184,7 @@ impl ClusterState for InMemoryClusterState {
             }
             TaskDistributionPolicy::Custom(ref policy) => {
                 // Custom policies don't support affinity tracking yet
-                BindingResult::from_tasks(
-                    policy.bind_tasks(budgets, active_jobs).await?,
-                )
+                BindingResult::from_tasks(policy.bind_tasks(budgets, active_jobs).await?)
             }
         };
 

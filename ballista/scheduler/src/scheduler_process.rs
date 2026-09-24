@@ -17,11 +17,11 @@
 
 use crate::flight_proxy_service::BallistaFlightProxyService;
 
+use crate::api::SchedulerErrorResponse;
 #[cfg(feature = "rest-api")]
 use crate::api::get_routes;
 use crate::api::health_routes;
 use crate::api::route_disabled;
-use crate::api::SchedulerErrorResponse;
 use crate::cluster::BallistaCluster;
 use crate::config::SchedulerConfig;
 use crate::metrics::default_metrics_collector;

@@ -837,7 +837,8 @@ pub(crate) async fn bind_task_consistent_hash(
                         // we're about to push, that's `task_infos.len()`.
                         let task_id = running_stage.task_infos.len();
                         running_stage.pending.take(partition_id);
-                        let mut task_info = create_task_info(executor_id.clone(), task_id);
+                        let mut task_info =
+                            create_task_info(executor_id.clone(), task_id);
                         task_info.global_input_partition_ids = vec![partition_id];
                         task_info.vcores_consumed = 1;
                         running_stage.task_infos.push(task_info);

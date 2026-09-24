@@ -184,7 +184,6 @@ impl JobInfoCache {
             status,
         }
     }
-
 }
 
 /// Tracks stage state changes during task status updates.

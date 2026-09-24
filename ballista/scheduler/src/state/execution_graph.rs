@@ -1077,8 +1077,7 @@ impl StaticExecutionGraph {
                         );
                         let operator_metrics = task_status.metrics.clone();
 
-                        if !running_stage.update_task_info(task_id, task_status.clone())
-                        {
+                        if !running_stage.update_task_info(task_id, task_status.clone()) {
                             continue;
                         }
 
@@ -2249,7 +2248,9 @@ pub(crate) fn partition_to_location(
 ) -> Vec<PartitionLocation> {
     shuffles
         .into_iter()
-        .map(|shuffle| PartitionLocation { file_id: None, is_sort_shuffle: false,
+        .map(|shuffle| PartitionLocation {
+            file_id: None,
+            is_sort_shuffle: false,
             map_partition_id,
             partition_id: PartitionId {
                 job_id: job_id.to_owned(),

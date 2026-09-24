@@ -624,15 +624,16 @@ impl ShuffleWriterExec {
                 let mut stream = plan.execute(local_input_partition, context.clone())?;
                 handles.spawn(async move {
                     if use_memory {
-                        let (stats, storage_path) = ShuffleWriterExec::execute_shuffle_write_memory(
-                            &job_id,
-                            stage_id,
-                            global_partition,
-                            &mut stream,
-                            &write_metrics,
-                            shuffle_format,
-                        )
-                        .await?;
+                        let (stats, storage_path) =
+                            ShuffleWriterExec::execute_shuffle_write_memory(
+                                &job_id,
+                                stage_id,
+                                global_partition,
+                                &mut stream,
+                                &write_metrics,
+                                shuffle_format,
+                            )
+                            .await?;
                         return Ok::<_, DataFusionError>((
                             local_input_partition,
                             global_partition,
@@ -642,17 +643,18 @@ impl ShuffleWriterExec {
                     }
 
                     if use_object_store {
-                        let (stats, storage_path) = ShuffleWriterExec::execute_shuffle_write_object_store(
-                            &job_id,
-                            stage_id,
-                            global_partition,
-                            &mut stream,
-                            &write_metrics,
-                            storage_type,
-                            storage_url,
-                            shuffle_format,
-                        )
-                        .await?;
+                        let (stats, storage_path) =
+                            ShuffleWriterExec::execute_shuffle_write_object_store(
+                                &job_id,
+                                stage_id,
+                                global_partition,
+                                &mut stream,
+                                &write_metrics,
+                                storage_type,
+                                storage_url,
+                                shuffle_format,
+                            )
+                            .await?;
                         return Ok::<_, DataFusionError>((
                             local_input_partition,
                             global_partition,
@@ -1645,7 +1647,10 @@ mod tests {
             let stored_batches = data
                 .to_batches()
                 .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-            total_rows += stored_batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+            total_rows += stored_batches
+                .iter()
+                .map(|b| b.num_rows() as u64)
+                .sum::<u64>();
         }
         // Row conservation: 2 input partitions × 2 batches × 2 rows = 8.
         assert_eq!(8, total_rows);

@@ -233,13 +233,14 @@ where
                     let task_status_sender = task_status_sender.clone();
 
                     // Acquire a task-slot permit for the task.
-                    let permit = available_task_slots.clone().acquire_owned().await.map_err(
-                        |_| {
-                            BallistaError::Internal(
-                                "task-slot semaphore closed".to_string(),
-                            )
-                        },
-                    )?;
+                    let permit =
+                        available_task_slots.clone().acquire_owned().await.map_err(
+                            |_| {
+                                BallistaError::Internal(
+                                    "task-slot semaphore closed".to_string(),
+                                )
+                            },
+                        )?;
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)

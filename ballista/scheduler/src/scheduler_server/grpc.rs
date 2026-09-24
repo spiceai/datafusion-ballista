@@ -16,6 +16,7 @@
 // under the License.
 
 use axum::extract::ConnectInfo;
+use ballista_core::BALLISTA_PROTOCOL_VERSION;
 use ballista_core::JobId;
 use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::error::{BallistaError, Result as BResult};
@@ -36,7 +37,6 @@ use ballista_core::serde::protobuf::{
     UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
     execute_query_result,
 };
-use ballista_core::BALLISTA_PROTOCOL_VERSION;
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, ExecutorOperatingSystemSpecification,
 };

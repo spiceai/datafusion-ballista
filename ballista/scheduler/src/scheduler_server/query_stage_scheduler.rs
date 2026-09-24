@@ -507,12 +507,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 if let Err(e) = self
                     .state
                     .task_manager
-                    .abort_job(&job_id, "Cancelled".to_owned(), move |running_tasks| async move {
-                        if running_tasks.is_empty() {
-                            return Ok(());
-                        }
-                        executor_manager.cancel_running_tasks(running_tasks).await
-                    })
+                    .abort_job(
+                        &job_id,
+                        "Cancelled".to_owned(),
+                        move |running_tasks| async move {
+                            if running_tasks.is_empty() {
+                                return Ok(());
+                            }
+                            executor_manager.cancel_running_tasks(running_tasks).await
+                        },
+                    )
                     .await
                 {
                     error!("Fail to invoke cancel_job for job {job_id} due to {e:?}");
@@ -720,12 +724,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 mod tests {
     use crate::cluster::JobStateEvent;
     use crate::config::{SchedulerConfig, WorkAvailableReason};
-    use ballista_core::JobId;
     use crate::scheduler_server::SchedulerServer;
     use crate::test_utils::{
         SchedulerTest, TestMetricsCollector, await_condition, test_cluster_context,
     };
     use ballista_core::BALLISTA_PROTOCOL_VERSION;
+    use ballista_core::JobId;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
     use ballista_core::extension::SessionConfigExt;
@@ -883,7 +887,10 @@ mod tests {
                     .with_ballista_adaptive_query_planner(false),
             )
             .await?;
-        let job_id: JobId = scheduler.submit_job("", ctx, &test_plan(2), None).await?.into();
+        let job_id: JobId = scheduler
+            .submit_job("", ctx, &test_plan(2), None)
+            .await?
+            .into();
 
         // Job submission runs asynchronously through the event loop.
         let submitted = await_condition(Duration::from_millis(10), 100, || {

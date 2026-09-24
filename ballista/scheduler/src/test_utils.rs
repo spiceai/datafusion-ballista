@@ -1436,7 +1436,10 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
-            path: format!("/{}/{}/{}", task.key.job_id, task.key.stage_id, partition_id),
+            path: format!(
+                "/{}/{}/{}",
+                task.key.job_id, task.key.stage_id, partition_id
+            ),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,
@@ -1473,7 +1476,10 @@ pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskS
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
             partition_id: partition_id as u64,
-            path: format!("/{}/{}/{}", task.key.job_id, task.key.stage_id, partition_id),
+            path: format!(
+                "/{}/{}/{}",
+                task.key.job_id, task.key.stage_id, partition_id
+            ),
             num_batches: 1,
             num_rows: 1,
             num_bytes: 1,

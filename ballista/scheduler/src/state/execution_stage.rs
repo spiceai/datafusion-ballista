@@ -1426,8 +1426,11 @@ impl SuccessfulStage {
             .task_infos
             .into_iter()
             .map(|task_info| {
-                let partition_id =
-                    task_info.global_input_partition_ids.first().copied().unwrap_or(0);
+                let partition_id = task_info
+                    .global_input_partition_ids
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
                 encode_taskinfo(task_info, partition_id)
             })
             .collect();
@@ -1532,8 +1535,11 @@ impl FailedStage {
             .task_infos
             .into_iter()
             .map(|task_info| {
-                let partition_id =
-                    task_info.global_input_partition_ids.first().copied().unwrap_or(0);
+                let partition_id = task_info
+                    .global_input_partition_ids
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
                 encode_taskinfo(task_info, partition_id)
             })
             .collect();

@@ -639,7 +639,8 @@ mod test {
     }
 
     /// The result `execute_query_stage` hands back once a spawned task unwinds.
-    type TaskOutcome = Result<Vec<ballista_core::serde::protobuf::ShuffleWritePartition>, BallistaError>;
+    type TaskOutcome =
+        Result<Vec<ballista_core::serde::protobuf::ShuffleWritePartition>, BallistaError>;
 
     /// Builds an executor over `work_dir`, along with the session context whose
     /// runtime its tasks run on.

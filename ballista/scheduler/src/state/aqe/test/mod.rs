@@ -95,7 +95,9 @@ pub(crate) fn mock_partitions_with_size(
     num_rows: u64,
     num_bytes: u64,
 ) -> Vec<Vec<PartitionLocation>> {
-    let location = PartitionLocation { file_id: None, is_sort_shuffle: false,
+    let location = PartitionLocation {
+        file_id: None,
+        is_sort_shuffle: false,
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
@@ -119,7 +121,9 @@ pub(crate) fn mock_partitions_with_size(
 }
 
 pub(crate) fn mock_partitions_with_statistics_no_data() -> Vec<Vec<PartitionLocation>> {
-    let location = PartitionLocation { file_id: None, is_sort_shuffle: false,
+    let location = PartitionLocation {
+        file_id: None,
+        is_sort_shuffle: false,
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
