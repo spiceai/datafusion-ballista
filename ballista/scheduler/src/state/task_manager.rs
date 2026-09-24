@@ -34,8 +34,6 @@ use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::execution_plans::compute_global_output_partition_ids;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
-use rand::distr::Alphanumeric;
-use rand::distr::Distribution;
 
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
@@ -58,7 +56,6 @@ use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use log::{debug, error, info, trace, warn};
-use rand::rng;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
@@ -68,12 +65,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 type ActiveJobCache = Arc<DashMap<JobId, JobInfoCache>>;
-
-// TODO move to configuration file
-/// Default maximum number of failure attempts for task-level retry before the task is considered failed.
-pub const TASK_MAX_FAILURES: usize = 4;
-/// Default maximum number of failure attempts for stage-level retry before the stage is considered failed.
-pub const STAGE_MAX_FAILURES: usize = 4;
 
 /// Trait for launching tasks on executors.
 ///
@@ -162,6 +153,10 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     active_job_cache: ActiveJobCache,
     /// Task launcher implementation.
     launcher: Arc<dyn TaskLauncher>,
+    /// Maximum number of failure attempts for task-level retry before the task is considered failed
+    task_max_failures: usize,
+    /// Maximum number of failure attempts for stage-level retry before the stage is considered failed.
+    stage_max_failures: usize,
 }
 
 /// Contains the execution graph and cached data to improve performance
@@ -210,6 +205,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         state: Arc<dyn JobState>,
         codec: BallistaCodec<T, U>,
         scheduler_id: String,
+        config: Arc<SchedulerConfig>,
     ) -> Self {
         Self {
             state,
@@ -217,6 +213,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             scheduler_id: scheduler_id.clone(),
             active_job_cache: Arc::new(DashMap::new()),
             launcher: Arc::new(DefaultTaskLauncher::new(scheduler_id)),
+            task_max_failures: config.task_max_failures,
+            stage_max_failures: config.stage_max_failures,
         }
     }
 
@@ -226,6 +224,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         codec: BallistaCodec<T, U>,
         scheduler_id: String,
         launcher: Arc<dyn TaskLauncher>,
+        config: Arc<SchedulerConfig>,
     ) -> Self {
         Self {
             state,
@@ -233,6 +232,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             scheduler_id,
             active_job_cache: Arc::new(DashMap::new()),
             launcher,
+            task_max_failures: config.task_max_failures,
+            stage_max_failures: config.stage_max_failures,
         }
     }
 
@@ -604,6 +605,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let mut job_updates: HashMap<JobId, Vec<TaskStatus>> = HashMap::new();
         for status in task_status {
             trace!("Task Update\n{status:?}");
+            log_runtime_stats_arrival(executor, &status);
             let job_id: JobId = status.job_id.clone().into();
             let job_task_statuses = job_updates.entry(job_id).or_default();
             job_task_statuses.push(status);
@@ -619,8 +621,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 graph.update_task_status(
                     executor,
                     statuses,
-                    TASK_MAX_FAILURES,
-                    STAGE_MAX_FAILURES,
+                    self.task_max_failures,
+                    self.stage_max_failures,
                 )?
             } else {
                 // TODO Deal with curator changed case
@@ -1060,18 +1062,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             .map(|value| value.1.execution_graph)
     }
 
-    /// Generates a new random 7-character alphanumeric job ID.
-    pub fn generate_job_id(&self) -> JobId {
-        let mut rng = rng();
-        JobId::new(
-            std::iter::repeat(())
-                .map(|()| Alphanumeric.sample(&mut rng))
-                .map(char::from)
-                .take(7)
-                .collect::<String>(),
-        )
-    }
-
     /// Clean up a failed job in FailedJobs Keyspace by delayed clean_up_interval seconds
     pub(crate) fn clean_up_job_delayed(&self, job_id: JobId, clean_up_interval: u64) {
         if clean_up_interval == 0 {
@@ -1395,6 +1385,7 @@ mod tests {
             job_state,
             BallistaCodec::default(),
             "test-scheduler".to_string(),
+            Arc::new(SchedulerConfig::default()),
         );
 
         let graph: ExecutionGraphBox = Box::new(test_aggregation_plan(2).await);

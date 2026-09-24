@@ -467,9 +467,9 @@ fn list_entry(index: &JobIndex) -> JobResponse {
 /// The one endpoint that touches every job, and the reason the index is held
 /// in memory at all: it is served without going near the disk.
 ///
-/// Newest first. A job id is a random 7-character string
-/// (`TaskManager::generate_job_id`), so ordering by it would be arbitrary,
-/// whereas start time is both meaningful and the order the TUI puts the list
+/// Newest first. A job id comes from a pluggable
+/// [`JobIdGenerator`](crate::scheduler_server::JobIdGenerator) that promises
+/// uniqueness, not order, so ordering by it would be arbitrary, whereas start time is both meaningful and the order the TUI puts the list
 /// into once it has it.
 async fn get_jobs(State(store): State<Arc<HistoryStore>>) -> Json<Vec<JobResponse>> {
     let mut jobs: Vec<JobResponse> = store.summaries().iter().map(list_entry).collect();

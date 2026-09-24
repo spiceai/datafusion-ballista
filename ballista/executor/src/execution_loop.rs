@@ -56,11 +56,13 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
 /// Idle sleep between polls when polling is the only way to learn of new work.
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Idle sleep when a `poll_now_notify` wake-up is wired and the timer is only
-/// a fallback.
-const NOTIFIED_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// a fallback. Kept at the plain idle interval rather than stretched: work
+/// that becomes runnable without a `poll_now` broadcast is still picked up
+/// within one short poll.
+const NOTIFIED_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum time the poll loop waits for a free vcore before polling the
 /// scheduler anyway. `poll_work` doubles as the executor's heartbeat under
@@ -336,14 +338,14 @@ where
             match &poll_now_notify {
                 Some(notify) => {
                     tokio::select! {
-                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        () = tokio::time::sleep(NOTIFIED_IDLE_POLL_INTERVAL) => {}
                         () = notify.notified() => {
                             debug!("Received poll_now notification, polling immediately");
                         }
                     }
                 }
                 None => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(IDLE_POLL_INTERVAL).await;
                 }
             }
         }

@@ -148,6 +148,8 @@ pub struct SchedulerServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     /// Subscribers can receive notifications when jobs change state by calling
     /// `subscribe_job_updates()`.
     job_state_sender: broadcast::Sender<job_state_event::JobStateEvent>,
+    /// generates job ids
+    generator: Arc<dyn JobIdGenerator>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {
@@ -172,38 +174,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             config.clone(),
             metrics_collector.clone(),
         ));
-        let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
-        #[cfg(feature = "rest-api")]
-        let event_log = config.event_log_dir.as_ref().map(|dir| {
-            ballista_history::writer::EventLogWriter::new(
-                std::path::PathBuf::from(dir),
-                config.event_loop_buffer_size as usize,
-            )
-        });
-        let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
-            state.clone(),
-            metrics_collector,
-            config.clone(),
-            job_state_sender.clone(),
-            #[cfg(feature = "rest-api")]
-            event_log,
-        ));
-        let query_stage_event_loop = EventLoop::new(
-            "query_stage".to_owned(),
-            config.event_loop_buffer_size as usize,
-            query_stage_scheduler.clone(),
-        );
 
-        Self {
-            scheduler_name,
-            start_time: timestamp_millis() as u128,
-            state,
-            query_stage_event_loop,
-            #[cfg(feature = "rest-api")]
-            query_stage_scheduler,
-            config,
-            job_state_sender,
-        }
+        Self::from_state(scheduler_name, state, config, metrics_collector)
     }
 
     /// Creates a new `SchedulerServer` with a custom task launcher.
@@ -224,6 +196,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             metrics_collector.clone(),
             task_launcher,
         ));
+
+        Self::from_state(scheduler_name, state, config, metrics_collector)
+    }
+
+    fn from_state(
+        scheduler_name: String,
+        state: Arc<SchedulerState<T, U>>,
+        config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+    ) -> Self {
         let (job_state_sender, _) = broadcast::channel(Self::JOB_STATE_CHANNEL_CAPACITY);
         #[cfg(feature = "rest-api")]
         let event_log = config.event_log_dir.as_ref().map(|dir| {
@@ -260,6 +242,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             query_stage_scheduler,
             config,
             job_state_sender,
+            generator,
         }
     }
 
@@ -284,6 +267,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.task_manager.running_job_number()
     }
 
+    /// Returns a stream of cluster state events from the configured state backend.
     pub async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
         self.state.executor_manager.cluster_state_events().await
     }
@@ -393,7 +377,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         plan: &SubmitPlan,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<String> {
-        let job_id = self.state.task_manager.generate_job_id();
+        let job_id: JobId = self.generator.next_id().await.into();
         self.submit_plan_with_id(&job_id, job_name, ctx, plan, subscriber)
             .await
     }
@@ -846,6 +830,42 @@ mod test {
             event,
             Some(ClusterStateEvent::RegisteredExecutor { executor_id })
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_submit_uses_configured_job_id_generator() -> Result<()> {
+        struct FixedJobIdGenerator;
+
+        #[async_trait::async_trait]
+        impl crate::scheduler_server::JobIdGenerator for FixedJobIdGenerator {
+            async fn next_id(&self) -> String {
+                "custom-job-1".to_owned()
+            }
+        }
+
+        let config = SchedulerConfig::default()
+            .with_scheduler_policy(TaskSchedulingPolicy::PullStaged)
+            .with_job_id_generator(Arc::new(FixedJobIdGenerator));
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                Arc::new(TestMetricsCollector::default()),
+            );
+        scheduler.init().await?;
+
+        let ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session("session_id", &SessionConfig::new_with_ballista())
+            .await?;
+        let job_id = scheduler.submit_job("", ctx, &test_plan(), None).await?;
+
+        assert_eq!(job_id, "custom-job-1");
 
         Ok(())
     }
