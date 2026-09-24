@@ -1002,7 +1002,7 @@ mod test {
             available_slots.iter_mut().collect();
         let binding_result =
             bind_task_bias(available_slots_ref, Arc::new(active_jobs), |_| false).await;
-        assert_eq!(9, binding_result.bound_tasks.len());
+        assert_eq!(9, total_partitions_covered(&binding_result.bound_tasks));
 
         let result = get_result(binding_result.bound_tasks);
 
@@ -1057,10 +1057,12 @@ mod test {
         let binding_result =
             bind_task_round_robin(available_slots_ref, Arc::new(active_jobs), |_| false)
                 .await;
-        assert_eq!(9, binding_result.bound_tasks.len());
+        assert_eq!(9, total_partitions_covered(&binding_result.bound_tasks));
 
         let result = get_result(binding_result.bound_tasks);
 
+        // job_a iterated first: exec_3(7) takes job_a's 2 partitions, then
+        // exec_2(5) + exec_1(3) split job_b's 7 as 5/2.
         let mut expected = Vec::new();
         {
             let mut expected0 = HashMap::new();
@@ -1068,23 +1070,23 @@ mod test {
             let mut entry_a = HashMap::new();
             entry_a.insert("executor_3".to_string(), 2);
             let mut entry_b = HashMap::new();
-            entry_b.insert("executor_1".to_string(), 3);
-            entry_b.insert("executor_3".to_string(), 2);
-            entry_b.insert("executor_2".to_string(), 2);
+            entry_b.insert("executor_2".to_string(), 5);
+            entry_b.insert("executor_1".to_string(), 2);
 
             expected0.insert("job_a".to_string(), entry_a);
             expected0.insert("job_b".to_string(), entry_b);
 
             expected.push(expected0);
         }
+        // job_b iterated first: exec_3(7) takes job_b's full 7 partitions,
+        // then exec_2(5) takes job_a's 2.
         {
             let mut expected0 = HashMap::new();
 
             let mut entry_b = HashMap::new();
             entry_b.insert("executor_3".to_string(), 7);
             let mut entry_a = HashMap::new();
-            entry_a.insert("executor_2".to_string(), 1);
-            entry_a.insert("executor_1".to_string(), 1);
+            entry_a.insert("executor_2".to_string(), 2);
 
             expected0.insert("job_a".to_string(), entry_a);
             expected0.insert("job_b".to_string(), entry_b);

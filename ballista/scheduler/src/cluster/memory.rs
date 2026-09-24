@@ -587,22 +587,20 @@ impl JobState for InMemoryJobState {
 
     async fn fail_unscheduled_job(&self, job_id: &JobId, reason: String) -> Result<()> {
         if let Some((job_id, (job_name, queued_at))) = self.queued_jobs.remove(job_id) {
-            self.completed_jobs.insert(
-                job_id.clone(),
-                (
-                    JobStatus {
-                        job_id: job_id.clone().into(),
-                        job_name,
-                        status: Some(Status::Failed(FailedJob {
-                            error: reason,
-                            queued_at,
-                            started_at: 0,
-                            ended_at: timestamp_millis(),
-                        })),
-                    },
-                    None,
-                ),
-            );
+            let status = JobStatus {
+                job_id: job_id.clone().into(),
+                job_name,
+                status: Some(Status::Failed(FailedJob {
+                    error: reason,
+                    queued_at,
+                    started_at: 0,
+                    ended_at: timestamp_millis(),
+                })),
+            };
+            self.completed_jobs
+                .insert(job_id.clone(), (status.clone(), None));
+            self.job_event_sender
+                .send(&JobStateEvent::JobUpdated { job_id, status });
 
             Ok(())
         } else {

@@ -671,26 +671,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
     }
 
-    /// Persist a terminal job status and only then evict the job from the
-    /// active cache, so a concurrent `get_job_status` can't fall through to a
-    /// stale shared-state read while the save is in flight. If the persist
-    /// fails or times out the job stays cached — the graph already carries the
-    /// terminal status, so status reads stay correct — and the shared state is
-    /// left to a later persist.
+    /// Update the cached job status to its terminal value, persist the
+    /// terminal snapshot, and evict the job from the active cache — even if
+    /// the persist fails. The cached status is updated *before* the persist
+    /// starts (not after) so a concurrent `running_job_number()`/
+    /// `get_running_job_cache()` snapshot taken while the save is in flight
+    /// doesn't still count the job as running. The persist is not retried on
+    /// failure: the local cache entry is evicted regardless, and the failure
+    /// is only logged, so a job whose terminal save fails doesn't leak in the
+    /// active cache forever.
     async fn persist_terminal_and_evict(
         &self,
         job_id: &JobId,
         snapshot: &ExecutionGraphBox,
     ) -> Result<()> {
-        let save_result = self.try_save_job(job_id, snapshot).await;
-        if save_result.is_ok() {
-            self.remove_active_execution_graph(job_id);
-        } else if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
-            // The cached status is what get_running_job_cache() filters on; a
-            // kept entry must reflect the terminal status or the job keeps
-            // appearing in every task-binding snapshot until restart.
+        if let Some(mut job_info) = self.active_job_cache.get_mut(job_id) {
             job_info.status = snapshot.status().status.clone();
         }
+        let save_result = self.try_save_job(job_id, snapshot).await;
+        if let Err(error) = &save_result {
+            warn!(
+                "Failed to persist terminal state for job {job_id}; evicting the local cache entry: {error}"
+            );
+        }
+        self.remove_active_execution_graph(job_id);
         save_result
     }
 

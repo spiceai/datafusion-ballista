@@ -477,8 +477,10 @@ stage=3, partitioning: Hash([a@0], 48)"]
             .map_err(|e| BallistaError::Internal(format!("{e:?}")))?;
 
         let expected = r#"digraph G {
-		stage_3_0 [shape=box, label="SortShuffleWriter [2 partitions]"]
-		stage_3_0_0 [shape=box, label="DataSourceExec: (Memory) [2 partitions]"]
+		stage_3_0 [shape=box, label="SortShuffleWriterExec
+partitioning=Hash([a@0], 48)"]
+		stage_3_0_0 [shape=box, label="DataSourceExec
+Memory [2 partitions]"]
 		stage_3_0_0 -> stage_3_0
 }
 "#;

@@ -112,7 +112,7 @@ pub(crate) fn mock_partitions_with_size(
             os_info: ExecutorOperatingSystemSpecification::default(),
         },
         // next few properties are needed
-        partition_stats: PartitionStats::new(Some(42), None, Some(10)),
+        partition_stats: PartitionStats::new(Some(num_rows), None, Some(num_bytes)),
         path: String::new(),
     };
     vec![vec![location]]

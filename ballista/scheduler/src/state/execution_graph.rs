@@ -1839,6 +1839,8 @@ impl ExecutionGraph for StaticExecutionGraph {
 
     /// fail job with error message
     fn fail_job(&mut self, error: String) {
+        self.end_time = timestamp_millis();
+
         self.status = JobStatus {
             job_id: self.job_id.clone().into(),
             job_name: self.job_name.clone(),
