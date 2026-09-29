@@ -247,41 +247,19 @@ async fn execute_shuffle_write(
     let work_dir_str = work_dir.to_str().unwrap().to_string();
     fs::create_dir_all(&work_dir).expect("create work dir");
 
-    let metrics: MetricsSet = match writer_kind {
-        WriterKind::Hash => {
-            let exec = ShuffleWriterExec::try_new(
-                format!("bench_job_{task_id}").into(),
-                1,
-                input,
-                work_dir_str,
-                Some(partitioning),
-            )?;
-            let task_ctx = ctx.task_ctx();
-            let mut stream = exec.execute(0, task_ctx)?;
-            let _ = utils::collect_stream(&mut stream).await;
-            exec.metrics().unwrap_or_default()
-        }
-        WriterKind::Sort => {
-            let cfg = SortShuffleConfig {
-                enabled: true,
-                compression: CompressionType::LZ4_FRAME,
-                batch_size: args.batch_size,
-                ..Default::default()
-            };
-            let exec = SortShuffleWriterExec::try_new(
-                format!("bench_job_{task_id}").into(),
-                1,
-                input,
-                work_dir_str,
-                partitioning,
-                cfg,
-            )?;
-            let task_ctx = ctx.task_ctx();
-            let mut stream = exec.execute(0, task_ctx)?;
-            let _ = utils::collect_stream(&mut stream).await;
-            exec.metrics().unwrap_or_default()
-        }
-    };
+    let cfg = SortShuffleConfig::new(true, args.batch_size);
+    let exec = SortShuffleWriterExec::try_new(
+        format!("bench_job_{task_id}").into(),
+        1,
+        input,
+        work_dir_str,
+        partitioning,
+        cfg,
+    )?;
+    let task_ctx = ctx.task_ctx();
+    let mut stream = exec.execute(0, task_ctx)?;
+    let _ = utils::collect_stream(&mut stream).await;
+    let metrics: MetricsSet = exec.metrics().unwrap_or_default();
 
     Ok(metrics)
 }

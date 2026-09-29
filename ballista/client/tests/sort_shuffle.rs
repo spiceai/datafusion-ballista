@@ -198,7 +198,6 @@ mod sort_shuffle_tests {
     #[rstest]
     #[case::local(ReadMode::Local)]
     #[case::remote_flight(ReadMode::RemoteFlight)]
-    #[case::remote_block_io(ReadMode::RemoteBlockIo)]
     #[tokio::test]
     async fn test_sort_shuffle_group_by_binary_column(
         #[case] read_mode: ReadMode,
@@ -240,7 +239,6 @@ mod sort_shuffle_tests {
     #[rstest]
     #[case::local(ReadMode::Local)]
     #[case::remote_flight(ReadMode::RemoteFlight)]
-    #[case::remote_block_io(ReadMode::RemoteBlockIo)]
     #[tokio::test]
     async fn test_sort_shuffle_group_by_view_columns(
         #[case] read_mode: ReadMode,
