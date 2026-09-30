@@ -141,10 +141,11 @@ where
     let free_vcores = free_vcores.unwrap_or_else(|| {
         Arc::new(Semaphore::new(executor_specification.vcores as usize))
     });
-    assert!(
-        free_vcores.available_permits() > 0,
-        "free_vcores semaphore must have at least one permit; passing a closed or zero-permit semaphore would deadlock the poll loop"
-    );
+    // A caller may pass a semaphore with no permits yet and add them later:
+    // Spice registers an executor that way and opens its vcores only once
+    // object stores are bound. That cannot stall the loop, because it waits
+    // for a permit only up to HEARTBEAT_POLL_INTERVAL and then polls anyway,
+    // reporting `num_free_vcores: 0`; a closed semaphore ends it with an error.
 
     let (task_status_sender, mut task_status_receiver) =
         std::sync::mpsc::channel::<TaskStatus>();
