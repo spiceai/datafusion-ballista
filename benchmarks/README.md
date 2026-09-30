@@ -86,10 +86,10 @@ The benchmark can then be run (assuming the data created from `dbgen` is in `./d
 cargo run --release --bin tpch -- benchmark datafusion --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
 ```
 
-You can enable the feature `mimalloc` (to use the mimalloc allocator) as features by passing them in as `--features`:
+The `mimalloc` allocator is enabled by default. To build without it:
 
 ```
-cargo run --release --features "mimalloc" --bin tpch -- benchmark datafusion --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
+cargo run --release --no-default-features --bin tpch -- benchmark datafusion --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
 ```
 
 The benchmark program also supports CSV and Parquet input file formats and a utility is provided to convert from `tbl`
@@ -132,53 +132,86 @@ docker run -v /mnt:/mnt -it ballistacompute/spark-benchmarks:0.4.0-SNAPSHOT \
 
 ## Running the Ballista Benchmarks
 
-To run the benchmarks it is necessary to have at least one Ballista scheduler and one Ballista executor running.
+To run the benchmarks it is necessary to have at least one Ballista scheduler and one Ballista
+executor running. See
+[Ballista Quickstart](https://datafusion.apache.org/ballista/user-guide/deployment/quick-start.html)
+for how to build and start them, including the ports each executor binds.
 
-To run the scheduler from source:
-
-```bash
-cd $ARROW_HOME/ballista/scheduler
-RUST_LOG=info cargo run --release
-```
-
-By default the scheduler will bind to `0.0.0.0` and listen on port 50050.
-
-To run the executor from source:
-
-```bash
-cd $ARROW_HOME/ballista/executor
-RUST_LOG=info cargo run --release
-```
-
-By default the executor will bind to `0.0.0.0` and listen on port 50051.
-
-You can add mimalloc/LTO flags to improve speed (with longer build times):
+For benchmark runs specifically, LTO is worth the longer build. `mimalloc` is already on by default
+through the executor's `build-binary` feature:
 
 ```
-RUST_LOG=info RUSTFLAGS='-C target-cpu=native -C lto -C codegen-units=1 -C embed-bitcode' cargo run --release --bin executor --features "mimalloc" --target x86_64-unknown-linux-gnu
+RUST_LOG=info RUSTFLAGS='-C target-cpu=native -C lto -C codegen-units=1 -C embed-bitcode' cargo run --release --bin ballista-executor --target x86_64-unknown-linux-gnu
 ```
 
 To run the benchmarks:
 
 ```bash
-cd $ARROW_HOME/benchmarks
+cd benchmarks
 cargo run --release --bin tpch benchmark ballista --host localhost --port 50050 --query 1 --path $(pwd)/data --format tbl
+```
+
+## Recording and comparing results
+
+Pass `--output <dir>` (works for both the `ballista` and `datafusion` benchmark
+subcommands) to write a machine-readable summary to `<dir>/tpch-<start_time>.json`.
+Each run records the benchmark and DataFusion versions, CPU count, the full CLI
+arguments (so the configuration is self-describing), and per-query per-iteration
+elapsed times and row counts.
+
+The summary is rewritten after **every query**, atomically, so a run that is
+killed part way through (for example an out-of-memory `SIGKILL` at a large scale
+factor) still leaves the results collected so far on disk. A query that fails is
+recorded with an `error` message and its completed iterations, and the run
+continues to the remaining queries instead of aborting; the process still exits
+non-zero if any query failed.
+
+Compare two summary files query-by-query — fastest iteration per side, delta,
+delta percent, suite totals, and row-count agreement:
+
+```bash
+cargo run --release --bin tpch compare baseline.json candidate.json
 ```
 
 ## Running the Ballista Benchmarks on docker-compose
 
-To start a Rust scheduler and executor using Docker Compose:
+The `docker-compose.yml` at the repo root brings up one scheduler and two
+executors (4 vcores / 8 GB memory pool each) plus a benchmark client. End to
+end, including data generation, image builds, and running all 22 TPC-H
+queries:
 
 ```bash
-cargo build --release
-docker-compose up --build
+./dev/integration-tests.sh
 ```
 
-Then you can run the benchmark with:
+Defaults to SF=10, 16 partitioned Parquet files per table, 3 iterations per
+query. Override with env vars:
 
 ```bash
-docker-compose run ballista-client bash -c '/root/tpch benchmark ballista --host ballista-scheduler --port 50050 --query 1 --path /data --format tbl'
+SCALE_FACTOR=1 PARTITIONS=8 ITERATIONS=1 ./dev/integration-tests.sh
 ```
+
+The script generates Parquet via [`tpchgen-cli`](https://crates.io/crates/tpchgen-cli)
+(installed via `cargo install` if missing), builds the host binaries
+(`dev/build-ballista-executables.sh`), builds the docker images
+(`dev/build-ballista-docker.sh`), waits for healthy services, runs the queries,
+and tears down the stack on exit (success or failure).
+
+To run pieces by hand:
+
+```bash
+SCALE_FACTOR=1 ./benchmarks/tpch-gen.sh   # generate Parquet under benchmarks/data
+./dev/build-ballista-executables.sh        # cargo build the binaries on the host
+./dev/build-ballista-docker.sh             # build docker images that COPY the binaries
+docker compose up -d --wait                # bring up scheduler + 2 executors + client
+docker compose run --rm ballista-client /root/run.sh
+docker compose down --remove-orphans
+```
+
+> **Note:** `dev/build-ballista-executables.sh` builds the binaries on the host,
+> so the host needs a Rust toolchain that targets Linux (matching the runtime
+> images). Linux hosts work directly; macOS/Windows users need to either build
+> on a Linux host or arrange cross-compilation.
 
 ## Expected output
 
@@ -244,7 +277,7 @@ Run the benchmark.
 ```bash
 $SPARK_HOME/bin/spark-submit \
     --master spark://ripper:7077 \
-    --class org.apache.arrow.ballista.SparkTpch \
+    --class org.apache.arrow.SparkTpch \
     --conf spark.driver.memory=8G \
     --num-executors=1 \
     --conf spark.executor.memory=32G \
@@ -256,24 +289,6 @@ $SPARK_HOME/bin/spark-submit \
     --input-format parquet \
     --query-path /home/andy/git/apache/datafusion-ballista/benchmarks/queries \
     --query 1
-```
-
-## NYC Taxi Benchmark
-
-These benchmarks are based on the [New York Taxi and Limousine Commission][2] data set.
-
-```bash
-cargo run --release --bin nyctaxi -- --iterations 3 --path /mnt/nyctaxi/csv --format csv --batch-size 4096
-```
-
-Example output:
-
-```bash
-Running benchmarks with the following options: Opt { debug: false, iterations: 3, batch_size: 4096, path: "/mnt/nyctaxi/csv", file_format: "csv" }
-Executing 'fare_amt_by_passenger'
-Query 'fare_amt_by_passenger' iteration 0 took 7138 ms
-Query 'fare_amt_by_passenger' iteration 1 took 7599 ms
-Query 'fare_amt_by_passenger' iteration 2 took 7969 ms
 ```
 
 ## Running the Ballista Loadtest
@@ -291,5 +306,84 @@ Query 'fare_amt_by_passenger' iteration 2 took 7969 ms
   --debug
 ```
 
+## TPC-DS Correctness Tests
+
+Unlike the TPC-H suite above (which measures performance), the TPC-DS suite is
+a correctness gate: it runs each query on a Ballista cluster and compares the
+result, row-by-row, against a single-process DataFusion oracle running the
+same query.
+
+### Vendoring the queries
+
+The 99 TPC-DS queries are checked in at `benchmarks/queries-tpcds/qN.sql`, so
+no fetch step is needed to run the harness. They were vendored from DataFusion's
+`branch-54` (the queries DataFusion uses in its own TPC-DS tests) with:
+
+```bash
+./dev/vendor-tpcds-queries.sh
+```
+
+That script fetches `1.sql` .. `99.sql` from `datafusion/core/tests/tpc-ds` on
+the configured branch (`DATAFUSION_BRANCH`, default `branch-54`) and writes them
+to `benchmarks/queries-tpcds/qN.sql` (prefixed with `q` to match the TPC-H
+naming convention). Re-run it only to refresh the committed queries when the
+DataFusion pin changes.
+
+### Generating Test Data
+
+TPC-DS data is generated with the same [tpchgen-rs](https://github.com/clflushopt/tpchgen-rs)
+project as TPC-H, via its `tpcgen-cli tpcds` subcommand. TPC-DS support is not
+yet published to crates.io, so the script installs `tpcgen-cli` from git,
+pinned to a fixed rev:
+
+```bash
+SCALE_FACTOR=1 OUTPUT_DIR=./data-tpcds ./benchmarks/tpcds-gen.sh
+```
+
+`SCALE_FACTOR` (default `1`) and `OUTPUT_DIR` (default `benchmarks/data-tpcds`,
+resolved relative to the script) are env overrides; `TPCGEN_REV` overrides the
+pinned `tpcgen-cli` git rev if needed. Note that, unlike the TPC-H generator, `tpcgen-cli tpcds` has no
+`--parts` flag — it writes a single `<table>.parquet` file per table for all
+24 TPC-DS tables.
+
+### Running the correctness check
+
+Bring up a scheduler and executor as described above in "Running the
+Ballista Benchmarks", then run the `tpcds` binary with `--verify`:
+
+```bash
+cargo run --release --bin tpcds -- \
+  --host localhost --port 50050 \
+  --path $(pwd)/data-tpcds \
+  --partitions 16 \
+  --verify \
+  -c datafusion.optimizer.prefer_hash_join=false
+```
+
+With no `--query` given, this runs every non-skipped query (see "Skip list"
+below) on the Ballista cluster and, because `--verify` is set, also runs it
+against a single-process DataFusion `SessionContext` and diffs the results.
+The process exits non-zero and prints a summary if any query fails or
+mismatches. `--verify` assumes a local `--path`: the oracle context registers
+the tables directly and does not apply object-store credentials.
+
+### Skip list
+
+Some queries are excluded from the gate. These are listed in the `SKIP` const
+near the top of `benchmarks/src/bin/tpcds.rs`, as `(query_id, reason)` pairs,
+grouped by cause: queries whose distributed result diverges from DataFusion
+(tracked as bugs), queries that are non-deterministic under `LIMIT`/`ORDER BY`
+ties, and queries whose `tpcgen-cli` schema column names differ from the
+DataFusion query text. A default run (no `--query`) executes `1..=99` minus
+`SKIP`.
+
+### CI
+
+`.github/workflows/tpcds.yml` runs the SF1 suite against a local
+scheduler + executor on every push/PR touching `ballista/**` or
+`benchmarks/**`, under the default (static) planner. The adaptive planner
+(AQE on) is not gated yet — it currently fails many TPC-DS queries with an
+`EmptyExec invalid partition` assertion (issue #2047); re-enable an AQE-on run
+once that is fixed.
+
 [1]: http://www.tpc.org/tpch/
-[2]: https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page

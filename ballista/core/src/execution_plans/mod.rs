@@ -18,22 +18,53 @@
 //! This module contains execution plans that are needed to distribute DataFusion's execution plans into
 //! several Ballista executors.
 
+mod buffer;
 mod chaos_exec;
 mod distributed_explain_analyze;
 mod distributed_query;
+mod ordered_range_repartition;
+mod partitioned_bounded_window_agg;
+mod per_partition_filter;
+pub mod plan_algebra;
+mod prefix_merge;
+mod range_filter;
+mod range_repartition_common;
+pub mod range_shuffle;
+mod range_shuffle_reader;
+mod runtime_stats;
 mod shuffle_manager;
 pub(crate) mod shuffle_reader;
 mod shuffle_writer;
 mod shuffle_writer_trait;
 pub mod sort_shuffle;
+mod unordered_range_repartition;
 mod unresolved_shuffle;
+pub mod window_state;
 
 #[cfg(feature = "vortex")]
 pub mod vortex_shuffle;
 
+use std::path::{Path, PathBuf};
+
+pub use buffer::{BufferExec, BufferMode};
 pub use chaos_exec::ChaosExec;
+use datafusion::common::exec_err;
 pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
 pub use distributed_query::{DistributedQueryExec, execute_physical_plan};
+pub use ordered_range_repartition::OrderedRangeRepartitionExec;
+pub use partitioned_bounded_window_agg::PartitionedBoundedWindowAggExec;
+pub use per_partition_filter::{PerPartitionFilterExec, range_partition_predicates};
+pub use plan_algebra::{preserves_distribution, preserves_partitioning};
+pub use prefix_merge::{FinalizedPartitionState, PrefixMergeExec, ScalarOp, WindowApply};
+pub use range_filter::{InputOrder, RangeBound, RangeFilterExec, WidenedBound};
+pub use range_shuffle::RangeShuffleWriterExec;
+pub use range_shuffle_reader::RangeShuffleReaderExec;
+pub use runtime_stats::{
+    MergedRuntimeStats, RuntimeStatsExec, TaskRuntimeStats,
+    collect_reports as collect_runtime_stats_reports, cut_partitions,
+    log_merged_runtime_stats, merge_reports as merge_runtime_stats_reports,
+    repartition_routing_expr,
+};
 pub use shuffle_manager::{
     InMemoryShuffleManager, ShufflePartitionData, ShufflePartitionKey,
     global_shuffle_manager,
@@ -43,13 +74,135 @@ pub use shuffle_reader::{
     CoalescePlan, PartitionGroup, connect_ballista_client, set_shuffle_transport_runtime,
     stats_for_partition, stats_for_partitions,
 };
+pub use shuffle_writer::DEFAULT_SHUFFLE_CHANNEL_CAPACITY;
 pub use shuffle_writer::ShuffleWriterExec;
+pub use shuffle_writer::compute_global_output_partition_ids;
 pub use shuffle_writer_trait::ShuffleWriter;
 pub use sort_shuffle::SortShuffleWriterExec;
+pub use unordered_range_repartition::UnorderedRangeRepartitionExec;
 pub use unresolved_shuffle::UnresolvedShuffleExec;
+pub use window_state::{
+    ObservedWindowState, TaskWindowState, WindowStateCollector,
+    prefix_merge_window_state, window_state_from_proto, window_state_to_proto,
+};
 
 #[cfg(feature = "vortex")]
 pub use vortex_shuffle::{
     LocalVortexShuffleStream, VortexWriteTracker, vortex_file_extension,
     write_stream_to_disk_vortex,
 };
+
+use crate::JobId;
+
+/// Creates the file path for a shuffle output partition.
+///
+/// The path structure depends on the shuffle type:
+///
+/// - **Hash shuffle** (`is_sort_shuffle = false`): produces one directory per output
+///   partition; `partition_id` is always part of the path. `file_id` is an optional
+///   sequence number used when a single partition is written in multiple files:
+///   - With `file_id`: `{work_dir}/{job_id}/{stage_id}/{partition_id}/data-{file_id}.arrow`
+///   - Without `file_id`: `{work_dir}/{job_id}/{stage_id}/{partition_id}/data.arrow`
+///
+/// - **Sort shuffle** (`is_sort_shuffle = true`): produces a single output partition,
+///   so `partition_id` is **ignored** and not included in the path. `file_id` acts as a
+///   file sequence counter and is **required**:
+///   - With `file_id`: `{work_dir}/{job_id}/{stage_id}/{file_id}/data.arrow`
+///   - Without `file_id`: returns an error
+///
+/// # Arguments
+///
+/// - `work_dir` — base directory where shuffle files are written
+/// - `job_id` — unique identifier for the job
+/// - `stage_id` — stage within the job that produced this shuffle output
+/// - `partition_id` — output partition index; used by hash shuffle only, ignored for sort shuffle
+/// - `file_id` — file sequence number; optional for hash shuffle, required for sort shuffle
+/// - `is_sort_shuffle` — selects between sort-shuffle and hash-shuffle path layout
+pub fn create_shuffle_path<P: AsRef<Path>>(
+    work_dir: P,
+    job_id: &JobId,
+    stage_id: usize,
+    partition_id: usize,
+    file_id: Option<u64>,
+    is_sort_shuffle: bool,
+) -> datafusion::error::Result<PathBuf> {
+    let mut path = PathBuf::new();
+
+    path.push(work_dir);
+    path.push(job_id.as_str());
+    path.push(stage_id.to_string());
+
+    match (file_id, is_sort_shuffle) {
+        (Some(file_id), false) => {
+            path.push(partition_id.to_string());
+            path.push(format!("data-{}.arrow", file_id));
+        }
+        (Some(file_id), true) => {
+            path.push(file_id.to_string());
+            path.push("data.arrow");
+        }
+        (None, false) => {
+            path.push(partition_id.to_string());
+            path.push("data.arrow");
+        }
+        (None, true) => {
+            exec_err!("can't create path for sort shuffle without file_id provided")?
+        }
+    }
+
+    Ok(path)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_regular_shuffle_with_file_id() {
+        let path =
+            create_shuffle_path("/work", &"job1".into(), 2, 3, Some(42), false).unwrap();
+        assert_eq!(path, PathBuf::from("/work/job1/2/3/data-42.arrow"));
+    }
+
+    #[test]
+    fn test_regular_shuffle_without_file_id() {
+        let path =
+            create_shuffle_path("/work", &"job1".into(), 2, 3, None, false).unwrap();
+        assert_eq!(path, PathBuf::from("/work/job1/2/3/data.arrow"));
+    }
+
+    #[test]
+    fn test_sort_shuffle_with_file_id() {
+        let path =
+            create_shuffle_path("/work", &"job1".into(), 2, 3, Some(42), true).unwrap();
+        assert_eq!(path, PathBuf::from("/work/job1/2/42/data.arrow"));
+    }
+
+    #[test]
+    fn test_sort_shuffle_without_file_id_returns_error() {
+        let result = create_shuffle_path("/work", &"job1".into(), 2, 3, None, true);
+        assert!(result.is_err());
+    }
+
+    /// Verifies that even when the root directory `/` is used as `work_dir`, the
+    /// returned path always has a parent (i.e. the file is never at the filesystem root).
+    #[test]
+    fn test_root_work_dir_path_has_parent() {
+        for (file_id, is_sort_shuffle) in
+            [(Some(1), false), (None, false), (Some(1), true)]
+        {
+            let path =
+                create_shuffle_path("/", &"job1".into(), 2, 3, file_id, is_sort_shuffle)
+                    .unwrap();
+            assert!(
+                path.parent().is_some(),
+                "path {path:?} (file_id={file_id:?}, is_sort_shuffle={is_sort_shuffle}) has no parent"
+            );
+            assert_ne!(
+                path.parent().unwrap(),
+                std::path::Path::new("/"),
+                "path {path:?} parent is root — expected deeper nesting"
+            );
+        }
+    }
+}

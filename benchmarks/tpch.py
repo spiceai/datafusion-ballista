@@ -15,14 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import sys
 import time
 import argparse
 
-parser = argparse.ArgumentParser(description='Run SQL benchmarks.')
-parser.add_argument('--query', help='query to run, such as q1')
-parser.add_argument('--path', help='path to data files')
-parser.add_argument('--ext', default='', help='optional file extension, such as parquet')
+parser = argparse.ArgumentParser(description="Run SQL benchmarks.")
+parser.add_argument("--query", help="query to run, such as q1")
+parser.add_argument("--path", help="path to data files")
+parser.add_argument(
+    "--ext", default="parquet", help="optional file extension, such as parquet"
+)
 
 args = parser.parse_args()
 
@@ -30,12 +31,21 @@ query = args.query
 path = args.path
 table_ext = args.ext
 
-from ballista import BallistaBuilder
+from ballista import BallistaSessionContext
 from datafusion.context import SessionContext
-    
-ctx: SessionContext = BallistaBuilder().remote("df://127.0.0.1:50050")
 
-tables = ["part", "supplier", "partsupp", "customer", "orders", "lineitem", "nation", "region"]
+ctx: SessionContext = BallistaSessionContext("df://127.0.0.1:50050")
+
+tables = [
+    "part",
+    "supplier",
+    "partsupp",
+    "customer",
+    "orders",
+    "lineitem",
+    "nation",
+    "region",
+]
 
 for table in tables:
     table_path = path + "/" + table
@@ -44,10 +54,8 @@ for table in tables:
     print("Registering table", table, "at path", table_path)
     ctx.register_parquet(table, table_path)
 
-with open("queries/" + query + ".sql", 'r') as file:
+with open("queries/" + query + ".sql", "r") as file:
     sql = file.read()
-
-import time
 
 start = time.time()
 
@@ -56,5 +64,3 @@ df.show()
 
 end = time.time()
 print("Query", query, "took", end - start, "second(s)")
-
-

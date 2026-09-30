@@ -287,6 +287,8 @@ of the following crates:
 - [ballista-cli](https://crates.io/crates/ballista-cli)
 - [ballista-core](https://crates.io/crates/ballista-core)
 - [ballista-executor](https://crates.io/crates/ballista-executor)
+- [ballista-api-types](https://crates.io/crates/ballista-api-types)
+- [ballista-history](https://crates.io/crates/ballista-history)
 - [ballista-scheduler](https://crates.io/crates/ballista-scheduler)
 
 Download and unpack the official release tarball
@@ -306,6 +308,8 @@ dot -Tsvg dev/release/crate-deps.dot > dev/release/crate-deps.svg
 ```shell
 (cd ballista/core && cargo publish)
 (cd ballista/executor && cargo publish)
+(cd ballista/api-types && cargo publish)
+(cd ballista/history && cargo publish)
 (cd ballista/scheduler && cargo publish)
 (cd ballista/client && cargo publish)
 (cd ballista-cli && cargo publish)
@@ -597,8 +601,8 @@ with a copy of the previous release announcement.
 Run the following commands to get the number of commits and number of unique contributors for inclusion in the blog post.
 
 ```bash
-git log --pretty=oneline 0.11.0..0.10.0 ballista ballista-cli examples | wc -l
-git shortlog -sn 0.11.0..0.10.0 ballista ballista-cli examples | wc -l
+git log --pretty=oneline 0.10.0..0.11.0 ballista ballista-cli examples | wc -l
+git shortlog -sn 0.10.0..0.11.0 ballista ballista-cli examples | wc -l
 ```
 
 Once there is consensus on the contents of the post, create a PR to add a blog post to the

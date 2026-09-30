@@ -16,25 +16,24 @@
 // under the License.
 
 use axum::extract::ConnectInfo;
-use ballista_core::JobId;
+use ballista_core::BALLISTA_PROTOCOL_VERSION;
 use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::error::{BallistaError, Result as BResult};
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::protobuf::execute_query_params::Query;
-use ballista_core::serde::protobuf::executor_metric::Metric;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
 use ballista_core::serde::protobuf::{
-    AvailableTaskSlots, CancelJobParams, CancelJobResult, CleanJobDataParams,
+    AvailableVcores, CancelJobParams, CancelJobResult, CleanJobDataParams,
     CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
     ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
-    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
-    ExecutorStoppedResult, GetCatalogParams, GetCatalogResult, GetJobMetricsParams,
-    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
-    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
-    JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
-    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
-    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
-    execute_query_result,
+    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
+    ExecutorStoppedParams, ExecutorStoppedResult, GetCatalogParams, GetCatalogResult,
+    GetJobMetricsParams, GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
+    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams,
+    HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams, PollWorkResult,
+    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    execute_query_failure_result, execute_query_result, executor_metric::Metric,
 };
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, ExecutorOperatingSystemSpecification,
@@ -54,20 +53,52 @@ use {
     datafusion_substrait::serializer::deserialize_bytes,
 };
 
-use std::ops::Deref;
-
 use crate::cluster::{BindingResult, bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
-use crate::scheduler_server::SchedulerServer;
 use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
 use ballista_core::remote_catalog::catalog_serialize_ext::CatalogSerializeExt;
 use ballista_core::remote_catalog::remote_function_serialize_ext::RemoteFunctionSerializeExt;
 use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
 use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
+
+use crate::metrics::record_protocol_mismatch;
+use crate::scheduler_server::SchedulerServer;
+
+/// Rejects an executor RPC whose `ballista_protocol_version` does not match
+/// the scheduler's compiled-in `BALLISTA_PROTOCOL_VERSION`. See the constant
+/// in `ballista_core` for the upgrade semantics.
+fn check_protocol_version(metadata: &ExecutorRegistration) -> Result<(), Status> {
+    if metadata.ballista_protocol_version == BALLISTA_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    record_protocol_mismatch();
+    info!(
+        "Rejecting executor {}: protocol version mismatch (scheduler={}, executor={})",
+        metadata.id, BALLISTA_PROTOCOL_VERSION, metadata.ballista_protocol_version,
+    );
+    Err(Status::failed_precondition(format!(
+        "protocol version mismatch: scheduler={}, executor={}",
+        BALLISTA_PROTOCOL_VERSION, metadata.ballista_protocol_version,
+    )))
+}
+
+fn executor_registration_error(e: BallistaError) -> Status {
+    let msg = format!("Fail to do executor registration due to: {e}");
+    error!("{msg}");
+    match e {
+        BallistaError::Configuration(message)
+            if message.contains("already registered") =>
+        {
+            Status::already_exists(msg)
+        }
+        _ => Status::internal(msg),
+    }
+}
 
 #[tonic::async_trait]
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
@@ -89,11 +120,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         let remote_addr = extract_connect_info(&request);
         if let PollWorkParams {
             metadata: Some(metadata),
-            num_free_slots,
+            num_free_vcores,
             task_status,
         } = request.into_inner()
         {
             trace!("Received poll_work request for {metadata:?}");
+            check_protocol_version(&metadata)?;
             let executor_id = metadata.id.clone();
 
             // It's not necessary.
@@ -112,14 +144,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                         .map(Into::into)
                         .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
                 };
-                if let Err(e) = self
-                    .state
+                self.state
                     .executor_manager
                     .save_executor_metadata(metadata)
                     .await
-                {
-                    warn!("Could not save executor metadata: {e:?}");
-                }
+                    .map_err(executor_registration_error)?;
             }
 
             self.update_task_status(&executor_id, task_status)
@@ -133,19 +162,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     Status::internal(msg)
                 })?;
 
-            let mut available_slots = [AvailableTaskSlots {
+            let mut budgets = [AvailableVcores {
                 executor_id: executor_id.clone(),
-                slots: num_free_slots,
+                vcores: num_free_vcores,
             }];
-            let available_slots = available_slots.iter_mut().collect();
+            let budgets = budgets.iter_mut().collect();
             let running_jobs = self.state.task_manager.get_running_job_cache();
-
             let binding_result = match self.state.config.task_distribution {
                 TaskDistributionPolicy::Bias => {
-                    bind_task_bias(available_slots, running_jobs, |_| false).await
+                    bind_task_bias(budgets, running_jobs, |_| false).await
                 }
                 TaskDistributionPolicy::RoundRobin => {
-                    bind_task_round_robin(available_slots, running_jobs, |_| false).await
+                    bind_task_round_robin(budgets, running_jobs, |_| false).await
                 }
                 TaskDistributionPolicy::ConsistentHash { .. } => {
                     return Err(Status::unimplemented(
@@ -155,7 +183,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
                 TaskDistributionPolicy::Custom(ref policy) => BindingResult::from_tasks(
                     policy
-                        .bind_tasks(available_slots, running_jobs)
+                        .bind_tasks(budgets, running_jobs)
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?,
                 ),
@@ -189,8 +217,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .as_millis();
 
             for (_, task) in binding_result.bound_tasks {
-                let job_id = task.partition.job_id.clone();
-                let stage_id = task.partition.stage_id;
+                let job_id = task.key.job_id.clone();
+                let stage_id = task.key.stage_id;
 
                 // Record task scheduling metric with actual latency
                 let latency_ms = now_millis.saturating_sub(task.schedulable_time_millis);
@@ -217,7 +245,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 .drain_pending_cleanup_jobs(&executor_id)
                 .into_iter()
                 .map(|(job_id, remove_stage_ids)| CleanJobDataParams {
-                    job_id: job_id.into(),
+                    job_id: job_id.into_inner(),
                     remove_stage_ids,
                 })
                 .collect();
@@ -241,6 +269,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         } = request.into_inner()
         {
             info!("Received register executor request for {metadata:?}");
+            check_protocol_version(&metadata)?;
             let metadata = ExecutorMetadata {
                 id: metadata.id,
                 host: metadata
@@ -255,11 +284,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                     .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
             };
 
-            self.do_register_executor(metadata).await.map_err(|e| {
-                let msg = format!("Fail to do executor registration due to: {e}");
-                error!("{msg}");
-                Status::internal(msg)
-            })?;
+            self.do_register_executor(metadata)
+                .await
+                .map_err(executor_registration_error)?;
 
             Ok(Response::new(RegisterExecutorResult { success: true }))
         } else {
@@ -280,6 +307,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             metadata,
         } = request.into_inner();
         trace!("Received heart beat request for {:?}", executor_id);
+
+        let Some(metadata_ref) = metadata.as_ref() else {
+            info!(
+                "Rejecting heartbeat from {executor_id}: missing registration metadata"
+            );
+            record_protocol_mismatch();
+            return Err(Status::failed_precondition(
+                "heartbeat missing registration metadata; \
+                 executors must include ExecutorRegistration \
+                 (see BALLISTA_PROTOCOL_VERSION)",
+            ));
+        };
+        check_protocol_version(metadata_ref)?;
 
         // If not registered, do registration first before saving heart beat
         if let Err(e) = self
@@ -304,18 +344,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                         .unwrap_or_else(ExecutorOperatingSystemSpecification::default),
                 };
 
-                self.do_register_executor(metadata).await.map_err(|e| {
-                    let msg = format!("Fail to do executor registration due to: {e}");
-                    error!("{msg}");
-                    Status::internal(msg)
-                })?;
+                self.do_register_executor(metadata)
+                    .await
+                    .map_err(executor_registration_error)?;
             } else {
                 return Err(Status::invalid_argument(format!(
                     "The registration spec for executor {executor_id} is not included"
                 )));
             }
         }
-
+        // Extract current process memory from incoming metrics
         let current_proc_physical = metrics
             .iter()
             .find_map(|m| match m.metric {
@@ -332,6 +370,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             })
             .unwrap_or(0);
 
+        // Compare against previous peaks
         let (peak_proc_physical_memory, peak_proc_virtual_memory) = self
             .state
             .executor_manager
@@ -403,6 +442,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         let session_params = request.into_inner();
 
         let session_config = self.state.session_manager.produce_config();
+        // TODO(c2): compute total cluster vcores (sum of vcores across
+        // registered executors from ClusterState.registered_executor_metadata())
+        // and inject it here so downstream rules like ParallelWindowDetectRule
+        // can size their output partition counts to actual cluster shape
+        // instead of hardcoding.
         let session_config =
             session_config.update_from_key_value_pair(&session_params.settings);
 
@@ -582,7 +626,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             Ok(Response::new(ExecuteQueryResult {
                 operation_id,
                 result: Some(execute_query_result::Result::Success(
-                    ExecuteQuerySuccessResult { job_id, session_id },
+                    ExecuteQuerySuccessResult {
+                        job_id: job_id.into(),
+                        session_id,
+                    },
                 )),
             }))
         } else {
@@ -594,8 +641,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         &self,
         request: Request<GetJobStatusParams>,
     ) -> Result<Response<GetJobStatusResult>, Status> {
-        let job_id = request.into_inner().job_id;
-        let job_id = JobId::from(job_id);
+        let job_id = request.into_inner().job_id.into();
         trace!("Received get_job_status request for job {}", job_id);
 
         let flight_proxy = self.flight_proxy_config();
@@ -618,8 +664,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         &self,
         request: Request<GetJobMetricsParams>,
     ) -> Result<Response<GetJobMetricsResult>, Status> {
-        let job_id = request.into_inner().job_id;
-        let job_id = JobId::from(job_id);
+        let job_id = request.into_inner().job_id.into();
         trace!("Received get_job_metrics request for job {}", job_id);
 
         let graph = self
@@ -649,13 +694,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 };
 
                 let raw_metrics = &successful.stage_metrics;
+                let mut operators = Vec::with_capacity(raw_metrics.len());
                 let mut metric_index = 0;
                 let operators = (|| -> Result<
                     Vec<ballista_core::serde::protobuf::OperatorWithMetrics>,
                     BallistaError,
                 > {
                     let mut stack = vec![(successful.plan.as_ref(), 0_u32)];
-                    let mut operators = Vec::with_capacity(raw_metrics.len());
 
                     while let Some((plan, depth)) = stack.pop() {
                         let operator_desc = {
@@ -756,8 +801,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
             executor_id, reason
         );
 
-        let executor_manager = self.state.executor_manager.clone();
-        let metrics_collector = self.state.metrics_collector.clone();
         let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
             let msg = format!("Get query stage event loop error due to {e:?}");
             error!("{msg}");
@@ -765,9 +808,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         })?;
 
         Self::remove_executor(
-            executor_manager,
+            self.state.clone(),
             event_sender,
-            metrics_collector,
             &executor_id,
             Some(reason),
             self.config.executor_termination_grace_period,
@@ -780,7 +822,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         &self,
         request: Request<CancelJobParams>,
     ) -> Result<Response<CancelJobResult>, Status> {
-        let job_id = request.into_inner().job_id;
+        let job_id = request.into_inner().job_id.into();
         info!("Received cancellation request for job {}", job_id);
 
         self.cancel_job(job_id).await.map_err(|e| {
@@ -796,7 +838,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         &self,
         request: Request<CleanJobDataParams>,
     ) -> Result<Response<CleanJobDataResult>, Status> {
-        let job_id = request.into_inner().job_id;
+        let job_id = request.into_inner().job_id.into();
         info!("Received clean data request for job {}", job_id);
 
         self.query_stage_event_loop
@@ -806,7 +848,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 error!("{msg}");
                 Status::internal(msg)
             })?
-            .post_event(QueryStageSchedulerEvent::JobDataClean(JobId::from(job_id)))
+            .post_event(QueryStageSchedulerEvent::JobDataClean(job_id))
             .await
             .map_err(|e| {
                 let msg = format!("Post to query stage event loop error due to {e:?}");
@@ -917,7 +959,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             }
             #[cfg(feature = "substrait")]
             Query::SubstraitPlan(bytes) => {
-                let plan = deserialize_bytes(bytes).await.map_err(|e| BallistaError::DataFusionError(e.into()))?;
+                let plan = deserialize_bytes(&bytes).map_err(|e| BallistaError::DataFusionError(e.into()))?;
 
                 let ctx = session_ctx.clone();
                 from_substrait_plan(&ctx.state(), &plan)
@@ -940,15 +982,20 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         }
     }
 
+    /// Where clients should fetch result partitions from over Arrow Flight,
+    /// advertised in job-status responses. An explicitly advertised endpoint
+    /// wins over the embedded proxy, so a load balancer can front it.
     fn flight_proxy_config(&self) -> Option<FlightProxy> {
-        self.state
-            .config
-            .advertise_flight_sql_endpoint
-            .clone()
-            .map(|s| match s {
-                s if s.is_empty() => FlightProxy::Local(true),
-                s => FlightProxy::External(s),
-            })
+        let config = &self.state.config;
+        match config
+            .advertise_flight_endpoint
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            Some(endpoint) => Some(FlightProxy::External(endpoint.to_string())),
+            None if config.enable_embedded_flight_proxy => Some(FlightProxy::Local(true)),
+            None => None,
+        }
     }
 }
 
@@ -959,7 +1006,7 @@ mod test {
 
     use datafusion_proto::protobuf::LogicalPlanNode;
     use datafusion_proto::protobuf::PhysicalPlanNode;
-    use tonic::Request;
+    use tonic::{Code, Request};
 
     #[cfg(feature = "substrait")]
     use {
@@ -971,20 +1018,31 @@ mod test {
 
     use crate::config::SchedulerConfig;
     use crate::metrics::default_metrics_collector;
+    use ballista_core::BALLISTA_PROTOCOL_VERSION;
     use ballista_core::error::BallistaError;
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::{
-        ExecutorOperatingSystemSpecification, ExecutorRegistration, ExecutorStatus,
-        ExecutorStoppedParams, HeartBeatParams, PollWorkParams, RegisterExecutorParams,
-        executor_status,
+        ExecutorRegistration, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
+        PollWorkParams, RegisterExecutorParams, executor_status,
     };
-    use ballista_core::serde::scheduler::ExecutorSpecification;
+    use ballista_core::serde::scheduler::{
+        ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    };
 
     use crate::state::SchedulerState;
     use crate::test_utils::await_condition;
     use crate::test_utils::test_cluster_context;
 
-    use super::{SchedulerGrpc, SchedulerServer};
+    use super::{SchedulerGrpc, SchedulerServer, executor_registration_error};
+
+    #[test]
+    fn duplicate_executor_registration_maps_to_already_exists() {
+        let status = executor_registration_error(BallistaError::Configuration(
+            "executor_id id123 is already registered".to_string(),
+        ));
+
+        assert_eq!(status.code(), Code::AlreadyExists);
+    }
 
     #[tokio::test]
     async fn test_pull_work() -> Result<(), BallistaError> {
@@ -1007,12 +1065,13 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
-            num_free_slots: 0,
+            num_free_vcores: 0,
             task_status: vec![],
         });
         let response = scheduler
@@ -1023,7 +1082,7 @@ mod test {
         // no response task since we told the scheduler we didn't want to accept one
         assert!(response.tasks.is_empty());
         let state: SchedulerState<LogicalPlanNode, PhysicalPlanNode> =
-            SchedulerState::new_with_default_scheduler_name(
+            SchedulerState::new_with_default_scheduler_endpoint(
                 cluster.clone(),
                 BallistaCodec::default(),
                 default_metrics_collector().unwrap(),
@@ -1039,12 +1098,12 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
         let request: Request<PollWorkParams> = Request::new(PollWorkParams {
             metadata: Some(exec_meta.clone()),
-            num_free_slots: 1,
+            num_free_vcores: 1,
             task_status: vec![],
         });
         let response = scheduler
@@ -1056,7 +1115,7 @@ mod test {
         // still no response task since there are no tasks in the scheduler
         assert!(response.tasks.is_empty());
         let state: SchedulerState<LogicalPlanNode, PhysicalPlanNode> =
-            SchedulerState::new_with_default_scheduler_name(
+            SchedulerState::new_with_default_scheduler_endpoint(
                 cluster.clone(),
                 BallistaCodec::default(),
                 default_metrics_collector().unwrap(),
@@ -1072,7 +1131,27 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        let mut conflicting_exec_meta = exec_meta.clone();
+        conflicting_exec_meta.host = Some("http://localhost:8081".to_owned());
+        let request: Request<PollWorkParams> = Request::new(PollWorkParams {
+            metadata: Some(conflicting_exec_meta),
+            num_free_vcores: 1,
+            task_status: vec![],
+        });
+        let err = match scheduler.poll_work(request).await {
+            Ok(_) => panic!("duplicate executor id should fail poll_work"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), Code::AlreadyExists);
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
         Ok(())
@@ -1098,8 +1177,9 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1125,7 +1205,7 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
         let request: Request<ExecutorStoppedParams> =
@@ -1184,8 +1264,9 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
@@ -1211,9 +1292,129 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
+        Ok(())
+    }
+
+    async fn scheduler_for_protocol_test()
+    -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>, BallistaError> {
+        let cluster = test_cluster_context();
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster,
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+        Ok(scheduler)
+    }
+
+    fn exec_meta_with_version(version: u32) -> ExecutorRegistration {
+        ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: version,
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        // Version 0 is what an old executor without the field defaults to;
+        // the scheduler must reject it.
+        let request = Request::new(RegisterExecutorParams {
+            metadata: Some(exec_meta_with_version(0)),
+        });
+
+        let status = scheduler
+            .register_executor(request)
+            .await
+            .expect_err("register with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("protocol version mismatch"),
+            "unexpected message: {}",
+            status.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        let meta = exec_meta_with_version(BALLISTA_PROTOCOL_VERSION + 1);
+        let request = Request::new(HeartBeatParams {
+            executor_id: meta.id.clone(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: Some(meta),
+        });
+        let status = scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect_err("heartbeat with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("protocol version mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_missing_metadata() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        let request = Request::new(HeartBeatParams {
+            executor_id: "abc".to_owned(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: None,
+        });
+        let status = scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect_err("heartbeat with no metadata should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("missing registration metadata"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_work_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let config = SchedulerConfig {
+            scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
+            ..Default::default()
+        };
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let request = Request::new(PollWorkParams {
+            metadata: Some(exec_meta_with_version(0)),
+            num_free_vcores: 0,
+            task_status: vec![],
+        });
+        let status = scheduler
+            .poll_work(request)
+            .await
+            .expect_err("poll_work with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         Ok(())
     }
 
@@ -1238,8 +1439,9 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1265,7 +1467,7 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
         // heartbeat from the executor
@@ -1304,6 +1506,64 @@ mod test {
         assert!(active_executors.is_empty());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn flight_proxy_config_reflects_explicit_flag_and_endpoint() {
+        use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
+
+        let server = |config: SchedulerConfig| {
+            SchedulerServer::<LogicalPlanNode, PhysicalPlanNode>::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            )
+        };
+
+        // Neither set: nothing advertised.
+        assert_eq!(
+            server(SchedulerConfig::default()).flight_proxy_config(),
+            None
+        );
+
+        // Embedded proxy: advertise the scheduler itself.
+        let cfg = SchedulerConfig::default().with_enable_embedded_flight_proxy(true);
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::Local(true))
+        );
+
+        // An advertised endpoint alone points clients elsewhere without starting
+        // anything locally.
+        let cfg = SchedulerConfig::default()
+            .with_advertise_flight_endpoint(Some("lb.example.com:50055".into()));
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::External("lb.example.com:50055".into()))
+        );
+
+        // External endpoint wins, even alongside the embedded proxy.
+        let cfg = SchedulerConfig::default()
+            .with_enable_embedded_flight_proxy(true)
+            .with_advertise_flight_endpoint(Some("lb.example.com:50055".into()));
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::External("lb.example.com:50055".into()))
+        );
+
+        // An empty endpoint is not advertised, and does not suppress the proxy.
+        let cfg = SchedulerConfig {
+            advertise_flight_endpoint: Some(String::new()),
+            enable_embedded_flight_proxy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::Local(true))
+        );
+    }
+
     #[tokio::test]
     #[cfg(feature = "substrait")]
     async fn test_substrait_compatibility() -> Result<(), BallistaError> {
@@ -1325,8 +1585,9 @@ mod test {
             host: Some("http://localhost:8080".to_owned()),
             port: 0,
             grpc_port: 0,
-            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
         };
 
         let request: Request<RegisterExecutorParams> =
@@ -1352,7 +1613,7 @@ mod test {
 
         assert_eq!(stored_executor.grpc_port, 0);
         assert_eq!(stored_executor.port, 0);
-        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.specification.vcores, 2);
         assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
 
         // Context strictly used for values-based query serialization to avoid

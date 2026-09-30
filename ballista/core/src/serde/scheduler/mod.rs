@@ -17,7 +17,9 @@
 
 use crate::JobId;
 use crate::error::BallistaError;
+use crate::execution_plans::create_shuffle_path;
 use crate::registry::BallistaFunctionRegistry;
+use crate::serde::protobuf;
 use datafusion::arrow::array::{
     ArrayBuilder, StructArray, StructBuilder, UInt64Array, UInt64Builder,
 };
@@ -27,6 +29,7 @@ use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::SessionConfig;
 use serde::Serialize;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::{collections::HashMap, fmt, sync::Arc};
 
 /// Conversions from protobuf types to Ballista types.
@@ -45,13 +48,89 @@ pub enum Action {
         stage_id: usize,
         /// The partition identifier within the stage.
         partition_id: usize,
-        /// File path to the partition data.
+        /// Spice fork: explicit location of the partition data (local path,
+        /// `memory://` key or object-store URL).
         path: String,
         /// Hostname or IP address of the executor hosting this partition.
         host: String,
         /// Port number for data transfer.
         port: u16,
+        /// shuffle file block id
+        file_id: Option<u64>,
+        /// how the producing writer laid its output out on disk
+        layout: ShuffleLayout,
+        /// which file making up that output to fetch
+        file_kind: ShuffleFileKind,
+        /// byte ranges of that file to return, concatenated in order. Empty
+        /// asks for whatever the identifiers above address.
+        byte_ranges: Vec<ByteRange>,
     },
+}
+
+impl PartitionLocation {
+    /// How the writer that produced this partition laid its output out.
+    ///
+    /// Derived from `is_sort_shuffle`, which is the same question asked in the
+    /// vocabulary of one writer. The stored field keeps that name until the
+    /// construction sites are swept; the wire protocol already speaks layouts.
+    pub fn layout(&self) -> ShuffleLayout {
+        shuffle_layout(self.is_sort_shuffle)
+    }
+}
+
+impl crate::serde::protobuf::PartitionLocation {
+    /// How the writer that produced this partition laid its output out.
+    ///
+    /// The same rule as [`PartitionLocation::layout`], for callers holding the
+    /// protobuf message. They cannot go through `TryInto<PartitionLocation>`
+    /// first, because that conversion also demands `partition_stats`, which a
+    /// partition fetch has no use for.
+    pub fn layout(&self) -> ShuffleLayout {
+        shuffle_layout(self.is_sort_shuffle)
+    }
+}
+
+fn shuffle_layout(is_sort_shuffle: bool) -> ShuffleLayout {
+    if is_sort_shuffle {
+        ShuffleLayout::Sort
+    } else {
+        ShuffleLayout::Passthrough
+    }
+}
+
+/// How a shuffle writer laid its output out on disk.
+///
+/// Selects the path shape, and with it how a client parses the index beside
+/// the data. Says nothing about the framing of the data file's own bytes —
+/// that is the file's business, and a reader establishes it by opening it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShuffleLayout {
+    /// `{stage_id}/{partition_id}/data-{file_id}.arrow`, one file per output
+    /// partition. Written by the passthrough and range writers.
+    #[default]
+    Passthrough,
+    /// `{stage_id}/{file_id}/data.arrow`, one file per task holding every
+    /// partition. Written by the sort-based writer.
+    Sort,
+}
+
+/// Which file making up a shuffle output is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShuffleFileKind {
+    /// The data itself.
+    #[default]
+    Data,
+    /// The index beside it, whose name and encoding follow from the layout.
+    Index,
+}
+
+/// A half-open byte range of a file: `[offset, offset + length)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    /// Where the range starts, from the beginning of the file.
+    pub offset: u64,
+    /// How many bytes it spans.
+    pub length: u64,
 }
 
 /// Unique identifier for the output partition of an operator.
@@ -63,6 +142,24 @@ pub struct PartitionId {
     pub stage_id: usize,
     /// The partition identifier within the stage.
     pub partition_id: usize,
+}
+
+/// Locator for a task within an execution graph: (job, stage, task_id).
+///
+/// One task processes a partition slice, so the third component is
+/// `task_id` — the task's append-order slot in
+/// `RunningStage.task_infos`, not a partition index. Sibling to
+/// [`PartitionId`] — [`PartitionId`] identifies an operator output
+/// partition (shuffle location, etc.), [`TaskKey`] identifies a scheduled
+/// task attempt.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskKey {
+    /// The job identifier.
+    pub job_id: JobId,
+    /// The stage identifier within the job.
+    pub stage_id: usize,
+    /// Task slot within the stage.
+    pub task_id: usize,
 }
 
 impl PartitionId {
@@ -87,8 +184,31 @@ pub struct PartitionLocation {
     pub executor_meta: ExecutorMetadata,
     /// Statistics about the partition data.
     pub partition_stats: PartitionStats,
-    /// File path to the partition data.
+    /// Spice fork: explicit location of the partition data (local path,
+    /// `memory://` key or object-store URL), as reported by the writer.
     pub path: String,
+    /// shuffle file id
+    pub file_id: Option<u64>,
+    /// whether this partition uses sort shuffle
+    pub is_sort_shuffle: bool,
+}
+
+impl PartitionLocation {
+    /// creates file actual file location
+    ///
+    /// Derives the upstream local-disk layout path from the identifiers. The
+    /// Spice fork's writers also report an explicit location in the `path`
+    /// field, which is authoritative for `memory://` and object-store shuffle.
+    pub fn path(&self, work_dir: &str) -> datafusion::error::Result<PathBuf> {
+        create_shuffle_path(
+            work_dir,
+            &self.partition_id.job_id,
+            self.partition_id.stage_id,
+            self.partition_id.partition_id,
+            self.file_id,
+            self.is_sort_shuffle,
+        )
+    }
 }
 
 /// Meta-data for an executor, used when fetching shuffle partitions from other executors.
@@ -108,29 +228,47 @@ pub struct ExecutorMetadata {
     pub os_info: ExecutorOperatingSystemSpecification,
 }
 
-/// Specification of an executor, indicating executor resources, like total task slots.
+/// Specification of an executor, indicating its runtime-assigned vcore count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ExecutorSpecification {
-    /// Number of concurrent task slots available on this executor.
-    pub task_slots: u32,
+    /// Virtual cores assigned to this executor at runtime — analogous to YARN
+    /// vcores (`yarn.nodemanager.resource.cpu-vcores`) or Spark's
+    /// `spark.executor.cores`. Not physical `nproc`: may over- or
+    /// under-subscribe. One task per executor drives this many DataFusion
+    /// partitions in parallel through one plan-Arc.
+    pub vcores: u32,
 }
 
 impl Default for ExecutorSpecification {
     fn default() -> Self {
-        Self { task_slots: 1 }
+        Self { vcores: 1 }
     }
 }
 
 impl ExecutorSpecification {
-    /// Sets the number of task slots for this executor specification.
-    pub fn with_task_slots(mut self, task_slots: u32) -> Self {
-        self.task_slots = task_slots;
+    /// Set the vcore count. See [`ExecutorSpecification::vcores`].
+    pub fn with_vcores(mut self, vcores: u32) -> Self {
+        self.vcores = vcores;
         self
+    }
+
+    /// Deprecated alias for [`Self::with_vcores`].
+    #[deprecated(note = "renamed to `with_vcores`")]
+    pub fn with_task_slots(self, task_slots: u32) -> Self {
+        self.with_vcores(task_slots)
+    }
+
+    /// Deprecated getter that returns [`Self::vcores`].
+    #[deprecated(note = "the `task_slots` field was renamed to `vcores`")]
+    pub fn task_slots(&self) -> u32 {
+        self.vcores
     }
 }
 
 /// Operating system level specification of an executor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ExecutorOperatingSystemSpecification {
     /// System name.
     pub system_name: String,
@@ -168,23 +306,107 @@ impl Default for ExecutorOperatingSystemSpecification {
     }
 }
 
-/// Available resources for an executor, including total and available task slots.
+impl ExecutorOperatingSystemSpecification {
+    /// Setting number of physical cores for executor
+    pub fn with_physical_cores(mut self, physical_cores: u32) -> Self {
+        self.physical_cores = physical_cores;
+        self
+    }
+
+    /// Setting number of disks for executor
+    pub fn with_num_disks(mut self, num_disks: u32) -> Self {
+        self.num_disks = num_disks;
+        self
+    }
+
+    /// Setting total disks space for executor
+    pub fn with_total_disk_space(mut self, total_disk_space: u64) -> Self {
+        self.total_disk_space = total_disk_space;
+        self
+    }
+
+    /// Setting total available disk space for executor
+    pub fn with_total_available_disk_space(
+        mut self,
+        total_available_disk_space: u64,
+    ) -> Self {
+        self.total_available_disk_space = total_available_disk_space;
+        self
+    }
+
+    /// Setting open files limit for executor
+    pub fn with_open_files_limit(mut self, open_files_limit: u64) -> Self {
+        self.open_files_limit = open_files_limit;
+        self
+    }
+
+    /// Setting system name for executor
+    pub fn with_system_name(mut self, system_name: String) -> Self {
+        self.system_name = system_name;
+        self
+    }
+
+    /// Setting kernel version for executor
+    pub fn with_kernel_ver(mut self, kernel_ver: String) -> Self {
+        self.kernel_ver = kernel_ver;
+        self
+    }
+
+    /// Setting OS version for executor
+    pub fn with_os_ver(mut self, os_ver: String) -> Self {
+        self.os_ver = os_ver;
+        self
+    }
+
+    /// Setting OS version (longer variant) for executor
+    pub fn with_os_ver_long(mut self, os_ver_long: String) -> Self {
+        self.os_ver_long = os_ver_long;
+        self
+    }
+}
+
+/// Executor vcore accounting: total assigned vs currently free.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutorData {
     /// Unique executor identifier.
     pub executor_id: String,
-    /// Total number of task slots.
-    pub total_task_slots: u32,
-    /// Currently available task slots.
-    pub available_task_slots: u32,
+    /// Total vcores assigned to this executor. See
+    /// [`ExecutorSpecification::vcores`].
+    pub total_vcores: u32,
+    /// Currently free vcores (total minus reserved).
+    pub available_vcores: u32,
 }
 
-/// Represents a change in executor task slot availability.
+impl ExecutorData {
+    /// Deprecated getter that returns [`Self::total_vcores`].
+    #[deprecated(note = "the `total_task_slots` field was renamed to `total_vcores`")]
+    pub fn total_task_slots(&self) -> u32 {
+        self.total_vcores
+    }
+
+    /// Deprecated getter that returns [`Self::available_vcores`].
+    #[deprecated(
+        note = "the `available_task_slots` field was renamed to `available_vcores`"
+    )]
+    pub fn available_task_slots(&self) -> u32 {
+        self.available_vcores
+    }
+}
+
+/// Represents a change in an executor's free-vcore count.
 pub struct ExecutorDataChange {
     /// Unique executor identifier.
     pub executor_id: String,
-    /// Change in available task slots (positive or negative).
-    pub task_slots: i32,
+    /// Change in free vcores (positive to release, negative to reserve).
+    pub vcores: i32,
+}
+
+impl ExecutorDataChange {
+    /// Deprecated getter that returns [`Self::vcores`].
+    #[deprecated(note = "the `task_slots` field was renamed to `vcores`")]
+    pub fn task_slots(&self) -> i32 {
+        self.vcores
+    }
 }
 
 /// Summary of executed partition
@@ -192,6 +414,9 @@ pub struct ExecutorDataChange {
 pub struct PartitionStats {
     pub(crate) num_rows: Option<u64>,
     pub(crate) num_batches: Option<u64>,
+    /// Per-partition byte size reported by the shuffle writer. Read by the
+    /// AQE coalesce rule (in `ballista-scheduler`) to bin-pack alignment
+    /// groups, so this field is `pub` rather than `pub(crate)`.
     pub(crate) num_bytes: Option<u64>,
 }
 
@@ -388,7 +613,10 @@ impl ExecutePartitionResult {
 /// Definition of a task to be executed on an executor.
 #[derive(Clone, Debug)]
 pub struct TaskDefinition {
-    /// Unique task identifier.
+    /// Append-order slot of this task in `RunningStage.task_infos`. Not a
+    /// partition index — one task processes a slice of partitions given
+    /// by `global_output_partition_ids`. `(job_id, stage_id, task_id)` is
+    /// globally unique.
     pub task_id: usize,
     /// Current attempt number for this task.
     pub task_attempt_num: usize,
@@ -398,8 +626,16 @@ pub struct TaskDefinition {
     pub stage_id: usize,
     /// Current attempt number for the stage.
     pub stage_attempt_num: usize,
-    /// Partition to process.
-    pub partition_id: usize,
+    /// Global partition ids this task's restricted plan covers, in slice
+    /// order. `plan.output_partitioning().partition_count() == global_output_partition_ids.len()`
+    /// for pass-through shapes; writers use the slice to attach global
+    /// identity to shuffle files (with special-casing for plan-level
+    /// partitioning resets like SPM and RepartitionExec::Hash).
+    pub global_output_partition_ids: Vec<usize>,
+    /// Vcores this task consumed from the executor's budget at bind time.
+    /// Used to scale the task's memory pool so a task claiming N vcores
+    /// gets N/total_vcores of the executor's memory budget.
+    pub vcores_consumed: u32,
     /// Physical execution plan for this task.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Timestamp when the task was launched.
@@ -410,4 +646,40 @@ pub struct TaskDefinition {
     pub session_config: SessionConfig,
     /// Function registry for UDFs.
     pub function_registry: Arc<BallistaFunctionRegistry>,
+}
+
+impl From<ShuffleLayout> for protobuf::ShuffleLayout {
+    fn from(layout: ShuffleLayout) -> Self {
+        match layout {
+            ShuffleLayout::Passthrough => protobuf::ShuffleLayout::Passthrough,
+            ShuffleLayout::Sort => protobuf::ShuffleLayout::Sort,
+        }
+    }
+}
+
+impl From<protobuf::ShuffleLayout> for ShuffleLayout {
+    fn from(layout: protobuf::ShuffleLayout) -> Self {
+        match layout {
+            protobuf::ShuffleLayout::Passthrough => ShuffleLayout::Passthrough,
+            protobuf::ShuffleLayout::Sort => ShuffleLayout::Sort,
+        }
+    }
+}
+
+impl From<ShuffleFileKind> for protobuf::ShuffleFileKind {
+    fn from(kind: ShuffleFileKind) -> Self {
+        match kind {
+            ShuffleFileKind::Data => protobuf::ShuffleFileKind::Data,
+            ShuffleFileKind::Index => protobuf::ShuffleFileKind::Index,
+        }
+    }
+}
+
+impl From<protobuf::ShuffleFileKind> for ShuffleFileKind {
+    fn from(kind: protobuf::ShuffleFileKind) -> Self {
+        match kind {
+            protobuf::ShuffleFileKind::Data => ShuffleFileKind::Data,
+            protobuf::ShuffleFileKind::Index => ShuffleFileKind::Index,
+        }
+    }
 }

@@ -228,6 +228,16 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
             return Ok(plan);
         }
 
+        // Coalesce and range-repartition are both set, bail so as to not return incorrect results
+        // TODO: handle this case by coalescing range cuts too (see #2220)
+        if leaves
+            .iter()
+            .any(|arc| as_exchange(arc).range_repartition_routing().is_some())
+        {
+            debug!("[coalesce-rule] range-repartitioned leaf present; bail entire group");
+            return Ok(plan);
+        }
+
         // The alignment-group invariant assumes a shared `M`. In every plan
         // shape we currently produce, all leaves of one stage subtree are
         // hash-partitioned by the same target_partitions setting upstream,
@@ -276,7 +286,8 @@ impl PhysicalOptimizerRule for CoalescePartitionsRule {
         // get parallelism preservation unless they explicitly trade it for
         // larger tasks. This corresponds to Spark's
         // `parallelismFirst=false` mode — direct advisory-driven packing.
-        let starts = split_size_list_by_target_size(&summed, target, small, merged);
+        let starts =
+            split_size_list_by_target_size(&summed, target as u64, small, merged);
         let k = starts.len();
         debug!("[coalesce-rule] bin-pack result: K={k} M={m}");
         if k >= m || k <= 1 {

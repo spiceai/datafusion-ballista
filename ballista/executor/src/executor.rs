@@ -20,6 +20,7 @@
 use crate::execution_engine::DefaultExecutionEngine;
 use crate::execution_engine::ExecutionEngine;
 use crate::execution_engine::QueryStageExecutor;
+use crate::execution_loop::any_to_string;
 use crate::metrics::ExecutorMetricsCollector;
 use crate::metrics::LoggingMetricsCollector;
 use crate::runtime_cache::SessionRuntimeCache;
@@ -31,13 +32,17 @@ use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf;
 use ballista_core::serde::protobuf::ExecutorRegistration;
-use ballista_core::serde::scheduler::PartitionId;
+use ballista_core::serde::scheduler::TaskKey;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
+use futures::FutureExt;
 use futures::future::AbortHandle;
+use futures::task::AtomicWaker;
+use log::error;
+use log::warn;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +52,6 @@ use std::task::{Context, Poll};
 ///
 /// This function is provided for use by custom `ExecutorMetricsCollector` implementations
 /// that may need to categorize errors differently than the default.
-#[allow(dead_code)]
 pub fn categorize_ballista_error(error: &BallistaError) -> String {
     match error {
         BallistaError::NotImplemented(_) => "not_implemented".to_string(),
@@ -209,7 +213,8 @@ pub struct TasksDrainedFuture(
 impl Future for TasksDrainedFuture {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.tasks_drained_waker.register(cx.waker());
         if !self.0.abort_handles.is_empty() {
             Poll::Pending
         } else {
@@ -218,7 +223,7 @@ impl Future for TasksDrainedFuture {
     }
 }
 
-type AbortHandles = Arc<DashMap<(usize, PartitionId), AbortHandle>>;
+type AbortHandles = Arc<DashMap<TaskKey, AbortHandle>>;
 
 /// Ballista executor
 #[derive(Clone)]
@@ -241,11 +246,13 @@ pub struct Executor {
     /// Collector for runtime execution metrics
     pub metrics_collector: Arc<dyn ExecutorMetricsCollector>,
 
-    /// Concurrent tasks can run in executor
-    pub concurrent_tasks: usize,
+    /// Virtual cores assigned to this executor. See CLI docs on `--vcores`.
+    pub vcores: usize,
 
     /// Handles to abort executing tasks
     abort_handles: AbortHandles,
+
+    tasks_drained_waker: Arc<AtomicWaker>,
 
     /// Execution engine that the executor will delegate to
     /// for executing query stages
@@ -265,7 +272,7 @@ impl Executor {
         work_dir: &str,
         runtime_producer: RuntimeProducer,
         config_producer: ConfigProducer,
-        concurrent_tasks: usize,
+        vcores: usize,
     ) -> Self {
         Self::new(
             metadata,
@@ -274,13 +281,15 @@ impl Executor {
             config_producer,
             Arc::new(BallistaFunctionRegistry::default()),
             Arc::new(LoggingMetricsCollector::default()),
-            concurrent_tasks,
+            vcores,
             None,
         )
     }
 
     /// Create a new executor instance with given [RuntimeEnv],
     /// [datafusion::logical_expr::ScalarUDF], [datafusion::logical_expr::AggregateUDF] and [datafusion::logical_expr::WindowUDF]
+    ///
+    /// `execution_engine` of `None` uses [`DefaultExecutionEngine`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         metadata: ExecutorRegistration,
@@ -289,7 +298,7 @@ impl Executor {
         config_producer: ConfigProducer,
         function_registry: Arc<BallistaFunctionRegistry>,
         metrics_collector: Arc<dyn ExecutorMetricsCollector>,
-        concurrent_tasks: usize,
+        vcores: usize,
         execution_engine: Option<Arc<dyn ExecutionEngine>>,
     ) -> Self {
         Self {
@@ -299,16 +308,48 @@ impl Executor {
             runtime_producer,
             config_producer,
             metrics_collector,
-            concurrent_tasks,
+            vcores,
             abort_handles: Default::default(),
+            tasks_drained_waker: Default::default(),
             execution_engine: execution_engine
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
+            session_runtime_cache: None,
+        }
+    }
+    /// Creates new Executor with default `ExecutionEngine`.
+    /// Default `ExecutionEngine` does not cache client connections.
+    pub fn with_default_execution_engine(
+        metadata: ExecutorRegistration,
+        work_dir: &str,
+        runtime_producer: RuntimeProducer,
+        config_producer: ConfigProducer,
+        function_registry: Arc<BallistaFunctionRegistry>,
+        metrics_collector: Arc<dyn ExecutorMetricsCollector>,
+        vcores: usize,
+    ) -> Self {
+        Self {
+            metadata,
+            work_dir: work_dir.to_owned(),
+            function_registry,
+            runtime_producer,
+            config_producer,
+            metrics_collector,
+            vcores,
+            abort_handles: Default::default(),
+            tasks_drained_waker: Default::default(),
+            execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
         }
     }
 }
 
 impl Executor {
+    fn wake_tasks_drained(&self) {
+        if self.abort_handles.is_empty() {
+            self.tasks_drained_waker.wake();
+        }
+    }
+
     /// Creates a [`RuntimeEnv`] using the configured runtime producer.
     pub fn produce_runtime(
         &self,
@@ -329,14 +370,17 @@ impl Executor {
 
     /// Produces the runtime for a task, reusing the session's shared read-side
     /// state when a session cache is attached; otherwise builds a runtime per
-    /// task via the `runtime_producer`.
+    /// task via the `runtime_producer`. `vcores_consumed` is the number of
+    /// vcores this task claimed at bind time; the memory pool policy uses it
+    /// to size the per-task pool proportionally.
     pub fn produce_runtime_for_session(
         &self,
         session_id: &str,
         config: &SessionConfig,
+        vcores_consumed: u32,
     ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
         match &self.session_runtime_cache {
-            Some(cache) => cache.produce_runtime(session_id, config),
+            Some(cache) => cache.produce_runtime(session_id, config, vcores_consumed),
             None => (self.runtime_producer)(config),
         }
     }
@@ -351,8 +395,7 @@ impl Executor {
     /// and statistics.
     pub async fn execute_query_stage(
         &self,
-        task_id: usize,
-        partition: PartitionId,
+        key: TaskKey,
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<protobuf::ShuffleWritePartition>, BallistaError> {
@@ -360,33 +403,34 @@ impl Executor {
 
         // Record task start for metrics tracking
         self.metrics_collector.record_task_started(
-            &partition.job_id,
-            partition.stage_id,
-            partition.partition_id,
+            &key.job_id,
+            key.stage_id,
+            key.task_id,
         );
 
         let (task, abort_handle) = futures::future::abortable(
-            query_stage_exec.execute_query_stage(partition.partition_id, task_ctx),
+            query_stage_exec.execute_query_stage(key.task_id, task_ctx),
         );
 
-        self.abort_handles
-            .insert((task_id, partition.clone()), abort_handle);
+        self.abort_handles.insert(key.clone(), abort_handle);
 
-        let result = task.await;
+        let result = std::panic::AssertUnwindSafe(task).catch_unwind().await;
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
-        self.abort_handles.remove(&(task_id, partition.clone()));
+        // cancel_task only signals the abort; this task owns removal after unwinding.
+        self.abort_handles.remove(&key);
+        self.wake_tasks_drained();
 
         match result {
-            Ok(Ok(partitions)) => {
+            Ok(Ok(Ok(partitions))) => {
                 // Extract shuffle write metrics from the plan
                 let shuffle_write_metrics =
                     extract_shuffle_write_metrics(&query_stage_exec);
                 if let Some((bytes, rows, write_time_ms)) = shuffle_write_metrics {
                     self.metrics_collector.record_shuffle_write(
-                        &partition.job_id,
-                        partition.stage_id,
-                        partition.partition_id,
+                        &key.job_id,
+                        key.stage_id,
+                        key.task_id,
                         bytes,
                         rows,
                         write_time_ms,
@@ -405,9 +449,9 @@ impl Executor {
                         .map(|(_, _, write_ms)| duration_ms.saturating_sub(write_ms))
                         .unwrap_or(0);
                     self.metrics_collector.record_shuffle_read(
-                        &partition.job_id,
-                        partition.stage_id,
-                        partition.partition_id,
+                        &key.job_id,
+                        key.stage_id,
+                        key.task_id,
                         bytes,
                         rows,
                         read_duration_ms,
@@ -415,26 +459,39 @@ impl Executor {
                 }
 
                 self.metrics_collector.record_stage(
-                    &partition.job_id,
-                    partition.stage_id,
-                    partition.partition_id,
+                    &key.job_id,
+                    key.stage_id,
+                    key.task_id,
                     query_stage_exec,
                     duration_ms,
                 );
                 Ok(partitions)
             }
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 self.metrics_collector.record_task_failed(
-                    &partition.job_id,
-                    partition.stage_id,
-                    partition.partition_id,
+                    &key.job_id,
+                    key.stage_id,
+                    key.task_id,
                     &categorize_datafusion_error(&e),
                 );
                 Err(BallistaError::from(e))
             }
-            Err(_aborted) => {
+            Ok(Err(_aborted)) => {
                 // Task was cancelled - don't record as failure, it was intentional
+                warn!("Task has been aborted!");
                 Err(BallistaError::Cancelled)
+            }
+            Err(p) => {
+                let error_msg = format!("{:#?}", any_to_string(&p));
+                error!("{error_msg}");
+                let error = BallistaError::Internal(error_msg);
+                self.metrics_collector.record_task_failed(
+                    &key.job_id,
+                    key.stage_id,
+                    key.task_id,
+                    &categorize_ballista_error(&error),
+                );
+                Err(error)
             }
         }
     }
@@ -444,19 +501,16 @@ impl Executor {
     /// Returns `Ok(true)` if the task was found and cancelled, `Ok(false)` if not found.
     pub async fn cancel_task(
         &self,
-        task_id: usize,
         job_id: JobId,
         stage_id: usize,
-        partition_id: usize,
+        task_id: usize,
     ) -> Result<bool, BallistaError> {
-        if let Some((_, handle)) = self.abort_handles.remove(&(
+        // execute_query_stage removes the handle after the aborted task unwinds.
+        if let Some(handle) = self.abort_handles.get(&TaskKey {
+            job_id,
+            stage_id,
             task_id,
-            PartitionId {
-                job_id,
-                stage_id,
-                partition_id,
-            },
-        )) {
+        }) {
             handle.abort();
             Ok(true)
         } else {
@@ -478,39 +532,52 @@ impl Executor {
 #[cfg(test)]
 mod test {
     use crate::execution_engine::{DefaultQueryStageExec, ShuffleWriterVariant};
-    use crate::executor::Executor;
+    use crate::executor::{Executor, TasksDrainedFuture};
     use crate::runtime_cache::{
         DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
     };
-    use ballista_core::JobId;
     use ballista_core::RuntimeProducer;
+    use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::ShuffleWriterExec;
-    use ballista_core::serde::protobuf::{
-        ExecutorOperatingSystemSpecification, ExecutorRegistration,
-    };
-    use ballista_core::serde::scheduler::PartitionId;
+    use ballista_core::serde::protobuf;
+    use ballista_core::serde::protobuf::ExecutorRegistration;
+    use ballista_core::serde::scheduler::TaskKey;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::error::{DataFusionError, Result};
     use datafusion::execution::context::TaskContext;
     use datafusion::execution::runtime_env::RuntimeEnv;
-    use datafusion::prelude::SessionConfig;
 
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        RecordBatchStream, SendableRecordBatchStream, Statistics,
+        RecordBatchStream, SendableRecordBatchStream,
     };
+    use datafusion::prelude::SessionConfig;
     use datafusion::prelude::SessionContext;
     use futures::Stream;
+    use futures::task::{ArcWake, waker_ref};
+    use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tempfile::TempDir;
 
     /// A RecordBatchStream that will never terminate
     struct NeverendingRecordBatchStream;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     impl RecordBatchStream for NeverendingRecordBatchStream {
         fn schema(&self) -> SchemaRef {
@@ -583,6 +650,13 @@ mod test {
             vec![]
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -597,40 +671,17 @@ mod test {
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
             Ok(Box::pin(NeverendingRecordBatchStream))
         }
-
-        fn partition_statistics(
-            &self,
-            _partition: Option<usize>,
-        ) -> Result<Arc<Statistics>> {
-            Ok(Arc::new(Statistics::new_unknown(&self.schema())))
-        }
     }
 
-    #[tokio::test]
-    async fn test_task_cancellation() {
-        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
+    /// The result `execute_query_stage` hands back once a spawned task unwinds.
+    type TaskOutcome = Result<Vec<protobuf::ShuffleWritePartition>, BallistaError>;
 
-        let job_id = JobId::new("job-id");
-        let cancel_job_id = job_id.clone();
-        let shuffle_write = ShuffleWriterExec::try_new(
-            job_id.clone(),
-            1,
-            Arc::new(NeverendingOperator::new()),
-            work_dir.clone(),
-            None,
-        )
-        .expect("creating shuffle writer");
-
-        let query_stage_exec =
-            DefaultQueryStageExec::new(ShuffleWriterVariant::Hash(shuffle_write));
-
+    /// Builds an executor over `work_dir`, along with the session context whose
+    /// runtime its tasks run on.
+    fn never_ending_executor(work_dir: &str) -> (Arc<Executor>, SessionContext) {
         let executor_registration = ExecutorRegistration {
             id: "executor".to_string(),
-            port: 0,
-            grpc_port: 0,
-            specification: None,
-            host: None,
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ..Default::default()
         };
         let config_producer = Arc::new(default_config_producer);
         let ctx = SessionContext::new();
@@ -638,64 +689,174 @@ mod test {
         let runtime_producer: RuntimeProducer =
             Arc::new(move |_| Ok(runtime_env.clone()));
 
-        let executor = Executor::new_basic(
+        let executor = Arc::new(Executor::new_basic(
             executor_registration,
-            &work_dir,
+            work_dir,
             runtime_producer,
             config_producer,
             2,
-        );
+        ));
+
+        (executor, ctx)
+    }
+
+    /// Spawns a task that never yields a batch on a separate fiber. The returned
+    /// channel fires once `execute_query_stage` has unwound, which is after it has
+    /// removed its own abort handle.
+    fn spawn_never_ending_task(
+        executor: &Arc<Executor>,
+        ctx: &SessionContext,
+        work_dir: &str,
+        key: TaskKey,
+    ) -> tokio::sync::oneshot::Receiver<TaskOutcome> {
+        let shuffle_write = ShuffleWriterExec::try_new(
+            key.job_id.clone(),
+            key.stage_id,
+            Arc::new(NeverendingOperator::new()),
+            work_dir.to_string(),
+        )
+        .expect("creating shuffle writer");
+        let query_stage_exec =
+            DefaultQueryStageExec::new(ShuffleWriterVariant::Passthrough(shuffle_write));
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        // Spawn our non-terminating task on a separate fiber.
-        let executor_clone = executor.clone();
+        let executor = executor.clone();
+        let task_ctx = ctx.task_ctx();
         tokio::task::spawn(async move {
-            let part = PartitionId {
-                job_id: job_id.clone(),
-                stage_id: 1,
-                partition_id: 0,
-            };
-            let task_result = executor_clone
-                .execute_query_stage(1, part, Arc::new(query_stage_exec), ctx.task_ctx())
+            let task_result = executor
+                .execute_query_stage(key, Arc::new(query_stage_exec), task_ctx)
                 .await;
             sender.send(task_result).expect("sending result");
         });
 
-        // Now cancel the task. We can only cancel once the task has been executed and has an `AbortHandle` registered, so
-        // poll until that happens.
+        receiver
+    }
+
+    /// A task is only registered once it starts executing, so poll until the
+    /// executor reports the count the test is waiting on.
+    async fn await_active_task_count(executor: &Executor, expected: usize) {
         for _ in 0..20 {
-            if executor
-                .cancel_task(1, cancel_job_id.clone(), 1, 0)
-                .await
-                .expect("cancelling task")
-            {
+            if executor.active_task_count() == expected {
                 break;
             } else {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+        assert_eq!(executor.active_task_count(), expected);
+    }
 
-        // Wait for our task to complete
-        let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
+    /// Awaits a cancelled task's unwind and asserts it reported failure.
+    async fn await_cancelled_task(receiver: tokio::sync::oneshot::Receiver<TaskOutcome>) {
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("task unwinding before the timeout")
+            .expect("receiving task result")
+            .expect_err("a cancelled task fails");
+    }
 
-        // Make sure the task didn't timeout
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn test_task_cancellation() {
+        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
+        let (executor, ctx) = never_ending_executor(&work_dir);
 
-        // Make sure the actual task failed
-        let inner_result = result.unwrap().unwrap();
-        assert!(inner_result.is_err());
+        let receiver = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 0,
+            },
+        );
+        await_active_task_count(&executor, 1).await;
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = waker_ref(&wake_counter);
+        let mut context = Context::from_waker(&waker);
+        let mut tasks_drained = Box::pin(TasksDrainedFuture(executor.clone()));
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 0)
+                .await
+                .expect("cancelling task")
+        );
+        assert_eq!(executor.active_task_count(), 1);
+
+        await_cancelled_task(receiver).await;
+
+        assert_eq!(wake_counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[tokio::test]
+    async fn test_tasks_drained_waits_for_last_task() {
+        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
+        let (executor, ctx) = never_ending_executor(&work_dir);
+
+        let first = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 0,
+            },
+        );
+        let second = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 1,
+            },
+        );
+        await_active_task_count(&executor, 2).await;
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = waker_ref(&wake_counter);
+        let mut context = Context::from_waker(&waker);
+        let mut tasks_drained = Box::pin(TasksDrainedFuture(executor.clone()));
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 0)
+                .await
+                .expect("cancelling the first task")
+        );
+        await_cancelled_task(first).await;
+
+        // Draining a task that is not the last one may wake the future, but it must
+        // not resolve it, so re-poll rather than counting wakes.
+        assert_eq!(executor.active_task_count(), 1);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+
+        let wakes_before_last = wake_counter.0.load(Ordering::SeqCst);
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 1)
+                .await
+                .expect("cancelling the second task")
+        );
+        await_cancelled_task(second).await;
+
+        // Draining the last task has to wake the waker registered by the re-poll
+        // above; without that, shutdown would never look at the map again.
+        assert!(wake_counter.0.load(Ordering::SeqCst) > wakes_before_last);
+        assert_eq!(executor.active_task_count(), 0);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
     #[test]
     fn produce_runtime_for_session_shares_read_side_state() {
         let executor_registration = ExecutorRegistration {
             id: "executor".to_string(),
-            port: 0,
-            grpc_port: 0,
-            specification: None,
-            host: None,
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ..Default::default()
         };
         let config_producer = Arc::new(default_config_producer);
 
@@ -703,7 +864,7 @@ mod test {
         // pool policy, so shared read-side state is observable via ptr equality.
         let base_producer: RuntimeProducer =
             Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
-        let identity: MemoryPoolPolicy = Arc::new(|base, _| Ok(base));
+        let identity: MemoryPoolPolicy = Arc::new(|base, _, _| Ok(base));
         let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
             DefaultSessionRuntimeCache::new(base_producer.clone(), identity, 4),
         );
@@ -718,9 +879,9 @@ mod test {
         .with_session_runtime_cache(Some(cache));
 
         let cfg = SessionConfig::new();
-        let e1 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
-        let e2 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
-        let e3 = executor.produce_runtime_for_session("s2", &cfg).unwrap();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e3 = executor.produce_runtime_for_session("s2", &cfg, 1).unwrap();
 
         assert!(Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
         assert!(!Arc::ptr_eq(&e1.cache_manager, &e3.cache_manager));
@@ -730,11 +891,7 @@ mod test {
     fn produce_runtime_for_session_falls_back_without_cache() {
         let executor_registration = ExecutorRegistration {
             id: "executor".to_string(),
-            port: 0,
-            grpc_port: 0,
-            specification: None,
-            host: None,
-            os_info: Some(ExecutorOperatingSystemSpecification::default()),
+            ..Default::default()
         };
         let config_producer = Arc::new(default_config_producer);
         let base_producer: RuntimeProducer =
@@ -750,8 +907,8 @@ mod test {
         );
 
         let cfg = SessionConfig::new();
-        let e1 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
-        let e2 = executor.produce_runtime_for_session("s1", &cfg).unwrap();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
         assert!(!Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
     }
 }

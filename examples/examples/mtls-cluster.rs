@@ -54,6 +54,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
+use ballista_core::BALLISTA_PROTOCOL_VERSION;
 use ballista_core::ConfigProducer;
 use ballista_core::extension::{SessionConfigExt, SessionStateExt};
 use ballista_core::serde::protobuf::executor_resource::Resource;
@@ -320,7 +321,7 @@ async fn run_scheduler() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
         SchedulerServer::new(
-            config.scheduler_name(),
+            config.scheduler_endpoint(),
             cluster,
             codec,
             Arc::new(config),
@@ -363,10 +364,11 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
         grpc_port: 0, // Not used in pull-based scheduling
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(4)),
+                resource: Some(Resource::Vcores(4)),
             }],
         }),
         os_info: None,
+        ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
     };
 
     let config_producer = create_tls_config_producer(tls.client_tls.clone());
@@ -381,21 +383,21 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
 
-    let executor = Arc::new(Executor::new(
+    let executor = Arc::new(Executor::with_default_execution_engine(
         executor_meta,
         &work_dir_str,
         runtime_producer,
         config_producer,
         Default::default(), // function_registry
         Arc::new(LoggingMetricsCollector::default()), // metrics_collector
-        4,                  // concurrent_tasks
-        None,               // execution_engine
+        4,                  // vcores
     ));
 
     // Start Flight service with mTLS for serving shuffle data
-    let flight_service = FlightServiceServer::new(BallistaFlightService::new())
-        .max_decoding_message_size(16 * 1024 * 1024)
-        .max_encoding_message_size(16 * 1024 * 1024);
+    let flight_service =
+        FlightServiceServer::new(BallistaFlightService::new(work_dir_str))
+            .max_decoding_message_size(16 * 1024 * 1024)
+            .max_encoding_message_size(16 * 1024 * 1024);
 
     // Spawn Flight server with TLS
     let server_tls = tls.server_tls_config();
@@ -429,8 +431,11 @@ async fn run_executor() -> Result<(), Box<dyn std::error::Error>> {
     // Run the pull-based execution loop
     // This registers the executor and starts polling for tasks
     info!("Starting execution poll loop...");
+    let health = ballista_executor::health::ExecutorHealth::new();
     let poll_handle = tokio::spawn(async move {
-        execution_loop::poll_loop(scheduler, executor, codec, None, None, None).await
+        // readiness, poll_now_notify, free_vcores, health
+        execution_loop::poll_loop(scheduler, executor, codec, None, None, None, health)
+            .await
     });
 
     tokio::select! {

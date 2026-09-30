@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG RELEASE_FLAG=release
 
