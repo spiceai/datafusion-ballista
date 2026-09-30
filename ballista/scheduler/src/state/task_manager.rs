@@ -18,7 +18,7 @@
 use crate::cluster::{ExecutorSlot, JobState, JobStateEventStream};
 use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
-use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
+use crate::scheduler_server::event::SubmitPlan;
 use crate::state::aqe::AdaptiveExecutionGraph;
 use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_graph::{
@@ -634,7 +634,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let num_tasks = statuses.len();
             debug!("Updating {num_tasks} tasks in job {job_id}");
 
-            let job_events = if let Some(cached) = self.get_active_execution_graph(&job_id)
+            let job_events = if let Some(cached) =
+                self.get_active_execution_graph(&job_id)
             {
                 let mut graph = cached.write().await;
                 graph.update_task_status(
@@ -663,7 +664,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// Persist the job state, bounded by [`JOB_PERSIST_TIMEOUT`] so a stalled
     /// object-store operation cannot hang the scheduler event loop (which
     /// awaits these persists). A timeout is reported as an error.
-    async fn try_save_job(&self, job_id: &JobId, snapshot: &ExecutionGraphBox) -> Result<()> {
+    async fn try_save_job(
+        &self,
+        job_id: &JobId,
+        snapshot: &ExecutionGraphBox,
+    ) -> Result<()> {
         match tokio::time::timeout(
             JOB_PERSIST_TIMEOUT,
             self.state.save_job(job_id, snapshot),

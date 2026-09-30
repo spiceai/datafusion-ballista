@@ -54,8 +54,8 @@ use datafusion::physical_plan::{
 use crate::physical_optimizer::join_selection::{
     collect_left_broadcast_safe, should_swap_join_order,
 };
-use log::{debug, info};
 use crate::state::task_builder::restrict_plan_to_partitions;
+use log::{debug, info};
 
 type PartialQueryStageResult = (Arc<dyn ExecutionPlan>, Vec<Arc<dyn ShuffleWriter>>);
 

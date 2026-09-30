@@ -413,7 +413,8 @@ impl ExecutionPlan for ShuffleReaderExec {
         if let Some(work_dir) = self.work_dir.as_deref() {
             for location in partition_locations.iter_mut() {
                 if location.path.is_empty() {
-                    location.path = location.path(work_dir)?.to_string_lossy().to_string();
+                    location.path =
+                        location.path(work_dir)?.to_string_lossy().to_string();
                 }
             }
         }

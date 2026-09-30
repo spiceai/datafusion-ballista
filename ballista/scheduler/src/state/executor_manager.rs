@@ -25,7 +25,9 @@ use ballista_core::serde::protobuf::ExecutorMetric;
 use ballista_core::serde::protobuf::executor_metric::Metric;
 use log::trace;
 
-use crate::cluster::{BindingResult, ClusterState, ClusterStateEventStream, ExecutorSlot};
+use crate::cluster::{
+    BindingResult, ClusterState, ClusterStateEventStream, ExecutorSlot,
+};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;

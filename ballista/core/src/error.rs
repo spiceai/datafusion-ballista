@@ -170,7 +170,9 @@ fn find_fetch_failed_in_df(e: &DataFusionError) -> Option<BallistaError> {
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
             find_fetch_failed_in_df(inner)
         }
-        DataFusionError::Collection(errs) => errs.iter().find_map(find_fetch_failed_in_df),
+        DataFusionError::Collection(errs) => {
+            errs.iter().find_map(find_fetch_failed_in_df)
+        }
         DataFusionError::Shared(arc) => find_fetch_failed_in_df(arc.as_ref()),
         _ => None,
     }

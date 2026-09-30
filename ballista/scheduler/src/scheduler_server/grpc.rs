@@ -29,11 +29,11 @@ use ballista_core::serde::protobuf::{
     ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
     ExecutorStoppedParams, ExecutorStoppedResult, GetCatalogParams, GetCatalogResult,
     GetJobMetricsParams, GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult,
-    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams,
-    HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams, PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
-    execute_query_failure_result, execute_query_result, executor_metric::Metric,
+    GetRemoteFunctionsParams, GetRemoteFunctionsResult, HeartBeatParams, HeartBeatResult,
+    JobStatus, KeyValuePair, PollWorkParams, PollWorkResult, RegisterExecutorParams,
+    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
+    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
+    execute_query_result, executor_metric::Metric,
 };
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, ExecutorOperatingSystemSpecification,

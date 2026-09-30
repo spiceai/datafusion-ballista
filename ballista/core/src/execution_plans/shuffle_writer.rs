@@ -708,8 +708,8 @@ impl ShuffleWriterExec {
 
             let mut results = Vec::with_capacity(num_partitions);
             while let Some(joined) = handles.join_next().await {
-                let (local_input_partition, global_partition, stats, path) =
-                    joined.map_err(|e| {
+                let (local_input_partition, global_partition, stats, path) = joined
+                    .map_err(|e| {
                         DataFusionError::Execution(format!(
                             "shuffle-write drain task panicked: {e}"
                         ))
@@ -843,8 +843,12 @@ async fn write_partition_memory(
 
     let timer = write_time.timer();
     let num_batches = batches.len();
-    let key =
-        InMemoryShuffleManager::hash_partition_key(job_id, stage_id, partition_id, task_id);
+    let key = InMemoryShuffleManager::hash_partition_key(
+        job_id,
+        stage_id,
+        partition_id,
+        task_id,
+    );
     let data = create_partition_data(schema, batches, shuffle_format)?;
     global_shuffle_manager().store_partition(key.clone(), data);
     timer.done();
@@ -914,8 +918,6 @@ async fn write_partition_object_store(
         }
         #[cfg(feature = "vortex")]
         ShuffleFormat::Vortex => {
-            use vortex_array::arrow::FromArrowArray;
-
             let mut writer = writer;
             let mut vortex_buffer: Vec<vortex_array::ArrayRef> = Vec::new();
             let mut num_rows: u64 = 0;
@@ -925,7 +927,10 @@ async fn write_partition_object_store(
                 num_rows += batch.num_rows() as u64;
                 num_batches += 1;
                 let timer = write_time.timer();
-                let vortex_array = vortex_array::ArrayRef::from_arrow(&batch, false)
+                let vortex_array =
+                    crate::execution_plans::vortex_shuffle::record_batch_to_vortex(
+                        &batch,
+                    )
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 vortex_buffer.push(vortex_array);
                 timer.done();
@@ -976,9 +981,6 @@ fn create_partition_data(
         ShuffleFormat::ArrowIpc => Ok(ShufflePartitionData::new(schema, batches)),
         #[cfg(feature = "vortex")]
         ShuffleFormat::Vortex => {
-            use vortex_array::ArrayRef;
-            use vortex_array::arrow::FromArrowArray;
-
             let mut arrays = Vec::with_capacity(batches.len());
             let mut total_rows = 0u64;
             let mut total_bytes = 0u64;
@@ -986,7 +988,10 @@ fn create_partition_data(
             for batch in batches {
                 total_rows += batch.num_rows() as u64;
                 // Convert Arrow RecordBatch to Vortex Array
-                let vortex_array = ArrayRef::from_arrow(&batch, false)
+                let vortex_array =
+                    crate::execution_plans::vortex_shuffle::record_batch_to_vortex(
+                        &batch,
+                    )
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 total_bytes += vortex_array.nbytes();
                 arrays.push(vortex_array);
@@ -1514,7 +1519,7 @@ fn serialize_vortex_arrays_to_bytes(
         .map(|a| Ok(a) as VortexResult<vortex_array::ArrayRef>);
     let array_iter = ArrayIteratorAdapter::new(dtype, iter);
     let ipc_data = array_iter
-        .into_ipc(&vortex_array::LEGACY_SESSION)
+        .into_ipc(crate::execution_plans::vortex_shuffle::vortex_session())
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .collect_to_buffer()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1833,14 +1838,16 @@ mod tests {
                 .expect("num_rows is UInt64");
             for row in 0..batch.num_rows() {
                 let location = path.value(row);
-                let key = location
-                    .strip_prefix("memory://")
-                    .unwrap_or_else(|| panic!("expected a memory:// location, got {location}"));
+                let key = location.strip_prefix("memory://").unwrap_or_else(|| {
+                    panic!("expected a memory:// location, got {location}")
+                });
                 assert!(
                     key.starts_with(&format!("{job}/1/")) && key.ends_with("/data-7"),
                     "unexpected in-memory shuffle key: {key}"
                 );
-                let stored = manager.get_partition(key).expect("partition stored in memory");
+                let stored = manager
+                    .get_partition(key)
+                    .expect("partition stored in memory");
                 assert_eq!(stored.num_rows, num_rows.value(row));
                 total_rows += num_rows.value(row);
             }
@@ -1956,7 +1963,8 @@ mod tests {
         let reader = StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None)?;
 
         let read_batches: Vec<RecordBatch> = reader
-            .collect::<std::result::Result<Vec<_>, datafusion::arrow::error::ArrowError>>()
+            .collect::<std::result::Result<Vec<_>, datafusion::arrow::error::ArrowError>>(
+            )
             .map_err(|e| {
                 DataFusionError::Execution(format!(
                     "unexpected error reading shuffle stream back: {e}"

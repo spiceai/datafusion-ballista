@@ -100,6 +100,7 @@ message ListingTableScanNode {
     datafusion_common.AvroFormat avro = 12;
     datafusion_common.NdJsonFormat json = 15;
     datafusion_common.ArrowFormat arrow = 16;
+    datafusion_common.VortexFormat vortex = 17;
   }
   repeated SortExprNodeCollection file_sort_order = 13;
 }

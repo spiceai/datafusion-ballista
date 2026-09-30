@@ -57,6 +57,16 @@ message NdJsonFormat {
 
 message ArrowFormat {}
 
+message VortexFormat {
+  VortexOptions options = 1;
+}
+
+// Options controlling Vortex format
+message VortexOptions {
+  uint64 footer_cache_size_mb = 1; // default = 64
+  uint64 segment_cache_size_mb = 2; // default = 0
+  uint64 footer_initial_read_size_bytes = 3; // default = 65535
+}
 
 message PrimaryKeyConstraint{
   repeated uint64 indices = 1;

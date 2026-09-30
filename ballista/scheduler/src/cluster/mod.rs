@@ -25,6 +25,7 @@ use crate::state::execution_stage::RunningStage;
 use crate::state::session_manager::share_file_statistics_cache;
 use crate::state::task_manager::JobInfoCache;
 use ballista_core::config::BallistaConfig;
+use ballista_core::consistent_hash::ConsistentHash;
 use ballista_core::error::Result;
 use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
 use ballista_core::serde::protobuf::{
@@ -32,7 +33,6 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, TaskKey};
 use ballista_core::utils::{default_config_producer, default_session_builder};
-use ballista_core::consistent_hash::ConsistentHash;
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber, consistent_hash};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::listing::PartitionedFile;
@@ -1033,7 +1033,6 @@ mod test {
         BoundTask, TopologyNode, bind_task_bias, bind_task_consistent_hash,
         bind_task_round_robin,
     };
-    use datafusion::datasource::listing::PartitionedFile;
     use crate::state::execution_graph::{ExecutionGraph, StaticExecutionGraph};
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
@@ -1042,6 +1041,7 @@ mod test {
     };
     use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
     use ballista_core::extension::SessionConfigExt;
+    use datafusion::datasource::listing::PartitionedFile;
     use datafusion::prelude::SessionConfig;
 
     #[tokio::test]
@@ -1050,10 +1050,9 @@ mod test {
         let active_jobs = mock_active_jobs(num_partition).await?;
         let mut budgets = mock_budgets();
         let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
-        let bound_tasks =
-            bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false)
-                .await
-                .bound_tasks;
+        let bound_tasks = bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false)
+            .await
+            .bound_tasks;
         // 9 total pending partitions (job_a: 2, job_b: 7) — verify all were
         // covered. Task count is emergent under multi-partition binding.
         assert_eq!(9, total_partitions_covered(&bound_tasks));

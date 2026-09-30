@@ -31,6 +31,12 @@ build = "build.rs"
 # Exclude proto files so crates.io consumers don't need protoc
 exclude = ["*.proto"]
 
+[package.metadata.cargo-machete]
+ignored = [
+    # imported under its library name `md5` (`use md5::...`), which machete does not map back to `md-5`
+    "md-5",
+]
+
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
 
@@ -47,7 +53,13 @@ force_hash_collisions = ["datafusion/force_hash_collisions"]
 spark-compat = ["dep:datafusion-spark"]
 utoipa = ["dep:utoipa"]
 # Spice fork: Vortex shuffle format.
-vortex = ["vortex-array", "vortex-buffer", "vortex-error", "vortex-ipc"]
+vortex = [
+    "vortex-array",
+    "vortex-arrow",
+    "vortex-error",
+    "vortex-ipc",
+    "vortex-session",
+]
 
 [dependencies]
 arrow-flight = { workspace = true }
@@ -61,7 +73,6 @@ datafusion-proto = { workspace = true }
 datafusion-proto-common = { workspace = true }
 datafusion-spark = { workspace = true, optional = true, features = ["datafusion"] }
 futures = { workspace = true }
-itertools = { workspace = true }
 log = { workspace = true }
 md-5 = { version = "^0.10.0" }
 object_store = { workspace = true, features = ["aws", "azure", "http"] }
@@ -80,9 +91,10 @@ uuid = { workspace = true }
 
 # Vortex columnar format dependencies (optional)
 vortex-array = { workspace = true, optional = true }
-vortex-buffer = { workspace = true, optional = true }
+vortex-arrow = { workspace = true, optional = true }
 vortex-error = { workspace = true, optional = true }
 vortex-ipc = { workspace = true, optional = true }
+vortex-session = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

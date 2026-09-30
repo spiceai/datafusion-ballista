@@ -746,7 +746,6 @@ fn read_vortex_partition(
     use std::io::Cursor;
     use std::sync::Arc;
     use vortex_array::ArrayRef;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::iter::ArrayIterator;
     use vortex_ipc::iterator::SyncIPCReader;
 
@@ -767,7 +766,7 @@ fn read_vortex_partition(
     })?;
 
     // Create default session with all canonical encodings
-    let session = &*LEGACY_SESSION;
+    let session = ballista_core::execution_plans::vortex_shuffle::vortex_session();
 
     // Read IPC data
     let cursor = Cursor::new(data);
@@ -780,11 +779,15 @@ fn read_vortex_partition(
     // Get schema from IPC header via ArrayIterator::dtype() method
     // This is stored in the Vortex IPC format header, not inferred from data
     let dtype = reader.dtype().clone();
-    let arrow_schema = dtype.to_arrow_schema().map_err(|e| {
-        from_ballista_err(&BallistaError::General(format!(
-            "Failed to convert Vortex DType to Arrow schema: {e:?}"
-        )))
-    })?;
+    let arrow_schema =
+        ballista_core::execution_plans::vortex_shuffle::vortex_dtype_to_arrow_schema(
+            &dtype,
+        )
+        .map_err(|e| {
+            from_ballista_err(&BallistaError::General(format!(
+                "Failed to convert Vortex DType to Arrow schema: {e:?}"
+            )))
+        })?;
     let schema = Arc::new(arrow_schema);
 
     let arrays: Vec<ArrayRef> = reader
@@ -809,13 +812,10 @@ fn read_vortex_partition(
 
 /// Read Vortex arrays and send them as record batches
 #[cfg(feature = "vortex")]
-#[allow(deprecated)]
 fn read_vortex_batches(
     arrays: Vec<vortex_array::ArrayRef>,
     tx: Sender<Result<RecordBatch, FlightError>>,
 ) -> Result<(), FlightError> {
-    use vortex_array::arrow::IntoArrowArray;
-
     if tx.is_closed() {
         return Err(FlightError::Tonic(Box::new(Status::internal(
             "Can't send a batch, channel is closed",
@@ -823,9 +823,11 @@ fn read_vortex_batches(
     }
 
     for array in arrays {
-        let arrow_array = array
-            .into_arrow_preferred()
-            .map_err(|e| FlightError::Arrow(ArrowError::ExternalError(Box::new(e))))?;
+        let arrow_array =
+            ballista_core::execution_plans::vortex_shuffle::vortex_to_arrow(array)
+                .map_err(|e| {
+                    FlightError::Arrow(ArrowError::ExternalError(Box::new(e)))
+                })?;
 
         let struct_array = arrow_array
             .as_any()

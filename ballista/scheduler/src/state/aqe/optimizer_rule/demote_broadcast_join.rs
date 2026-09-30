@@ -20,8 +20,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::joins::{MinMaxLeftAccumulator, 
-    HashJoinExec, HashJoinExecBuilder, PartitionMode,
+use datafusion::physical_plan::joins::{
+    HashJoinExec, HashJoinExecBuilder, MinMaxLeftAccumulator, PartitionMode,
 };
 use log::debug;
 use std::sync::Arc;
