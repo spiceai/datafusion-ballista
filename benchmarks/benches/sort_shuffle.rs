@@ -27,7 +27,6 @@ use datafusion::arrow::array::{
     Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
@@ -220,8 +219,8 @@ fn run_sort_shuffle(
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();
 
-    let config = SortShuffleConfig::new(true, CompressionType::LZ4_FRAME, 8192)
-        .with_memory_limit_per_task_bytes(memory_limit);
+    let config =
+        SortShuffleConfig::new(true, 8192).with_memory_limit_per_task_bytes(memory_limit);
 
     let writer = SortShuffleWriterExec::try_new(
         "bench_job".into(),

@@ -137,39 +137,36 @@ mod unsupported {
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
     #[tokio::test]
-
-    async fn should_execute_sql_collect_from_arrow_file(
+    async fn should_support_information_schema_query_reading_other_tables(
         #[future(awt)]
         #[case]
         ctx: SessionContext,
         test_data: String,
     ) -> datafusion::error::Result<()> {
-        ctx.register_arrow(
+        ctx.register_parquet(
             "test",
-            &format!("{test_data}/alltypes_plain.arrow"),
+            &format!("{test_data}/alltypes_plain.parquet"),
             Default::default(),
         )
         .await?;
 
+        // information_schema can only be read on the client, and `test` should
+        // be scanned by the cluster, so the query is refused rather than run
+        // on the client
         let result = ctx
-            .sql("select string_col, timestamp_col from test where id > 4")
+            .sql("select table_name, (select count(*) from test) as row_count from information_schema.tables where table_name = 'test'")
             .await?
             .collect()
             .await;
 
-        // Reading Arrow files is now supported (DataFusion 53).
-        let result = result?;
-        let expected = [
-            "+------------+---------------------+",
-            "| string_col | timestamp_col       |",
-            "+------------+---------------------+",
-            "| 31         | 2009-03-01T00:01:00 |",
-            "| 30         | 2009-04-01T00:00:00 |",
-            "| 31         | 2009-04-01T00:01:00 |",
-            "+------------+---------------------+",
-        ];
-
-        assert_batches_eq!(expected, &result);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(
+                "cannot run a query that reads information_schema together with other tables"
+            ),
+            "Expected unsupported error, got: {err_msg}"
+        );
 
         Ok(())
     }

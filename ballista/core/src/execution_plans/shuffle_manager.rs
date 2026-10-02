@@ -104,35 +104,33 @@ impl ShufflePartitionData {
     }
 
     /// Returns the batches if stored in Arrow format, otherwise converts from Vortex.
-    #[allow(deprecated)]
     pub fn to_batches(&self) -> Result<Vec<RecordBatch>> {
         match &self.data {
             InMemoryShuffleData::Arrow(batches) => Ok(batches.clone()),
             #[cfg(feature = "vortex")]
-            InMemoryShuffleData::Vortex(arrays) => {
-                use vortex_array::arrow::IntoArrowArray;
-                arrays
-                    .iter()
-                    .map(|array| {
-                        let arrow_array =
-                            array.clone().into_arrow_preferred().map_err(|e| {
-                                BallistaError::General(format!(
-                                    "Failed to convert Vortex array to Arrow: {e}"
-                                ))
-                            })?;
-                        let struct_array = arrow_array
-                            .as_any()
-                            .downcast_ref::<datafusion::arrow::array::StructArray>()
-                            .ok_or_else(|| {
-                                BallistaError::General(
-                                    "Expected StructArray from Vortex conversion"
-                                        .to_string(),
-                                )
-                            })?;
-                        Ok(RecordBatch::from(struct_array))
-                    })
-                    .collect()
-            }
+            InMemoryShuffleData::Vortex(arrays) => arrays
+                .iter()
+                .map(|array| {
+                    let arrow_array =
+                        crate::execution_plans::vortex_shuffle::vortex_to_arrow(
+                            array.clone(),
+                        )
+                        .map_err(|e| {
+                            BallistaError::General(format!(
+                                "Failed to convert Vortex array to Arrow: {e}"
+                            ))
+                        })?;
+                    let struct_array = arrow_array
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::StructArray>()
+                        .ok_or_else(|| {
+                            BallistaError::General(
+                                "Expected StructArray from Vortex conversion".to_string(),
+                            )
+                        })?;
+                    Ok(RecordBatch::from(struct_array))
+                })
+                .collect(),
         }
     }
 }

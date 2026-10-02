@@ -15,9 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG RELEASE_FLAG=release
+
+# ca-certificates so DataFusion's object_store S3 client can verify TLS
+# certs at query time (executors do the parquet reads). Reads from
+# s3:// fail with InvalidCertificate(UnknownIssuer) otherwise.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV RELEASE_FLAG=${RELEASE_FLAG}
 ENV RUST_LOG=info
