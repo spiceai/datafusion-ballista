@@ -30,8 +30,7 @@ use ballista_core::RuntimeProducer;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::serde::protobuf;
-use ballista_core::serde::protobuf::ExecutorRegistration;
+use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
 use ballista_core::serde::scheduler::TaskKey;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
@@ -398,7 +397,7 @@ impl Executor {
         key: TaskKey,
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
-    ) -> Result<Vec<protobuf::ShuffleWritePartition>, BallistaError> {
+    ) -> Result<Vec<ShuffleWritePartition>, BallistaError> {
         let start_time = std::time::Instant::now();
 
         // Record task start for metrics tracking
@@ -539,8 +538,7 @@ mod test {
     use ballista_core::RuntimeProducer;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::ShuffleWriterExec;
-    use ballista_core::serde::protobuf;
-    use ballista_core::serde::protobuf::ExecutorRegistration;
+    use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
     use ballista_core::serde::scheduler::TaskKey;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -674,7 +672,7 @@ mod test {
     }
 
     /// The result `execute_query_stage` hands back once a spawned task unwinds.
-    type TaskOutcome = Result<Vec<protobuf::ShuffleWritePartition>, BallistaError>;
+    type TaskOutcome = Result<Vec<ShuffleWritePartition>, BallistaError>;
 
     /// Builds an executor over `work_dir`, along with the session context whose
     /// runtime its tasks run on.

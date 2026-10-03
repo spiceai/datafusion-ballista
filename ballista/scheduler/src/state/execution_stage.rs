@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::common::ColumnStatistics;
+use datafusion::common::stats::Precision;
+use datafusion::config::ConfigOptions;
+use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use datafusion::config::ConfigOptions;
-use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 //use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
@@ -276,6 +277,48 @@ pub struct SuccessfulStage {
     /// re-encoding it on every graph save is pure overhead; the shared
     /// [`OnceLock`] survives clones, letting later saves skip the work.
     pub encoded_plan: Arc<OnceLock<Vec<u8>>>,
+    /// Per-column stats, one entry per output-schema column. `null_count` is
+    /// `Exact` only when every successful task reported that column.
+    pub output_column_stats: Vec<ColumnStatistics>,
+}
+
+/// Folds each successful task's reported column stats into one entry per
+/// output-schema column. `null_count` stays `Exact` only when every successful
+/// task reported that column. Shared by [`RunningStage::to_successful`] and
+/// [`SuccessfulStage::decode`], which rebuilds the stats from persisted task
+/// statuses rather than storing them separately.
+fn fold_output_column_stats(
+    num_columns: usize,
+    task_infos: &[TaskInfo],
+) -> Vec<ColumnStatistics> {
+    let mut output_column_stats = vec![
+        ColumnStatistics {
+            null_count: Precision::Exact(0),
+            ..ColumnStatistics::new_unknown()
+        };
+        num_columns
+    ];
+    for info in task_infos {
+        let task_status::Status::Successful(task_status) = &info.task_status else {
+            continue;
+        };
+        let mut reported = vec![false; num_columns];
+        for col_stats in &task_status.task_column_stats {
+            let column = col_stats.column as usize;
+            if let Some(slot) = output_column_stats.get_mut(column) {
+                slot.null_count = slot
+                    .null_count
+                    .add(&Precision::Exact(col_stats.null_count as usize));
+                reported[column] = true;
+            }
+        }
+        for (slot, reported) in output_column_stats.iter_mut().zip(reported) {
+            if !reported {
+                slot.null_count = Precision::Absent;
+            }
+        }
+    }
+    output_column_stats
 }
 
 /// If a stage fails, it will be with an error message
@@ -770,6 +813,9 @@ impl RunningStage {
             warn!("The metrics for stage {} should not be none", self.stage_id);
             vec![]
         });
+        let output_column_stats =
+            fold_output_column_stats(self.plan.schema().fields().len(), &self.task_infos);
+
         SuccessfulStage {
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num,
@@ -781,6 +827,7 @@ impl RunningStage {
             stage_metrics,
             session_config: self.session_config.clone(),
             encoded_plan: Arc::new(OnceLock::new()),
+            output_column_stats,
         }
     }
 
@@ -1413,6 +1460,9 @@ impl SuccessfulStage {
             .map(|m| m.try_into())
             .collect::<Result<Vec<_>>>()?;
 
+        let output_column_stats =
+            fold_output_column_stats(plan.schema().fields().len(), &task_infos);
+
         Ok(SuccessfulStage {
             stage_id: stage.stage_id as usize,
             stage_attempt_num: stage.stage_attempt_num as usize,
@@ -1424,6 +1474,7 @@ impl SuccessfulStage {
             stage_metrics,
             session_config,
             encoded_plan: Arc::new(OnceLock::new()),
+            output_column_stats,
         })
     }
 
@@ -1876,7 +1927,8 @@ fn encode_taskinfo(task_info: TaskInfo) -> protobuf::TaskInfo {
 mod tests {
     use super::*;
     use ballista_core::serde::protobuf::{
-        OperatorMetric, SuccessfulTask, TaskStatus, operator_metric, task_status,
+        OperatorMetric, SuccessfulTask, TaskColumnStats, TaskStatus, operator_metric,
+        task_status,
     };
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionConfig;
@@ -1909,6 +1961,7 @@ mod tests {
                 executor_id: "executor-1".to_string(),
                 partitions: vec![],
                 runtime_stats: vec![],
+                task_column_stats: vec![],
                 window_state: vec![],
             })),
             metrics: vec![],
@@ -1968,6 +2021,132 @@ mod tests {
             global_input_partition_ids: partitions,
             vcores_consumed,
         });
+    }
+
+    /// Build a running stage over a two-column schema plus a successful task
+    /// reporting the given per-column null counts.
+    fn stage_with_col_stats(tasks: Vec<Vec<TaskColumnStats>>) -> RunningStage {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::UInt32, true),
+            Field::new("b", DataType::UInt32, true),
+        ]));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let mut stage = RunningStage::new(
+            1,
+            0,
+            plan,
+            tasks.len(),
+            vec![],
+            HashMap::new(),
+            Arc::new(SessionConfig::default()),
+        );
+        for (task_id, task_column_stats) in tasks.into_iter().enumerate() {
+            stage.task_infos.push(TaskInfo {
+                task_id,
+                executor_id: "executor-1".to_string(),
+                scheduled_time: 50,
+                launch_time: 100,
+                start_exec_time: 200,
+                end_exec_time: 300,
+                finish_time: 300,
+                task_status: task_status::Status::Successful(SuccessfulTask {
+                    executor_id: "executor-1".to_string(),
+                    partitions: vec![],
+                    runtime_stats: vec![],
+                    task_column_stats,
+                    window_state: vec![],
+                }),
+                global_input_partition_ids: vec![task_id],
+                vcores_consumed: 1,
+            });
+        }
+        stage
+    }
+
+    fn col(column: u32, null_count: u64) -> TaskColumnStats {
+        TaskColumnStats {
+            column,
+            null_count,
+            sketches: vec![],
+        }
+    }
+
+    #[test]
+    fn test_to_successful_folds_column_null_counts_across_tasks() {
+        let stage = stage_with_col_stats(vec![
+            vec![col(0, 1), col(1, 2)],
+            vec![col(0, 3), col(1, 4)],
+        ]);
+        let successful = stage.to_successful();
+        assert_eq!(
+            successful.output_column_stats[0].null_count,
+            Precision::Exact(4)
+        );
+        assert_eq!(
+            successful.output_column_stats[1].null_count,
+            Precision::Exact(6)
+        );
+    }
+
+    #[test]
+    fn test_to_successful_marks_unreported_column_absent() {
+        // Second task reports only column 0 (e.g. an older executor); column 1
+        // must degrade to Absent rather than silently undercounting as Exact.
+        let stage =
+            stage_with_col_stats(vec![vec![col(0, 1), col(1, 2)], vec![col(0, 3)]]);
+        let successful = stage.to_successful();
+        assert_eq!(
+            successful.output_column_stats[0].null_count,
+            Precision::Exact(4)
+        );
+        assert_eq!(
+            successful.output_column_stats[1].null_count,
+            Precision::Absent
+        );
+    }
+
+    #[test]
+    fn test_to_successful_skips_column_past_schema_width() {
+        // Column index past the 2-wide output schema must be skipped by
+        // get_mut, not panic (the fold runs on the stage event loop).
+        let stage = stage_with_col_stats(vec![vec![col(0, 1), col(5, 9)]]);
+        let successful = stage.to_successful();
+        assert_eq!(successful.output_column_stats.len(), 2);
+        assert_eq!(
+            successful.output_column_stats[0].null_count,
+            Precision::Exact(1)
+        );
+        assert_eq!(
+            successful.output_column_stats[1].null_count,
+            Precision::Absent
+        );
+    }
+
+    #[test]
+    fn test_successful_stage_decode_rebuilds_column_stats() -> Result<()> {
+        // Persisted stages keep column stats only in their task statuses, so
+        // decode has to fold them back the way to_successful did.
+        let stage =
+            stage_with_col_stats(vec![vec![col(0, 1), col(1, 2)], vec![col(0, 3)]]);
+        let successful = stage.to_successful();
+        let codec: BallistaCodec = BallistaCodec::default();
+
+        let encoded = SuccessfulStage::encode(successful.clone(), &codec)?;
+        let decoded = SuccessfulStage::decode(
+            encoded,
+            &codec,
+            &SessionContext::new(),
+            Arc::new(SessionConfig::default()),
+        )?;
+
+        assert_eq!(decoded.output_column_stats, successful.output_column_stats);
+        assert_eq!(
+            decoded.output_column_stats[0].null_count,
+            Precision::Exact(4)
+        );
+        assert_eq!(decoded.output_column_stats[1].null_count, Precision::Absent);
+        Ok(())
     }
 
     /// Verify that a normal status update transitions the task to Successful.
@@ -2346,6 +2525,7 @@ mod tests {
                     executor_id: executor.to_string(),
                     partitions: vec![],
                     runtime_stats: vec![],
+                    task_column_stats: vec![],
                     window_state: vec![],
                 });
             stage.append_runtime_stats_reports(
