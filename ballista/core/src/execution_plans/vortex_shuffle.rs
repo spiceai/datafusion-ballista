@@ -36,17 +36,44 @@ use datafusion::physical_plan::RecordBatchStream;
 use futures::Stream;
 use log::debug;
 
-use vortex_array::ArrayRef;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::arrow::FromArrowArray;
-#[allow(deprecated)]
-use vortex_array::arrow::IntoArrowArray;
+use datafusion::arrow::array::ArrayRef as ArrowArrayRef;
+use datafusion::arrow::datatypes::Schema;
+use vortex_array::dtype::DType;
 use vortex_array::iter::ArrayIteratorAdapter;
+use vortex_array::{ArrayRef, VortexSessionExecute, legacy_session};
+use vortex_arrow::ArrowSessionExt;
 use vortex_error::VortexResult;
 use vortex_ipc::iterator::{ArrayIteratorIPC, SyncIPCReader};
+use vortex_session::VortexSession;
 
 use crate::error::BallistaError;
 use crate::serde::scheduler::PartitionStats;
+
+/// The Vortex session shuffle data is encoded and decoded with: Vortex's global
+/// session, which registers every canonical encoding and the Arrow conversions.
+pub fn vortex_session() -> &'static VortexSession {
+    legacy_session()
+}
+
+/// Converts a record batch into a Vortex struct array.
+pub fn record_batch_to_vortex(batch: &RecordBatch) -> VortexResult<ArrayRef> {
+    vortex_session()
+        .arrow()
+        .from_arrow_record_batch(batch.clone(), &batch.schema())
+}
+
+/// Converts a Vortex array into an Arrow array of its preferred Arrow type.
+pub fn vortex_to_arrow(array: ArrayRef) -> VortexResult<ArrowArrayRef> {
+    let session = vortex_session();
+    session
+        .arrow()
+        .execute_arrow(array, None, &mut session.create_execution_ctx())
+}
+
+/// The Arrow schema a Vortex struct dtype decodes to.
+pub fn vortex_dtype_to_arrow_schema(dtype: &DType) -> VortexResult<Schema> {
+    vortex_session().arrow().to_arrow_schema(dtype)
+}
 
 /// Writer for Vortex format shuffle data
 pub struct VortexWriteTracker {
@@ -81,7 +108,7 @@ impl VortexWriteTracker {
     /// Write a record batch to the buffer
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         // Convert Arrow RecordBatch to Vortex Array
-        let vortex_array = ArrayRef::from_arrow(batch, false)
+        let vortex_array = record_batch_to_vortex(batch)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         self.buffer.push(vortex_array);
@@ -106,7 +133,7 @@ impl VortexWriteTracker {
 
             // Convert to IPC bytes
             let ipc_data = array_iter
-                .into_ipc(&LEGACY_SESSION)
+                .into_ipc(vortex_session())
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
                 .collect_to_buffer()
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -153,7 +180,7 @@ impl LocalVortexShuffleStream {
         })?;
 
         // Create default session with all canonical encodings
-        let session = &*LEGACY_SESSION;
+        let session = vortex_session();
 
         // Read IPC data
         let cursor = Cursor::new(data);
@@ -181,7 +208,6 @@ impl LocalVortexShuffleStream {
 impl Stream for LocalVortexShuffleStream {
     type Item = Result<RecordBatch>;
 
-    #[allow(deprecated)]
     fn poll_next(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -189,7 +215,7 @@ impl Stream for LocalVortexShuffleStream {
         match self.arrays.next() {
             Some(array) => {
                 // Convert Vortex array back to Arrow
-                let arrow_array = array.into_arrow_preferred().map_err(|e| {
+                let arrow_array = vortex_to_arrow(array).map_err(|e| {
                     datafusion::error::DataFusionError::External(Box::new(e))
                 })?;
 
@@ -249,7 +275,7 @@ pub async fn write_stream_to_disk_vortex(
         num_bytes += batch_size_bytes;
 
         // Convert Arrow RecordBatch to Vortex Array
-        let vortex_array = ArrayRef::from_arrow(&batch, false).map_err(|e| {
+        let vortex_array = record_batch_to_vortex(&batch).map_err(|e| {
             BallistaError::General(format!("Failed to convert to Vortex: {e}"))
         })?;
         arrays.push(vortex_array);
@@ -269,7 +295,7 @@ pub async fn write_stream_to_disk_vortex(
 
         // Convert to IPC bytes
         let ipc_data = array_iter
-            .into_ipc(&LEGACY_SESSION)
+            .into_ipc(vortex_session())
             .map_err(|e| {
                 BallistaError::General(format!("Failed to create Vortex IPC: {e}"))
             })?

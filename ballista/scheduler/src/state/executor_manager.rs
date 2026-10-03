@@ -25,11 +25,14 @@ use ballista_core::serde::protobuf::ExecutorMetric;
 use ballista_core::serde::protobuf::executor_metric::Metric;
 use log::trace;
 
-use crate::cluster::{BindingResult, ClusterState, ExecutorSlot};
+use crate::cluster::{
+    BindingResult, ClusterState, ClusterStateEventStream, ExecutorSlot,
+};
 use crate::config::SchedulerConfig;
 
 use crate::state::execution_graph::RunningTaskInfo;
 use crate::state::task_manager::JobInfoCache;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::executor_grpc_client::ExecutorGrpcClient;
 use ballista_core::serde::protobuf::{
     CancelTasksParams, ExecutorHeartbeat, MultiTaskDefinition, RemoveJobDataParams,
@@ -59,7 +62,7 @@ type ExecutorClients = Arc<DashMap<String, ExecutorGrpcClient<Channel>>>;
 /// - Cleaning up job data on executors
 #[derive(Clone)]
 pub struct ExecutorManager {
-    /// Cluster state for tracking executor registration and task slots.
+    /// Cluster state for tracking executor registration and vcores.
     cluster_state: Arc<dyn ClusterState>,
     /// Scheduler configuration.
     config: Arc<SchedulerConfig>,
@@ -68,6 +71,8 @@ pub struct ExecutorManager {
     /// Per-executor pending cleanups: job id -> stage ids to remove
     /// (empty stage ids ⇒ remove the whole job dir).
     pending_cleanup_jobs: Arc<DashMap<String, HashMap<JobId, Vec<u32>>>>,
+    /// Configuration for gRPC client connections.
+    grpc_client_config: GrpcClientConfig,
 }
 
 impl ExecutorManager {
@@ -76,11 +81,29 @@ impl ExecutorManager {
         cluster_state: Arc<dyn ClusterState>,
         config: Arc<SchedulerConfig>,
     ) -> Self {
+        // Prefer an explicit override_config_producer if the embedder wired one,
+        // so a full BallistaConfig (with all its grpc-client knobs) still takes
+        // precedence. Otherwise, use `default()` but override
+        // `max_message_size` from the scheduler's `grpc_client_max_message_size`
+        // CLI flag so users can raise the ceiling for outbound task-assignment
+        // RPCs without having to write a config-producer in Rust.
+        let grpc_client_config =
+            if let Some(config_producer) = &config.override_config_producer {
+                let session_config = config_producer();
+                let ballista_config = session_config.ballista_config();
+                GrpcClientConfig::from(&ballista_config)
+            } else {
+                GrpcClientConfig {
+                    max_message_size: config.grpc_client_max_message_size as usize,
+                    ..GrpcClientConfig::default()
+                }
+            };
         Self {
             cluster_state,
             config,
             clients: Default::default(),
             pending_cleanup_jobs: Default::default(),
+            grpc_client_config,
         }
     }
 
@@ -91,9 +114,14 @@ impl ExecutorManager {
         Ok(())
     }
 
+    /// Returns a stream of cluster state events from the configured state backend.
+    pub async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
+        self.cluster_state.cluster_state_events().await
+    }
+
     /// Binds ready-to-run tasks from active jobs to available executor slots.
     ///
-    /// Returns a binding result containing bound tasks and shuffle affinity info.
+    /// Returns a list of bound tasks that can be launched on executors.
     pub async fn bind_schedulable_tasks(
         &self,
         running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
@@ -104,7 +132,7 @@ impl ExecutorManager {
         }
         let alive_executors = self.get_alive_executors();
         if alive_executors.is_empty() {
-            debug!("There's no alive executors for binding tasks");
+            warn!("There are no alive executors to bind tasks");
             return Ok(BindingResult::new());
         }
         self.cluster_state
@@ -116,7 +144,7 @@ impl ExecutorManager {
             .await
     }
 
-    /// Returns reserved task slots to the pool of available slots.
+    /// Returns reserved vcores to the pool of available slots.
     ///
     /// This operation is atomic: either all slots are returned or none are.
     pub async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
@@ -154,7 +182,6 @@ impl ExecutorManager {
                         task_id: task_info.task_id as u32,
                         job_id: task_info.job_id.into(),
                         stage_id: task_info.stage_id as u32,
-                        partition_id: task_info.partition_id as u32,
                     })
                     .collect(),
             );
@@ -163,7 +190,10 @@ impl ExecutorManager {
         let executor_manager = self.clone();
         tokio::spawn(async move {
             for (executor_id, infos) in tasks_to_cancel {
-                if let Ok(mut client) = executor_manager.get_client(&executor_id).await {
+                if let Ok(mut client) = executor_manager
+                    .get_client(&executor_id, &executor_manager.grpc_client_config)
+                    .await
+                {
                     if let Err(e) = client
                         .cancel_tasks(CancelTasksParams { task_infos: infos })
                         .await
@@ -255,10 +285,12 @@ impl ExecutorManager {
         let alive_executors = self.get_alive_executors();
 
         for executor in alive_executors {
-            let job_id_clone = job_id.clone().into_inner();
+            let job_id_clone = job_id.to_owned().into_inner();
 
             if self.config.is_push_staged_scheduling() {
-                if let Ok(mut client) = self.get_client(&executor).await {
+                if let Ok(mut client) =
+                    self.get_client(&executor, &self.grpc_client_config).await
+                {
                     let remove_stage_ids = remove_stage_ids.clone();
                     tokio::spawn(async move {
                         if let Err(err) = client
@@ -285,12 +317,11 @@ impl ExecutorManager {
         }
     }
 
-    /// Returns a list of all executors along with the timestamp of their last recorded heartbeat.
+    /// Returns a list of all executors, the timestamp of the last recorded hearbeat and metrics received from it
     pub async fn get_executors_state(
         &self,
     ) -> Result<Vec<(ExecutorMetadata, Option<Duration>, Vec<ExecutorMetric>)>> {
-        let mut state: Vec<(ExecutorMetadata, Option<Duration>, Vec<ExecutorMetric>)> =
-            vec![];
+        let mut state = vec![];
         for metadata in self.cluster_state.registered_executor_metadata().await {
             let heartbeat = self.cluster_state.get_executor_heartbeat(&metadata.id);
             let duration = heartbeat
@@ -315,13 +346,7 @@ impl ExecutorManager {
 
             state.push((metadata, duration, metrics));
         }
-
         Ok(state)
-    }
-
-    /// Return executor latest heartbeat, or None if not found.
-    pub fn get_executor_hearbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
-        self.cluster_state.get_executor_heartbeat(executor_id)
     }
 
     /// Returns executor metadata for the provided executor ID.
@@ -334,20 +359,25 @@ impl ExecutorManager {
         self.cluster_state.get_executor_metadata(executor_id).await
     }
 
+    /// Return executor latest hearbeat, or None if not found
+    pub fn get_executor_hearbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
+        self.cluster_state.get_executor_heartbeat(executor_id)
+    }
+
     /// Saves executor metadata for pull-based task scheduling.
     ///
     /// For push-based scheduling, use [`Self::register_executor`] instead.
     pub async fn save_executor_metadata(&self, metadata: ExecutorMetadata) -> Result<()> {
         trace!(
-            "save executor metadata {} with {} task slots (pull-based registration)",
-            metadata.id, metadata.specification.task_slots
+            "save executor metadata {} with {} vcores (pull-based registration)",
+            metadata.id, metadata.specification.vcores
         );
         self.cluster_state.save_executor_metadata(metadata).await
     }
 
     /// Registers the executor with the scheduler for push-based task scheduling.
     ///
-    /// This saves both the executor metadata and available task slots to persistent state.
+    /// This saves both the executor metadata and vcore inventory to persistent state.
     /// For pull-based scheduling, use [`Self::save_executor_metadata`] instead.
     pub async fn register_executor(
         &self,
@@ -355,8 +385,8 @@ impl ExecutorManager {
         specification: ExecutorData,
     ) -> Result<()> {
         debug!(
-            "registering executor {} with {} task slots (push-based registration)",
-            metadata.id, specification.total_task_slots
+            "registering executor {} with {} vcores (push-based registration)",
+            metadata.id, specification.total_vcores
         );
 
         ExecutorManager::test_connectivity(&metadata).await?;
@@ -375,13 +405,18 @@ impl ExecutorManager {
         reason: Option<String>,
     ) -> Result<()> {
         info!("Removing executor {executor_id}: {reason:?}");
+        // Drop the cached client
+        self.clients.remove(executor_id);
         self.cluster_state.remove_executor(executor_id).await
     }
 
     /// Sends a stop request to the specified executor.
     pub async fn stop_executor(&self, executor_id: &str, stop_reason: String) {
         let executor_id = executor_id.to_string();
-        match self.get_client(&executor_id).await {
+        match self
+            .get_client(&executor_id, &self.grpc_client_config)
+            .await
+        {
             Ok(mut client) => {
                 tokio::task::spawn(async move {
                     match client
@@ -408,26 +443,28 @@ impl ExecutorManager {
     }
 
     /// Launches multiple tasks on the specified executor.
+    ///
+    /// `Ok` means the RPC was dispatched; the returned set holds job IDs the
+    /// executor rejected (could not decode) and failed individually. `Err` is
+    /// only returned for a transport-level failure of the whole RPC.
     pub async fn launch_multi_task(
         &self,
         executor_id: &str,
         multi_tasks: Vec<MultiTaskDefinition>,
-        scheduler_id: String,
-    ) -> Result<()> {
-        let mut client = self.get_client(executor_id).await?;
-        client
+        scheduler_endpoint: String,
+    ) -> Result<HashSet<JobId>> {
+        let mut client = self
+            .get_client(executor_id, &self.grpc_client_config)
+            .await?;
+        let res = client
             .launch_multi_task(protobuf::LaunchMultiTaskParams {
                 multi_tasks,
-                scheduler_id,
+                scheduler_endpoint,
             })
-            .await
-            .map_err(|e| {
-                BallistaError::Internal(format!(
-                    "Failed to connect to executor {executor_id}: {e:?}"
-                ))
-            })?;
+            .await?
+            .into_inner();
 
-        Ok(())
+        Ok(res.failed_jobs.into_iter().map(JobId::from).collect())
     }
 
     pub(crate) fn drain_pending_cleanup_jobs(
@@ -526,7 +563,11 @@ impl ExecutorManager {
             .collect::<Vec<_>>()
     }
 
-    async fn get_client(&self, executor_id: &str) -> Result<ExecutorGrpcClient<Channel>> {
+    async fn get_client(
+        &self,
+        executor_id: &str,
+        grpc_client_config: &GrpcClientConfig,
+    ) -> Result<ExecutorGrpcClient<Channel>> {
         let client = self.clients.get(executor_id).map(|value| value.clone());
 
         if let Some(client) = client {
@@ -537,23 +578,27 @@ impl ExecutorManager {
                 "http://{}:{}",
                 executor_metadata.host, executor_metadata.grpc_port
             );
-            let mut endpoint = create_grpc_client_endpoint(
-                executor_url,
-                Some(&GrpcClientConfig::default()),
-            )?;
+            let mut endpoint =
+                create_grpc_client_endpoint(executor_url, Some(grpc_client_config))?;
 
             if let Some(ref override_fn) =
                 self.config.override_create_grpc_client_endpoint
             {
                 endpoint = override_fn(endpoint).map_err(|e| {
-                    BallistaError::Internal(format!(
-                        "Error overriding gRPC client endpoint: {e}"
+                    BallistaError::GrpcConnectionError(format!(
+                        "Failed to customize endpoint for executor {executor_id}: {e}"
                     ))
                 })?;
             }
 
             let connection = endpoint.connect().await?;
-            let client = ExecutorGrpcClient::new(connection);
+            // Message-size limits are tonic codec settings, not `Endpoint`
+            // settings, so `create_grpc_client_endpoint` cannot apply them.
+            // Without this the configured `max_message_size` is silently
+            // ignored and task assignment falls back to tonic's own defaults.
+            let client = ExecutorGrpcClient::new(connection)
+                .max_encoding_message_size(grpc_client_config.max_message_size)
+                .max_decoding_message_size(grpc_client_config.max_message_size);
 
             {
                 self.clients.insert(executor_id.to_owned(), client.clone());
@@ -587,6 +632,10 @@ impl ExecutorManager {
 mod tests {
     use super::*;
     use crate::cluster::memory::InMemoryClusterState;
+    use crate::test_utils::test_cluster_context;
+    use ballista_core::extension::SessionConfigExt;
+    use datafusion::prelude::SessionConfig;
+    use tonic::transport::Endpoint;
 
     #[tokio::test]
     async fn cancel_running_tasks_uses_callback() {
@@ -612,23 +661,20 @@ mod tests {
         let tasks = vec![
             RunningTaskInfo {
                 task_id: 1,
-                job_id: JobId::new("job-1"),
+                job_id: JobId::from("job-1"),
                 stage_id: 1,
-                partition_id: 0,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 2,
-                job_id: JobId::new("job-1"),
+                job_id: JobId::from("job-1"),
                 stage_id: 1,
-                partition_id: 1,
                 executor_id: "executor-a".to_string(),
             },
             RunningTaskInfo {
                 task_id: 3,
-                job_id: JobId::new("job-2"),
+                job_id: JobId::from("job-2"),
                 stage_id: 2,
-                partition_id: 0,
                 executor_id: "executor-b".to_string(),
             },
         ];
@@ -642,5 +688,67 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert_eq!(captured.get("executor-a").map(std::vec::Vec::len), Some(2));
         assert_eq!(captured.get("executor-b").map(std::vec::Vec::len), Some(1));
+    }
+
+    #[test]
+    fn grpc_client_max_message_size_flag_reaches_client_config() {
+        let config = Arc::new(
+            SchedulerConfig::default()
+                .with_grpc_client_max_message_size(64 * 1024 * 1024),
+        );
+        let manager =
+            ExecutorManager::new(test_cluster_context().cluster_state(), config);
+
+        assert_eq!(
+            manager.grpc_client_config.max_message_size,
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn config_producer_still_wins_over_the_flag() {
+        let config = Arc::new(
+            SchedulerConfig::default()
+                .with_grpc_client_max_message_size(64 * 1024 * 1024)
+                .with_override_config_producer(Arc::new(|| {
+                    let mut session_config = SessionConfig::new_with_ballista();
+                    session_config
+                        .options_mut()
+                        .set("ballista.client.grpc_max_message_size", "33554432")
+                        .expect("valid setting");
+                    session_config
+                })),
+        );
+        let manager =
+            ExecutorManager::new(test_cluster_context().cluster_state(), config);
+
+        assert_eq!(
+            manager.grpc_client_config.max_message_size,
+            32 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_an_executor_drops_its_cached_client() {
+        let manager = ExecutorManager::new(
+            test_cluster_context().cluster_state(),
+            Arc::new(SchedulerConfig::default()),
+        );
+
+        // `get_client` needs an executor to connect to, so cache a client
+        // directly. `connect_lazy` gives a `Channel` without a server behind it.
+        let channel = Endpoint::from_static("http://localhost:1").connect_lazy();
+        manager
+            .clients
+            .insert("executor-1".to_owned(), ExecutorGrpcClient::new(channel));
+
+        manager
+            .remove_executor("executor-1", None)
+            .await
+            .expect("executor removed");
+
+        // An executor id is a fresh uuid per executor process, so a client left
+        // behind here would never be reused, and never dropped either.
+        assert!(manager.clients.is_empty());
     }
 }

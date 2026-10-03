@@ -31,22 +31,24 @@ cargo install ballista-cli
 ## Usage
 
 ```
-USAGE:
-    ballista-cli [OPTIONS]
+Command Line Client for Ballista distributed query engine.
 
-OPTIONS:
-    -c, --batch-size <BATCH_SIZE>    The batch size of each query, or use Ballista default
-    -f, --file <FILE>...             Execute commands from file(s), then exit
-        --format <FORMAT>            [default: table] [possible values: csv, tsv, table, json,
-                                     nd-json]
-    -h, --help                       Print help information
-        --host <HOST>                Ballista scheduler host
-    -p, --data-path <DATA_PATH>      Path to your data, default to current directory
-        --port <PORT>                Ballista scheduler port
-    -q, --quiet                      Reduce printing other than the results and work quietly
-    -r, --rc <RC>...                 Run the provided files on startup instead of ~/.ballistarc
-        --tui                        Enables terminal user interface (requires `tui` feature)
-    -V, --version                    Print version information
+Usage: ballista-cli [OPTIONS]
+
+Options:
+  -p, --data-path <DATA_PATH>    Path to your data, default to current directory
+  -c, --batch-size <BATCH_SIZE>  The batch size of each query, or use Ballista default
+      --vcores <VCORES>          Virtual cores for the local Ballista executor. Default: all available physical cores.
+  -f, --file [<FILE>...]         Execute commands from file(s), then exit
+  -r, --rc [<RC>...]             Run the provided files on startup instead of ~/.ballistarc
+      --format <FORMAT>          [default: table] [possible values: csv, tsv, table, json, nd-json, automatic]
+      --host <HOST>              Ballista scheduler host
+      --port <PORT>              Ballista scheduler port
+  -q, --quiet                    Reduce printing other than the results and work quietly
+      --color                    Enables console syntax highlighting
+      --tui                      Enables terminal user interface
+  -h, --help                     Print help
+  -V, --version                  Print version
 ```
 
 ## Example
@@ -72,7 +74,7 @@ It is also possible to run the CLI in standalone mode, where it will create a sc
 ```bash
 $ ballista-cli
 
-Ballista CLI v52.0.0
+Ballista CLI v54.0.0
 
 > CREATE EXTERNAL TABLE foo (a INT, b INT) STORED AS CSV LOCATION 'data.csv';
 0 rows in set. Query took 0.001 seconds.
@@ -132,6 +134,18 @@ Available commands inside Ballista CLI are:
 > \h function_table
 ```
 
+- Set table output format
+
+```bash
+> \pset format json
+```
+
+- Open the terminal user interface
+
+```bash
+> \tui
+```
+
 ## Terminal User Interface (TUI)
 
 When Ballista CLI is built with the `tui` feature, you can launch an interactive terminal user interface
@@ -158,7 +172,7 @@ ballista-cli
 
 The TUI provides the following views:
 
-- **Executors**: Lists all registered executors with their host, port, task slots, memory usage, and last seen time.
+- **Executors**: Lists all registered executors with their host, port, vcores, memory usage, and last seen time.
   Supports sorting by any column.
 - **Executor details**: Select an executor and press `Enter` to show extra details about it.
 - **Jobs**: Displays active and completed jobs with their status, start time, and duration. Supports sorting, job
@@ -328,3 +342,48 @@ BALLISTA__SCHEDULER__URL=http://localhost:50051 ballista-cli --tui
 Double underscores (`__`) are used to denote nesting in the configuration structure. In the above example, `BALLISTA__SCHEDULER__URL` overrides the `scheduler.url` setting in the YAML configuration.
 
 The TUI connects to the scheduler via HTTP and refreshes the data automatically every `data_reload_interval_ms` milliseconds.
+
+## Web Terminal User Interface (Web TUI)
+
+Ballista also provides a browser-based version of the TUI, compiled to WebAssembly, that allows cluster monitoring directly from a web browser.
+
+### Using the hosted Web TUI
+
+When the scheduler HTTP endpoint is available, open its root URL in a browser. For a scheduler using the default port:
+
+```text
+http://localhost:50050
+```
+
+The scheduler redirects the browser to the hosted Web TUI and passes the scheduler URL so that the Web TUI can connect to it.
+
+The Scheduler provides additional configuration options for the Web TUI redirect and CORS settings. See the [Scheduler documentation](./scheduler.md#web-tui-configuration) for details.
+
+### Running the Web TUI locally
+
+For local development, install the WebAssembly target and [Trunk](https://trunk-rs.github.io/trunk/), then start the application from the `ballista-cli` directory:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+cd ballista-cli
+trunk serve --no-default-features --features web
+```
+
+Then open `http://localhost:8080` in a browser.
+
+### Web TUI Screenshots
+
+The following screenshots show the Web TUI running in a browser.
+
+#### Main View
+
+![Web TUI main view](./screenshots/tui-web-main.png)
+
+#### Help
+
+![Web TUI help view](./screenshots/tui-web-help.png)
+
+#### Search
+
+![Web TUI search view](./screenshots/tui-web-search.png)

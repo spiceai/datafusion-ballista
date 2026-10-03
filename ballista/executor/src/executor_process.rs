@@ -25,46 +25,33 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::serde::protobuf::ExecutorOperatingSystemSpecification;
+use datafusion::DATAFUSION_VERSION;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{error, info, warn};
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, MemoryRefreshKind, System};
 use tempfile::TempDir;
 use tokio::fs::DirEntry;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::{fs, time};
-use uuid::Uuid;
 
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionConfig;
 
-use crate::client_pool::DefaultBallistaClientPool;
-use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
-use crate::executor::{Executor, TasksDrainedFuture};
-use crate::executor_server::TERMINATING;
-use crate::flight_service::BallistaFlightService;
-use crate::metrics::{ExecutorMetricCollectionPolicy, LoggingMetricsCollector};
-use crate::runtime_cache::{
-    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
-};
-use crate::shutdown::Shutdown;
-use crate::shutdown::ShutdownNotifier;
-use crate::{ArrowFlightServerProvider, terminate};
-use crate::{execution_loop, executor_server};
 use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
 use ballista_core::error::BallistaError;
 use ballista_core::extension::{EndpointOverrideFn, SessionConfigExt};
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::executor_status::Status;
 use ballista_core::serde::protobuf::{
-    ExecutorOperatingSystemSpecification, ExecutorRegistration, ExecutorResource,
-    ExecutorSpecification, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
-    scheduler_grpc_client::SchedulerGrpcClient,
+    ExecutorRegistration, ExecutorResource, ExecutorSpecification, ExecutorStatus,
+    ExecutorStoppedParams, HeartBeatParams, scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
@@ -73,29 +60,186 @@ use ballista_core::utils::{
     GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
     default_config_producer, get_time_before,
 };
-use ballista_core::{BALLISTA_VERSION, ConfigProducer, JobId, RuntimeProducer};
+use ballista_core::{
+    BALLISTA_PROTOCOL_VERSION, BALLISTA_VERSION, ConfigProducer, JobId, RuntimeProducer,
+    ids::new_instance_id,
+};
+
+use crate::client_pool::DefaultBallistaClientPool;
+use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
+use crate::executor::{Executor, TasksDrainedFuture};
+use crate::executor_server::TERMINATING;
+use crate::flight_service::BallistaFlightService;
+use crate::metrics::ExecutorMetricCollectionPolicy;
+use crate::metrics::LoggingMetricsCollector;
+use crate::runtime_cache::{
+    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+};
+use crate::shutdown::Shutdown;
+use crate::shutdown::ShutdownNotifier;
+use crate::{ArrowFlightServerProvider, terminate};
+use crate::{execution_loop, executor_server};
+
+/// Default fraction of the detected memory limit handed to the pool when
+/// `--memory-pool-fraction` is not set. The `FairSpillPool` only bounds memory
+/// operators register with it, so the remaining budget absorbs untracked
+/// overhead (in-flight Arrow batches, shuffle writer buffers, fragmentation).
+pub(crate) const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.70;
+
+/// How the operator interpreted `--memory-pool-size`.
+#[derive(Debug, PartialEq)]
+enum MemoryBudget {
+    /// Flag unset: auto-size to `fraction` of detected host/cgroup memory.
+    Auto { fraction: f64 },
+    /// `--memory-pool-size 0`: run DataFusion's unbounded pool.
+    Unbounded,
+    /// `--memory-pool-size N`: bound the pool to exactly `N` bytes.
+    Bytes(u64),
+}
+
+/// Classify the raw CLI value into a [`MemoryBudget`]. `fraction` is only used
+/// for the auto path.
+fn memory_budget_from_cli(opt: Option<u64>, fraction: f64) -> MemoryBudget {
+    match opt {
+        None => MemoryBudget::Auto { fraction },
+        Some(0) => MemoryBudget::Unbounded,
+        Some(n) => MemoryBudget::Bytes(n),
+    }
+}
+
+/// Where an auto/explicit pool size came from (for logging).
+#[derive(Debug, PartialEq, Eq)]
+enum PoolSource {
+    /// Explicit `--memory-pool-size N`.
+    Configured,
+    /// Auto: fraction of the cgroup memory limit.
+    AutoCgroup,
+    /// Auto: fraction of host memory.
+    AutoHost,
+}
+
+/// Why the executor is running without a bounded pool (for logging).
+#[derive(Debug, PartialEq, Eq)]
+enum UnboundedReason {
+    /// User asked for it via `--memory-pool-size 0`.
+    Explicit,
+    /// Neither host nor cgroup memory could be detected.
+    Undetected,
+}
+
+/// The resolved pool decision: a concrete byte budget or unbounded.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedPool {
+    Bounded { bytes: u64, source: PoolSource },
+    Unbounded(UnboundedReason),
+}
+
+/// Pure resolver: turn the budget plus detected limits into a decision.
+/// `host_total` and `cgroup_limit` are only consulted for [`MemoryBudget::Auto`].
+fn resolve_pool(
+    budget: MemoryBudget,
+    host_total: Option<u64>,
+    cgroup_limit: Option<u64>,
+) -> ResolvedPool {
+    match budget {
+        MemoryBudget::Unbounded => ResolvedPool::Unbounded(UnboundedReason::Explicit),
+        MemoryBudget::Bytes(n) => ResolvedPool::Bounded {
+            bytes: n,
+            source: PoolSource::Configured,
+        },
+        MemoryBudget::Auto { fraction } => {
+            let (base, source) = match (host_total, cgroup_limit) {
+                (Some(h), Some(c)) if c <= h => (c, PoolSource::AutoCgroup),
+                (Some(h), Some(_)) => (h, PoolSource::AutoHost),
+                (Some(h), None) => (h, PoolSource::AutoHost),
+                (None, Some(c)) => (c, PoolSource::AutoCgroup),
+                (None, None) => {
+                    return ResolvedPool::Unbounded(UnboundedReason::Undetected);
+                }
+            };
+            let bytes = (base as f64 * fraction) as u64;
+            ResolvedPool::Bounded { bytes, source }
+        }
+    }
+}
+
+/// Read the cgroup memory limit in bytes, or `None` if unlimited/absent.
+/// Tries cgroup v2 (`<root>/memory.max`) then v1
+/// (`<root>/memory/memory.limit_in_bytes`). A v1 "unlimited" sentinel (a value
+/// near `u64::MAX`) is returned as-is; callers clamp it with `min(host, _)`.
+fn read_cgroup_memory_limit(cgroup_root: &Path) -> Option<u64> {
+    // cgroup v2
+    if let Ok(s) = std::fs::read_to_string(cgroup_root.join("memory.max")) {
+        let s = s.trim();
+        if s == "max" {
+            return None;
+        }
+        if let Ok(v) = s.parse::<u64>() {
+            return Some(v);
+        }
+    }
+    // cgroup v1
+    if let Ok(s) =
+        std::fs::read_to_string(cgroup_root.join("memory").join("memory.limit_in_bytes"))
+        && let Ok(v) = s.trim().parse::<u64>()
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// Total host memory in bytes via `sysinfo`, or `None` if unreadable.
+fn read_host_total_memory() -> Option<u64> {
+    let mut system = System::new_all();
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    let total = system.total_memory();
+    (total > 0).then_some(total)
+}
+
+/// Resolve the pool decision, reading host/cgroup limits only when auto-sizing.
+fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
+    match budget {
+        MemoryBudget::Auto { fraction } => resolve_pool(
+            MemoryBudget::Auto { fraction },
+            read_host_total_memory(),
+            // Fixed cgroup root: assumes a cgroup-namespaced container (the
+            // default for modern k8s/Docker), where this path *is* the
+            // container's own limit. In a non-namespaced setup the real limit
+            // may live under a sub-slice instead, in which case this reads
+            // the host's root limit and we fall back to host memory below.
+            read_cgroup_memory_limit(Path::new("/sys/fs/cgroup")),
+        ),
+        other => resolve_pool(other, None, None),
+    }
+}
 
 /// Builds a per-task memory-pool policy: each task's runtime is rebuilt from the
 /// shared base env with a fresh [`FairSpillPool`] of size
-/// `total_bytes / concurrent_tasks`. The base env's disk manager, cache manager,
+/// `total_bytes / vcores`. The base env's disk manager, cache manager,
 /// and object-store registry are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`].
 ///
 /// Returns an error if the per-task share would be zero (i.e. `total_bytes <
-/// concurrent_tasks`).
+/// vcores`).
 fn memory_pool_policy(
     total_bytes: u64,
-    concurrent_tasks: usize,
+    vcores: usize,
 ) -> Result<MemoryPoolPolicy, BallistaError> {
-    let per_task = (total_bytes / concurrent_tasks as u64) as usize;
-    if per_task == 0 {
+    let per_vcore = (total_bytes / vcores as u64) as usize;
+    if per_vcore == 0 {
         return Err(BallistaError::Configuration(format!(
-            "memory_pool_size ({total_bytes} bytes) is smaller than concurrent_tasks ({concurrent_tasks})"
+            "memory_pool_size ({total_bytes} bytes) is smaller than vcores ({vcores})"
         )));
     }
     Ok(Arc::new(
-        move |base: Arc<RuntimeEnv>, _config: &SessionConfig| {
-            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(per_task));
+        move |base: Arc<RuntimeEnv>, _config: &SessionConfig, vcores_consumed: u32| {
+            // Multi-partition tasks that claim N vcores get N × per-vcore
+            // share of the executor's memory pool. A collapse task with
+            // vcores_consumed=1 (see scheduler `bind_one`) gets the
+            // single-vcore share it uses; a 4-partition task gets 4×,
+            // matching the parallelism DataFusion will actually drive.
+            let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
+            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(size));
             RuntimeEnvBuilder::from_runtime_env(&base)
                 .with_memory_pool(pool)
                 .build_arc()
@@ -106,7 +250,7 @@ fn memory_pool_policy(
 /// A no-op policy: the task uses the shared base env unchanged (DataFusion's
 /// default unbounded pool). Used when `--memory-pool-size` is unset.
 fn identity_pool_policy() -> MemoryPoolPolicy {
-    Arc::new(|base, _config| Ok(base))
+    Arc::new(|base, _config, _vcores| Ok(base))
 }
 
 /// Configuration for the executor process.
@@ -115,6 +259,8 @@ fn identity_pool_policy() -> MemoryPoolPolicy {
 /// network configuration, scheduler connection details, resource limits,
 /// and optional overrides for customizing executor behavior.
 pub struct ExecutorProcessConfig {
+    /// Identifier for this executor instance.
+    pub executor_id: String,
     /// Local IP address for binding executor services.
     pub bind_host: String,
     /// External hostname/IP advertised to other components for connectivity.
@@ -129,8 +275,8 @@ pub struct ExecutorProcessConfig {
     pub scheduler_port: u16,
     /// Timeout in seconds for establishing scheduler connection.
     pub scheduler_connect_timeout_seconds: u16,
-    /// Maximum number of concurrent tasks this executor can run.
-    pub concurrent_tasks: usize,
+    /// Virtual cores advertised by this executor to the scheduler.
+    pub vcores: usize,
     /// Task scheduling policy (pull-staged or push-staged).
     pub task_scheduling_policy: TaskSchedulingPolicy,
     /// Directory for storing log files.
@@ -155,13 +301,16 @@ pub struct ExecutorProcessConfig {
     pub grpc_server_config: GrpcServerConfig,
     /// Interval in seconds between heartbeat messages.
     pub executor_heartbeat_interval_seconds: u64,
-    /// Metric collection policy of this executor instance.
+    /// Metric collection policy of this executor instance
     pub metric_collection_policy: ExecutorMetricCollectionPolicy,
     /// Optional total memory pool size in bytes. When set, every task's
     /// runtime env receives a FairSpillPool of size
-    /// `memory_pool_size / concurrent_tasks`. When `None`, no pool is
+    /// `memory_pool_size / vcores`. When `None`, no pool is
     /// installed and DataFusion falls back to its unbounded default.
     pub memory_pool_size: Option<u64>,
+    /// Fraction (0.0, 1.0] of the detected host/cgroup memory limit used for the
+    /// auto memory pool when `memory_pool_size` is `None`.
+    pub memory_pool_fraction: f64,
     /// Maximum number of sessions whose shared base runtime env is retained on
     /// the executor (LRU). Sharing reuses object-store clients and the Parquet
     /// footer cache across a session's tasks and queries. `0` disables caching
@@ -184,11 +333,30 @@ pub struct ExecutorProcessConfig {
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
     /// Override function for customizing gRPC client endpoints before they are used
     pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
-    /// Number of seconds established client connection should be cached (0 means no cache)
+    /// Number of seconds an established client connection is cached while idle.
+    /// `0` disables the pool, so every shuffle fetch opens and drops its own
+    /// connection and a shuffle-heavy query can exhaust the host's ephemeral
+    /// ports.
     pub client_ttl: u64,
+    /// Shared readiness state that the heartbeat loops flip on every RPC
+    /// outcome. Embedders leave this as `Default::default()` and never
+    /// observe it; the standalone binary passes a handle here and also spawns
+    /// an HTTP server on it (see `bin/main.rs`).
+    pub health: crate::health::ExecutorHealth,
 }
 
 impl ExecutorProcessConfig {
+    /// Validates executor process configuration.
+    pub fn validate(&self) -> ballista_core::error::Result<()> {
+        if self.executor_id.trim().is_empty() {
+            return Err(BallistaError::Configuration(
+                "executor_id must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Generates a prefix for log file names based on executor host and port.
     pub fn log_file_name_prefix(&self) -> String {
         format!(
@@ -204,6 +372,7 @@ impl ExecutorProcessConfig {
 impl Default for ExecutorProcessConfig {
     fn default() -> Self {
         Self {
+            executor_id: new_instance_id(),
             bind_host: "127.0.0.1".into(),
             external_host: None,
             port: 50051,
@@ -211,7 +380,7 @@ impl Default for ExecutorProcessConfig {
             scheduler_host: "localhost".into(),
             scheduler_port: 50050,
             scheduler_connect_timeout_seconds: 0,
-            concurrent_tasks: std::thread::available_parallelism().unwrap().get(),
+            vcores: std::thread::available_parallelism().unwrap().get(),
             task_scheduling_policy: Default::default(),
             log_dir: None,
             work_dir: None,
@@ -226,6 +395,7 @@ impl Default for ExecutorProcessConfig {
             executor_heartbeat_interval_seconds: 60,
             metric_collection_policy: ExecutorMetricCollectionPolicy::default(),
             memory_pool_size: None,
+            memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
             session_runtime_cache_capacity: 16,
             override_execution_engine: None,
             override_function_registry: None,
@@ -235,7 +405,8 @@ impl Default for ExecutorProcessConfig {
             override_physical_codec: None,
             override_arrow_flight_service: None,
             override_create_grpc_client_endpoint: None,
-            client_ttl: 0,
+            client_ttl: 30,
+            health: crate::health::ExecutorHealth::new(),
         }
     }
 }
@@ -253,6 +424,8 @@ impl Default for ExecutorProcessConfig {
 pub async fn start_executor_process(
     opt: Arc<ExecutorProcessConfig>,
 ) -> ballista_core::error::Result<()> {
+    opt.validate()?;
+
     let addr = format!("{}:{}", opt.bind_host, opt.port);
     let address = addr.parse().map_err(|e: std::net::AddrParseError| {
         BallistaError::Configuration(e.to_string())
@@ -273,23 +446,23 @@ pub async fn start_executor_process(
         ));
     };
 
-    let concurrent_tasks = if opt.concurrent_tasks == 0 {
+    let vcores = if opt.vcores == 0 {
         // use all available cores if no concurrency level is specified
         std::thread::available_parallelism().unwrap().get()
     } else {
-        opt.concurrent_tasks
+        opt.vcores
     };
     let task_scheduling_policy = opt.task_scheduling_policy;
-    // assign this executor an unique ID
-    let executor_id = Uuid::new_v4().to_string();
-    info!("Executor starting ... (Datafusion Ballista {BALLISTA_VERSION})");
+    let executor_id = opt.executor_id.clone();
+    info!(
+        "Ballista Executor v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) starting ..."
+    );
     info!("Executor id: {executor_id}");
     info!("Executor working directory: {work_dir}");
-    info!("Executor number of concurrent tasks: {concurrent_tasks}");
+    info!("Executor vcores (default: available CPU cores): {vcores}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
-    let executor_meta =
-        structure_executor_metadata(&executor_id, &opt, concurrent_tasks as u32);
+    let executor_meta = structure_executor_metadata(&opt, vcores as u32);
 
     // put them to session config
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());
@@ -309,24 +482,54 @@ pub async fn start_executor_process(
             })
         });
 
-    let pool_policy: MemoryPoolPolicy = if let Some(total) = opt.memory_pool_size {
-        let policy = memory_pool_policy(total, concurrent_tasks)?;
-        let per_task = total / concurrent_tasks as u64;
-        info!(
-            "Memory pool: total {total} bytes split into {concurrent_tasks} tasks ({per_task} bytes each)"
-        );
-        policy
-    } else {
-        identity_pool_policy()
-    };
+    let fraction = opt.memory_pool_fraction;
+    let pool_policy: MemoryPoolPolicy =
+        match detect_pool(memory_budget_from_cli(opt.memory_pool_size, fraction)) {
+            ResolvedPool::Bounded { bytes, source } => {
+                let per_vcore = bytes / vcores as u64;
+                let source_desc = match source {
+                    PoolSource::Configured => {
+                        "configured via --memory-pool-size".to_string()
+                    }
+                    PoolSource::AutoCgroup => {
+                        format!("auto: {:.0}% of cgroup memory limit", fraction * 100.0)
+                    }
+                    PoolSource::AutoHost => {
+                        format!("auto: {:.0}% of host memory", fraction * 100.0)
+                    }
+                };
+                info!(
+                    "Executor memory pool: {} ({source_desc}), \
+                     split across {vcores} vcores ({}/vcore)",
+                    bytesize::ByteSize::b(bytes),
+                    bytesize::ByteSize::b(per_vcore),
+                );
+                memory_pool_policy(bytes, vcores)?
+            }
+            ResolvedPool::Unbounded(reason) => {
+                match reason {
+                    UnboundedReason::Explicit => {
+                        info!("Executor memory pool: unbounded (--memory-pool-size 0)")
+                    }
+                    UnboundedReason::Undetected => warn!(
+                        "Executor memory pool: unbounded (could not detect host or \
+                         cgroup memory limit; set --memory-pool-size to enable spilling)"
+                    ),
+                }
+                identity_pool_policy()
+            }
+        };
 
     // Combined producer preserving the current per-task behavior: build a fresh
     // base env, then apply the pool policy. Used by `Executor::produce_runtime`
     // and as the fallback when session caching is disabled.
+    // Session-level fallback (used only when no session cache is attached);
+    // per-task vcores aren't threaded here, so size the pool for the smallest
+    // task shape (1 vcore).
     let runtime_producer: RuntimeProducer = {
         let base = base_runtime_producer.clone();
         let policy = pool_policy.clone();
-        Arc::new(move |config: &SessionConfig| policy(base(config)?, config))
+        Arc::new(move |config: &SessionConfig| policy(base(config)?, config, 1))
     };
 
     let logical = opt
@@ -344,29 +547,26 @@ pub async fn start_executor_process(
         datafusion_proto::protobuf::PhysicalPlanNode,
     > = BallistaCodec::new(logical, physical);
 
-    // Session caching applies only to the default runtime producer. With an
-    // override producer we cannot split base + pool, so we serve per-task as
-    // before by leaving the cache unset.
-    let session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>> =
-        if opt.override_runtime_producer.is_none() {
-            Some(Arc::new(DefaultSessionRuntimeCache::new(
-                base_runtime_producer.clone(),
-                pool_policy.clone(),
-                opt.session_runtime_cache_capacity,
-            )))
-        } else {
-            None
-        };
+    // Always attach the session cache: `pool_policy` wraps whatever base env
+    // the producer returns with a fresh per-task memory pool sized to the
+    // task's vcores, so an override producer (e.g. S3-aware) composes with
+    // the pool the same way the default one does.
+    let session_runtime_cache: Arc<dyn SessionRuntimeCache> =
+        Arc::new(DefaultSessionRuntimeCache::new(
+            base_runtime_producer.clone(),
+            pool_policy.clone(),
+            opt.session_runtime_cache_capacity,
+        ));
 
     let executor = Arc::new(
         Executor::new(
-            executor_meta,
+            executor_meta.clone(),
             &work_dir,
             runtime_producer,
             config_producer,
             opt.override_function_registry.clone().unwrap_or_default(),
             metrics_collector,
-            concurrent_tasks,
+            vcores,
             Some(opt.override_execution_engine.clone().unwrap_or_else(|| {
                 if opt.client_ttl > 0 {
                     let client_pool =
@@ -379,7 +579,7 @@ pub async fn start_executor_process(
                 }
             })),
         )
-        .with_session_runtime_cache(session_runtime_cache),
+        .with_session_runtime_cache(Some(session_runtime_cache)),
     );
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
@@ -472,6 +672,7 @@ pub async fn start_executor_process(
 
     // Graceful shutdown notification
     let shutdown_notification = ShutdownNotifier::new();
+    let flight_work_dir = work_dir.clone();
 
     if opt.job_data_clean_up_interval_seconds > 0 {
         let mut interval_time =
@@ -511,10 +712,20 @@ pub async fn start_executor_process(
     // Channels used to receive stop requests from Executor grpc service.
     let (stop_send, mut stop_recv) = mpsc::channel::<bool>(10);
 
+    // Shared readiness state, flipped by the heartbeat/poll_work loop. When
+    // the caller is the standalone binary, an HTTP probe server observes
+    // this same handle (see `bin/main.rs`); library embedders leave it
+    // unobserved.
+    let health = opt.health.clone();
+
+    // Starting main executor process based on the TaskSchedulingPolicy
+    //
+    // PushStaged => starting new executor_server that waits for tasks from the schedule
+    // PullStaged => executor is polling the scheduler when it is idle
     match scheduler_policy {
         TaskSchedulingPolicy::PushStaged => {
             service_handlers.push(
-                //If there is executor registration error during startup, return the error and stop early.
+                // If there is executor registration error during startup, return the error and stop early.
                 executor_server::startup(
                     scheduler.clone(),
                     opt.clone(),
@@ -522,6 +733,7 @@ pub async fn start_executor_process(
                     default_codec,
                     stop_send,
                     &shutdown_notification,
+                    health,
                 )
                 .await?,
             );
@@ -531,9 +743,10 @@ pub async fn start_executor_process(
                 scheduler.clone(),
                 executor.clone(),
                 default_codec,
-                None,
-                None, // poll_now_notify: not used in standalone executor
-                None, // available_task_slots: use internal semaphore
+                None, // readiness: no embedder waiting on registration
+                None, // poll_now_notify
+                None, // free_vcores: use internal semaphore
+                health,
             )));
         }
     };
@@ -544,6 +757,7 @@ pub async fn start_executor_process(
         None => {
             info!("Starting built-in arrow flight service");
             flight_server_task(
+                flight_work_dir,
                 address,
                 shutdown,
                 opt.grpc_max_encoding_message_size as usize,
@@ -554,7 +768,12 @@ pub async fn start_executor_process(
         }
         Some(flight_provider) => {
             info!("Starting custom, user provided, arrow flight service");
-            (flight_provider)(address, shutdown, opt.grpc_server_config.clone())
+            (flight_provider)(
+                flight_work_dir,
+                address,
+                shutdown,
+                opt.grpc_server_config.clone(),
+            )
         }
     });
 
@@ -598,11 +817,7 @@ pub async fn start_executor_process(
                 status: Some(ExecutorStatus {
                     status: Some(Status::Terminating(String::default())),
                 }),
-                metadata: Some(structure_executor_metadata(
-                    &executor_id,
-                    &opt,
-                    concurrent_tasks as u32,
-                )),
+                metadata: Some(executor_meta),
             })
             .await
         {
@@ -636,6 +851,7 @@ pub async fn start_executor_process(
 
     // When `notify_shutdown` is dropped, all components which have `subscribe`d will
     // receive the shutdown signal and can exit
+    let _ = notify_shutdown.send(());
     drop(notify_shutdown);
     // Drop final `Sender` so the `Receiver` below can complete
     drop(shutdown_complete_tx);
@@ -648,6 +864,7 @@ pub async fn start_executor_process(
 
 // Arrow flight service
 async fn flight_server_task(
+    work_dir: String,
     address: SocketAddr,
     mut grpc_shutdown: Shutdown,
     max_encoding_message_size: usize,
@@ -661,9 +878,11 @@ async fn flight_server_task(
 
         let server_future = create_grpc_server(&grpc_server_config)
             .add_service(
-                FlightServiceServer::new(BallistaFlightService::new())
-                    .max_decoding_message_size(max_decoding_message_size)
-                    .max_encoding_message_size(max_encoding_message_size),
+                FlightServiceServer::new(
+                    BallistaFlightService::new().with_work_dir(work_dir),
+                )
+                .max_decoding_message_size(max_decoding_message_size)
+                .max_encoding_message_size(max_encoding_message_size),
             )
             .serve_with_shutdown(address, grpc_shutdown.recv());
 
@@ -880,11 +1099,10 @@ pub async fn satisfy_dir_ttl(
     Ok(false)
 }
 
-/// Builds executor registration metadata including OS/hardware specification.
+/// Structuring executor's metadata to start the main process
 pub fn structure_executor_metadata(
-    executor_id: &str,
     options: &Arc<ExecutorProcessConfig>,
-    concurrent_tasks: u32,
+    vcores: u32,
 ) -> ExecutorRegistration {
     let system_name =
         System::name().unwrap_or_else(|| String::from("Unknown system name"));
@@ -901,19 +1119,19 @@ pub fn structure_executor_metadata(
     let num_disks = disks.list().len() as u32;
     let mut total_disk_space: u64 = 0;
     let mut total_available_disk_space: u64 = 0;
-    for disk in disks.list() {
+    for disk in &disks {
         total_disk_space += disk.total_space();
         total_available_disk_space += disk.available_space();
     }
 
     ExecutorRegistration {
-        id: executor_id.to_string(),
+        id: options.executor_id.clone(),
         host: options.external_host.clone(),
         port: options.port as u32,
         grpc_port: options.grpc_port as u32,
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks)),
+                resource: Some(Resource::Vcores(vcores)),
             }],
         }),
         os_info: Some(ExecutorOperatingSystemSpecification {
@@ -927,6 +1145,7 @@ pub fn structure_executor_metadata(
             total_available_disk_space,
             open_files_limit,
         }),
+        ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
     }
 }
 
@@ -934,13 +1153,72 @@ pub fn structure_executor_metadata(
 mod tests {
     use crate::executor_process::is_subdirectory;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
+    use super::ExecutorProcessConfig;
     use super::clean_shuffle_data_loop;
+    use super::remove_job_data;
+    use super::structure_executor_metadata;
+    use ballista_core::BALLISTA_PROTOCOL_VERSION;
+    use ballista_core::JobId;
+    use ballista_core::ids::new_instance_id;
+    use ballista_core::serde::protobuf::executor_resource::Resource;
     use std::fs;
     use std::fs::File;
     use std::io::Write;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn executor_metadata_reflects_process_configuration() {
+        let executor_id = new_instance_id();
+        let config = Arc::new(ExecutorProcessConfig {
+            executor_id: executor_id.clone(),
+            external_host: Some("executor.example.com".to_string()),
+            port: 10051,
+            grpc_port: 10052,
+            ..ExecutorProcessConfig::default()
+        });
+
+        let metadata = structure_executor_metadata(&config, 4);
+
+        assert_eq!(metadata.id, executor_id);
+        uuid::Uuid::parse_str(&metadata.id).unwrap();
+        assert_eq!(metadata.host.as_deref(), Some("executor.example.com"));
+        assert_eq!(metadata.port, 10051);
+        assert_eq!(metadata.grpc_port, 10052);
+        assert_eq!(
+            metadata
+                .specification
+                .as_ref()
+                .and_then(|spec| spec.resources.first())
+                .and_then(|resource| resource.resource.as_ref()),
+            Some(&Resource::Vcores(4))
+        );
+        assert!(metadata.os_info.is_some());
+        assert_eq!(
+            metadata.ballista_protocol_version,
+            BALLISTA_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn default_executor_id_is_uuid() {
+        let config = ExecutorProcessConfig::default();
+
+        uuid::Uuid::parse_str(&config.executor_id).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_empty_executor_id() {
+        let config = ExecutorProcessConfig {
+            executor_id: " ".to_string(),
+            ..ExecutorProcessConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("executor_id"));
+    }
 
     #[tokio::test]
     async fn test_executor_clean_up() {
@@ -976,7 +1254,7 @@ mod tests {
     async fn test_arrow_flight_provider_ergonomics() {
         let config = crate::executor_process::ExecutorProcessConfig {
             override_arrow_flight_service: Some(std::sync::Arc::new(
-                move |address, mut grpc_shutdown, ballista_config| {
+                move |work_dir, address, mut grpc_shutdown, ballista_config| {
                     tokio::spawn(async move {
                         log::info!(
                             "custom arrow flight server listening on: {address:?}"
@@ -987,7 +1265,8 @@ mod tests {
                         )
                         .add_service(
                             arrow_flight::flight_service_server::FlightServiceServer::new(
-                                crate::flight_service::BallistaFlightService::new(),
+                                crate::flight_service::BallistaFlightService::new()
+                                    .with_work_dir(work_dir),
                             ),
                         )
                         .serve_with_shutdown(address, grpc_shutdown.recv());
@@ -1012,31 +1291,291 @@ mod tests {
 
         // Normal correct one
         {
-            let job_path = prepare_testing_job_directory(base_dir, "job_a");
+            let job_path = prepare_testing_job_directory(base_dir, &"job_a".into());
             assert!(is_subdirectory(&job_path, base_dir));
         }
 
         // Empty job id
         {
-            let job_path = prepare_testing_job_directory(base_dir, "");
+            let job_path = prepare_testing_job_directory(base_dir, &"".into());
             assert!(!is_subdirectory(&job_path, base_dir));
 
-            let job_path = prepare_testing_job_directory(base_dir, ".");
+            let job_path = prepare_testing_job_directory(base_dir, &".".into());
             assert!(!is_subdirectory(&job_path, base_dir));
         }
 
         // Malicious job id
         {
-            let job_path = prepare_testing_job_directory(base_dir, "..");
+            let job_path = prepare_testing_job_directory(base_dir, &"..".into());
             assert!(!is_subdirectory(&job_path, base_dir));
         }
     }
-    fn prepare_testing_job_directory(base_dir: &Path, job_id: &str) -> PathBuf {
+    #[tokio::test]
+    async fn test_remove_intermediate_stage_data() {
+        let work_dir = TempDir::new().unwrap();
+        let work = work_dir.path();
+        let job_id: JobId = "job".into();
+
+        // Create job/1, job/2, job/3, each with a data file.
+        for stage in [1u32, 2, 3] {
+            let stage_dir = work.join("job").join(stage.to_string());
+            fs::create_dir_all(&stage_dir).unwrap();
+            File::create(stage_dir.join("data.arrow"))
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+        }
+
+        // Remove intermediate stages 1 and 2; stage 3 (final) is retained.
+        remove_job_data(work.to_str().unwrap(), &job_id, &[1, 2])
+            .await
+            .unwrap();
+        assert!(!work.join("job").join("1").exists());
+        assert!(!work.join("job").join("2").exists());
+        assert!(work.join("job").join("3").exists());
+
+        // Removing a missing stage id is a no-op (idempotent).
+        remove_job_data(work.to_str().unwrap(), &job_id, &[99])
+            .await
+            .unwrap();
+        assert!(work.join("job").join("3").exists());
+
+        // Empty list removes the whole job dir.
+        remove_job_data(work.to_str().unwrap(), &job_id, &[])
+            .await
+            .unwrap();
+        assert!(!work.join("job").exists());
+    }
+
+    fn prepare_testing_job_directory(base_dir: &Path, job_id: &JobId) -> PathBuf {
         let mut path = base_dir.to_path_buf();
-        path.push(job_id);
+        path.push(job_id.as_str());
         if !path.exists() {
             fs::create_dir(&path).unwrap();
         }
         path
+    }
+}
+
+#[cfg(test)]
+mod memory_pool_tests {
+    use super::*;
+    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::execution::object_store::DefaultObjectStoreRegistry;
+    use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+    use std::sync::Arc;
+
+    #[test]
+    fn returns_error_when_total_smaller_than_vcores() {
+        let result = memory_pool_policy(4, 8);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("memory_pool_size"));
+        assert!(msg.contains("vcores"));
+    }
+
+    #[test]
+    fn produces_runtime_with_fair_spill_pool_scaled_by_vcores() {
+        let total = 8u64 * 1024 * 1024 * 1024;
+        let vcores = 8usize;
+        let per_vcore = (total / vcores as u64) as usize;
+
+        let policy = memory_pool_policy(total, vcores).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+
+        // A 1-vcore task gets the per-vcore share; a 4-vcore task gets 4×.
+        let env_1 = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
+        let env_4 = policy(base, &SessionConfig::new(), 4).unwrap();
+
+        match env_1.memory_pool.memory_limit() {
+            MemoryLimit::Finite(n) => assert_eq!(n, per_vcore),
+            MemoryLimit::Infinite => panic!("expected Finite, got Infinite"),
+            MemoryLimit::Unknown => panic!("expected Finite, got Unknown"),
+        }
+        match env_4.memory_pool.memory_limit() {
+            MemoryLimit::Finite(n) => assert_eq!(n, per_vcore * 4),
+            MemoryLimit::Infinite => panic!("expected Finite, got Infinite"),
+            MemoryLimit::Unknown => panic!("expected Finite, got Unknown"),
+        }
+    }
+
+    #[test]
+    fn preserves_base_object_store_registry() {
+        let registry: Arc<dyn datafusion::execution::object_store::ObjectStoreRegistry> =
+            Arc::new(DefaultObjectStoreRegistry::new());
+        let base = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_object_store_registry(registry.clone())
+                .build()
+                .unwrap(),
+        );
+
+        let policy = memory_pool_policy(1024, 1).unwrap();
+        let env = policy(base, &SessionConfig::new(), 1).unwrap();
+
+        assert!(Arc::ptr_eq(&env.object_store_registry, &registry));
+    }
+
+    #[test]
+    fn identity_policy_returns_base_unchanged() {
+        let base = Arc::new(RuntimeEnv::default());
+        let env = identity_pool_policy()(base.clone(), &SessionConfig::new(), 1).unwrap();
+        assert!(Arc::ptr_eq(&env, &base));
+    }
+
+    #[test]
+    fn budget_from_cli_classifies_none_zero_and_positive() {
+        assert_eq!(
+            memory_budget_from_cli(None, 0.7),
+            MemoryBudget::Auto { fraction: 0.7 }
+        );
+        assert_eq!(
+            memory_budget_from_cli(Some(0), 0.7),
+            MemoryBudget::Unbounded
+        );
+        assert_eq!(
+            memory_budget_from_cli(Some(1024), 0.7),
+            MemoryBudget::Bytes(1024)
+        );
+    }
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn resolve_explicit_bytes_ignores_detection() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Bytes(4 * GB), Some(32 * GB), Some(8 * GB)),
+            ResolvedPool::Bounded {
+                bytes: 4 * GB,
+                source: PoolSource::Configured
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_unbounded_is_explicit() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Unbounded, Some(32 * GB), None),
+            ResolvedPool::Unbounded(UnboundedReason::Explicit)
+        );
+    }
+
+    #[test]
+    fn resolve_auto_prefers_cgroup_when_smaller() {
+        let expected = ((8 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.70 },
+                Some(32 * GB),
+                Some(8 * GB)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_honors_custom_fraction() {
+        let expected = ((8 * GB) as f64 * 0.50) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.50 },
+                Some(32 * GB),
+                Some(8 * GB)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_falls_back_to_host_when_cgroup_unlimited_sentinel() {
+        // cgroup v1 "unlimited" reports a value larger than host; min() picks host.
+        let expected = ((32 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.70 },
+                Some(32 * GB),
+                Some(u64::MAX)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoHost
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_host_only() {
+        let expected = ((32 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, Some(32 * GB), None),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoHost
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_cgroup_only() {
+        let expected = ((8 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, None, Some(8 * GB)),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_undetected_is_unbounded() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, None, None),
+            ResolvedPool::Unbounded(UnboundedReason::Undetected)
+        );
+    }
+
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cgroup_v2_reads_numeric_limit() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("memory.max"), "8589934592").unwrap();
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(8 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_max_means_unlimited() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("memory.max"), "max\n").unwrap();
+        assert_eq!(read_cgroup_memory_limit(dir.path()), None);
+    }
+
+    #[test]
+    fn cgroup_v1_reads_numeric_limit() {
+        let dir = tempdir().unwrap();
+        let v1 = dir.path().join("memory");
+        fs::create_dir_all(&v1).unwrap();
+        fs::write(v1.join("memory.limit_in_bytes"), "8589934592\n").unwrap();
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(8 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cgroup_absent_returns_none() {
+        let dir = tempdir().unwrap();
+        assert_eq!(read_cgroup_memory_limit(dir.path()), None);
     }
 }

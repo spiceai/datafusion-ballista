@@ -24,6 +24,7 @@ use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -32,10 +33,13 @@ use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
 use futures::StreamExt;
 use log::error;
 use std::io::BufWriter;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Error, Server};
 
 /// Configuration for gRPC client connections.
@@ -80,16 +84,14 @@ pub struct GrpcClientConfig {
 impl From<&BallistaConfig> for GrpcClientConfig {
     fn from(config: &BallistaConfig) -> Self {
         Self {
-            connect_timeout_seconds: config.default_grpc_client_connect_timeout_seconds()
-                as u64,
-            timeout_seconds: config.default_grpc_client_timeout_seconds() as u64,
-            tcp_keepalive_seconds: config.default_grpc_client_tcp_keepalive_seconds()
-                as u64,
+            connect_timeout_seconds: config.grpc_client_connect_timeout_seconds() as u64,
+            timeout_seconds: config.grpc_client_timeout_seconds() as u64,
+            tcp_keepalive_seconds: config.grpc_client_tcp_keepalive_seconds() as u64,
             http2_keepalive_interval_seconds: config
-                .default_grpc_client_http2_keepalive_interval_seconds()
+                .grpc_client_http2_keepalive_interval_seconds()
                 as u64,
-            use_tls: config.client_use_tls(),
-            max_message_size: config.default_grpc_client_max_message_size(),
+            use_tls: config.use_tls(),
+            max_message_size: config.grpc_client_max_message_size(),
             io_retries_times: config.io_retries_times() as u8,
             io_retry_wait_time_ms: config.io_retry_wait_time_ms() as u64,
             initial_connection_window_size: config
@@ -165,6 +167,7 @@ pub fn default_session_builder(
         .with_default_features()
         .with_config(config)
         .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build()?))
+        .with_optimizer_rules(crate::optimizer::ballista_default_optimizer_rules())
         .with_scalar_functions(ballista_scalar_functions())
         .with_aggregate_functions(ballista_aggregate_functions())
         .with_window_functions(ballista_window_functions())
@@ -178,77 +181,131 @@ pub fn default_config_producer() -> SessionConfig {
     SessionConfig::new_with_ballista()
 }
 
-/// Stream data to disk in Arrow IPC format
+/// Creates [IpcWriteOptions] using the compression codec configured in the BallistaConfig
+pub fn create_write_options(
+    compression_type: Option<CompressionType>,
+) -> std::result::Result<IpcWriteOptions, DataFusionError> {
+    IpcWriteOptions::default()
+        .try_with_compression(compression_type)
+        .map_err(|err| {
+            DataFusionError::Internal(format!("Failed to set compression codec: {err}"))
+        })
+}
+
+/// Stream data to disk in Arrow IPC format.
+///
+/// Batches are read from the async stream and forwarded through a bounded
+/// channel to a `spawn_blocking` task that performs all synchronous file I/O,
+/// keeping the tokio worker thread unblocked.
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-    path: &str,
+    path: &Path,
     disk_write_metric: &metrics::Time,
+    channel_capacity: usize,
+    compression_type: Option<CompressionType>,
 ) -> Result<PartitionStats> {
-    let file = BufWriter::new(File::create(path).map_err(|e| {
-        error!("Failed to create partition file at {path}: {e:?}");
-        BallistaError::IoError(e)
-    })?);
+    let schema = stream.schema();
+    let path_owned = path.to_owned();
+    let write_metric = disk_write_metric.clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
+
+    let handle = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
+            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
+            BallistaError::IoError(e)
+        })?);
+
+        let options = create_write_options(compression_type)?;
+
+        let mut writer =
+            StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
+
+        while let Some(batch) = rx.blocking_recv() {
+            let timer = write_metric.timer();
+            writer.write(&batch)?;
+            timer.done();
+        }
+        let timer = write_metric.timer();
+        writer.finish()?;
+        timer.done();
+        Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
+    });
 
     let mut num_rows = 0;
     let mut num_batches = 0;
-    let mut num_bytes = 0;
 
-    let options = IpcWriteOptions::default()
-        .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
+    let stream_err = loop {
+        match stream.next().await {
+            Some(Ok(batch)) => {
+                num_batches += 1;
+                num_rows += batch.num_rows();
+                if tx.send(batch).await.is_err() {
+                    break None;
+                }
+            }
+            Some(Err(e)) => break Some(e),
+            None => break None,
+        }
+    };
+    drop(tx);
 
-    let mut writer =
-        StreamWriter::try_new_with_options(file, stream.schema().as_ref(), options)?;
+    let write_result = handle
+        .await
+        .map_err(|e| BallistaError::General(format!("Disk writer task failed: {e}")))?;
 
-    while let Some(result) = stream.next().await {
-        let batch = result?;
-
-        let batch_size_bytes: usize = batch.get_array_memory_size();
-        num_batches += 1;
-        num_rows += batch.num_rows();
-        num_bytes += batch_size_bytes;
-
-        let timer = disk_write_metric.timer();
-        writer.write(&batch)?;
-        timer.done();
+    if let Some(e) = stream_err {
+        if let Err(write_err) = &write_result {
+            error!("Disk writer also failed: {write_err}");
+        }
+        return Err(e.into());
     }
-    let timer = disk_write_metric.timer();
-    writer.finish()?;
-    timer.done();
+    let num_bytes = write_result?;
+
     Ok(PartitionStats::new(
         Some(num_rows as u64),
         Some(num_batches),
-        Some(num_bytes as u64),
+        Some(num_bytes),
     ))
 }
 
-/// Collects all record batches from a stream into a vector.
-pub async fn collect_stream(
-    stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-) -> Result<Vec<RecordBatch>> {
-    let mut batches = vec![];
-    while let Some(batch) = stream.next().await {
-        batches.push(batch?);
-    }
-    Ok(batches)
-}
-
-/// Write stream to disk using the specified shuffle format
+/// Write stream to disk using the specified shuffle format (Spice fork).
 ///
 /// This function dispatches to the appropriate writer based on the format:
-/// - ArrowIpc: Uses Arrow IPC streaming format with LZ4 compression
+/// - ArrowIpc: Uses Arrow IPC streaming format via [`write_stream_to_disk`]
 /// - Vortex: Uses Vortex columnar format (requires 'vortex' feature)
 pub async fn write_stream_to_disk_with_format(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
-    path: &str,
+    path: &Path,
     disk_write_metric: &metrics::Time,
+    channel_capacity: usize,
+    compression_type: Option<CompressionType>,
     format: ShuffleFormat,
 ) -> Result<PartitionStats> {
     match format {
-        ShuffleFormat::ArrowIpc => write_stream_to_disk(stream, path, disk_write_metric).await,
+        ShuffleFormat::ArrowIpc => {
+            write_stream_to_disk(
+                stream,
+                path,
+                disk_write_metric,
+                channel_capacity,
+                compression_type,
+            )
+            .await
+        }
         #[cfg(feature = "vortex")]
         ShuffleFormat::Vortex => {
-            crate::execution_plans::write_stream_to_disk_vortex(stream, path, disk_write_metric)
-                .await
+            let path = path.to_str().ok_or_else(|| {
+                BallistaError::General(format!(
+                    "Shuffle file path {path:?} is not valid UTF-8"
+                ))
+            })?;
+            crate::execution_plans::write_stream_to_disk_vortex(
+                stream,
+                path,
+                disk_write_metric,
+            )
+            .await
         }
         #[cfg(not(feature = "vortex"))]
         ShuffleFormat::Vortex => Err(BallistaError::General(
@@ -263,6 +320,17 @@ pub fn shuffle_file_extension(format: ShuffleFormat) -> &'static str {
         ShuffleFormat::ArrowIpc => "arrow",
         ShuffleFormat::Vortex => "vortex",
     }
+}
+
+/// Collects all record batches from a stream into a vector.
+pub async fn collect_stream(
+    stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = vec![];
+    while let Some(batch) = stream.next().await {
+        batches.push(batch?);
+    }
+    Ok(batches)
 }
 
 /// Creates a gRPC client connection with the specified configuration.
@@ -303,7 +371,7 @@ where
 {
     let endpoint = tonic::transport::Endpoint::new(dst)?;
     if let Some(config) = config {
-        Ok(endpoint
+        let mut endpoint = endpoint
             .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
             .timeout(Duration::from_secs(config.timeout_seconds))
             .tcp_nodelay(true)
@@ -312,7 +380,17 @@ where
                 config.http2_keepalive_interval_seconds,
             ))
             .keep_alive_timeout(Duration::from_secs(20))
-            .keep_alive_while_idle(true))
+            .keep_alive_while_idle(true);
+        if config.initial_connection_window_size > 0 {
+            endpoint = endpoint.initial_connection_window_size(Some(
+                config.initial_connection_window_size,
+            ));
+        }
+        if config.initial_stream_window_size > 0 {
+            endpoint = endpoint
+                .initial_stream_window_size(Some(config.initial_stream_window_size));
+        }
+        Ok(endpoint)
     } else {
         Ok(endpoint)
     }
@@ -331,6 +409,30 @@ pub fn create_grpc_server(config: &GrpcServerConfig) -> Server {
         .http2_keepalive_timeout(Some(Duration::from_secs(
             config.http2_keepalive_timeout_seconds,
         )))
+}
+
+/// Binds a gRPC server's listening socket, for use with tonic's
+/// `serve_with_incoming` / `serve_with_incoming_shutdown`. Unlike tonic's
+/// `serve`, which binds lazily inside the future it returns, the socket is
+/// listening by the time this returns — so use this whenever a peer may be
+/// told to connect as soon as the server is started.
+///
+/// tonic ignores the builder's `tcp_nodelay` and `tcp_keepalive` when serving
+/// from a pre-bound listener, so this applies the same values that
+/// [`create_grpc_server`] sets, for the same reasons. The remaining settings
+/// still come from the builder.
+///
+/// # Panics
+///
+/// The listener is registered with the Tokio reactor, so this must be called
+/// from within a Tokio runtime.
+pub fn create_grpc_server_incoming(
+    addr: SocketAddr,
+    config: &GrpcServerConfig,
+) -> Result<TcpIncoming> {
+    Ok(TcpIncoming::bind(addr)?
+        .with_nodelay(Some(true))
+        .with_keepalive(Some(Duration::from_secs(config.tcp_keepalive_seconds))))
 }
 
 /// Recursively collects metrics from an execution plan and all its children.
@@ -378,19 +480,19 @@ mod tests {
         // Verify the conversion picks up the right values
         assert_eq!(
             grpc_config.connect_timeout_seconds,
-            ballista_config.default_grpc_client_connect_timeout_seconds() as u64
+            ballista_config.grpc_client_connect_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.timeout_seconds,
-            ballista_config.default_grpc_client_timeout_seconds() as u64
+            ballista_config.grpc_client_timeout_seconds() as u64
         );
         assert_eq!(
             grpc_config.tcp_keepalive_seconds,
-            ballista_config.default_grpc_client_tcp_keepalive_seconds() as u64
+            ballista_config.grpc_client_tcp_keepalive_seconds() as u64
         );
         assert_eq!(
             grpc_config.http2_keepalive_interval_seconds,
-            ballista_config.default_grpc_client_http2_keepalive_interval_seconds() as u64
+            ballista_config.grpc_client_http2_keepalive_interval_seconds() as u64
         );
     }
 
@@ -401,7 +503,12 @@ mod tests {
             timeout_seconds: 30,
             tcp_keepalive_seconds: 1800,
             http2_keepalive_interval_seconds: 150,
-            ..Default::default()
+            use_tls: false,
+            max_message_size: 16 * 1024 * 1024,
+            io_retries_times: 3,
+            io_retry_wait_time_ms: 3000,
+            initial_connection_window_size: 67108864,
+            initial_stream_window_size: 16777216,
         };
         let result = create_grpc_client_endpoint("http://localhost:50051", Some(&config));
         assert!(result.is_ok());
@@ -410,6 +517,39 @@ mod tests {
     #[test]
     fn test_create_grpc_client_endpoint_invalid_url() {
         let result = create_grpc_client_endpoint("not a valid url", None);
+        assert!(result.is_err());
+    }
+
+    /// The point of binding up front is that the port is reachable before
+    /// anything is served on it, so a peer told to connect back cannot arrive
+    /// too early.
+    #[tokio::test]
+    async fn test_create_grpc_server_incoming_binds_eagerly() {
+        let incoming = create_grpc_server_incoming(
+            "127.0.0.1:0".parse().unwrap(),
+            &GrpcServerConfig::default(),
+        )
+        .expect("bind");
+        let addr = incoming.local_addr().expect("local addr");
+
+        // `incoming` is never handed to a server, and yet:
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("port is already listening");
+    }
+
+    /// Binding eagerly means a port conflict surfaces here, as an error, rather
+    /// than later inside the spawned server task.
+    #[tokio::test]
+    async fn test_create_grpc_server_incoming_port_in_use() {
+        let first = create_grpc_server_incoming(
+            "127.0.0.1:0".parse().unwrap(),
+            &GrpcServerConfig::default(),
+        )
+        .expect("bind");
+        let addr = first.local_addr().expect("local addr");
+
+        let result = create_grpc_server_incoming(addr, &GrpcServerConfig::default());
         assert!(result.is_err());
     }
 }

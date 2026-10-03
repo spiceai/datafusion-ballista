@@ -15,8 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::flight_proxy_service::BallistaFlightProxyService;
+use crate::api::SchedulerErrorResponse;
+use ballista_core::flight_proxy_service::BallistaFlightProxyService;
 
+#[cfg(feature = "rest-api")]
+use crate::api::get_routes;
+use crate::api::health_routes;
+use crate::api::route_disabled;
+use crate::cluster::BallistaCluster;
+use crate::config::SchedulerConfig;
+use crate::metrics::default_metrics_collector;
+use crate::scheduler_server::SchedulerServer;
+#[cfg(feature = "keda-scaler")]
+use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ballista_core::BALLISTA_VERSION;
 use ballista_core::error::BallistaError;
@@ -25,26 +36,15 @@ use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
+use datafusion::DATAFUSION_VERSION;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use http::StatusCode;
+use http::{HeaderName, HeaderValue, StatusCode};
 use log::info;
 use std::{net::SocketAddr, sync::Arc};
 use tonic::service::RoutesBuilder;
-
-use crate::api::SchedulerErrorResponse;
-#[cfg(feature = "rest-api")]
-use crate::api::get_routes;
-use crate::api::route_disabled;
-use crate::cluster::BallistaCluster;
-use crate::config::SchedulerConfig;
-
-use crate::metrics::default_metrics_collector;
-use crate::scheduler_server::SchedulerServer;
-#[cfg(feature = "keda-scaler")]
-use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
-
+use tower_http::set_header::SetResponseHeaderLayer;
 /// Creates as initialized scheduler service
 /// without exposing it as a grpc service
 pub async fn create_scheduler<
@@ -77,7 +77,7 @@ pub async fn create_scheduler<
         .map_or_else(|| default_metrics_collector(), Ok)?;
 
     let mut scheduler_server = SchedulerServer::new(
-        config.scheduler_name(),
+        config.scheduler_endpoint(),
         cluster,
         codec,
         config,
@@ -89,7 +89,29 @@ pub async fn create_scheduler<
     Ok(scheduler_server)
 }
 
-/// Exposes scheduler grpc service
+/// Wraps a router so every response carries `Server` and `X-App-Version`
+/// headers, regardless of whether it was handled by the REST or gRPC routes
+/// merged into it.
+fn with_version_headers(router: axum::Router) -> axum::Router {
+    let server_value = HeaderValue::from_str(&format!("ballista/{BALLISTA_VERSION}"))
+        .expect("BALLISTA_VERSION should be a valid header value");
+
+    let datafusion_value =
+        HeaderValue::from_str(&format!("datafusion/{DATAFUSION_VERSION}"))
+            .expect("DATAFUSION_VERSION should be a valid header value");
+
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            http::header::SERVER,
+            server_value,
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-powered-by"),
+            datafusion_value,
+        ))
+}
+
+/// Exposes scheduler grpc service on `address`.
 pub async fn start_grpc_service<
     T: 'static + AsLogicalPlan,
     U: 'static + AsExecutionPlan,
@@ -97,7 +119,26 @@ pub async fn start_grpc_service<
     address: SocketAddr,
     scheduler: SchedulerServer<T, U>,
 ) -> ballista_core::error::Result<()> {
-    let config = &scheduler.state.config;
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(BallistaError::from)?;
+
+    start_grpc_service_with_listener(listener, scheduler).await
+}
+
+/// Exposes scheduler grpc service on an already-bound listener.
+///
+/// Use this when the caller needs the bound address before the service starts,
+/// such as binding port 0 in tests, or when the listener comes from a socket
+/// activation mechanism.
+pub async fn start_grpc_service_with_listener<
+    T: 'static + AsLogicalPlan,
+    U: 'static + AsExecutionPlan,
+>(
+    listener: tokio::net::TcpListener,
+    scheduler: SchedulerServer<T, U>,
+) -> ballista_core::error::Result<()> {
+    let config = scheduler.state.config.clone();
     let scheduler_grpc_server = SchedulerGrpcServer::new(scheduler.clone())
         .max_encoding_message_size(config.grpc_server_max_encoding_message_size as usize)
         .max_decoding_message_size(config.grpc_server_max_decoding_message_size as usize);
@@ -105,34 +146,71 @@ pub async fn start_grpc_service<
     let mut tonic_builder = RoutesBuilder::default();
     tonic_builder.add_service(scheduler_grpc_server);
 
-    match &config.advertise_flight_sql_endpoint {
-        Some(proxy) if proxy.is_empty() => {
-            info!("Adding embedded flight proxy service on scheduler");
-            // Wrap the endpoint override function in BallistaConfigGrpcEndpoint
-            let customize_endpoint = config
-                .override_create_grpc_client_endpoint
-                .clone()
-                .map(|f| Arc::new(BallistaConfigGrpcEndpoint::new(f)));
+    let max_decoding = config.grpc_server_max_decoding_message_size as usize;
+    let max_encoding = config.grpc_server_max_encoding_message_size as usize;
 
-            let flight_proxy = FlightServiceServer::new(BallistaFlightProxyService::new(
-                config.grpc_server_max_encoding_message_size as usize,
-                config.grpc_server_max_decoding_message_size as usize,
-                config.use_tls,
-                customize_endpoint,
-            ))
-            .max_decoding_message_size(
-                config.grpc_server_max_decoding_message_size as usize,
-            )
-            .max_encoding_message_size(
-                config.grpc_server_max_encoding_message_size as usize,
-            );
-            tonic_builder.add_service(flight_proxy);
+    // Wrap the endpoint override function in BallistaConfigGrpcEndpoint
+    let customize_endpoint = config
+        .override_create_grpc_client_endpoint
+        .clone()
+        .map(|f| Arc::new(BallistaConfigGrpcEndpoint::new(f)));
+
+    // These sizes configure the proxy's own client to the executors.
+    let flight_proxy = BallistaFlightProxyService::new(
+        max_decoding,
+        max_encoding,
+        config.use_tls,
+        customize_endpoint,
+    );
+
+    let scheduler = Arc::new(scheduler);
+
+    // The Flight SQL frontend and the standalone proxy both serve
+    // `arrow.flight.protocol.FlightService`, so at most one can be mounted.
+    // The frontend subsumes the proxy: its `do_get_fallback` forwards Ballista's
+    // own partition-fetch tickets, so Ballista clients keep working either way.
+    let flight_sql_enabled = config.flight_sql_enabled();
+
+    #[cfg(feature = "flight-sql")]
+    if flight_sql_enabled {
+        let mut flight_sql = ballista_flight_sql::BallistaFlightSqlService::new(
+            scheduler.clone(),
+            flight_proxy.clone(),
+        );
+
+        if let Some(authenticator) = config.override_flight_sql_authenticator.clone() {
+            flight_sql = flight_sql.with_authenticator(authenticator);
         }
-        _ => {}
+
+        if flight_sql.allows_anonymous() {
+            log::warn!(
+                "Arrow Flight SQL is enabled with no authenticator: any client that can \
+                 reach the scheduler port can run queries, and unauthenticated clients \
+                 share a single session. Set \
+                 SchedulerConfig::with_flight_sql_authenticator, or restrict network \
+                 access, before using this outside a trusted network."
+            );
+        }
+
+        info!("Adding Arrow Flight SQL service on scheduler");
+        tonic_builder.add_service(
+            FlightServiceServer::new(flight_sql)
+                .max_decoding_message_size(max_decoding)
+                .max_encoding_message_size(max_encoding),
+        );
+    }
+
+    if !flight_sql_enabled && config.enable_embedded_flight_proxy {
+        info!("Adding embedded flight proxy service on scheduler");
+        tonic_builder.add_service(
+            FlightServiceServer::new(flight_proxy)
+                .max_decoding_message_size(max_decoding)
+                .max_encoding_message_size(max_encoding),
+        );
     }
 
     #[cfg(feature = "keda-scaler")]
-    tonic_builder.add_service(ExternalScalerServer::new(scheduler.clone()));
+    tonic_builder.add_service(ExternalScalerServer::new(scheduler.as_ref().clone()));
 
     let tonic = tonic_builder.routes().into_axum_router();
 
@@ -140,29 +218,29 @@ pub async fn start_grpc_service<
     let tonic =
         tonic.fallback(|| async { SchedulerErrorResponse::new(StatusCode::NOT_FOUND) });
 
+    let health = health_routes(scheduler.clone());
+
     #[cfg(feature = "rest-api")]
-    let final_route = if config.disable_rest_api {
+    let merged = if config.disable_rest_api {
         tonic
             .merge(route_disabled(
                 "REST API has been disabled at startup".to_string(),
             ))
-            .into_make_service_with_connect_info::<SocketAddr>()
+            .merge(health)
     } else {
-        let axum = get_routes(Arc::new(scheduler));
-        axum.merge(tonic)
-            .into_make_service_with_connect_info::<SocketAddr>()
+        let axum = get_routes(scheduler);
+        axum.merge(tonic).merge(health)
     };
 
     #[cfg(not(feature = "rest-api"))]
-    let final_route = tonic
+    let merged = tonic
         .merge(route_disabled(
             "REST API has been disabled at compile time".to_string(),
         ))
-        .into_make_service_with_connect_info::<SocketAddr>();
+        .merge(health);
 
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .map_err(BallistaError::from)?;
+    let final_route =
+        with_version_headers(merged).into_make_service_with_connect_info::<SocketAddr>();
 
     axum::serve(listener, final_route)
         .await
@@ -177,9 +255,45 @@ pub async fn start_server(
     address: SocketAddr,
     config: Arc<SchedulerConfig>,
 ) -> ballista_core::error::Result<()> {
-    info!("Ballista v{BALLISTA_VERSION} Scheduler listening on {address:?}");
+    info!(
+        "Ballista Scheduler v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) listening on {address:?}"
+    );
+    config.validate()?;
     let scheduler =
         create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config).await?;
 
     start_grpc_service(address, scheduler).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn adds_server_and_app_version_headers() {
+        let router = with_version_headers(
+            axum::Router::new().route("/ping", get(|| async { "pong" })),
+        );
+
+        let response = router
+            .oneshot(
+                http::Request::builder()
+                    .uri("/ping")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(http::header::SERVER).unwrap(),
+            &format!("ballista/{BALLISTA_VERSION}")[..],
+        );
+        assert_eq!(
+            response.headers().get("x-powered-by").unwrap(),
+            &format!("datafusion/{DATAFUSION_VERSION}")[..],
+        );
+    }
 }

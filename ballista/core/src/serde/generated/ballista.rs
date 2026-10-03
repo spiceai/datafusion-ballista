@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -51,7 +51,307 @@ pub mod ballista_physical_plan_node {
         SortShuffleWriter(super::SortShuffleWriterExecNode),
         #[prost(message, tag = "5")]
         ChaosExec(super::ChaosExecNode),
+        #[prost(message, tag = "6")]
+        RuntimeStats(super::RuntimeStatsExecNode),
+        #[prost(message, tag = "7")]
+        Buffer(super::BufferExecNode),
+        #[prost(message, tag = "8")]
+        UnorderedRangeRepartition(super::UnorderedRangeRepartitionExecNode),
+        #[prost(message, tag = "9")]
+        OrderedRangeRepartition(super::OrderedRangeRepartitionExecNode),
+        #[prost(message, tag = "10")]
+        PerPartitionFilter(super::PerPartitionFilterExecNode),
+        #[prost(message, tag = "11")]
+        PartitionedBoundedWindowAgg(super::PartitionedBoundedWindowAggExecNode),
+        #[prost(message, tag = "12")]
+        RangeShuffleReader(super::RangeShuffleReaderExecNode),
+        #[prost(message, tag = "13")]
+        RangeFilter(super::RangeFilterExecNode),
+        #[prost(message, tag = "14")]
+        PrefixMerge(super::PrefixMergeExecNode),
+        #[prost(message, tag = "15")]
+        RangeShuffleWriter(super::RangeShuffleWriterExecNode),
     }
+}
+/// Value-range router over N locally-sorted overlapping input partitions.
+/// Redistributes them into K range-disjoint output partitions where each
+/// output is fully sorted on the routing expression. Uses N × K scatter
+/// channels feeding K per-output k-way merges (via DataFusion's SPM
+/// internals). Discovery of cut boundaries is identical to the unordered
+/// variant — walk the child subtree for a matching `RuntimeStatsExec`, snap
+/// its T-Digest.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OrderedRangeRepartitionExecNode {
+    /// Lexicographic ORDER BY. Routing keys off the first entry; the full
+    /// ordering is preserved for downstream operators. Must match the
+    /// input's declared `output_ordering` at plan time.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+    /// K — number of output partitions. Must be ≥ 2.
+    #[prost(uint32, tag = "2")]
+    pub output_partitions: u32,
+}
+/// Runtime-stats tap. Passes batches through unmodified while accumulating:
+///
+/// * per-partition row counts (always)
+/// * a quantile sketch over the first ORDER BY expression's Float64 values
+///   (only when order_by is non-empty)
+///   Downstream operators inside the same Ballista task read the stats via a
+///   child-tree walk. The child plan is plumbed by the framework as `inputs\[0\]`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeStatsExecNode {
+    /// Optional lexicographic ORDER BY. Empty means row-count-only mode
+    /// (no sketch allocated). When non-empty, the first entry drives the
+    /// sketch and the rest are preserved for downstream operators
+    /// (SortExec, BoundedWindowAggExec) that need the full ordering.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+}
+/// A `SortKeySketch` is a wrapper around a KLL, that also includes NULL counts
+///
+/// `levels` is an Arrow IPC stream for now. Binary blob encoding was considered
+/// so that encoding tricks could be used like delta+varint. These showed a 4x
+/// improvement for u64, but only 25% on f64 due to mantissas being effectively
+/// random. Ultimately it was decided that a more complex encoder is not worth
+/// the added complexity in this PR. We can revisit the decision in the future.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SortKeySketchState {
+    /// KLL's nominal top-level compactor capacity
+    #[prost(uint32, tag = "1")]
+    pub k: u32,
+    /// Rows whose key was NULL. Not in `levels`, and not recoverable from it.
+    #[prost(uint64, tag = "2")]
+    pub null_count: u64,
+    /// The exact minimum and maximum over every value observed, one element per
+    /// ORDER BY expression. Tracked outside the compactor stack so no coin flip
+    /// can move them, which is what keeps `quantile(0.0)` and `quantile(1.0)`
+    /// exact. Empty when no value was observed.
+    #[prost(message, repeated, tag = "3")]
+    pub key_min: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    #[prost(message, repeated, tag = "4")]
+    pub key_max: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    /// The compactor stack: one row per level in level order, single column
+    /// `levels: List<Struct<...>>` holding that level's retained keys ascending,
+    /// one struct field per ORDER BY expression. An item's weight is
+    /// `2^level`, so the row index carries the weight and the total count is
+    /// the weighted sum — neither ships.
+    ///
+    /// Levels are sorted before serialization, so a decoder takes ascending
+    /// order as given rather than being told per level.
+    ///
+    /// A three-level stack over an `Int64` key decodes to one batch of one
+    /// column, where the row index is the level:
+    ///
+    /// levels: List\<item: Struct\<expr_0: Int64>>
+    ///
+    /// +-------------------------------------------+
+    /// \| levels                                    |
+    /// +-------------------------------------------+
+    /// \| \[{expr_0: 4}, {expr_0: 17}, {expr_0: 23}\] |  level 0, weight 1
+    /// \| \[{expr_0: 9}, {expr_0: 31}\]               |  level 1, weight 2
+    /// \| \[{expr_0: 12}\]                            |  level 2, weight 4
+    /// +-------------------------------------------+
+    #[prost(bytes = "vec", tag = "5")]
+    pub levels: ::prost::alloc::vec::Vec<u8>,
+}
+/// Flow-control operator with an operator-mode enum. The child plan is
+/// plumbed by the framework as `inputs\[0\]` during decode.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BufferExecNode {
+    #[prost(enumeration = "BufferMode", tag = "1")]
+    pub mode: i32,
+}
+/// Value-range router over unordered inputs. Reads P input partitions with
+/// no sort assumption, evaluates the first ORDER BY expression per row, and
+/// routes each row to one of K output partitions using cuts discovered at
+/// runtime from a sibling RuntimeStatsExec's quantile sketch. The child
+/// plan is plumbed by the framework as `inputs\[0\]`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnorderedRangeRepartitionExecNode {
+    /// Lexicographic ORDER BY carried through from the wrapping window
+    /// operator. Routing keys off the first entry today; the full ordering is
+    /// preserved so downstream operators (SortExec, BWAG) that need it keep
+    /// working.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+    /// K — number of output partitions. Must be ≥ 2.
+    #[prost(uint32, tag = "2")]
+    pub output_partitions: u32,
+}
+/// Filter with per-input-partition predicates. `predicates\[k\]` is the
+/// boolean expression applied to input partition `k`. Requires
+/// `predicates.len() == input_partition_count`. The child plan is
+/// plumbed by the framework as `inputs\[0\]` during decode.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PerPartitionFilterExecNode {
+    #[prost(message, repeated, tag = "1")]
+    pub predicates: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalExprNode,
+    >,
+}
+/// Filter inputs with a per-input-partition half-open range predicate
+/// widened by `halo_lo` / `halo_hi`. `raw_bounds\[k\]` is the cut range for
+/// input partition `k` before halo widening; RFE widens internally at
+/// resolve time. Zero halo recovers the exact range-repartition trim used
+/// above `ShuffleReaderExec`; non-zero halo widens each partition's read
+/// range to include a boundary "context" band (bounded RANGE-frame windows).
+/// The child plan is plumbed by the framework as `inputs\[0\]` during decode.
+/// Serialization requires bounds to be resolved.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeFilterExecNode {
+    #[prost(message, optional, tag = "1")]
+    pub filter_expr: ::core::option::Option<
+        ::datafusion_proto::protobuf::PhysicalExprNode,
+    >,
+    #[prost(message, optional, tag = "2")]
+    pub halo_lo: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+    #[prost(message, optional, tag = "3")]
+    pub halo_hi: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+    #[prost(message, repeated, tag = "4")]
+    pub raw_bounds: ::prost::alloc::vec::Vec<RangeBound>,
+    /// What the operator that produced the cuts says about the rows arriving.
+    /// Unset claims nothing, which a nullable `filter_expr` has no answer for:
+    /// a NULL has a side in the order, not a position among the values.
+    ///
+    /// `ordered` is also required of the input, so nothing planted between can
+    /// reorder the rows the placement was stated against. `unordered_nulls_first`
+    /// states the side without demanding an order, which is what leaves an
+    /// unordered range-repartition upstream legal.
+    #[prost(oneof = "range_filter_exec_node::InputOrder", tags = "5, 6")]
+    pub input_order: ::core::option::Option<range_filter_exec_node::InputOrder>,
+}
+/// Nested message and enum types in `RangeFilterExecNode`.
+pub mod range_filter_exec_node {
+    /// What the operator that produced the cuts says about the rows arriving.
+    /// Unset claims nothing, which a nullable `filter_expr` has no answer for:
+    /// a NULL has a side in the order, not a position among the values.
+    ///
+    /// `ordered` is also required of the input, so nothing planted between can
+    /// reorder the rows the placement was stated against. `unordered_nulls_first`
+    /// states the side without demanding an order, which is what leaves an
+    /// unordered range-repartition upstream legal.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum InputOrder {
+        #[prost(bool, tag = "5")]
+        UnorderedNullsFirst(bool),
+        #[prost(message, tag = "6")]
+        Ordered(super::SortOptions),
+    }
+}
+/// An arrow `SortOptions`, which has no proto of its own in the DataFusion
+/// descriptors — `PhysicalSortExprNode` carries the pair inline beside an
+/// expression this message's users already have.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SortOptions {
+    #[prost(bool, tag = "1")]
+    pub descending: bool,
+    #[prost(bool, tag = "2")]
+    pub nulls_first: bool,
+}
+/// Half-open `[lo, hi)` cut range for one input partition. Either side may be
+/// unset to signal ±∞.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeBound {
+    #[prost(message, optional, tag = "1")]
+    pub lo: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+    #[prost(message, optional, tag = "2")]
+    pub hi: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+}
+/// Applies scheduler-computed prefix state to a window-aggregate column, so
+/// each range-disjoint task's local running aggregate becomes a global one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrefixMergeExecNode {
+    /// One entry per output column needing correction. Empty makes the operator
+    /// a passthrough.
+    #[prost(message, repeated, tag = "1")]
+    pub applies: ::prost::alloc::vec::Vec<WindowApplyNode>,
+    /// Resolved prefix state, one entry per input partition, `\[k\]` summarising
+    /// every partition before `k`. Encoding refuses while unresolved — an
+    /// over-the-wire plan always ships with state bound, since an executor has
+    /// no way to obtain it.
+    #[prost(message, repeated, tag = "2")]
+    pub per_partition_state: ::prost::alloc::vec::Vec<FinalizedPartitionStateNode>,
+}
+/// How to correct one window-function output column.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WindowApplyNode {
+    #[prost(oneof = "window_apply_node::Apply", tags = "1, 2")]
+    pub apply: ::core::option::Option<window_apply_node::Apply>,
+}
+/// Nested message and enum types in `WindowApplyNode`.
+pub mod window_apply_node {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Apply {
+        #[prost(message, tag = "1")]
+        Scalar(super::ScalarWindowApplyNode),
+        #[prost(message, tag = "2")]
+        Aggregate(super::AggregateWindowApplyNode),
+    }
+}
+/// Fast path: combine each row's value with a per-partition scalar.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarWindowApplyNode {
+    #[prost(enumeration = "ScalarOpNode", tag = "1")]
+    pub op: i32,
+    /// One scalar per input partition.
+    #[prost(message, repeated, tag = "2")]
+    pub offset: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    #[prost(uint32, tag = "3")]
+    pub output_column: u32,
+}
+/// Fallback path: seed a fresh accumulator from the prefix state and replay
+/// each row through it. Needed where a row's output is not itself a valid
+/// partial state — AVG, and sketch-backed aggregates like approx_distinct.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregateWindowApplyNode {
+    /// Resolved from the executor's function registry on decode.
+    #[prost(string, tag = "1")]
+    pub udf_name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub args: ::prost::alloc::vec::Vec<::datafusion_proto::protobuf::PhysicalExprNode>,
+    #[prost(uint32, tag = "3")]
+    pub output_column: u32,
+    /// Position in the upstream window operator's `window_expr()` list, which
+    /// is what indexes into each FinalizedPartitionStateNode.
+    #[prost(uint32, tag = "4")]
+    pub window_expr_index: u32,
+}
+/// Prefix state for one input partition: one slot per window expression.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FinalizedPartitionStateNode {
+    #[prost(message, repeated, tag = "1")]
+    pub slots: ::prost::alloc::vec::Vec<AggregateStateSlotNode>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregateStateSlotNode {
+    /// Unset when that window expression published no state — a non-aggregate
+    /// window function. Distinct from a present-but-empty state.
+    #[prost(message, optional, tag = "1")]
+    pub state: ::core::option::Option<AggregateStateNode>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregateStateNode {
+    #[prost(message, repeated, tag = "1")]
+    pub values: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+}
+/// Wrapper for `BoundedWindowAggExec` that overrides
+/// `required_input_distribution` to `Unspecified` — see the module doc on
+/// `execution_plans::partitioned_bounded_window_agg` for what makes that safe.
+/// The child plan is plumbed by the framework as `inputs\[0\]` during decode.
+/// `input_order_mode` and `can_repartition` are hardcoded on the decode side
+/// per the rule's shape gates; only `window_expr` needs to cross the wire.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionedBoundedWindowAggExecNode {
+    #[prost(message, repeated, tag = "1")]
+    pub window_expr: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalWindowExprNode,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChaosExecNode {
@@ -90,15 +390,35 @@ pub struct SortShuffleWriterExecNode {
     pub output_partitioning: ::core::option::Option<
         ::datafusion_proto::protobuf::PhysicalHashRepartition,
     >,
-    /// Configuration for sort shuffle
+    /// Deprecated sort-shuffle knobs, still accepted for wire/embedder
+    /// compatibility (Spice fork). Superseded by `memory_limit_per_task_bytes`.
     #[prost(uint64, tag = "5")]
     pub buffer_size: u64,
     #[prost(uint64, tag = "6")]
     pub memory_limit: u64,
     #[prost(double, tag = "7")]
     pub spill_threshold: f64,
+    /// Target batch size in rows when materializing buffered shuffle data.
     #[prost(uint64, tag = "8")]
     pub batch_size: u64,
+    /// Per-task buffered-bytes budget at which the writer spills its in-memory
+    /// batches to disk. A value of 0 disables the per-task budget so spilling is
+    /// driven solely by runtime memory-pool pressure. Optional so a plan produced
+    /// before this field existed decodes to the built-in default rather than 0.
+    #[prost(uint64, optional, tag = "9")]
+    pub memory_limit_per_task_bytes: ::core::option::Option<u64>,
+}
+/// Passthrough shuffle writer that emits the seekable Arrow IPC file format.
+/// Carries no output partitioning: like `ShuffleWriterExecNode`'s passthrough
+/// case it writes its input's partitioning through, one file per partition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeShuffleWriterExecNode {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub stage_id: u32,
+    #[prost(message, optional, tag = "3")]
+    pub input: ::core::option::Option<::datafusion_proto::protobuf::PhysicalPlanNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnresolvedShuffleExecNode {
@@ -112,6 +432,7 @@ pub struct UnresolvedShuffleExecNode {
     pub broadcast: bool,
     #[prost(uint32, tag = "7")]
     pub upstream_partition_count: u32,
+    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
     #[prost(message, optional, tag = "8")]
     pub coalesce: ::core::option::Option<CoalescePlan>,
 }
@@ -130,6 +451,7 @@ pub struct ShuffleReaderExecNode {
     pub broadcast: bool,
     #[prost(uint32, tag = "6")]
     pub upstream_partition_count: u32,
+    /// Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
     #[prost(message, optional, tag = "7")]
     pub coalesce: ::core::option::Option<CoalescePlan>,
 }
@@ -139,13 +461,46 @@ pub struct ShuffleReaderPartition {
     #[prost(message, repeated, tag = "1")]
     pub location: ::prost::alloc::vec::Vec<PartitionLocation>,
 }
+/// Ordering-preserving shuffle reader. Reuses `ShuffleReaderPartition` for the
+/// M-shape source layout. Partitioning is derived from `partition.len()`
+/// (always `UnknownPartitioning`, range-partitioned by `merge_ordering`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeShuffleReaderExecNode {
+    #[prost(message, repeated, tag = "1")]
+    pub partition: ::prost::alloc::vec::Vec<ShuffleReaderPartition>,
+    #[prost(message, optional, tag = "2")]
+    pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
+    #[prost(uint32, tag = "3")]
+    pub stage_id: u32,
+    /// Sort key the reader's k-way merge preserves. Advertised on the reader's
+    /// `PlanProperties.eq_properties` for downstream consumers.
+    #[prost(message, repeated, tag = "4")]
+    pub merge_ordering: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+    /// Row limit pushed down by a consuming merge. Absent means read everything.
+    #[prost(uint64, optional, tag = "5")]
+    pub fetch: ::core::option::Option<u64>,
+    /// Half-open value range each output partition covers, halo already applied.
+    /// One per output partition, or empty when the scheduler had no cuts. Lets
+    /// the reader skip the parts of an indexed source that cannot hold a row the
+    /// partition wants; the consuming RangeFilterExec still does the exact trim.
+    #[prost(message, repeated, tag = "6")]
+    pub bounds: ::prost::alloc::vec::Vec<RangeBound>,
+}
+/// CoalescePartitionsRule output: groups upstream partitions into coalesced output partitions.
+/// Empty when no coalesce is applied (the optional field on the parent message is absent).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoalescePlan {
+    /// Original number of upstream partitions (M) before coalescing. Required for EXPLAIN's "K of M" rendering.
     #[prost(uint32, tag = "1")]
     pub upstream_partition_count: u32,
+    /// Coalesced output groups. Length is K (the post-coalesce partition count).
     #[prost(message, repeated, tag = "2")]
     pub groups: ::prost::alloc::vec::Vec<PartitionGroup>,
 }
+/// One coalesced output partition's source list: a set of upstream partition indices in \[0, upstream_partition_count).
+/// Default algorithm produces only contiguous indices, but proto allows arbitrary index sets for future strategies.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PartitionGroup {
     #[prost(uint32, repeated, tag = "1")]
@@ -170,8 +525,6 @@ pub struct ExecutionGraph {
     pub output_locations: ::prost::alloc::vec::Vec<PartitionLocation>,
     #[prost(string, tag = "7")]
     pub scheduler_id: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "8")]
-    pub task_id_gen: u32,
     #[prost(message, repeated, tag = "9")]
     pub failed_attempts: ::prost::alloc::vec::Vec<StageAttempts>,
     #[prost(string, tag = "10")]
@@ -304,6 +657,14 @@ pub struct TaskInfo {
     /// Scheduler side finish time
     #[prost(uint64, tag = "7")]
     pub finish_time: u64,
+    /// Global input partition ids this (multi-partition) task covers, in slice
+    /// order. Absent in graphs persisted before the field existed; decoders fall
+    /// back to `partition_id` alone.
+    #[prost(uint32, repeated, tag = "11")]
+    pub global_input_partition_ids: ::prost::alloc::vec::Vec<u32>,
+    /// Vcores the task consumed from the executor's budget at bind time.
+    #[prost(uint32, tag = "12")]
+    pub vcores_consumed: u32,
     #[prost(oneof = "task_info::Status", tags = "8, 9, 10")]
     pub status: ::core::option::Option<task_info::Status>,
 }
@@ -352,7 +713,7 @@ pub struct Action {
 }
 /// Nested message and enum types in `Action`.
 pub mod action {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum ActionType {
         /// Fetch a partition from an executor
         #[prost(message, tag = "3")]
@@ -378,7 +739,15 @@ pub struct ExecutePartition {
         ::datafusion_proto::protobuf::PhysicalHashRepartition,
     >,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// A half-open byte range of a file: `[offset, offset + length)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ByteRange {
+    #[prost(uint64, tag = "1")]
+    pub offset: u64,
+    #[prost(uint64, tag = "2")]
+    pub length: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchPartition {
     #[prost(string, tag = "1")]
     pub job_id: ::prost::alloc::string::String,
@@ -386,12 +755,38 @@ pub struct FetchPartition {
     pub stage_id: u32,
     #[prost(uint32, tag = "3")]
     pub partition_id: u32,
+    /// Spice fork: explicit location of the partition data (local path,
+    /// `memory://` key or object-store URL). Reuses the tag upstream reserved
+    /// for its removed `path`, so it can never collide with an upstream field.
     #[prost(string, tag = "4")]
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub host: ::prost::alloc::string::String,
     #[prost(uint32, tag = "6")]
     pub port: u32,
+    #[prost(uint64, optional, tag = "7")]
+    pub file_id: ::core::option::Option<u64>,
+    /// How the producing writer laid its output out, which is what turns the
+    /// identifiers above into a path.
+    #[prost(enumeration = "ShuffleLayout", tag = "9")]
+    pub layout: i32,
+    /// Which file beside that partition to serve.
+    #[prost(enumeration = "ShuffleFileKind", tag = "10")]
+    pub file_kind: i32,
+    /// Ranges to return, concatenated in request order, as absolute offsets into
+    /// the file.
+    ///
+    /// Empty asks for whatever the identifiers above address. Under the sort
+    /// layout that is the named partition's slice, which the executor resolves
+    /// through its own index — one round trip, as it has always been. Under the
+    /// passthrough layout it is the whole file.
+    ///
+    /// With ranges given the executor serves bytes and nothing else: no index
+    /// read, no comparison, no notion of what a range means. That is what a
+    /// consumer needs against object storage, where there is no executor to ask,
+    /// and it is why the range shuffle's index carries byte offsets at all.
+    #[prost(message, repeated, tag = "11")]
+    pub byte_ranges: ::prost::alloc::vec::Vec<ByteRange>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionLocation {
@@ -405,8 +800,13 @@ pub struct PartitionLocation {
     pub executor_meta: ::core::option::Option<ExecutorMetadata>,
     #[prost(message, optional, tag = "4")]
     pub partition_stats: ::core::option::Option<PartitionStats>,
+    /// Spice fork: explicit location of the partition data (see FetchPartition.path).
     #[prost(string, tag = "5")]
     pub path: ::prost::alloc::string::String,
+    #[prost(uint64, optional, tag = "6")]
+    pub file_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "7")]
+    pub is_sort_shuffle: bool,
 }
 /// Unique identifier for a materialized partition of data
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -418,14 +818,35 @@ pub struct PartitionId {
     #[prost(uint32, tag = "4")]
     pub partition_id: u32,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+/// Within-stage task identity (paired with job_id + stage_id on the parent
+/// MultiTaskDefinition). One task processes a slice of partitions;
+/// `task_id` names the task within the stage (it's the task's append-order
+/// slot in `RunningStage.task_infos`, so (job_id, stage_id, task_id) is
+/// globally unique). `global_output_partition_ids` gives the concrete
+/// global partition ids the task's restricted plan is covering. Writers
+/// use these to name shuffle files with global identity (via
+/// `create_shuffle_path`) so downstream reads have a stable, canonical
+/// address regardless of how the scheduler split the work.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskId {
     #[prost(uint32, tag = "1")]
     pub task_id: u32,
     #[prost(uint32, tag = "2")]
     pub task_attempt_num: u32,
-    #[prost(uint32, tag = "3")]
-    pub partition_id: u32,
+    /// Global partition ids covered by this task, in slice order. Position i in
+    /// the restricted plan corresponds to `global_output_partition_ids\[i\]` globally.
+    /// `\[packed=false\]` keeps the single-partition case wire-compatible with the
+    /// legacy `uint32 partition_id = 3` field: one element writes as a single
+    /// varint at tag 3, exactly matching the old scalar encoding.
+    #[prost(uint32, repeated, packed = "false", tag = "3")]
+    pub global_output_partition_ids: ::prost::alloc::vec::Vec<u32>,
+    /// Vcores this task consumed from the executor's budget at bind time.
+    /// The executor uses this to size the task's memory pool proportionally
+    /// (`pool = total_memory * vcores_consumed / total_vcores`), so a
+    /// multi-partition task claiming N vcores gets N/total of the executor's
+    /// memory budget rather than a single per-vcore share.
+    #[prost(uint32, tag = "5")]
+    pub vcores_consumed: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionStats {
@@ -495,6 +916,11 @@ pub struct NamedRatio {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OperatorMetric {
+    /// Local partition index within the reporting task's plan (0..slice_len-1).
+    /// The scheduler maps this to a global partition id via the task's
+    /// `global_input_partition_ids` when folding metrics into stage metrics.
+    #[prost(uint32, optional, tag = "16")]
+    pub partition: ::core::option::Option<u32>,
     #[prost(
         oneof = "operator_metric::Metric",
         tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
@@ -569,6 +995,12 @@ pub struct ExecutorRegistration {
     pub specification: ::core::option::Option<ExecutorSpecification>,
     #[prost(message, optional, tag = "6")]
     pub os_info: ::core::option::Option<ExecutorOperatingSystemSpecification>,
+    /// Wire-protocol version this executor was built against. The scheduler
+    /// rejects heartbeats/registrations whose version does not match its own
+    /// compiled-in BALLISTA_PROTOCOL_VERSION. Old executors that predate this
+    /// field default to 0, which is never a valid scheduler version.
+    #[prost(uint32, tag = "7")]
+    pub ballista_protocol_version: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutorHeartbeat {
@@ -637,19 +1069,22 @@ pub struct ExecutorSpecification {
     #[prost(message, repeated, tag = "1")]
     pub resources: ::prost::alloc::vec::Vec<ExecutorResource>,
 }
+/// Virtual cores this executor has been assigned at runtime — analogous to
+/// YARN vcores (yarn.nodemanager.resource.cpu-vcores) or Spark's
+/// spark.executor.cores. Not physical `nproc`: may over- or under-subscribe.
+/// One task per executor drives this many DataFusion partitions in parallel
+/// through one plan-Arc.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutorResource {
-    /// TODO add more resources
     #[prost(oneof = "executor_resource::Resource", tags = "1")]
     pub resource: ::core::option::Option<executor_resource::Resource>,
 }
 /// Nested message and enum types in `ExecutorResource`.
 pub mod executor_resource {
-    /// TODO add more resources
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Resource {
         #[prost(uint32, tag = "1")]
-        TaskSlots(u32),
+        Vcores(u32),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -673,17 +1108,20 @@ pub struct ExecutorOperatingSystemSpecification {
     #[prost(uint64, tag = "9")]
     pub open_files_limit: u64,
 }
+/// One instance per executor. Tracks free vcores for scheduler-side task
+/// binding. See ExecutorResource for the vcore definition (YARN vcores or
+/// Spark's spark.executor.cores).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct AvailableTaskSlots {
+pub struct AvailableVcores {
     #[prost(string, tag = "1")]
     pub executor_id: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
-    pub slots: u32,
+    pub vcores: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExecutorTaskSlots {
+pub struct ExecutorVcores {
     #[prost(message, repeated, tag = "1")]
-    pub task_slots: ::prost::alloc::vec::Vec<AvailableTaskSlots>,
+    pub vcores: ::prost::alloc::vec::Vec<AvailableVcores>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutorData {
@@ -735,6 +1173,25 @@ pub mod failed_task {
         TaskKilled(super::TaskKilled),
     }
 }
+/// Per-column statistics for one task's shuffle output. An empty list on
+/// SuccessfulTask means stats were not collected for that task.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TaskColumnStats {
+    /// Index into the output schema's fields.
+    #[prost(uint32, tag = "1")]
+    pub column: u32,
+    #[prost(uint64, tag = "2")]
+    pub null_count: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub sketches: ::prost::alloc::vec::Vec<ColumnSketch>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ColumnSketch {
+    #[prost(enumeration = "SketchType", tag = "1")]
+    pub r#type: i32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessfulTask {
     #[prost(string, tag = "1")]
@@ -743,6 +1200,106 @@ pub struct SuccessfulTask {
     /// so we might want to think about some refactoring of the task definitions
     #[prost(message, repeated, tag = "2")]
     pub partitions: ::prost::alloc::vec::Vec<ShuffleWritePartition>,
+    /// Reports from `RuntimeStatsExec` operators in this task's plan that
+    /// are still valid at the plan's output (walked from the top through
+    /// distribution-preserving nodes only — see
+    /// `range_repartition_common::preserves_distribution`). Empty when the
+    /// plan has no such stats-taps. Currently reports one entry per
+    /// executed `RuntimeStatsExec`; the scheduler groups by `order_by` tag
+    /// to combine reports across tasks/executors.
+    #[prost(message, repeated, tag = "3")]
+    pub runtime_stats: ::prost::alloc::vec::Vec<RuntimeStatsReport>,
+    /// Finalized window-aggregate state captured during this task, one entry
+    /// per (output partition, window expression, PARTITION BY group) that
+    /// closed. Empty unless the plan contains an ever-expanding-frame window
+    /// (`UNBOUNDED PRECEDING`), which is the only shape DataFusion will
+    /// publish accumulator state for. The scheduler prefix-merges these across
+    /// tasks and bakes the result into a downstream `PrefixMergeExec`.
+    ///
+    /// TODO: watch the size of this. Task completion is a hot, frequent
+    /// message, and sketch-backed aggregates make the payload unbounded in a
+    /// way row counts and quantile sketches are not — an HLL or KLL state is
+    /// kilobytes per window expression per partition, and a task covering a
+    /// wide partition slice carries one of each. If it stops being small,
+    /// write the state as a sidecar next to the shuffle files instead, the way
+    /// sort-shuffle already writes `<data>.arrow.index` beside its data
+    /// (`sort_shuffle::get_index_path`), and send only a reference here. That
+    /// keeps the completion message fixed-size regardless of aggregate.
+    #[prost(message, repeated, tag = "4")]
+    pub window_state: ::prost::alloc::vec::Vec<WindowStateReport>,
+    #[prost(message, repeated, tag = "5")]
+    pub task_column_stats: ::prost::alloc::vec::Vec<TaskColumnStats>,
+}
+/// One finalized window-aggregate state from a task's
+/// `BoundedWindowAggExec`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WindowStateReport {
+    /// The stage's *global* output partition this state belongs to.
+    #[prost(uint32, tag = "1")]
+    pub global_partition_id: u32,
+    /// Position in the window operator's `window_expr()` list. Indexes window
+    /// expressions, not partitions.
+    #[prost(uint32, tag = "2")]
+    pub window_expr_index: u32,
+    /// The PARTITION BY tuple that closed. Empty for a window with no
+    /// PARTITION BY, which is the only shape the prefix rewrite plants today.
+    #[prost(message, repeated, tag = "3")]
+    pub partition_key: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    /// `Accumulator::state` for the closed group: one element for SUM / COUNT /
+    /// MIN / MAX, two for AVG's (sum, count), one opaque Binary for
+    /// sketch-backed aggregates like approx_distinct. Carried as ScalarValue
+    /// rather than a numeric field so non-decomposable aggregates work
+    /// unchanged.
+    #[prost(message, repeated, tag = "4")]
+    pub state: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+}
+/// One report per `RuntimeStatsExec` in the executed plan.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeStatsReport {
+    /// What the operator was sampling. Empty = row-count-only mode. When
+    /// non-empty, the first entry identifies which routing expression this
+    /// sketch describes; the scheduler groups sketches by this tag to
+    /// combine samples across tasks that were sampling the same expression.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+    /// Per-partition observations. Interpretation depends on the operator's
+    /// position in the plan — pre-repartition gets one entry per input
+    /// partition, post-repartition gets one per output sub-partition. The
+    /// scheduler groups by `order_by` tag and aggregates.
+    #[prost(message, repeated, tag = "2")]
+    pub partitions: ::prost::alloc::vec::Vec<RuntimeStatsPartitionEntry>,
+    /// Every partition's observations folded into one sketch, merged on the
+    /// executor before the report is sent. Absent in row-count-only mode,
+    /// and when no partition observed a value.
+    #[prost(message, optional, tag = "3")]
+    pub sketch: ::core::option::Option<SortKeySketchState>,
+}
+/// One partition's observations from a `RuntimeStatsExec`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeStatsPartitionEntry {
+    #[prost(uint32, tag = "1")]
+    pub partition_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub row_count: u64,
+    /// This partition's exact key range, one element per ORDER BY expression.
+    /// `cut_partitions` routes a whole shuffle file into every downstream
+    /// partition whose range overlaps `\[key_min, key_max\]`, so these are the
+    /// only per-partition facts a router needs — never the distribution, which
+    /// is why the sketch beside them is merged rather than repeated here.
+    ///
+    /// Both empty when this partition observed no value, which `null_count`
+    /// then distinguishes: some NULLs means a file of NULLs with no value range
+    /// to overlap, none means the partition saw nothing at all.
+    #[prost(message, repeated, tag = "4")]
+    pub key_min: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    #[prost(message, repeated, tag = "5")]
+    pub key_max: ::prost::alloc::vec::Vec<::datafusion_proto_common::ScalarValue>,
+    /// Rows in this partition whose key was NULL. Folds to the report-level
+    /// `SortKeySketchState.null_count`.
+    #[prost(uint64, tag = "6")]
+    pub null_count: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecutionError {}
@@ -767,6 +1324,7 @@ pub struct TaskKilled {}
 pub struct ShuffleWritePartition {
     #[prost(uint64, tag = "1")]
     pub partition_id: u64,
+    /// Spice fork: explicit location of the written partition data.
     #[prost(string, tag = "2")]
     pub path: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
@@ -775,9 +1333,17 @@ pub struct ShuffleWritePartition {
     pub num_rows: u64,
     #[prost(uint64, tag = "5")]
     pub num_bytes: u64,
+    #[prost(uint64, optional, tag = "6")]
+    pub file_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "7")]
+    pub is_sort_shuffle: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskStatus {
+    /// Task's append-order slot in `RunningStage.task_infos`; (job_id,
+    /// stage_id, task_id) is globally unique. Under the multi-partition-task
+    /// model one task processes a partition slice, so this names the task,
+    /// not a single partition.
     #[prost(uint32, tag = "1")]
     pub task_id: u32,
     #[prost(string, tag = "2")]
@@ -786,8 +1352,6 @@ pub struct TaskStatus {
     pub stage_id: u32,
     #[prost(uint32, tag = "4")]
     pub stage_attempt_num: u32,
-    #[prost(uint32, tag = "5")]
-    pub partition_id: u32,
     #[prost(uint64, tag = "6")]
     pub launch_time: u64,
     #[prost(uint64, tag = "7")]
@@ -816,11 +1380,21 @@ pub struct PollWorkParams {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<ExecutorRegistration>,
     #[prost(uint32, tag = "2")]
-    pub num_free_slots: u32,
+    pub num_free_vcores: u32,
     /// All tasks must be reported until they reach the failed or completed state
     #[prost(message, repeated, tag = "3")]
     pub task_status: ::prost::alloc::vec::Vec<TaskStatus>,
 }
+/// Pull-based single-task dispatch. One task processes a slice of
+/// partitions; `task_id` names the task within the stage (its append-order
+/// slot in `RunningStage.task_infos`), `global_output_partition_ids` gives
+/// the concrete global partition ids it covers. The task's plan is
+/// scheduler-side shrink-restricted so its leaves report `slice.len()`
+/// partitions; the writer uses `global_output_partition_ids` to attach
+/// global identity to shuffle files (except in cases where the plan itself
+/// resets partitioning: the writer walks its child plan to detect
+/// SortPreservingMergeExec or RepartitionExec::Hash and picks the right
+/// global mapping).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskDefinition {
     #[prost(uint32, tag = "1")]
@@ -833,8 +1407,6 @@ pub struct TaskDefinition {
     pub stage_id: u32,
     #[prost(uint32, tag = "5")]
     pub stage_attempt_num: u32,
-    #[prost(uint32, tag = "6")]
-    pub partition_id: u32,
     #[prost(bytes = "vec", tag = "7")]
     pub plan: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "9")]
@@ -843,6 +1415,12 @@ pub struct TaskDefinition {
     pub launch_time: u64,
     #[prost(message, repeated, tag = "11")]
     pub props: ::prost::alloc::vec::Vec<KeyValuePair>,
+    /// Global partition ids covered by this task, in slice order.
+    #[prost(uint32, repeated, tag = "12")]
+    pub global_output_partition_ids: ::prost::alloc::vec::Vec<u32>,
+    /// Vcores this task consumed at bind time — see TaskId.vcores_consumed.
+    #[prost(uint32, tag = "13")]
+    pub vcores_consumed: u32,
 }
 /// A set of tasks in the same stage
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1194,16 +1772,18 @@ pub struct LaunchTaskParams {
     /// Allow to launch a task set to an executor at once
     #[prost(message, repeated, tag = "1")]
     pub tasks: ::prost::alloc::vec::Vec<TaskDefinition>,
+    /// Scheduler callback endpoint in host:port format.
     #[prost(string, tag = "2")]
-    pub scheduler_id: ::prost::alloc::string::String,
+    pub scheduler_endpoint: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LaunchMultiTaskParams {
     /// Allow to launch a task set to an executor at once
     #[prost(message, repeated, tag = "1")]
     pub multi_tasks: ::prost::alloc::vec::Vec<MultiTaskDefinition>,
+    /// Scheduler callback endpoint in host:port format.
     #[prost(string, tag = "2")]
-    pub scheduler_id: ::prost::alloc::string::String,
+    pub scheduler_endpoint: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LaunchTaskResult {
@@ -1211,11 +1791,13 @@ pub struct LaunchTaskResult {
     #[prost(bool, tag = "1")]
     pub success: bool,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LaunchMultiTaskResult {
-    /// TODO when part of the task set are scheduled successfully
-    #[prost(bool, tag = "1")]
-    pub success: bool,
+    /// Job IDs the executor could not decode/validate. These jobs are failed
+    /// individually while the rest of the batch still runs; an empty list means
+    /// the whole batch was accepted. A successful RPC does not imply every job ran.
+    #[prost(string, repeated, tag = "2")]
+    pub failed_jobs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CancelTasksParams {
@@ -1240,14 +1822,14 @@ pub struct RemoveJobDataParams {
 pub struct RemoveJobDataResult {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunningTaskInfo {
+    /// Per-stage append-order slot; (job_id, stage_id, task_id) is globally
+    /// unique (see TaskStatus).
     #[prost(uint32, tag = "1")]
     pub task_id: u32,
     #[prost(string, tag = "2")]
     pub job_id: ::prost::alloc::string::String,
     #[prost(uint32, tag = "3")]
     pub stage_id: u32,
-    #[prost(uint32, tag = "4")]
-    pub partition_id: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetCatalogParams {
@@ -1334,6 +1916,156 @@ pub struct ScalarUdfDocumentationArgument {
     pub argument: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub description: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BufferMode {
+    /// Buffers input while a MemoryReservation grows against the runtime's
+    /// MemoryPool; the dam breaks when `try_grow` refuses further allocation.
+    ///
+    /// Future modes: PASS_THROUGH, BUFFER_ALL, SPILL_ON_PRESSURE, ...
+    /// Add here as they land in Rust.
+    Dam = 0,
+}
+impl BufferMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Dam => "BUFFER_MODE_DAM",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BUFFER_MODE_DAM" => Some(Self::Dam),
+            _ => None,
+        }
+    }
+}
+/// How a scalar offset combines with a row's existing value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ScalarOpNode {
+    Add = 0,
+    Min = 1,
+    Max = 2,
+    /// Ignores the row's value entirely.
+    Overwrite = 3,
+}
+impl ScalarOpNode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Add => "SCALAR_OP_NODE_ADD",
+            Self::Min => "SCALAR_OP_NODE_MIN",
+            Self::Max => "SCALAR_OP_NODE_MAX",
+            Self::Overwrite => "SCALAR_OP_NODE_OVERWRITE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SCALAR_OP_NODE_ADD" => Some(Self::Add),
+            "SCALAR_OP_NODE_MIN" => Some(Self::Min),
+            "SCALAR_OP_NODE_MAX" => Some(Self::Max),
+            "SCALAR_OP_NODE_OVERWRITE" => Some(Self::Overwrite),
+            _ => None,
+        }
+    }
+}
+/// How a shuffle writer laid its output out on disk. Selects the path shape,
+/// and with it how a client parses the index beside the data. It says nothing
+/// about the framing of the bytes inside the data file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ShuffleLayout {
+    /// {stage_id}/{partition_id}/data-{file_id}.arrow — one file per output
+    /// partition, written by the passthrough and range writers.
+    Passthrough = 0,
+    /// {stage_id}/{file_id}/data.arrow — one file per task holding every
+    /// partition, written by the sort-based writer.
+    Sort = 1,
+}
+impl ShuffleLayout {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Passthrough => "SHUFFLE_LAYOUT_PASSTHROUGH",
+            Self::Sort => "SHUFFLE_LAYOUT_SORT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SHUFFLE_LAYOUT_PASSTHROUGH" => Some(Self::Passthrough),
+            "SHUFFLE_LAYOUT_SORT" => Some(Self::Sort),
+            _ => None,
+        }
+    }
+}
+/// Which of the files making up a shuffle output is being asked for. Which
+/// index sits beside the data, and how to read it, follows from the layout, so
+/// it is not spelled out here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ShuffleFileKind {
+    Data = 0,
+    Index = 1,
+}
+impl ShuffleFileKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Data => "SHUFFLE_FILE_KIND_DATA",
+            Self::Index => "SHUFFLE_FILE_KIND_INDEX",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SHUFFLE_FILE_KIND_DATA" => Some(Self::Data),
+            "SHUFFLE_FILE_KIND_INDEX" => Some(Self::Index),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SketchType {
+    Unspecified = 0,
+    Hll = 1,
+}
+impl SketchType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SKETCH_TYPE_UNSPECIFIED",
+            Self::Hll => "SKETCH_TYPE_HLL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SKETCH_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SKETCH_TYPE_HLL" => Some(Self::Hll),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod scheduler_grpc_client {
@@ -1803,7 +2535,7 @@ pub mod scheduler_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Get catalog metadata for a session
+        /// Get remote scalar UDF metadata for a session
         pub async fn get_remote_functions(
             &mut self,
             request: impl tonic::IntoRequest<super::GetRemoteFunctionsParams>,
@@ -1948,7 +2680,7 @@ pub mod scheduler_grpc_server {
             tonic::Response<super::GetCatalogResult>,
             tonic::Status,
         >;
-        /// Get catalog metadata for a session
+        /// Get remote scalar UDF metadata for a session
         async fn get_remote_functions(
             &self,
             request: tonic::Request<super::GetRemoteFunctionsParams>,
