@@ -104,7 +104,7 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | Job-state event broadcast channel | #15 | present | Equivalent already upstream via `ClusterState::job_state_events`; `apache#1891` remains open | `adopt-upstream`; reassess whether #1891 is still needed | `JobStateEvent` broadcast |
 | Task-cancellation routing hook | #19 | present | Complementary to `apache#1903` | keep; P2 upstream | `OnCancelTasksFn` |
 | `executor_id` on `TaskInfo` + public graph | #38 #49 | present | Not upstreamed | keep; P1 upstream (merge-clobbered twice) | `executor_id` on task info / `get_job_execution_graph` |
-| Task-runner pool sized independently of vcores | #74 | present | Not upstreamed | `spice-only` — lets `runtime.executor.task_slots` exceed cores without spawning a thread per slot | `with_task_runner_threads`, `task_runner_threads` |
+| Task-runner pool sized independently of vcores | (this PR) | present | Not upstreamed | `spice-only` — lets `runtime.executor.task_slots` exceed cores without spawning a thread per slot | `with_task_runner_threads`, `task_runner_threads` |
 
 ### Scheduler correctness / HA
 
