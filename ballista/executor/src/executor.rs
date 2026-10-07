@@ -43,6 +43,7 @@ use futures::task::AtomicWaker;
 use log::error;
 use log::warn;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -261,6 +262,9 @@ pub struct Executor {
     /// `produce_runtime_for_session` reuses read-side state across a session's
     /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
     session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
+
+    /// Worker-thread override for the task-runner pool; `None` means `vcores`.
+    task_runner_threads: Option<NonZeroUsize>,
 }
 
 impl Executor {
@@ -313,6 +317,7 @@ impl Executor {
             execution_engine: execution_engine
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
+            task_runner_threads: None,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -338,6 +343,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
+            task_runner_threads: None,
         }
     }
 }
@@ -365,6 +371,28 @@ impl Executor {
     ) -> Self {
         self.session_runtime_cache = cache;
         self
+    }
+
+    /// Sets the number of worker threads in the task-runner pool, independently
+    /// of `vcores`.
+    ///
+    /// `vcores` bounds how many tasks run concurrently (the slot count advertised
+    /// to the scheduler); this bounds the OS threads that poll them. Tasks are
+    /// async, so the two are independent: an embedder can advertise more slots
+    /// than cores for I/O-bound work without oversubscribing the CPU. Defaults
+    /// to `vcores` when unset.
+    #[must_use]
+    pub fn with_task_runner_threads(mut self, threads: NonZeroUsize) -> Self {
+        self.task_runner_threads = Some(threads);
+        self
+    }
+
+    /// Worker threads for the task-runner pool: the
+    /// [`with_task_runner_threads`](Self::with_task_runner_threads) override, or
+    /// `vcores` when none was set (at least 1).
+    pub fn task_runner_threads(&self) -> usize {
+        self.task_runner_threads
+            .map_or(self.vcores.max(1), NonZeroUsize::get)
     }
 
     /// Produces the runtime for a task, reusing the session's shared read-side
@@ -530,6 +558,7 @@ impl Executor {
 
 #[cfg(test)]
 mod test {
+    use crate::cpu_bound_executor::DedicatedExecutor;
     use crate::execution_engine::{DefaultQueryStageExec, ShuffleWriterVariant};
     use crate::executor::{Executor, TasksDrainedFuture};
     use crate::runtime_cache::{
@@ -558,6 +587,7 @@ mod test {
     use futures::Stream;
     use futures::task::{ArcWake, waker_ref};
     use std::future::Future;
+    use std::num::NonZeroUsize;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -908,5 +938,43 @@ mod test {
         let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
         let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
         assert!(!Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
+    }
+
+    #[test]
+    fn task_runner_threads_defaults_to_vcores() {
+        let executor = test_executor(7);
+        assert_eq!(executor.task_runner_threads(), 7);
+    }
+
+    #[test]
+    fn task_runner_threads_override_wins_and_leaves_vcores() {
+        let executor = test_executor(256)
+            .with_task_runner_threads(NonZeroUsize::new(3).expect("3 is non-zero"));
+        assert_eq!(executor.task_runner_threads(), 3);
+        assert_eq!(executor.vcores, 256);
+    }
+
+    #[test]
+    fn task_runner_pool_uses_configured_thread_count() {
+        let executor = test_executor(256)
+            .with_task_runner_threads(NonZeroUsize::new(2).expect("2 is non-zero"));
+        let pool = DedicatedExecutor::new("task_runner", executor.task_runner_threads());
+        assert!(
+            format!("{pool:?}").contains("num_threads: 2"),
+            "unexpected pool state: {pool:?}"
+        );
+        pool.join();
+    }
+
+    fn test_executor(vcores: usize) -> Executor {
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        Executor::new_basic(
+            ExecutorRegistration::default(),
+            "/tmp",
+            base_producer,
+            Arc::new(default_config_producer),
+            vcores,
+        )
     }
 }

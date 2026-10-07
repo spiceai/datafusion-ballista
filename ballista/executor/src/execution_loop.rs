@@ -159,7 +159,7 @@ where
     );
 
     let dedicated_executor =
-        DedicatedExecutor::new("task_runner", executor_specification.vcores as usize);
+        DedicatedExecutor::new("task_runner", executor.task_runner_threads());
 
     let report_ready = LazyCell::new(|| {
         if let Some(chan) = readiness {
