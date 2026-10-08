@@ -163,6 +163,14 @@ fn process_cpu_seconds() -> Option<f64> {
     None
 }
 
+/// Largest ceiling: slots are reported to the scheduler as `u32` vcores and are
+/// permits of a tokio `Semaphore`.
+const MAX_CEILING: usize = if (u32::MAX as usize) < Semaphore::MAX_PERMITS {
+    u32::MAX as usize
+} else {
+    Semaphore::MAX_PERMITS
+};
+
 /// Configuration of the adaptive slot controller.
 #[derive(Debug, Clone)]
 pub struct AdaptiveSlotsConfig {
@@ -232,6 +240,10 @@ impl AdaptiveSlotsConfig {
         };
         check(self.floor >= 1, "floor must be at least 1")?;
         check(self.floor <= self.ceiling, "floor must not exceed ceiling")?;
+        check(
+            self.ceiling <= MAX_CEILING,
+            "ceiling must not exceed the scheduler protocol's u32 vcores or tokio's Semaphore::MAX_PERMITS",
+        )?;
         check(
             !self.sample_period.is_zero(),
             "sample_period must be non-zero",
@@ -569,6 +581,7 @@ impl Controller {
     /// running task is never taken.
     fn restart_revoke(&mut self) {
         self.revoke = (self.revoke_pending > 0).then(|| {
+            // Validation bounds `revoke_pending`, at most the ceiling, by `u32::MAX`.
             let n = u32::try_from(self.revoke_pending).unwrap_or(u32::MAX);
             Box::pin(self.semaphore.clone().acquire_many_owned(n)) as RevokeFuture
         });
@@ -602,6 +615,12 @@ mod tests {
         assert!(AdaptiveSlotsConfig::new(0, 8).validate().is_err());
         assert!(AdaptiveSlotsConfig::new(9, 8).validate().is_err());
         assert!(AdaptiveSlotsConfig::new(8, 8).validate().is_ok());
+        assert!(AdaptiveSlotsConfig::new(1, MAX_CEILING).validate().is_ok());
+        assert!(
+            AdaptiveSlotsConfig::new(1, MAX_CEILING + 1)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
