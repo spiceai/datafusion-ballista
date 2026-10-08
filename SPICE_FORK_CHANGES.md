@@ -105,7 +105,7 @@ listed below. `take.yml`/`stale.yml` (ASF probot configs) stay deleted.
 | Task-cancellation routing hook | #19 | present | Complementary to `apache#1903` | keep; P2 upstream | `OnCancelTasksFn` |
 | `executor_id` on `TaskInfo` + public graph | #38 #49 | present | Not upstreamed | keep; P1 upstream (merge-clobbered twice) | `executor_id` on task info / `get_job_execution_graph` |
 | Task-runner pool sized independently of vcores | #75 | present | Not upstreamed | `spice-only` — lets `runtime.executor.task_slots` exceed cores without spawning a thread per slot | `with_task_runner_threads`, `task_runner_threads` |
-| Adaptive task-slot controller (pull mode): drives the `poll_loop` slot semaphore to hold executor CPU near a setpoint within `[floor, ceiling]` | #75 | present | Not upstreamed | `spice-only` — mechanism only; the Spice runtime supplies bounds, CPU source and policy | `AdaptiveSlotsConfig`, `AdaptiveSlots`, `CpuUtilization`, `ProcessCpu`, `ControllerState` |
+| Adaptive task-slot controller (pull mode): drives the `poll_loop` slot semaphore to hold executor CPU near a setpoint within `[floor, ceiling]` | #75 | present | Not upstreamed | `spice-only` — mechanism only; the Spice runtime supplies bounds, CPU source and policy | `AdaptiveSlotsConfig`, `AdaptiveSlots` (owns the slot semaphore), `CpuUtilization`, `ProcessCpu`, `ControllerState` |
 
 ### Scheduler correctness / HA
 

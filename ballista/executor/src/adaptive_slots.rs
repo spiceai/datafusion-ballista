@@ -21,7 +21,7 @@
 //! semaphore has permits (see [`crate::execution_loop::poll_loop`]). A fixed
 //! count of one slot per core leaves cores idle when tasks wait on I/O, and no
 //! fixed count suits a workload that moves between I/O-bound and CPU-bound.
-//! [`AdaptiveSlotsConfig::start`] drives that semaphore at runtime so the
+//! [`AdaptiveSlots`] drives that semaphore at runtime so the
 //! executor holds its CPU utilization near a setpoint (80% by default)
 //! whenever there is work to run. It applies to pull mode only; push mode
 //! (`executor_server`) has no slot semaphore.
@@ -76,10 +76,11 @@
 //! reflects the effective slot count that the poll loop reports to the
 //! scheduler.
 //!
-//! The controller is created closed: nothing touches the semaphore until
-//! [`AdaptiveSlotsConfig::start`], which grants the `floor` permits and spawns
-//! the control task. An embedder that creates its semaphore with zero permits
-//! and opens it once its object stores are bound calls `start` at that point.
+//! The controller owns the semaphore, so no permits it did not grant can
+//! exist and the ceiling always holds. The semaphore is created closed (zero
+//! permits): the embedder passes [`AdaptiveSlots::semaphore`] to `poll_loop`,
+//! and calls [`AdaptiveSlots::start`], which grants the `floor` permits and
+//! spawns the control task, once its object stores are bound.
 //! The task-runner thread pool stays sized by the CPU budget (see
 //! `with_task_runner_threads`), so growing slots never adds threads.
 
@@ -301,48 +302,6 @@ impl AdaptiveSlotsConfig {
         state.slots = next.clamp(self.floor, self.ceiling);
         state.slots
     }
-
-    /// Grants `floor` permits on `semaphore` and spawns the control task on
-    /// `runtime`. The task stops when the returned handle is dropped.
-    ///
-    /// `semaphore` is the one passed to `poll_loop` as `free_vcores`; it
-    /// should hold no permits when this is called, as the controller owns its
-    /// permit count from here on.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration is invalid.
-    pub fn start(
-        self,
-        semaphore: Arc<Semaphore>,
-        cpu: impl CpuUtilization,
-        memory_pressure: Option<MemoryPressure>,
-        runtime: &tokio::runtime::Handle,
-    ) -> Result<AdaptiveSlots> {
-        self.validate()?;
-        let stats = Arc::new(Stats {
-            slots: AtomicUsize::new(self.floor),
-            floor: self.floor,
-            ceiling: self.ceiling,
-        });
-        semaphore.add_permits(self.floor);
-
-        let token = CancellationToken::new();
-        let controller = Controller {
-            state: ControllerState::new(self.floor),
-            config: self,
-            semaphore,
-            stats: stats.clone(),
-            cpu: Box::new(cpu),
-            memory_pressure,
-            revoke_pending: 0,
-        };
-        runtime.spawn(controller.run(token.clone()));
-        Ok(AdaptiveSlots {
-            stats,
-            _guard: token.drop_guard(),
-        })
-    }
 }
 
 /// Mutable state of the control law.
@@ -383,15 +342,83 @@ struct Stats {
     ceiling: usize,
 }
 
-/// Handle to a running controller; dropping it stops the control task. Slots
-/// already granted stay in place.
+/// The adaptive slot controller and the semaphore it owns.
+///
+/// [`AdaptiveSlots::semaphore`] is the semaphore to pass to `poll_loop` as
+/// `free_vcores`. It starts with no permits, so the executor registers and
+/// heartbeats with no free slots until [`AdaptiveSlots::start`] opens it.
+/// Dropping this stops the control task; permits already granted stay in place.
 #[derive(Debug)]
 pub struct AdaptiveSlots {
+    config: AdaptiveSlotsConfig,
+    semaphore: Arc<Semaphore>,
     stats: Arc<Stats>,
-    _guard: DropGuard,
+    guard: Option<DropGuard>,
 }
 
 impl AdaptiveSlots {
+    /// Creates a controller, and the empty semaphore it owns, from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid.
+    pub fn new(config: AdaptiveSlotsConfig) -> Result<Self> {
+        config.validate()?;
+        let stats = Arc::new(Stats {
+            slots: AtomicUsize::new(0),
+            floor: config.floor,
+            ceiling: config.ceiling,
+        });
+        Ok(Self {
+            config,
+            semaphore: Arc::new(Semaphore::new(0)),
+            stats,
+            guard: None,
+        })
+    }
+
+    /// The slot semaphore, to pass to `poll_loop` as `free_vcores`. The
+    /// controller is the only party that adds or removes its permits.
+    #[must_use]
+    pub fn semaphore(&self) -> Arc<Semaphore> {
+        self.semaphore.clone()
+    }
+
+    /// Grants `floor` permits and spawns the control task on `runtime`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the controller was already started.
+    pub fn start(
+        &mut self,
+        cpu: impl CpuUtilization,
+        memory_pressure: Option<MemoryPressure>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<()> {
+        if self.guard.is_some() {
+            return Err(BallistaError::General(
+                "adaptive slots controller is already started".to_string(),
+            ));
+        }
+        let floor = self.config.floor;
+        self.semaphore.add_permits(floor);
+        self.stats.slots.store(floor, Ordering::Relaxed);
+
+        let token = CancellationToken::new();
+        let controller = Controller {
+            state: ControllerState::new(floor),
+            config: self.config.clone(),
+            semaphore: self.semaphore.clone(),
+            stats: self.stats.clone(),
+            cpu: Box::new(cpu),
+            memory_pressure,
+            revoke_pending: 0,
+        };
+        runtime.spawn(controller.run(token.clone()));
+        self.guard = Some(token.drop_guard());
+        Ok(())
+    }
+
     /// Current target slot count, which `executor_task_slots` can report.
     #[must_use]
     pub fn slots(&self) -> usize {
@@ -411,6 +438,13 @@ impl AdaptiveSlots {
     }
 }
 
+/// Samples per adjustment, rounded up so an adjustment never comes before
+/// `interval`.
+fn samples_per_interval(interval: Duration, sample_period: Duration) -> u32 {
+    let n = interval.as_nanos().div_ceil(sample_period.as_nanos());
+    u32::try_from(n).unwrap_or(u32::MAX).max(1)
+}
+
 struct Controller {
     config: AdaptiveSlotsConfig,
     state: ControllerState,
@@ -424,9 +458,8 @@ struct Controller {
 
 impl Controller {
     async fn run(mut self, token: CancellationToken) {
-        let samples_per_interval = (self.config.interval.as_nanos()
-            / self.config.sample_period.as_nanos())
-        .max(1) as u32;
+        let samples_per_interval =
+            samples_per_interval(self.config.interval, self.config.sample_period);
         let mut ticker = interval(self.config.sample_period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // The first tick completes immediately.
@@ -700,6 +733,41 @@ mod tests {
         assert!(u > 0.3, "busy loop should use CPU, got {u}");
     }
 
+    fn new_slots() -> (AdaptiveSlots, Arc<Semaphore>) {
+        let mut config = AdaptiveSlotsConfig::new(2, 8);
+        config.interval = Duration::from_secs(1);
+        let slots = AdaptiveSlots::new(config).expect("valid config");
+        let sem = slots.semaphore();
+        (slots, sem)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_grants_floor_once_and_rejects_a_second_start() {
+        let (mut slots, sem) = new_slots();
+        assert_eq!(sem.available_permits(), 0);
+        assert_eq!(slots.slots(), 0);
+        let cpu = || FakeCpu(Arc::new(AtomicU64::new(0.8f64.to_bits())));
+        slots
+            .start(cpu(), None, &tokio::runtime::Handle::current())
+            .expect("first start");
+        assert_eq!(sem.available_permits(), 2);
+        assert_eq!(slots.slots(), 2);
+        assert!(
+            slots
+                .start(cpu(), None, &tokio::runtime::Handle::current())
+                .is_err()
+        );
+        assert_eq!(sem.available_permits(), 2);
+    }
+
+    #[test]
+    fn samples_per_interval_rounds_up() {
+        let ms = Duration::from_millis;
+        assert_eq!(samples_per_interval(ms(1000), ms(600)), 2);
+        assert_eq!(samples_per_interval(ms(1000), ms(250)), 4);
+        assert_eq!(samples_per_interval(ms(100), ms(250)), 1);
+    }
+
     struct FakeCpu(Arc<AtomicU64>);
 
     impl CpuUtilization for FakeCpu {
@@ -714,19 +782,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn semaphore_grows_and_shrinks_without_revoking_running_tasks() {
-        let sem = Arc::new(Semaphore::new(0));
         let cpu = Arc::new(AtomicU64::new(0));
         set(&cpu, 0.2);
-        let mut config = AdaptiveSlotsConfig::new(2, 8);
-        config.interval = Duration::from_secs(1);
-        let slots = config
+        let (mut slots, sem) = new_slots();
+        assert_eq!(sem.available_permits(), 0);
+        slots
             .start(
-                sem.clone(),
                 FakeCpu(cpu.clone()),
                 None,
                 &tokio::runtime::Handle::current(),
             )
-            .expect("valid config");
+            .expect("starts once");
         assert_eq!(sem.available_permits(), 2);
 
         // Running tasks hold every permit, so slots are saturated and grow 2 -> 4.
@@ -762,19 +828,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_handle_stops_the_controller() {
-        let sem = Arc::new(Semaphore::new(0));
         let cpu = Arc::new(AtomicU64::new(0));
         set(&cpu, 0.2);
-        let mut config = AdaptiveSlotsConfig::new(2, 8);
-        config.interval = Duration::from_secs(1);
-        let slots = config
-            .start(
-                sem.clone(),
-                FakeCpu(cpu),
-                None,
-                &tokio::runtime::Handle::current(),
-            )
-            .expect("valid config");
+        let (mut slots, sem) = new_slots();
+        slots
+            .start(FakeCpu(cpu), None, &tokio::runtime::Handle::current())
+            .expect("starts once");
         drop(slots);
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(sem.available_permits(), 2);
