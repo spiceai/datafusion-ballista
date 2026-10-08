@@ -410,7 +410,8 @@ impl Drop for TaskPermit {
     }
 }
 
-/// Longest a single `poll_work` call may take before the loop gives up on it.
+/// Longest a `poll_work` call may hold the reservation before the loop releases
+/// it.
 ///
 /// The poll reserves every free permit while it waits, so a scheduler that
 /// stops responding would otherwise hold the executor's capacity, starve other
@@ -418,21 +419,26 @@ impl Drop for TaskPermit {
 /// finishes in milliseconds to a few seconds, including a response carrying
 /// large task plans, so the bound is far above that and trips only on a
 /// stalled scheduler. It is 12 times [`HEARTBEAT_POLL_INTERVAL`] and a third of
-/// the scheduler's default 180 s executor timeout, which leaves several more
-/// polls (heartbeats) before the scheduler could declare the executor dead.
+/// the scheduler's default 180 s executor timeout. The call itself is never
+/// cancelled; see [`reserve_and_poll`].
 const POLL_WORK_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Reserves the free permits, reports their count to `poll`, and waits at most
-/// `timeout` for its response, which is returned with the reservation for
-/// admitting the tasks it carries.
+/// Reserves the free permits, reports their count to `poll`, and returns its
+/// response with the reservation to admit the tasks it carries from.
 ///
-/// A poll that fails or times out is handled alike: its error is returned, the
-/// reservation is dropped so the permits return to the semaphore, and the caller
-/// re-delivers the task statuses it sent with the next poll. A timeout that
-/// fires after the scheduler bound tasks drops the response that carried them,
-/// exactly as a transport error after the scheduler handled the request does;
-/// the scheduler has no per-task recovery for either, and only an executor that
-/// stops heartbeating has its tasks reset. That is why the timeout is generous.
+/// `timeout` bounds how long the reservation is held, not the call. When it
+/// passes, the reservation is dropped, so its permits return to the semaphore
+/// for other loops and queued shrinks, and the same call keeps being awaited.
+/// It is not cancelled and no second poll is sent: the scheduler may already
+/// have bound tasks for it, and dropping that response would strand them, as
+/// nothing resets the tasks of an executor that keeps heartbeating. A late
+/// response is admitted from a fresh reservation of whatever is free then, and
+/// [`admit`] never waits, so a shortfall costs the tasks reserved slots rather
+/// than blocking the loop. (A response lost to a transport error after the
+/// scheduler bound tasks strands them in the same way; that is a known gap of
+/// the pull protocol and not addressed here.)
+///
+/// A call that fails returns its error and the reservation is dropped.
 async fn reserve_and_poll<R, Fut>(
     free_vcores: &Arc<Semaphore>,
     timeout: Duration,
@@ -441,16 +447,33 @@ async fn reserve_and_poll<R, Fut>(
 where
     Fut: Future<Output = Result<R, tonic::Status>>,
 {
-    let reservation = reserve_free_vcores(free_vcores)?;
-    let free = u32::try_from(reservation.num_permits()).unwrap_or(u32::MAX);
-    let response = match tokio::time::timeout(timeout, poll(free)).await {
-        Ok(response) => response,
-        Err(_) => Err(tonic::Status::deadline_exceeded(format!(
-            "poll_work did not complete within {}s, so the scheduler may be stalled",
-            timeout.as_secs()
-        ))),
+    let mut reservation = Some(reserve_free_vcores(free_vcores)?);
+    let free = reservation
+        .as_ref()
+        .map_or(0, |r| u32::try_from(r.num_permits()).unwrap_or(u32::MAX));
+    let poll = poll(free);
+    tokio::pin!(poll);
+    let response = tokio::select! {
+        response = &mut poll => response,
+        () = tokio::time::sleep(timeout) => {
+            reservation = None;
+            warn!(
+                "poll_work has not completed within {}s, so the scheduler may be stalled; the executor released its reserved slots and keeps waiting for the response",
+                timeout.as_secs()
+            );
+            poll.await
+        }
     };
-    Ok(response.map(|response| (response, reservation)))
+    match response {
+        Ok(response) => {
+            let reservation = match reservation {
+                Some(reservation) => reservation,
+                None => reserve_free_vcores(free_vcores)?,
+            };
+            Ok(Ok((response, reservation)))
+        }
+        Err(status) => Ok(Err(status)),
+    }
 }
 
 /// Takes every free permit up front, so the poll can report exactly that many
@@ -803,37 +826,90 @@ mod tests {
         drop(reservation);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn stalled_poll_times_out_and_returns_the_reservation() {
-        let sem = Arc::new(Semaphore::new(4));
-        let _running = sem.clone().try_acquire_many_owned(1).expect("running");
-        let reported = std::sync::atomic::AtomicU32::new(0);
-        let outcome = reserve_and_poll(&sem, Duration::from_secs(60), |free| {
-            reported.store(free, std::sync::atomic::Ordering::SeqCst);
-            std::future::pending::<Result<(), tonic::Status>>()
-        })
-        .await
-        .expect("open");
-        let status = outcome.expect_err("a stalled poll times out");
-        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(reported.load(std::sync::atomic::Ordering::SeqCst), 3);
-        // The reservation was dropped, so the loop can proceed with all free permits.
-        assert_eq!(sem.available_permits(), 3);
+    /// Polls `reserve_and_poll` with a response after `delay` carrying tasks
+    /// charged `charges`, while `probe` runs alongside; returns the granted
+    /// permits per task.
+    async fn late_poll(
+        sem: &Arc<Semaphore>,
+        delay: Duration,
+        charges: &[u32],
+        probe: impl Future<Output = ()>,
+    ) -> Vec<usize> {
+        let usage = TaskSlotUsage::default();
+        let poll = async {
+            let (charges, mut reservation) =
+                reserve_and_poll(sem, Duration::from_secs(60), |_| async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(charges.to_vec())
+                })
+                .await
+                .expect("open")
+                .expect("answered");
+            charges
+                .into_iter()
+                .map(|c| {
+                    admit(&mut reservation, c, &usage)
+                        .expect("split")
+                        .num_permits()
+                })
+                .collect::<Vec<_>>()
+        };
+        tokio::join!(poll, probe).0
     }
 
     #[tokio::test(start_paused = true)]
-    async fn answered_poll_hands_back_the_reservation() {
+    async fn late_response_releases_the_reservation_and_admits_every_task() {
         let sem = Arc::new(Semaphore::new(4));
-        let (response, reservation) =
-            reserve_and_poll(&sem, Duration::from_secs(60), |free| async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok(free)
-            })
-            .await
-            .expect("open")
-            .expect("answered in time");
-        assert_eq!(response, 4);
-        assert_eq!(reservation.num_permits(), 4);
-        assert_eq!(sem.available_permits(), 0);
+        let probe = async {
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            // Released at the deadline while the call is still pending.
+            assert_eq!(sem.available_permits(), 4);
+        };
+        let granted = late_poll(&sem, Duration::from_secs(90), &[1, 1, 2], probe).await;
+        assert_eq!(granted, vec![1, 1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_response_with_fewer_free_permits_admits_with_a_shortfall() {
+        let sem = Arc::new(Semaphore::new(4));
+        let probe = async {
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            // Another loop takes slots after the deadline.
+            std::mem::forget(sem.clone().try_acquire_many_owned(3).expect("free"));
+        };
+        let granted = late_poll(&sem, Duration::from_secs(90), &[1, 2, 1], probe).await;
+        // One permit was left: no task is dropped and nothing waits.
+        assert_eq!(granted, vec![1, 0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_time_response_is_admitted_from_the_original_reservation() {
+        let sem = Arc::new(Semaphore::new(4));
+        let probe = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Still reserved while the call is in flight.
+            assert_eq!(sem.available_permits(), 0);
+        };
+        let granted = late_poll(&sem, Duration::from_secs(2), &[1, 2], probe).await;
+        assert_eq!(granted, vec![1, 2]);
+        // The helper's tasks have finished and the leftover returned.
+        assert_eq!(sem.available_permits(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn never_answered_poll_still_releases_the_reservation_at_the_deadline() {
+        let sem = Arc::new(Semaphore::new(4));
+        let probe = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            assert_eq!(sem.available_permits(), 0);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            assert_eq!(sem.available_permits(), 4);
+        };
+        tokio::select! {
+            _ = reserve_and_poll(&sem, Duration::from_secs(60), |_| {
+                std::future::pending::<Result<(), tonic::Status>>()
+            }) => panic!("a never-answered poll must keep waiting"),
+            () = probe => {}
+        }
     }
 }

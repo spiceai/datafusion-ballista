@@ -815,14 +815,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn process_cpu_measures_busy_work() {
-        let mut cpu = ProcessCpu::new(1.0);
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_millis(100) {
-            std::hint::black_box(0u64.wrapping_add(1));
+    fn process_cpu_utilization_is_cpu_time_over_wall_time_and_budget() {
+        for budget in [1.0, 2.0] {
+            let start = std::time::Instant::now();
+            let mut cpu = ProcessCpu::new(budget);
+            let cpu_before = process_cpu_seconds().expect("measurable on unix");
+            // Spin until this process has used 100 ms of CPU, however the
+            // scheduler shares cores with other tests; bounded by wall time.
+            while process_cpu_seconds().expect("measurable") - cpu_before < 0.1
+                && start.elapsed() < Duration::from_secs(30)
+            {
+                std::hint::black_box(0u64.wrapping_add(1));
+            }
+            let u = cpu.sample().expect("measurable on unix");
+            // Our wall interval encloses the sampler's and its CPU delta
+            // includes the 100 ms, so this holds under any contention and fails
+            // if the CPU delta, wall time or budget scaling is wrong.
+            let wall = start.elapsed().as_secs_f64();
+            assert!(
+                u * wall * budget >= 0.1,
+                "budget {budget}: utilization {u} over {wall}s implies under 100 ms of CPU"
+            );
+            assert!(u > 0.0 && u.is_finite());
         }
-        let u = cpu.sample().expect("measurable on unix");
-        assert!(u > 0.0, "busy loop should use CPU, got {u}");
     }
 
     fn new_slots() -> (AdaptiveSlots, Arc<Semaphore>) {
