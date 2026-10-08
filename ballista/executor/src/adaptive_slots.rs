@@ -50,7 +50,8 @@
 //! `(0, 1]` the closed-loop pole is `1 - lambda`, in `[0, 1)`, so the loop
 //! converges without overshoot or oscillation.
 //!
-//! * Anti-windup: slots only grow when they were saturated (no free permit)
+//! * Anti-windup: slots only grow when they were saturated (running tasks hold
+//!   every slot, counted by [`TaskSlotUsage`])
 //!   for most of the interval, so an idle executor never grows.
 //! * Memory guard: slots do not grow while the executor reports memory
 //!   pressure (spilling). Shrinking is still allowed.
@@ -83,17 +84,14 @@
 //! exist and the ceiling always holds. The semaphore is created closed (zero
 //! permits): the embedder passes [`AdaptiveSlots::semaphore`] to `poll_loop`,
 //! and calls [`AdaptiveSlots::start`], which grants the `floor` permits and
-//! spawns the control task, once its object stores are bound. The executor
-//! must also be built with `Executor::with_guaranteed_task_slots` set to
-//! [`AdaptiveSlots::guaranteed_task_slots`], or a task bundling more partitions
-//! than the semaphore keeps could wait forever after a shrink.
+//! spawns the control task, once its object stores are bound.
 //! The task-runner thread pool stays sized by the CPU budget (see
 //! `with_task_runner_threads`), so growing slots never adds threads.
 
+use crate::executor::TaskSlotUsage;
 use ballista_core::error::{BallistaError, Result};
 use log::debug;
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -388,19 +386,18 @@ impl AdaptiveSlots {
 
     /// The slot semaphore, to pass to `poll_loop` as `free_vcores`. The
     /// controller is the only party that adds or removes its permits.
-    ///
-    /// The executor using it MUST be built with
-    /// `Executor::with_guaranteed_task_slots(slots.guaranteed_task_slots())`
-    /// (the `floor`). The pull loop charges a task one permit per bundled
-    /// partition and waits for them; waiting for more than the semaphore is
-    /// guaranteed to hold would hang if a shrink dropped capacity meanwhile.
-    /// Without it the guarantee defaults to `vcores`, the ceiling.
     #[must_use]
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.semaphore.clone()
     }
 
     /// Grants `floor` permits and spawns the control task on `runtime`.
+    ///
+    /// `usage` must be the executor's own handle, `Executor::task_slot_usage()`
+    /// for the executor whose `poll_loop` uses [`AdaptiveSlots::semaphore`]. The
+    /// controller grows only while that handle shows every slot held by a
+    /// running task; the semaphore's free permits cannot tell, because a poll in
+    /// flight reserves them without running anything.
     ///
     /// # Errors
     ///
@@ -409,6 +406,7 @@ impl AdaptiveSlots {
         &mut self,
         cpu: impl CpuUtilization,
         memory_pressure: Option<MemoryPressure>,
+        usage: TaskSlotUsage,
         runtime: &tokio::runtime::Handle,
     ) -> Result<()> {
         if self.guard.is_some() {
@@ -428,6 +426,7 @@ impl AdaptiveSlots {
             stats: self.stats.clone(),
             cpu: Box::new(cpu),
             memory_pressure,
+            usage,
             revoke_pending: 0,
             revoke: None,
         };
@@ -440,12 +439,6 @@ impl AdaptiveSlots {
     #[must_use]
     pub fn slots(&self) -> usize {
         self.stats.slots.load(Ordering::Relaxed)
-    }
-
-    /// The `floor`, as the value for `Executor::with_guaranteed_task_slots`.
-    #[must_use]
-    pub fn guaranteed_task_slots(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.stats.floor).unwrap_or(NonZeroUsize::MIN)
     }
 
     /// Fewest slots.
@@ -482,6 +475,7 @@ struct Controller {
     stats: Arc<Stats>,
     cpu: Box<dyn CpuUtilization>,
     memory_pressure: Option<MemoryPressure>,
+    usage: TaskSlotUsage,
     /// Permits still to be taken out of circulation after a shrink.
     revoke_pending: usize,
     /// Waits for `revoke_pending` permits; `None` when nothing is pending.
@@ -524,7 +518,7 @@ impl Controller {
                 }
             }
             samples += 1;
-            saturated += u32::from(self.semaphore.available_permits() == 0);
+            saturated += u32::from(self.usage.busy() >= self.state.slots);
             pressured |= self.memory_pressure.as_ref().is_some_and(|f| f());
             if samples < samples_per_interval {
                 continue;
@@ -567,7 +561,7 @@ impl Controller {
     ///
     /// The revocation waits in the semaphore's FIFO queue like any other
     /// acquirer, so permits released by finishing tasks are handed to it until
-    /// the shrink is satisfied; polling `available_permits` instead would never
+    /// the shrink is satisfied; polling the free permits instead would never
     /// see them while another waiter, such as the poll loop, is queued. Dropping
     /// the old future leaves the queue and returns any permits it had partially
     /// acquired (`Acquire`'s `Drop` in tokio's batch semaphore re-adds them), and
@@ -795,17 +789,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn start_grants_floor_once_and_rejects_a_second_start() {
         let (mut slots, sem) = new_slots();
+        let usage = TaskSlotUsage::default();
         assert_eq!(sem.available_permits(), 0);
         assert_eq!(slots.slots(), 0);
         let cpu = || FakeCpu(Arc::new(AtomicU64::new(0.8f64.to_bits())));
         slots
-            .start(cpu(), None, &tokio::runtime::Handle::current())
+            .start(
+                cpu(),
+                None,
+                usage.clone(),
+                &tokio::runtime::Handle::current(),
+            )
             .expect("first start");
         assert_eq!(sem.available_permits(), 2);
         assert_eq!(slots.slots(), 2);
         assert!(
             slots
-                .start(cpu(), None, &tokio::runtime::Handle::current())
+                .start(
+                    cpu(),
+                    None,
+                    usage.clone(),
+                    &tokio::runtime::Handle::current()
+                )
                 .is_err()
         );
         assert_eq!(sem.available_permits(), 2);
@@ -836,11 +841,13 @@ mod tests {
         let cpu = Arc::new(AtomicU64::new(0));
         set(&cpu, 0.2);
         let (mut slots, sem) = new_slots();
+        let usage = TaskSlotUsage::default();
         assert_eq!(sem.available_permits(), 0);
         slots
             .start(
                 FakeCpu(cpu.clone()),
                 None,
+                usage.clone(),
                 &tokio::runtime::Handle::current(),
             )
             .expect("starts once");
@@ -852,6 +859,7 @@ mod tests {
                 .try_acquire_many_owned(2)
                 .expect("floor permits"),
         ];
+        usage.add(2);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(slots.slots(), 4);
         assert_eq!(sem.available_permits(), 2);
@@ -860,6 +868,7 @@ mod tests {
                 .try_acquire_many_owned(2)
                 .expect("grown permits"),
         );
+        usage.add(2);
 
         // Shrink 4 -> 3 while all four permits are held: nothing is revoked.
         set(&cpu, 0.9);
@@ -869,8 +878,10 @@ mod tests {
 
         // Released permits are taken out of circulation until three remain.
         drop(held.pop());
+        usage.sub(2);
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(held.pop());
+        usage.sub(2);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(sem.available_permits(), 3);
         assert_eq!(slots.floor(), 2);
@@ -882,8 +893,14 @@ mod tests {
         let cpu = Arc::new(AtomicU64::new(0));
         set(&cpu, 0.2);
         let (mut slots, sem) = new_slots();
+        let usage = TaskSlotUsage::default();
         slots
-            .start(FakeCpu(cpu), None, &tokio::runtime::Handle::current())
+            .start(
+                FakeCpu(cpu),
+                None,
+                usage.clone(),
+                &tokio::runtime::Handle::current(),
+            )
             .expect("starts once");
         drop(slots);
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -909,6 +926,7 @@ mod tests {
             }),
             cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0.8f64.to_bits())))),
             memory_pressure: None,
+            usage: TaskSlotUsage::default(),
             revoke_pending: 0,
             revoke: None,
         };
@@ -966,6 +984,7 @@ mod tests {
             }),
             cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0)))),
             memory_pressure: None,
+            usage: TaskSlotUsage::default(),
             revoke_pending: 0,
             revoke: None,
         };
@@ -994,6 +1013,7 @@ mod tests {
             }),
             cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0)))),
             memory_pressure: None,
+            usage: TaskSlotUsage::default(),
             revoke_pending: 0,
             revoke: None,
         };
@@ -1023,5 +1043,26 @@ mod tests {
         permits.expect("acquired").forget();
         c.revoke = None;
         assert_eq!(sem.available_permits() + held.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_executor_with_reserved_permits_does_not_grow() {
+        let cpu = Arc::new(AtomicU64::new(0));
+        set(&cpu, 0.2);
+        let (mut slots, sem) = new_slots();
+        let usage = TaskSlotUsage::default();
+        slots
+            .start(
+                FakeCpu(cpu),
+                None,
+                usage.clone(),
+                &tokio::runtime::Handle::current(),
+            )
+            .expect("starts once");
+        // A poll holding every free permit across its RPC, as
+        // `reserve_free_vcores` does, with no task running.
+        let _reservation = sem.clone().try_acquire_many_owned(2).expect("free permits");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(slots.slots(), 2, "idle executor must not grow");
     }
 }
