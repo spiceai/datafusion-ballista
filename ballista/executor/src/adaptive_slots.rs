@@ -568,6 +568,7 @@ impl Controller {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+    use std::task::Poll;
 
     fn cfg() -> AdaptiveSlotsConfig {
         AdaptiveSlotsConfig::new(8, 64)
@@ -960,5 +961,50 @@ mod tests {
         assert_eq!(c.revoke_pending, 0);
         assert!(c.revoke.is_none());
         assert_eq!(sem.available_permits(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grow_returns_permits_a_partial_shrink_had_collected() {
+        let sem = Arc::new(Semaphore::new(4));
+        let mut c = Controller {
+            state: ControllerState::new(4),
+            config: AdaptiveSlotsConfig::new(1, 8),
+            semaphore: sem.clone(),
+            stats: Arc::new(Stats {
+                slots: AtomicUsize::new(4),
+                floor: 1,
+                ceiling: 8,
+            }),
+            cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0)))),
+            memory_pressure: None,
+            revoke_pending: 0,
+            revoke: None,
+        };
+        let mut held: Vec<_> = (0..4)
+            .map(|_| sem.clone().try_acquire_owned().expect("running task"))
+            .collect();
+
+        // Shrink by 3 while all four are held: the request queues, taking nothing.
+        c.apply(4, 1);
+        let revoke = c.revoke.as_mut().expect("shrink queued");
+        assert!(futures::poll!(revoke.as_mut()).is_pending());
+
+        // Two tasks finish: the request collects both but still needs a third.
+        held.truncate(2);
+        let revoke = c.revoke.as_mut().expect("shrink queued");
+        assert!(futures::poll!(revoke.as_mut()).is_pending());
+        assert_eq!(sem.available_permits(), 0);
+
+        // Growing to 3 cancels the shrink and returns the collected permits.
+        c.apply(1, 3);
+        assert_eq!(sem.available_permits(), 2);
+        // The remaining shrink of 1 completes at once from the returned permits.
+        let revoke = c.revoke.as_mut().expect("remaining shrink");
+        let Poll::Ready(permits) = futures::poll!(revoke.as_mut()) else {
+            panic!("shrink should complete from the returned permits");
+        };
+        permits.expect("acquired").forget();
+        c.revoke = None;
+        assert_eq!(sem.available_permits() + held.len(), 3);
     }
 }

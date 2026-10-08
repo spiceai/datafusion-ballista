@@ -265,6 +265,9 @@ pub struct Executor {
 
     /// Worker-thread override for the task-runner pool; `None` means `vcores`.
     task_runner_threads: Option<NonZeroUsize>,
+
+    /// Slots that are always available; `None` means `vcores`.
+    guaranteed_task_slots: Option<NonZeroUsize>,
 }
 
 impl Executor {
@@ -318,6 +321,7 @@ impl Executor {
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
             task_runner_threads: None,
+            guaranteed_task_slots: None,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -344,6 +348,7 @@ impl Executor {
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
             task_runner_threads: None,
+            guaranteed_task_slots: None,
         }
     }
 }
@@ -385,6 +390,28 @@ impl Executor {
     pub fn with_task_runner_threads(mut self, threads: NonZeroUsize) -> Self {
         self.task_runner_threads = Some(threads);
         self
+    }
+
+    /// Sets the number of task slots the embedder guarantees are always
+    /// available, for executors whose slot count varies at runtime (the adaptive
+    /// controller's `floor`). Defaults to `vcores`, which is correct for a fixed
+    /// slot count.
+    ///
+    /// The pull loop charges a task one slot per bundled partition but never
+    /// more than this, since waiting for more slots than the semaphore is
+    /// guaranteed to hold could hang if it shrinks meanwhile. A task wider than
+    /// this is under-charged rather than at risk of hanging.
+    #[must_use]
+    pub fn with_guaranteed_task_slots(mut self, slots: NonZeroUsize) -> Self {
+        self.guaranteed_task_slots = Some(slots);
+        self
+    }
+
+    /// The [`with_guaranteed_task_slots`](Self::with_guaranteed_task_slots)
+    /// override, or `vcores` when none was set (at least 1).
+    pub fn guaranteed_task_slots(&self) -> usize {
+        self.guaranteed_task_slots
+            .map_or(self.vcores.max(1), NonZeroUsize::get)
     }
 
     /// Worker threads for the task-runner pool: the

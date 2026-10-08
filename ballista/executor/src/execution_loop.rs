@@ -266,10 +266,12 @@ where
                     let task_status_sender = task_status_sender.clone();
 
                     // Acquire a vcore permit for the task.
-                    let permit =
-                        free_vcores.clone().acquire_owned().await.map_err(|_| {
-                            BallistaError::Internal("vcore semaphore closed".to_string())
-                        })?;
+                    let permit = acquire_task_permits(
+                        &free_vcores,
+                        task.vcores_consumed,
+                        executor.guaranteed_task_slots(),
+                    )
+                    .await?;
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -386,6 +388,29 @@ pub(crate) fn any_to_string(any: &Box<dyn Any + Send>) -> String {
     } else {
         "Unknown error occurred".to_string()
     }
+}
+
+/// Permits to charge a task: the vcores the scheduler charged it at bind time
+/// (at least 1), clamped to `guaranteed`, the slots that are always available.
+/// Waiting for more than the semaphore is guaranteed to hold could hang if it
+/// shrinks meanwhile, so a task wider than `guaranteed` is under-charged.
+fn task_permits(vcores_consumed: u32, guaranteed: usize) -> u32 {
+    let guaranteed = u32::try_from(guaranteed).unwrap_or(u32::MAX).max(1);
+    vcores_consumed.clamp(1, guaranteed)
+}
+
+/// Takes the permits for a task, held until the task completes. Keeps the
+/// executor's reported free vcores in step with the scheduler's accounting.
+async fn acquire_task_permits(
+    free_vcores: &Arc<Semaphore>,
+    vcores_consumed: u32,
+    guaranteed: usize,
+) -> Result<OwnedSemaphorePermit, BallistaError> {
+    free_vcores
+        .clone()
+        .acquire_many_owned(task_permits(vcores_consumed, guaranteed))
+        .await
+        .map_err(|_| BallistaError::Internal("vcore semaphore closed".to_string()))
 }
 
 async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
@@ -569,4 +594,45 @@ async fn sample_tasks_status(
     }
 
     task_status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn task_permits_charges_bundled_partitions_within_the_guarantee() {
+        assert_eq!(task_permits(1, 8), 1);
+        assert_eq!(task_permits(4, 8), 4);
+        assert_eq!(task_permits(0, 8), 1);
+        assert_eq!(task_permits(12, 8), 8);
+        assert_eq!(task_permits(3, 0), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_partition_task_holds_its_permits_until_it_finishes() {
+        let sem = Arc::new(Semaphore::new(8));
+        let permit = acquire_task_permits(&sem, 4, 8).await.expect("open");
+        assert_eq!(sem.available_permits(), 4);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn charge_wider_than_a_shrunken_semaphore_does_not_hang() {
+        // The semaphore shrank to the guaranteed 2 slots; a task bundling 6
+        // partitions is charged 2 and runs, instead of waiting for 6 forever.
+        let sem = Arc::new(Semaphore::new(2));
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_task_permits(&sem, 6, 2),
+        )
+        .await
+        .expect("charge is clamped to the guaranteed slots")
+        .expect("open");
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 2);
+    }
 }
