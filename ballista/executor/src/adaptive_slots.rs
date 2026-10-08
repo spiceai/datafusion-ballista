@@ -69,12 +69,15 @@
 //!
 //! # Actuator
 //!
-//! Growing adds permits. Shrinking takes permits out of circulation as they
-//! become free, with a non-blocking `try_acquire` followed by `forget`, and
-//! carries any unmet deficit to the next sample. Running tasks are never
-//! cancelled or waited on, so the semaphore's `available_permits` already
-//! reflects the effective slot count that the poll loop reports to the
-//! scheduler.
+//! Growing adds permits. Shrinking queues an `acquire_many` for the surplus on
+//! the semaphore and `forget`s the permits it receives. The semaphore is
+//! fair, so permits released by finishing tasks go to that request ahead of
+//! later waiters such as the poll loop, and the shrink completes under
+//! continuous load; the executor takes no new work while it is above target.
+//! A grow cancels a shrink still in flight. Running tasks are never cancelled,
+//! and the control loop never waits on the request, so the semaphore's
+//! `available_permits` already reflects the effective slot count that the
+//! poll loop reports to the scheduler.
 //!
 //! The controller owns the semaphore, so no permits it did not grant can
 //! exist and the ceiling always holds. The semaphore is created closed (zero
@@ -86,10 +89,12 @@
 
 use ballista_core::error::{BallistaError, Result};
 use log::debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -413,6 +418,7 @@ impl AdaptiveSlots {
             cpu: Box::new(cpu),
             memory_pressure,
             revoke_pending: 0,
+            revoke: None,
         };
         runtime.spawn(controller.run(token.clone()));
         self.guard = Some(token.drop_guard());
@@ -445,6 +451,13 @@ fn samples_per_interval(interval: Duration, sample_period: Duration) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX).max(1)
 }
 
+type RevokeFuture = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<OwnedSemaphorePermit, AcquireError>>
+            + Send,
+    >,
+>;
+
 struct Controller {
     config: AdaptiveSlotsConfig,
     state: ControllerState,
@@ -454,9 +467,23 @@ struct Controller {
     memory_pressure: Option<MemoryPressure>,
     /// Permits still to be taken out of circulation after a shrink.
     revoke_pending: usize,
+    /// Waits for `revoke_pending` permits; `None` when nothing is pending.
+    revoke: Option<RevokeFuture>,
 }
 
 impl Controller {
+    /// Resolves with the revoked permits, or never if no shrink is pending.
+    async fn revoked(revoke: &mut Option<RevokeFuture>) -> Option<OwnedSemaphorePermit> {
+        match revoke {
+            Some(f) => {
+                let permits = f.await.ok();
+                *revoke = None;
+                permits
+            }
+            None => std::future::pending().await,
+        }
+    }
+
     async fn run(mut self, token: CancellationToken) {
         let samples_per_interval =
             samples_per_interval(self.config.interval, self.config.sample_period);
@@ -472,8 +499,13 @@ impl Controller {
             tokio::select! {
                 () = token.cancelled() => return,
                 _ = ticker.tick() => {}
+                Some(permits) = Self::revoked(&mut self.revoke) => {
+                    // Taking the permits out of circulation is the shrink.
+                    permits.forget();
+                    self.revoke_pending = 0;
+                    continue;
+                }
             }
-            self.reconcile_revoked();
             samples += 1;
             saturated += u32::from(self.semaphore.available_permits() == 0);
             pressured |= self.memory_pressure.as_ref().is_some_and(|f| f());
@@ -509,25 +541,26 @@ impl Controller {
             self.semaphore.add_permits(grow - cancelled);
         } else {
             self.revoke_pending += from - to;
-            self.reconcile_revoked();
         }
+        self.restart_revoke();
         self.stats.slots.store(to, Ordering::Relaxed);
     }
 
-    /// Takes as many pending permits out of circulation as are free now;
-    /// permits held by running tasks are taken as they are released.
-    fn reconcile_revoked(&mut self) {
-        let take = self.revoke_pending.min(self.semaphore.available_permits());
-        if take == 0 {
-            return;
-        }
-        let Ok(take_u32) = u32::try_from(take) else {
-            return;
-        };
-        if let Ok(permits) = self.semaphore.try_acquire_many(take_u32) {
-            permits.forget();
-            self.revoke_pending -= take;
-        }
+    /// Replaces the in-flight revocation with one for `revoke_pending` permits.
+    ///
+    /// The revocation waits in the semaphore's FIFO queue like any other
+    /// acquirer, so permits released by finishing tasks are handed to it until
+    /// the shrink is satisfied; polling `available_permits` instead would never
+    /// see them while another waiter, such as the poll loop, is queued. Dropping
+    /// the old future leaves the queue and returns any permits it had partially
+    /// acquired (`Acquire`'s `Drop` in tokio's batch semaphore re-adds them), and
+    /// the semaphore only hands out permits that are free, so a permit held by a
+    /// running task is never taken.
+    fn restart_revoke(&mut self) {
+        self.revoke = (self.revoke_pending > 0).then(|| {
+            let n = u32::try_from(self.revoke_pending).unwrap_or(u32::MAX);
+            Box::pin(self.semaphore.clone().acquire_many_owned(n)) as RevokeFuture
+        });
     }
 }
 
@@ -837,5 +870,95 @@ mod tests {
         drop(slots);
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(sem.available_permits(), 2);
+    }
+
+    /// Saturated demand (more workers than slots) with the poll loop queued on
+    /// the semaphore: released permits go to queued waiters, so the shrink
+    /// must queue fairly instead of polling `available_permits`.
+    #[tokio::test(start_paused = true)]
+    async fn shrink_completes_under_continuous_load() {
+        let mut config = AdaptiveSlotsConfig::new(2, 8);
+        config.interval = Duration::from_secs(1);
+        let sem = Arc::new(Semaphore::new(4));
+        let mut controller = Controller {
+            state: ControllerState::new(4),
+            config,
+            semaphore: sem.clone(),
+            stats: Arc::new(Stats {
+                slots: AtomicUsize::new(4),
+                floor: 2,
+                ceiling: 8,
+            }),
+            cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0.8f64.to_bits())))),
+            memory_pressure: None,
+            revoke_pending: 0,
+            revoke: None,
+        };
+        let holders = Arc::new(AtomicUsize::new(0));
+        let max_holders = Arc::new(AtomicUsize::new(0));
+        for _ in 0..8 {
+            let (sem, holders, max_holders) =
+                (sem.clone(), holders.clone(), max_holders.clone());
+            tokio::spawn(async move {
+                loop {
+                    let permit = sem.clone().acquire_owned().await.expect("open");
+                    let now = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_holders.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    holders.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                }
+            });
+        }
+        let poll_sem = sem.clone();
+        tokio::spawn(async move {
+            loop {
+                drop(poll_sem.acquire().await.expect("open"));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(max_holders.load(Ordering::SeqCst), 4);
+
+        controller.apply(4, 2);
+        let token = CancellationToken::new();
+        tokio::spawn(controller.run(token.clone()));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        max_holders.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        token.cancel();
+        assert!(
+            max_holders.load(Ordering::SeqCst) <= 2,
+            "workers still hold {} permits after shrinking to 2",
+            max_holders.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn grow_cancels_an_in_flight_shrink() {
+        let sem = Arc::new(Semaphore::new(4));
+        let mut c = Controller {
+            state: ControllerState::new(4),
+            config: AdaptiveSlotsConfig::new(2, 8),
+            semaphore: sem.clone(),
+            stats: Arc::new(Stats {
+                slots: AtomicUsize::new(4),
+                floor: 2,
+                ceiling: 8,
+            }),
+            cpu: Box::new(FakeCpu(Arc::new(AtomicU64::new(0)))),
+            memory_pressure: None,
+            revoke_pending: 0,
+            revoke: None,
+        };
+        c.apply(4, 2);
+        assert_eq!(c.revoke_pending, 2);
+        c.apply(2, 3);
+        assert_eq!(c.revoke_pending, 1);
+        assert!(c.revoke.is_some());
+        c.apply(3, 5);
+        assert_eq!(c.revoke_pending, 0);
+        assert!(c.revoke.is_none());
+        assert_eq!(sem.available_permits(), 5);
     }
 }
