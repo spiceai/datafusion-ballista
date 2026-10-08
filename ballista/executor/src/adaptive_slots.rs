@@ -83,13 +83,17 @@
 //! exist and the ceiling always holds. The semaphore is created closed (zero
 //! permits): the embedder passes [`AdaptiveSlots::semaphore`] to `poll_loop`,
 //! and calls [`AdaptiveSlots::start`], which grants the `floor` permits and
-//! spawns the control task, once its object stores are bound.
+//! spawns the control task, once its object stores are bound. The executor
+//! must also be built with `Executor::with_guaranteed_task_slots` set to
+//! [`AdaptiveSlots::guaranteed_task_slots`], or a task bundling more partitions
+//! than the semaphore keeps could wait forever after a shrink.
 //! The task-runner thread pool stays sized by the CPU budget (see
 //! `with_task_runner_threads`), so growing slots never adds threads.
 
 use ballista_core::error::{BallistaError, Result};
 use log::debug;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -384,6 +388,13 @@ impl AdaptiveSlots {
 
     /// The slot semaphore, to pass to `poll_loop` as `free_vcores`. The
     /// controller is the only party that adds or removes its permits.
+    ///
+    /// The executor using it MUST be built with
+    /// `Executor::with_guaranteed_task_slots(slots.guaranteed_task_slots())`
+    /// (the `floor`). The pull loop charges a task one permit per bundled
+    /// partition and waits for them; waiting for more than the semaphore is
+    /// guaranteed to hold would hang if a shrink dropped capacity meanwhile.
+    /// Without it the guarantee defaults to `vcores`, the ceiling.
     #[must_use]
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.semaphore.clone()
@@ -429,6 +440,12 @@ impl AdaptiveSlots {
     #[must_use]
     pub fn slots(&self) -> usize {
         self.stats.slots.load(Ordering::Relaxed)
+    }
+
+    /// The `floor`, as the value for `Executor::with_guaranteed_task_slots`.
+    #[must_use]
+    pub fn guaranteed_task_slots(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.stats.floor).unwrap_or(NonZeroUsize::MIN)
     }
 
     /// Fewest slots.

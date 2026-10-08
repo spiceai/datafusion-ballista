@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tonic::codegen::{Body, Bytes, StdError};
 
 /// Idle sleep between polls when polling is the only way to learn of new work.
@@ -209,6 +209,12 @@ where
             Err(_) => {}
         }
 
+        // The scheduler binds tasks against the free vcores reported below, so
+        // reserve exactly those: a slot shrink queued before the tasks arrive
+        // cannot take them, and admitting a task never waits.
+        let mut reservation = reserve_free_vcores(&free_vcores)?;
+        let reported_free_vcores = reservation.num_permits();
+
         let mut task_status: Vec<TaskStatus> = std::mem::take(&mut pending_status);
         task_status.extend(sample_tasks_status(&mut task_status_receiver).await);
 
@@ -216,7 +222,7 @@ where
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_vcores: free_vcores.available_permits() as u32,
+                    num_free_vcores: reported_free_vcores as u32,
                     task_status: task_status.clone(),
                 })
                 .await;
@@ -265,13 +271,11 @@ where
                 for task in tasks {
                     let task_status_sender = task_status_sender.clone();
 
-                    // Acquire a vcore permit for the task.
-                    let permit = acquire_task_permits(
-                        &free_vcores,
+                    let permit = admit(
+                        &mut reservation,
                         task.vcores_consumed,
                         executor.guaranteed_task_slots(),
-                    )
-                    .await?;
+                    )?;
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -331,8 +335,11 @@ where
                         }
                     }
                 }
+                // Return what the scheduler did not use before idling.
+                drop(reservation);
             }
             Err(error) => {
+                drop(reservation);
                 // Preserve this poll's statuses so the next attempt re-delivers
                 // them rather than losing the completions.
                 pending_status = task_status;
@@ -399,18 +406,53 @@ fn task_permits(vcores_consumed: u32, guaranteed: usize) -> u32 {
     vcores_consumed.clamp(1, guaranteed)
 }
 
-/// Takes the permits for a task, held until the task completes. Keeps the
-/// executor's reported free vcores in step with the scheduler's accounting.
-async fn acquire_task_permits(
+/// Takes every free permit up front, so the poll can report exactly that many
+/// free vcores and a revocation queued by the adaptive slot controller
+/// afterwards cannot take them. Returns an empty reservation when none are free.
+fn reserve_free_vcores(
     free_vcores: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, BallistaError> {
+    loop {
+        let free = u32::try_from(free_vcores.available_permits()).unwrap_or(u32::MAX);
+        match free_vcores.clone().try_acquire_many_owned(free) {
+            Ok(reservation) => return Ok(reservation),
+            // Another taker won the permits between the read and the acquire.
+            Err(TryAcquireError::NoPermits) => {}
+            Err(TryAcquireError::Closed) => {
+                return Err(BallistaError::Internal(
+                    "vcore semaphore closed".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Splits a task's permits out of `reservation`, held until the task
+/// completes. Charges as [`task_permits`], keeping the executor's reported free
+/// vcores in step with the scheduler's accounting.
+///
+/// Never waits: if the reservation is short of the charge, which the scheduler
+/// binding against the reported free vcores should prevent, the task gets what
+/// remains, since waiting would stop the loop heartbeating and get a busy
+/// executor declared dead. The shortfall is logged once.
+fn admit(
+    reservation: &mut OwnedSemaphorePermit,
     vcores_consumed: u32,
     guaranteed: usize,
 ) -> Result<OwnedSemaphorePermit, BallistaError> {
-    free_vcores
-        .clone()
-        .acquire_many_owned(task_permits(vcores_consumed, guaranteed))
-        .await
-        .map_err(|_| BallistaError::Internal("vcore semaphore closed".to_string()))
+    static SHORTFALL_LOGGED: std::sync::Once = std::sync::Once::new();
+    let charge = task_permits(vcores_consumed, guaranteed) as usize;
+    let take = charge.min(reservation.num_permits());
+    if take < charge {
+        SHORTFALL_LOGGED.call_once(|| {
+            warn!(
+                "scheduler assigned a task needing {charge} vcores but only {take} were reported free, so the task runs with fewer reserved slots"
+            );
+        });
+    }
+    reservation.split(take).ok_or_else(|| {
+        BallistaError::Internal("vcore reservation split failed".to_string())
+    })
 }
 
 async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
@@ -611,28 +653,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_partition_task_holds_its_permits_until_it_finishes() {
+    async fn multi_partition_charge_comes_out_of_the_reservation() {
         let sem = Arc::new(Semaphore::new(8));
-        let permit = acquire_task_permits(&sem, 4, 8).await.expect("open");
+        let mut reservation = reserve_free_vcores(&sem).expect("open");
+        assert_eq!(reservation.num_permits(), 8);
+        assert_eq!(sem.available_permits(), 0);
+        let task = admit(&mut reservation, 4, 8).expect("split");
+        assert_eq!(task.num_permits(), 4);
+        // What the tasks did not use returns to the semaphore.
+        drop(reservation);
         assert_eq!(sem.available_permits(), 4);
-        drop(permit);
+        drop(task);
         assert_eq!(sem.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn reservation_covers_only_the_free_permits() {
+        let sem = Arc::new(Semaphore::new(4));
+        let _running = sem.clone().try_acquire_many_owned(3).expect("running");
+        assert_eq!(reserve_free_vcores(&sem).expect("open").num_permits(), 1);
+        let none = Arc::new(Semaphore::new(0));
+        assert_eq!(reserve_free_vcores(&none).expect("open").num_permits(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_reservation_never_blocks() {
+        let sem = Arc::new(Semaphore::new(4));
+        let mut reservation = reserve_free_vcores(&sem).expect("open");
+        let first = admit(&mut reservation, 3, 4).expect("split");
+        // One permit remains for a task charged 3; it gets that one, instantly.
+        let second = admit(&mut reservation, 3, 4).expect("split");
+        let third = admit(&mut reservation, 1, 4).expect("split");
+        assert_eq!(
+            (
+                first.num_permits(),
+                second.num_permits(),
+                third.num_permits()
+            ),
+            (3, 1, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_does_not_wait_behind_a_queued_revocation() {
+        let sem = Arc::new(Semaphore::new(4));
+        let _running = sem
+            .clone()
+            .try_acquire_many_owned(2)
+            .expect("running tasks");
+        let mut reservation = reserve_free_vcores(&sem).expect("open");
+        let reported = reservation.num_permits();
+        assert_eq!(reported, 2);
+        // The controller queues a shrink that needs more than is free.
+        let revoker = sem.clone();
+        tokio::spawn(async move { revoker.acquire_many_owned(3).await });
+        tokio::task::yield_now().await;
+        let admit_all = async {
+            for _ in 0..reported {
+                admit(&mut reservation, 1, 4).expect("split").forget();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), admit_all)
+            .await
+            .expect("admission must not wait on running tasks");
     }
 
     #[tokio::test(start_paused = true)]
     async fn charge_wider_than_a_shrunken_semaphore_does_not_hang() {
-        // The semaphore shrank to the guaranteed 2 slots; a task bundling 6
-        // partitions is charged 2 and runs, instead of waiting for 6 forever.
+        // Capacity shrank to the guaranteed 2 slots; a 6-partition task is
+        // charged 2 and admitted from the reservation.
         let sem = Arc::new(Semaphore::new(2));
-        let permit = tokio::time::timeout(
-            Duration::from_secs(1),
-            acquire_task_permits(&sem, 6, 2),
-        )
-        .await
-        .expect("charge is clamped to the guaranteed slots")
-        .expect("open");
-        assert_eq!(sem.available_permits(), 0);
+        let mut reservation = reserve_free_vcores(&sem).expect("open");
+        let permit = admit(&mut reservation, 6, 2).expect("split");
+        assert_eq!(permit.num_permits(), 2);
         drop(permit);
+        drop(reservation);
         assert_eq!(sem.available_permits(), 2);
     }
 }
