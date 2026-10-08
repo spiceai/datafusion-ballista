@@ -355,7 +355,8 @@ impl Executor {
 
 /// Task slots held by running tasks in the pull loop: each task counts the
 /// permits it was granted from the poll's reservation (the vcores the scheduler
-/// charged it, one per bundled partition), from admission until it finishes.
+/// charged it: one per bundled partition, or one in total for a collapse
+/// stage), from admission until it finishes.
 /// Permits reserved by a poll in flight are not counted. Clones share the count.
 #[derive(Debug, Clone, Default)]
 pub struct TaskSlotUsage(Arc<std::sync::atomic::AtomicUsize>);

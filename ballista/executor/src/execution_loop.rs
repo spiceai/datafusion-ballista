@@ -48,6 +48,7 @@ use std::any::Any;
 use std::cell::LazyCell;
 use std::convert::TryInto;
 use std::error::Error;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -208,23 +209,20 @@ where
             Err(_) => {}
         }
 
-        // The scheduler binds tasks against the free vcores reported below, so
-        // reserve exactly those: a slot shrink queued before the tasks arrive
-        // cannot take them, and admitting a task never waits.
-        let mut reservation = reserve_free_vcores(&free_vcores)?;
-        let reported_free_vcores = reservation.num_permits();
-
         let mut task_status: Vec<TaskStatus> = std::mem::take(&mut pending_status);
         task_status.extend(sample_tasks_status(&mut task_status_receiver).await);
 
-        let poll_work_result: Result<tonic::Response<PollWorkResult>, tonic::Status> =
-            scheduler
-                .poll_work(PollWorkParams {
-                    metadata: Some(executor.metadata.clone()),
-                    num_free_vcores: reported_free_vcores as u32,
-                    task_status: task_status.clone(),
-                })
-                .await;
+        // The scheduler binds tasks against the free vcores reported, so the
+        // poll reserves exactly those: a slot shrink queued before the tasks
+        // arrive cannot take them, and admitting a task never waits.
+        let polled = reserve_and_poll(&free_vcores, POLL_WORK_TIMEOUT, |free_vcores| {
+            scheduler.poll_work(PollWorkParams {
+                metadata: Some(executor.metadata.clone()),
+                num_free_vcores: free_vcores,
+                task_status: task_status.clone(),
+            })
+        })
+        .await?;
 
         *report_ready;
 
@@ -232,8 +230,8 @@ where
         // to avoid going in sleep mode between polling
         let active_job;
 
-        match poll_work_result {
-            Ok(result) => {
+        match polled {
+            Ok((result, mut reservation)) => {
                 // Reset backoff state on successful connection
                 if consecutive_failures > 0 {
                     info!(
@@ -334,7 +332,6 @@ where
                 drop(reservation);
             }
             Err(error) => {
-                drop(reservation);
                 // Preserve this poll's statuses so the next attempt re-delivers
                 // them rather than losing the completions.
                 pending_status = task_status;
@@ -411,6 +408,49 @@ impl Drop for TaskPermit {
     fn drop(&mut self) {
         self.usage.sub(self.permit.num_permits());
     }
+}
+
+/// Longest a single `poll_work` call may take before the loop gives up on it.
+///
+/// The poll reserves every free permit while it waits, so a scheduler that
+/// stops responding would otherwise hold the executor's capacity, starve other
+/// loops sharing the semaphore and block a queued shrink. A normal call
+/// finishes in milliseconds to a few seconds, including a response carrying
+/// large task plans, so the bound is far above that and trips only on a
+/// stalled scheduler. It is 12 times [`HEARTBEAT_POLL_INTERVAL`] and a third of
+/// the scheduler's default 180 s executor timeout, which leaves several more
+/// polls (heartbeats) before the scheduler could declare the executor dead.
+const POLL_WORK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Reserves the free permits, reports their count to `poll`, and waits at most
+/// `timeout` for its response, which is returned with the reservation for
+/// admitting the tasks it carries.
+///
+/// A poll that fails or times out is handled alike: its error is returned, the
+/// reservation is dropped so the permits return to the semaphore, and the caller
+/// re-delivers the task statuses it sent with the next poll. A timeout that
+/// fires after the scheduler bound tasks drops the response that carried them,
+/// exactly as a transport error after the scheduler handled the request does;
+/// the scheduler has no per-task recovery for either, and only an executor that
+/// stops heartbeating has its tasks reset. That is why the timeout is generous.
+async fn reserve_and_poll<R, Fut>(
+    free_vcores: &Arc<Semaphore>,
+    timeout: Duration,
+    poll: impl FnOnce(u32) -> Fut,
+) -> Result<Result<(R, OwnedSemaphorePermit), tonic::Status>, BallistaError>
+where
+    Fut: Future<Output = Result<R, tonic::Status>>,
+{
+    let reservation = reserve_free_vcores(free_vcores)?;
+    let free = u32::try_from(reservation.num_permits()).unwrap_or(u32::MAX);
+    let response = match tokio::time::timeout(timeout, poll(free)).await {
+        Ok(response) => response,
+        Err(_) => Err(tonic::Status::deadline_exceeded(format!(
+            "poll_work did not complete within {}s, so the scheduler may be stalled",
+            timeout.as_secs()
+        ))),
+    };
+    Ok(response.map(|response| (response, reservation)))
 }
 
 /// Takes every free permit up front, so the poll can report exactly that many
@@ -761,5 +801,39 @@ mod tests {
         assert_eq!(usage.busy(), 64);
         drop(permit);
         drop(reservation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_poll_times_out_and_returns_the_reservation() {
+        let sem = Arc::new(Semaphore::new(4));
+        let _running = sem.clone().try_acquire_many_owned(1).expect("running");
+        let reported = std::sync::atomic::AtomicU32::new(0);
+        let outcome = reserve_and_poll(&sem, Duration::from_secs(60), |free| {
+            reported.store(free, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<Result<(), tonic::Status>>()
+        })
+        .await
+        .expect("open");
+        let status = outcome.expect_err("a stalled poll times out");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(reported.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // The reservation was dropped, so the loop can proceed with all free permits.
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answered_poll_hands_back_the_reservation() {
+        let sem = Arc::new(Semaphore::new(4));
+        let (response, reservation) =
+            reserve_and_poll(&sem, Duration::from_secs(60), |free| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(free)
+            })
+            .await
+            .expect("open")
+            .expect("answered in time");
+        assert_eq!(response, 4);
+        assert_eq!(reservation.num_permits(), 4);
+        assert_eq!(sem.available_permits(), 0);
     }
 }
