@@ -17,8 +17,9 @@
 
 //! Adaptive task-slot controller for pull-mode executors.
 //!
-//! A pull-mode executor admits at most as many concurrent tasks as its slot
-//! semaphore has permits (see [`crate::execution_loop::poll_loop`]). A fixed
+//! A pull-mode executor admits tasks against its slot semaphore, each holding
+//! as many permits as the vcores the scheduler charged it, one per bundled
+//! partition (see [`crate::execution_loop::poll_loop`]). A fixed
 //! count of one slot per core leaves cores idle when tasks wait on I/O, and no
 //! fixed count suits a workload that moves between I/O-bound and CPU-bound.
 //! [`AdaptiveSlots`] drives that semaphore at runtime so the
@@ -75,16 +76,24 @@
 //! fair, so permits released by finishing tasks go to that request ahead of
 //! later waiters such as the poll loop, and the shrink completes under
 //! continuous load; the executor takes no new work while it is above target.
-//! A grow cancels a shrink still in flight. Running tasks are never cancelled,
-//! and the control loop never waits on the request, so the semaphore's
-//! `available_permits` already reflects the effective slot count that the
-//! poll loop reports to the scheduler.
+//! A poll reserves the free permits for the duration of its RPC, so a shrink
+//! cannot take permits the scheduler was just offered, and the free permits
+//! alone do not show whether tasks are running; saturation is measured with
+//! [`TaskSlotUsage`] instead. A grow cancels a shrink still in flight. Running
+//! tasks are never cancelled, and the control loop never waits on the request.
+//!
+//! # Startup
 //!
 //! The controller owns the semaphore, so no permits it did not grant can
 //! exist and the ceiling always holds. The semaphore is created closed (zero
-//! permits): the embedder passes [`AdaptiveSlots::semaphore`] to `poll_loop`,
-//! and calls [`AdaptiveSlots::start`], which grants the `floor` permits and
-//! spawns the control task, once its object stores are bound.
+//! permits) and [`AdaptiveSlots::slots`] is 0, so the executor registers and
+//! heartbeats with no free slots. The embedder passes
+//! [`AdaptiveSlots::semaphore`] to `poll_loop` and, once its object stores are
+//! bound, calls [`AdaptiveSlots::start`] with the executor's
+//! `task_slot_usage()`; that grants the `floor` permits and spawns the control
+//! task. A second `start` is an error. Dropping [`AdaptiveSlots`] stops the
+//! control task and leaves the granted permits in place.
+//!
 //! The task-runner thread pool stays sized by the CPU budget (see
 //! `with_task_runner_threads`), so growing slots never adds threads.
 
@@ -183,7 +192,7 @@ pub struct AdaptiveSlotsConfig {
     /// Time between slot adjustments. The paper finds about 5 s or more
     /// averages out CPU noise.
     pub interval: Duration,
-    /// Time between saturation samples and shrink reconciliation.
+    /// Time between saturation samples.
     pub sample_period: Duration,
     /// Damping `lambda` of the integral step, in `(0, 1]`.
     pub damping: f64,
@@ -195,8 +204,8 @@ pub struct AdaptiveSlotsConfig {
     pub overload_intervals: u32,
     /// Factor `beta` slots are multiplied by on overload, in `(0, 1)`.
     pub overload_backoff: f64,
-    /// Fraction of an interval's samples that must find every slot busy
-    /// before slots may grow.
+    /// Fraction of an interval's samples that must find running tasks holding
+    /// every slot before slots may grow.
     pub saturation_threshold: f64,
     /// Largest factor slots may grow by in one interval.
     pub max_growth: f64,
@@ -229,9 +238,11 @@ impl AdaptiveSlotsConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if `floor` is 0 or above `ceiling`, a period is zero or
-    /// the interval is shorter than the sample period, or a ratio is out of
-    /// range.
+    /// Returns an error if `floor` is 0 or above `ceiling`, `ceiling` exceeds
+    /// the `u32` vcores the scheduler protocol carries or tokio's
+    /// `Semaphore::MAX_PERMITS`, a period is zero, the interval is shorter than
+    /// the sample period or more than `u32::MAX` sample periods, or a ratio is
+    /// out of range.
     pub fn validate(&self) -> Result<()> {
         let check = |ok: bool, what: &str| {
             ok.then_some(()).ok_or_else(|| {
@@ -251,6 +262,13 @@ impl AdaptiveSlotsConfig {
         check(
             self.interval >= self.sample_period,
             "interval must be at least sample_period",
+        )?;
+        check(
+            self.interval
+                .as_nanos()
+                .div_ceil(self.sample_period.as_nanos())
+                <= u128::from(u32::MAX),
+            "interval must not exceed u32::MAX sample periods",
         )?;
         check(
             self.setpoint > 0.0 && self.setpoint < 1.0,
@@ -365,8 +383,9 @@ struct Stats {
 ///
 /// [`AdaptiveSlots::semaphore`] is the semaphore to pass to `poll_loop` as
 /// `free_vcores`. It starts with no permits, so the executor registers and
-/// heartbeats with no free slots until [`AdaptiveSlots::start`] opens it.
-/// Dropping this stops the control task; permits already granted stay in place.
+/// heartbeats with no free slots until [`AdaptiveSlots::start`] opens it, and
+/// [`AdaptiveSlots::slots`] is 0 until then. Dropping this stops the control
+/// task; permits already granted stay in place.
 #[derive(Debug)]
 pub struct AdaptiveSlots {
     config: AdaptiveSlotsConfig,
@@ -403,7 +422,8 @@ impl AdaptiveSlots {
         self.semaphore.clone()
     }
 
-    /// Grants `floor` permits and spawns the control task on `runtime`.
+    /// Grants `floor` permits and spawns the control task on `runtime`. Call it
+    /// once the executor may take work.
     ///
     /// `usage` must be the executor's own handle, `Executor::task_slot_usage()`
     /// for the executor whose `poll_loop` uses [`AdaptiveSlots::semaphore`]. The
@@ -447,7 +467,8 @@ impl AdaptiveSlots {
         Ok(())
     }
 
-    /// Current target slot count, which `executor_task_slots` can report.
+    /// Current target slot count, which `executor_task_slots` can report; 0
+    /// before [`start`](Self::start).
     #[must_use]
     pub fn slots(&self) -> usize {
         self.stats.slots.load(Ordering::Relaxed)
@@ -467,7 +488,8 @@ impl AdaptiveSlots {
 }
 
 /// Samples per adjustment, rounded up so an adjustment never comes before
-/// `interval`.
+/// `interval`. `validate` bounds the ratio by `u32::MAX`, so the fallback is
+/// unreachable.
 fn samples_per_interval(interval: Duration, sample_period: Duration) -> u32 {
     let n = interval.as_nanos().div_ceil(sample_period.as_nanos());
     u32::try_from(n).unwrap_or(u32::MAX).max(1)
@@ -615,6 +637,12 @@ mod tests {
         assert!(AdaptiveSlotsConfig::new(0, 8).validate().is_err());
         assert!(AdaptiveSlotsConfig::new(9, 8).validate().is_err());
         assert!(AdaptiveSlotsConfig::new(8, 8).validate().is_ok());
+        let mut c = AdaptiveSlotsConfig::new(1, 8);
+        c.sample_period = Duration::from_nanos(1);
+        c.interval = Duration::from_nanos(u64::from(u32::MAX));
+        assert!(c.validate().is_ok());
+        c.interval = Duration::from_nanos(u64::from(u32::MAX) + 1);
+        assert!(c.validate().is_err());
         assert!(AdaptiveSlotsConfig::new(1, MAX_CEILING).validate().is_ok());
         assert!(
             AdaptiveSlotsConfig::new(1, MAX_CEILING + 1)

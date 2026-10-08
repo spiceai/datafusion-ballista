@@ -81,9 +81,11 @@ const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// Concurrency is bounded by a semaphore. Pass `free_vcores` to supply your
 /// own semaphore — useful for sharing a single concurrency limit across
-/// multiple poll loops or for observing executor load from outside.
-/// Pass `None` to have the loop create a semaphore sized to the executor's
-/// configured vcore count.
+/// multiple poll loops, for observing executor load from outside, or for
+/// varying the slot count at runtime (see [`crate::adaptive_slots`]). It may
+/// start with no permits and gain them later: the loop then heartbeats with no
+/// free vcores until some exist. Pass `None` to have the loop create a
+/// semaphore sized to the executor's configured vcore count.
 ///
 /// `readiness`, when provided, receives the executor id once the first
 /// `poll_work` call to the scheduler has been attempted, so an embedder can
@@ -112,11 +114,6 @@ const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// tasks than the executor's thread pool has threads, admitted tasks queue
 /// behind running ones in the pool. The caller is responsible for sizing the
 /// semaphore appropriately for their thread pool.
-///
-/// # Panics
-///
-/// Panics on startup if `free_vcores` is a semaphore with zero permits,
-/// which would cause the loop to deadlock immediately.
 pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan, C>(
     mut scheduler: SchedulerGrpcClient<C>,
     executor: Arc<Executor>,

@@ -353,8 +353,10 @@ impl Executor {
     }
 }
 
-/// Task slots held by running tasks: each task counts the permits it was
-/// charged, from admission until its permit is dropped. Clones share the count.
+/// Task slots held by running tasks in the pull loop: each task counts the
+/// permits it was granted from the poll's reservation (the vcores the scheduler
+/// charged it, one per bundled partition), from admission until it finishes.
+/// Permits reserved by a poll in flight are not counted. Clones share the count.
 #[derive(Debug, Clone, Default)]
 pub struct TaskSlotUsage(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -416,8 +418,8 @@ impl Executor {
     }
 
     /// A handle to the number of task slots held by running tasks in the pull
-    /// loop. Pass it to the adaptive slot controller so it measures real
-    /// occupancy.
+    /// loop. Pass it to `AdaptiveSlots::start` of the controller driving this
+    /// executor's slot semaphore, so it measures real occupancy.
     pub fn task_slot_usage(&self) -> TaskSlotUsage {
         self.task_slot_usage.clone()
     }
