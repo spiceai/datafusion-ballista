@@ -88,3 +88,6 @@ vortex-ipc = { workspace = true, optional = true }
 # use libc on unix like platforms to set worker priority in DedicatedExecutor
 [target."cfg(unix)".dependencies.libc]
 version = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
