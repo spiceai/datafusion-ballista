@@ -20,14 +20,14 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, watch};
 
 /// What the background releaser is told about the lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Signal {
-    /// At least one gated stream is runnable; keep the vcore.
+    /// At least one wrapped stream is runnable; keep the vcore.
     Busy,
-    /// Every gated stream is parked. `epoch` identifies this parked period and
+    /// Every wrapped stream is parked. `epoch` identifies this parked period and
     /// `hinted` is true when an [`io_wait`] section is open, which skips the
     /// release threshold.
     Parked { epoch: u64, hinted: bool },
@@ -38,9 +38,9 @@ enum Signal {
 #[derive(Debug)]
 struct State {
     permit: Option<OwnedSemaphorePermit>,
-    /// Gated streams that are being polled or will be polled without a wake-up.
+    /// Wrapped streams that are being polled or will be polled without a wake-up.
     running: usize,
-    /// Gated streams that started and have not finished.
+    /// Wrapped streams that started and have not finished.
     registered: usize,
     /// Open [`io_wait`] sections.
     io_hints: usize,
@@ -65,7 +65,7 @@ pub(crate) enum Resume {
 /// Counters for one lease, also summed into process-wide totals by
 /// [`global_stats`].
 #[derive(Debug, Default)]
-pub struct LeaseStats {
+pub struct LendStats {
     /// Times the vcore was lent back to the executor.
     pub releases: AtomicU64,
     /// Times a stream had to wait for a vcore before resuming.
@@ -81,14 +81,14 @@ pub struct LeaseStats {
     pub parks: AtomicU64,
 }
 
-impl LeaseStats {
+impl LendStats {
     fn add(&self, field: impl Fn(&Self) -> &AtomicU64, n: u64) {
         field(self).fetch_add(n, Ordering::Relaxed);
         field(&GLOBAL_STATS).fetch_add(n, Ordering::Relaxed);
     }
 }
 
-static GLOBAL_STATS: LeaseStats = LeaseStats {
+static GLOBAL_STATS: LendStats = LendStats {
     releases: AtomicU64::new(0),
     reacquire_waits: AtomicU64::new(0),
     reacquire_wait_nanos: AtomicU64::new(0),
@@ -99,58 +99,50 @@ static GLOBAL_STATS: LeaseStats = LeaseStats {
 
 /// Process-wide totals across every lease, for experiments and diagnostics.
 #[must_use]
-pub fn global_stats() -> &'static LeaseStats {
+pub fn global_stats() -> &'static LendStats {
     &GLOBAL_STATS
 }
 
 /// A task's claim on its executor vcore that can be lent back to the executor
-/// while every gated stream of the task is parked on I/O.
+/// while every wrapped stream of the task is parked on I/O.
 ///
 /// The executor creates one lease per task, puts it into the task's
-/// `SessionConfig` as an extension, and closes it when the task ends. Gated
-/// streams ([`IoGateExec`](super::IoGateExec)) report when they park and
+/// `SessionConfig` as an extension, and closes it when the task ends. Wrapped
+/// streams ([`LendableVcoreExec`](super::LendableVcoreExec)) report when they park and
 /// resume; once all of them have been parked for `release_threshold` the
 /// permit is dropped, which frees the vcore for the poll loop to advertise.
 /// The next stream to resume must acquire a vcore before it polls its input.
 #[derive(Debug)]
-pub struct VcoreLease {
+pub struct LendableVcore {
     semaphore: Arc<Semaphore>,
     release_threshold: Duration,
     state: Mutex<State>,
     signal: watch::Sender<Signal>,
-    stats: LeaseStats,
+    stats: LendStats,
 }
 
-impl VcoreLease {
-    /// Wrap `permit`, which must come from `semaphore`, in a lease and start
-    /// its background releaser on the current tokio runtime.
-    ///
-    /// With `permit` set to `None` the lease starts lent: the first gated
-    /// stream acquires a vcore before polling its input. The poll loop uses
-    /// this so it never blocks on a vcore that a resuming task took back
-    /// between advertising it and binding the new task.
-    pub fn new(
-        semaphore: Arc<Semaphore>,
-        permit: Option<OwnedSemaphorePermit>,
-        release_threshold: Duration,
-    ) -> Arc<Self> {
-        let lent_since = permit.is_none().then(Instant::now);
+impl LendableVcore {
+    /// Create a lendable vcore drawing from `semaphore` and start its
+    /// background releaser on the current tokio runtime. It holds no vcore
+    /// until [`acquire`](Self::acquire) succeeds, which the executor awaits
+    /// before the task runs.
+    pub fn new(semaphore: Arc<Semaphore>, release_threshold: Duration) -> Arc<Self> {
         let (signal, rx) = watch::channel(Signal::Busy);
         let lease = Arc::new(Self {
             semaphore,
             release_threshold,
             state: Mutex::new(State {
-                permit,
+                permit: None,
                 running: 0,
                 registered: 0,
                 io_hints: 0,
                 cpu_holds: 0,
                 epoch: 0,
-                lent_since,
+                lent_since: None,
                 closed: false,
             }),
             signal,
-            stats: LeaseStats::default(),
+            stats: LendStats::default(),
         });
         tokio::spawn(run_releaser(Arc::downgrade(&lease), rx));
         lease
@@ -163,13 +155,30 @@ impl VcoreLease {
     }
 
     /// Counters for this lease.
-    pub fn stats(&self) -> &LeaseStats {
+    pub fn stats(&self) -> &LendStats {
         &self.stats
     }
 
     /// Whether the task currently holds its vcore.
     pub fn is_held(&self) -> bool {
         self.lock().permit.is_some()
+    }
+
+    /// Wait for the task's vcore. The executor calls this before running the
+    /// task; afterwards the vcore is only given up by lending or [`close`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the executor's vcore semaphore was closed (shutdown).
+    ///
+    /// [`close`]: Self::close
+    pub async fn acquire(&self) -> Result<(), AcquireError> {
+        let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+        let mut s = self.lock();
+        if !s.closed && s.permit.is_none() {
+            s.permit = Some(permit);
+        }
+        Ok(())
     }
 
     /// Return the vcore for good and stop the releaser. Streams that outlive
@@ -196,27 +205,27 @@ impl VcoreLease {
         self.stats.add(|s| &s.self_wakes, 1);
     }
 
-    /// A gated stream is about to poll its input for the first time.
+    /// A wrapped stream is about to poll its input for the first time.
     pub(crate) fn stream_started(&self) -> Resume {
         let mut s = self.lock();
         s.registered += 1;
         self.resume_locked(&mut s)
     }
 
-    /// A gated stream finished or was dropped while runnable.
+    /// A wrapped stream finished or was dropped while runnable.
     pub(crate) fn stream_finished(&self) {
         let mut s = self.lock();
         s.running = s.running.saturating_sub(1);
         s.registered = s.registered.saturating_sub(1);
     }
 
-    /// A gated stream was dropped while parked.
+    /// A wrapped stream was dropped while parked.
     pub(crate) fn parked_stream_dropped(&self) {
         let mut s = self.lock();
         s.registered = s.registered.saturating_sub(1);
     }
 
-    /// A gated stream returned `Pending` without waking itself.
+    /// A wrapped stream returned `Pending` without waking itself.
     pub(crate) fn stream_parked(&self) {
         self.stats.add(|s| &s.parks, 1);
         let mut s = self.lock();
@@ -311,7 +320,7 @@ fn duration_nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-async fn run_releaser(lease: Weak<VcoreLease>, mut rx: watch::Receiver<Signal>) {
+async fn run_releaser(lease: Weak<LendableVcore>, mut rx: watch::Receiver<Signal>) {
     loop {
         let signal = *rx.borrow_and_update();
         match signal {
@@ -349,15 +358,15 @@ async fn run_releaser(lease: Weak<VcoreLease>, mut rx: watch::Receiver<Signal>) 
     }
 }
 
-/// Await `fut`, telling the task's [`VcoreLease`] (if any) that the wait is
+/// Await `fut`, telling the task's [`LendableVcore`] (if any) that the wait is
 /// on external I/O.
 ///
-/// Inside a gated stream this lends the vcore as soon as every gated stream
+/// Inside a wrapped stream this lends the vcore as soon as every wrapped stream
 /// of the task is parked, without waiting for the release threshold. Use it
 /// around requests to slow remote systems (HTTP origins, databases). Without
 /// a lease, it simply awaits `fut`.
 pub async fn io_wait<F: Future>(ctx: &TaskContext, fut: F) -> F::Output {
-    let Some(lease) = VcoreLease::from_task_context(ctx) else {
+    let Some(lease) = LendableVcore::from_task_context(ctx) else {
         return fut.await;
     };
     lease.adjust(|s| s.io_hints += 1);
@@ -365,13 +374,13 @@ pub async fn io_wait<F: Future>(ctx: &TaskContext, fut: F) -> F::Output {
     fut.await
 }
 
-/// Await `fut`, keeping the task's vcore even if every gated stream parks.
+/// Await `fut`, keeping the task's vcore even if every wrapped stream parks.
 ///
 /// Use it when a source returns `Pending` while CPU work it depends on runs
 /// elsewhere (a spawned decode task, a blocking pool), so the lease does not
 /// mistake that wait for I/O. Without a lease, it simply awaits `fut`.
 pub async fn cpu_wait<F: Future>(ctx: &TaskContext, fut: F) -> F::Output {
-    let Some(lease) = VcoreLease::from_task_context(ctx) else {
+    let Some(lease) = LendableVcore::from_task_context(ctx) else {
         return fut.await;
     };
     lease.adjust(|s| s.cpu_holds += 1);
@@ -382,12 +391,12 @@ pub async fn cpu_wait<F: Future>(ctx: &TaskContext, fut: F) -> F::Output {
 /// Undoes an `adjust` when an [`io_wait`] or [`cpu_wait`] section ends or is
 /// cancelled.
 struct Guard {
-    lease: Arc<VcoreLease>,
+    lease: Arc<LendableVcore>,
     undo: fn(&mut State),
 }
 
 impl Guard {
-    fn new(lease: Arc<VcoreLease>, undo: fn(&mut State)) -> Self {
+    fn new(lease: Arc<LendableVcore>, undo: fn(&mut State)) -> Self {
         Self { lease, undo }
     }
 }
@@ -402,17 +411,11 @@ impl Drop for Guard {
 mod tests {
     use super::*;
 
-    async fn lease(threshold_ms: u64) -> (Arc<Semaphore>, Arc<VcoreLease>) {
+    async fn lease(threshold_ms: u64) -> (Arc<Semaphore>, Arc<LendableVcore>) {
         let sem = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&sem)
-            .acquire_owned()
-            .await
-            .expect("fresh semaphore has a permit");
-        let lease = VcoreLease::new(
-            Arc::clone(&sem),
-            Some(permit),
-            Duration::from_millis(threshold_ms),
-        );
+        let lease =
+            LendableVcore::new(Arc::clone(&sem), Duration::from_millis(threshold_ms));
+        lease.acquire().await.expect("fresh semaphore has a permit");
         (sem, lease)
     }
 
@@ -499,11 +502,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lease_started_lent_requires_acquire_on_first_poll() {
+    async fn holds_no_vcore_until_acquired() {
         let sem = Arc::new(Semaphore::new(1));
-        let lease = VcoreLease::new(Arc::clone(&sem), None, Duration::from_millis(10));
+        let lease = LendableVcore::new(Arc::clone(&sem), Duration::from_millis(10));
         assert!(!lease.is_held());
-        assert_eq!(lease.stream_started(), Resume::Reacquire);
+        assert_eq!(sem.available_permits(), 1);
+        lease.acquire().await.expect("permit");
+        assert!(lease.is_held());
+        assert_eq!(sem.available_permits(), 0);
     }
 
     #[tokio::test(start_paused = true)]

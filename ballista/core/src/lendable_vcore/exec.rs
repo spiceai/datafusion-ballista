@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::lease::{Resume, VcoreLease};
+use super::vcore::{LendableVcore, Resume};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -41,19 +41,19 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 /// Pass-through node that lets its input's task lend out its vcore while the
 /// input is parked on I/O.
 ///
-/// At execution time it looks for a [`VcoreLease`] in the task's
+/// At execution time it looks for a [`LendableVcore`] in the task's
 /// `SessionConfig`. Without one (plain `DataFusion`, push-based Ballista
 /// executors) the input stream is returned unchanged. With one, the stream
 /// reports every `Pending` that did not wake itself as "parked", and before
 /// polling the input after a park it re-acquires the vcore if it was lent.
 #[derive(Debug)]
-pub struct IoGateExec {
+pub struct LendableVcoreExec {
     input: Arc<dyn ExecutionPlan>,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl IoGateExec {
-    /// Gate `input`.
+impl LendableVcoreExec {
+    /// Wrap `input`.
     #[must_use]
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         Self {
@@ -62,26 +62,26 @@ impl IoGateExec {
         }
     }
 
-    /// The gated input.
+    /// The wrapped input.
     #[must_use]
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
     }
 }
 
-impl DisplayAs for IoGateExec {
+impl DisplayAs for LendableVcoreExec {
     fn fmt_as(
         &self,
         _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "IoGateExec")
+        write!(f, "LendableVcoreExec")
     }
 }
 
-impl ExecutionPlan for IoGateExec {
+impl ExecutionPlan for LendableVcoreExec {
     fn name(&self) -> &'static str {
-        "IoGateExec"
+        "LendableVcoreExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -106,7 +106,7 @@ impl ExecutionPlan for IoGateExec {
         if let (Some(input), true) = (children.pop(), children.is_empty()) {
             Ok(Arc::new(Self::new(input)))
         } else {
-            internal_err!("IoGateExec expects exactly one child")
+            internal_err!("LendableVcoreExec expects exactly one child")
         }
     }
 
@@ -115,13 +115,13 @@ impl ExecutionPlan for IoGateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let lease = VcoreLease::from_task_context(&context);
+        let lease = LendableVcore::from_task_context(&context);
         let input = self.input.execute(partition, context)?;
         let Some(lease) = lease else {
             return Ok(input);
         };
-        let metrics = GateMetrics::new(&self.metrics, partition);
-        Ok(Box::pin(GateStream::new(input, lease, metrics)))
+        let metrics = LendMetrics::new(&self.metrics, partition);
+        Ok(Box::pin(LendableVcoreStream::new(input, lease, metrics)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -129,7 +129,7 @@ impl ExecutionPlan for IoGateExec {
     }
 }
 
-struct GateMetrics {
+struct LendMetrics {
     /// Time spent inside the input's `poll_next`.
     poll_time: Time,
     /// Time between a park and the next poll.
@@ -140,17 +140,15 @@ struct GateMetrics {
     self_wakes: Count,
 }
 
-impl GateMetrics {
+impl LendMetrics {
     fn new(set: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
-            poll_time: MetricBuilder::new(set)
-                .subset_time("io_gate_poll_time", partition),
-            parked_time: MetricBuilder::new(set)
-                .subset_time("io_gate_parked_time", partition),
+            poll_time: MetricBuilder::new(set).subset_time("input_poll_time", partition),
+            parked_time: MetricBuilder::new(set).subset_time("pending_time", partition),
             reacquire_time: MetricBuilder::new(set)
-                .subset_time("io_gate_reacquire_time", partition),
-            parks: MetricBuilder::new(set).counter("io_gate_parks", partition),
-            self_wakes: MetricBuilder::new(set).counter("io_gate_self_wakes", partition),
+                .subset_time("vcore_reacquire_time", partition),
+            parks: MetricBuilder::new(set).counter("pending_parks", partition),
+            self_wakes: MetricBuilder::new(set).counter("yields", partition),
         }
     }
 }
@@ -197,20 +195,20 @@ enum Phase {
     Done,
 }
 
-struct GateStream {
+struct LendableVcoreStream {
     input: SendableRecordBatchStream,
-    lease: Arc<VcoreLease>,
+    lease: Arc<LendableVcore>,
     phase: Phase,
     flag: Arc<FlagWaker>,
     waker: Waker,
-    metrics: GateMetrics,
+    metrics: LendMetrics,
 }
 
-impl GateStream {
+impl LendableVcoreStream {
     fn new(
         input: SendableRecordBatchStream,
-        lease: Arc<VcoreLease>,
-        metrics: GateMetrics,
+        lease: Arc<LendableVcore>,
+        metrics: LendMetrics,
     ) -> Self {
         let flag = Arc::new(FlagWaker {
             woken: AtomicBool::new(false),
@@ -301,7 +299,7 @@ impl GateStream {
     }
 }
 
-impl Stream for GateStream {
+impl Stream for LendableVcoreStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -319,13 +317,13 @@ impl Stream for GateStream {
     }
 }
 
-impl RecordBatchStream for GateStream {
+impl RecordBatchStream for LendableVcoreStream {
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 }
 
-impl Drop for GateStream {
+impl Drop for LendableVcoreStream {
     fn drop(&mut self) {
         match self.phase {
             Phase::Running | Phase::Reacquiring(..) => self.lease.stream_finished(),
@@ -338,7 +336,7 @@ impl Drop for GateStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_gate::cpu_wait;
+    use crate::lendable_vcore::cpu_wait;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionConfig;
@@ -346,7 +344,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
-    fn ctx(lease: &Arc<VcoreLease>) -> Arc<TaskContext> {
+    fn ctx(lease: &Arc<LendableVcore>) -> Arc<TaskContext> {
         Arc::new(
             TaskContext::default().with_session_config(
                 SessionConfig::new().with_extension(Arc::clone(lease)),
@@ -354,29 +352,23 @@ mod tests {
         )
     }
 
-    fn gate(
+    fn wrap(
         stream: impl Stream<Item = Result<RecordBatch>> + Send + 'static,
-        lease: &Arc<VcoreLease>,
-    ) -> GateStream {
+        lease: &Arc<LendableVcore>,
+    ) -> LendableVcoreStream {
         let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(Schema::empty()),
             stream,
         ));
         let set = ExecutionPlanMetricsSet::new();
-        GateStream::new(input, Arc::clone(lease), GateMetrics::new(&set, 0))
+        LendableVcoreStream::new(input, Arc::clone(lease), LendMetrics::new(&set, 0))
     }
 
-    async fn new_lease(threshold_ms: u64) -> (Arc<Semaphore>, Arc<VcoreLease>) {
+    async fn new_lease(threshold_ms: u64) -> (Arc<Semaphore>, Arc<LendableVcore>) {
         let sem = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&sem)
-            .acquire_owned()
-            .await
-            .expect("fresh semaphore has a permit");
-        let lease = VcoreLease::new(
-            Arc::clone(&sem),
-            Some(permit),
-            Duration::from_millis(threshold_ms),
-        );
+        let lease =
+            LendableVcore::new(Arc::clone(&sem), Duration::from_millis(threshold_ms));
+        lease.acquire().await.expect("fresh semaphore has a permit");
         (sem, lease)
     }
 
@@ -387,7 +379,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = gate(slow, &lease);
+        let mut stream = wrap(slow, &lease);
         let next = tokio::spawn(async move { stream.next().await.map(|r| r.is_ok()) });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -413,7 +405,7 @@ mod tests {
             tokio::task::consume_budget().await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = gate(yielding, &lease);
+        let mut stream = wrap(yielding, &lease);
         let task = tokio::spawn(async move {
             while let Some(batch) = stream.next().await {
                 batch.expect("batch");
@@ -438,7 +430,7 @@ mod tests {
             tokio::task::yield_now().await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = gate(yielding, &lease);
+        let mut stream = wrap(yielding, &lease);
         while let Some(batch) = stream.next().await {
             batch.expect("batch");
         }
@@ -468,12 +460,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_on_offloaded_cpu_work_is_mistaken_for_io() {
         let (_sem, lease) = new_lease(10).await;
-        let mut stream = gate(offloaded_cpu_source(), &lease);
+        let mut stream = wrap(offloaded_cpu_source(), &lease);
         stream.next().await.expect("batch").expect("ok");
         assert_eq!(
             lease.stats().releases.load(Ordering::Relaxed),
             1,
-            "the gate cannot tell CPU work on another thread from I/O"
+            "lending cannot tell CPU work on another thread from I/O"
         );
     }
 
@@ -490,7 +482,7 @@ mod tests {
             .expect("blocking task");
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = gate(source, &lease);
+        let mut stream = wrap(source, &lease);
         stream.next().await.expect("batch").expect("ok");
         assert_eq!(lease.stats().releases.load(Ordering::Relaxed), 0);
     }
@@ -504,7 +496,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             Poll::Ready(None::<Result<RecordBatch>>)
         });
-        let mut stream = gate(source, &lease);
+        let mut stream = wrap(source, &lease);
         assert!(stream.next().await.is_none());
         assert_eq!(stream.metrics.parks.value(), 0);
         assert!(stream.metrics.poll_time.value() >= 200_000_000);
@@ -516,7 +508,7 @@ mod tests {
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
             Schema::empty(),
         )));
-        let exec = IoGateExec::new(input);
+        let exec = LendableVcoreExec::new(input);
         let stream = exec
             .execute(0, Arc::new(TaskContext::default()))
             .expect("execute");
@@ -530,7 +522,7 @@ mod tests {
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
             Schema::empty(),
         )));
-        let exec = IoGateExec::new(input);
+        let exec = LendableVcoreExec::new(input);
         let mut stream = exec.execute(0, ctx(&lease)).expect("execute");
         while stream.next().await.is_some() {}
         assert!(exec.metrics().expect("metrics").iter().next().is_some());

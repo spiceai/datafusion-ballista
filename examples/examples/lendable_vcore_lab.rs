@@ -1,13 +1,13 @@
-//! Prototype lab for `ballista_core::io_gate` (vcore lending on I/O waits).
+//! Prototype lab for `ballista_core::lendable_vcore` (lending vcores of pending tasks).
 //!
 //! `SCENARIO=io`: background loops scan a table whose object store answers
 //! after `SLOW_MS` (an async sleep standing in for a slow HTTP origin) while a
 //! probe query over a local table measures how long other work waits.
 //!
 //! `SCENARIO=cpu`: concurrent loops run a CPU-heavy aggregate over local
-//! Parquet, to measure the gate's overhead and any false vcore releases.
+//! Parquet, to measure the overhead and any false vcore releases.
 //!
-//! `IO_GATE=1` enables the gate for the session and lets the executor run
+//! `LEND_VCORE=1` enables vcore lending for the session and lets the executor run
 //! `INFLIGHT_FACTOR` x vcores tasks at once.
 
 use ballista::datafusion::{
@@ -17,10 +17,10 @@ use ballista::datafusion::{
 };
 use ballista::prelude::{SessionConfigExt, SessionContextExt};
 use ballista_core::config::{
-    BALLISTA_IO_GATE_ENABLED, BALLISTA_IO_GATE_MAX_INFLIGHT_TASKS,
-    BALLISTA_IO_GATE_RELEASE_THRESHOLD_MS,
+    BALLISTA_EXECUTOR_MAX_INFLIGHT_TASKS, BALLISTA_LEND_VCORE_ON_PENDING_TASK,
+    BALLISTA_LEND_VCORE_PENDING_THRESHOLD_MS,
 };
-use ballista_core::io_gate::global_stats;
+use ballista_core::lendable_vcore::global_stats;
 use ballista_examples::test_util;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -126,8 +126,8 @@ fn env_u64(k: &str, d: u64) -> u64 {
         .unwrap_or(d)
 }
 
-fn gate_enabled() -> bool {
-    std::env::var("IO_GATE").ok().as_deref() == Some("1")
+fn lending_enabled() -> bool {
+    std::env::var("LEND_VCORE").ok().as_deref() == Some("1")
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -162,11 +162,11 @@ fn cpu_secs() -> f64 {
     ticks / 100.0
 }
 
-fn print_gate_stats() {
+fn print_lending_stats() {
     let s = global_stats();
     let ms = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
     println!(
-        "gate: parks={} yields={} releases={} reacquires={} reacquire_wait={:.1}ms lent={:.1}ms slow_store_calls={}",
+        "lending: pending_parks={} yields={} releases={} reacquires={} reacquire_wait={:.1}ms lent={:.1}ms slow_store_calls={}",
         s.parks.load(Ordering::Relaxed),
         s.self_wakes.load(Ordering::Relaxed),
         s.releases.load(Ordering::Relaxed),
@@ -205,13 +205,13 @@ async fn context(vcores: usize, target_partitions: usize) -> Result<SessionConte
     let mut config = SessionConfig::new_with_ballista()
         .with_target_partitions(target_partitions)
         .with_ballista_standalone_parallelism(vcores);
-    if gate_enabled() {
+    if lending_enabled() {
         let factor = env_u64("INFLIGHT_FACTOR", 4) as usize;
         config = config
-            .set_bool(BALLISTA_IO_GATE_ENABLED, true)
-            .set_usize(BALLISTA_IO_GATE_MAX_INFLIGHT_TASKS, vcores * factor)
+            .set_bool(BALLISTA_LEND_VCORE_ON_PENDING_TASK, true)
+            .set_usize(BALLISTA_EXECUTOR_MAX_INFLIGHT_TASKS, vcores * factor)
             .set_u64(
-                BALLISTA_IO_GATE_RELEASE_THRESHOLD_MS,
+                BALLISTA_LEND_VCORE_PENDING_THRESHOLD_MS,
                 env_u64("RELEASE_MS", 50),
             );
     }
@@ -442,8 +442,8 @@ async fn main() -> Result<()> {
     let vcores = env_u64("VCORES", 2) as usize;
     let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "io".to_string());
     println!(
-        "scenario={scenario} gate={} vcores={vcores} inflight_factor={} release_ms={} slow_ms={} bg_loops={}",
-        gate_enabled(),
+        "scenario={scenario} lend_vcore={} vcores={vcores} inflight_factor={} release_ms={} slow_ms={} bg_loops={}",
+        lending_enabled(),
         env_u64("INFLIGHT_FACTOR", 4),
         env_u64("RELEASE_MS", 50),
         env_u64("SLOW_MS", 1000),
@@ -455,6 +455,6 @@ async fn main() -> Result<()> {
         "mixed" => mixed_scenario(vcores).await?,
         other => panic!("unknown SCENARIO {other}"),
     }
-    print_gate_stats();
+    print_lending_stats();
     Ok(())
 }

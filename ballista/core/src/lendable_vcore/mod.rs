@@ -15,24 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lending a task's vcore back to the executor while the task waits on I/O.
+//! Lending a pending task's vcore back to the executor.
 //!
 //! A Ballista task holds one vcore for its whole life, even while its sources
-//! sit on a slow remote response and use no CPU. With this module the
-//! executor wraps the task's permit in a [`VcoreLease`]; [`IoGateRule`] wraps
-//! every leaf of the stage plan in an [`IoGateExec`] whose stream reports when
-//! it parks (`Poll::Pending` without having woken itself) and resumes. When
-//! every gated stream of the task has been parked for the release threshold,
-//! the vcore is lent back so the poll loop can take more work; the next stream
-//! to resume must get a vcore back before it polls its input.
+//! sit on a slow remote response and use no CPU. With
+//! `ballista.executor.lend_vcore_on_pending_task` the executor acquires the
+//! task's vcore through a [`LendableVcore`], and [`LendableVcoreRule`] wraps
+//! every leaf of the stage plan in a [`LendableVcoreExec`] whose stream reports
+//! when it parks (`Poll::Pending` that is neither a self-wake nor a coop-budget
+//! yield) and resumes. Once every wrapped stream of the task has been parked
+//! for the pending threshold, the vcore is lent back so the poll loop can take
+//! more work; the next stream to resume gets a vcore back before it polls its
+//! input.
 //!
 //! Sources that know more than the `Pending` heuristic can mark their waits
 //! with [`io_wait`] (lend immediately) or [`cpu_wait`] (never lend).
 
 mod exec;
-mod lease;
 mod rule;
+mod vcore;
 
-pub use exec::IoGateExec;
-pub use lease::{LeaseStats, VcoreLease, cpu_wait, global_stats, io_wait};
-pub use rule::IoGateRule;
+pub use exec::LendableVcoreExec;
+pub use rule::LendableVcoreRule;
+pub use vcore::{LendStats, LendableVcore, cpu_wait, global_stats, io_wait};

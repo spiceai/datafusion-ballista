@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::IoGateExec;
+use super::LendableVcoreExec;
 use crate::config::BallistaConfig;
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -25,10 +25,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use std::fmt;
 use std::sync::Arc;
 
-/// Decides whether a leaf gets gated.
+/// Decides whether a leaf gets wrapped.
 pub type LeafFilter = Arc<dyn Fn(&dyn ExecutionPlan) -> bool + Send + Sync>;
 
-/// Wraps leaf nodes in [`IoGateExec`] when `ballista.executor.io_gate.enabled`
+/// Wraps leaf nodes in [`LendableVcoreExec`] when `ballista.executor.lend_vcore_on_pending_task`
 /// is set.
 ///
 /// Meant to run on the executor against the decoded stage plan, after every
@@ -36,12 +36,12 @@ pub type LeafFilter = Arc<dyn Fn(&dyn ExecutionPlan) -> bool + Send + Sync>;
 /// `ShuffleReaderExec` from rules that downcast to them, and the wrapper would
 /// need a codec entry to reach the executor. Applying it twice is a no-op.
 #[derive(Clone, Default)]
-pub struct IoGateRule {
+pub struct LendableVcoreRule {
     filter: Option<LeafFilter>,
 }
 
-impl IoGateRule {
-    /// Gate only the leaves for which `filter` returns true, e.g. to skip
+impl LendableVcoreRule {
+    /// Wrap only the leaves for which `filter` returns true, e.g. to skip
     /// sources known to block on CPU work done elsewhere.
     #[must_use]
     pub fn with_filter(mut self, filter: LeafFilter) -> Self {
@@ -49,21 +49,21 @@ impl IoGateRule {
         self
     }
 
-    fn should_gate(&self, plan: &Arc<dyn ExecutionPlan>) -> bool {
+    fn should_wrap(&self, plan: &Arc<dyn ExecutionPlan>) -> bool {
         plan.children().is_empty()
             && self.filter.as_ref().is_none_or(|f| f(plan.as_ref()))
     }
 }
 
-impl fmt::Debug for IoGateRule {
+impl fmt::Debug for LendableVcoreRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IoGateRule")
+        f.debug_struct("LendableVcoreRule")
             .field("filtered", &self.filter.is_some())
             .finish()
     }
 }
 
-impl PhysicalOptimizerRule for IoGateRule {
+impl PhysicalOptimizerRule for LendableVcoreRule {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -72,25 +72,25 @@ impl PhysicalOptimizerRule for IoGateRule {
         let enabled = config
             .extensions
             .get::<BallistaConfig>()
-            .is_some_and(BallistaConfig::io_gate_enabled);
+            .is_some_and(BallistaConfig::lend_vcore_on_pending_task);
         if !enabled {
             return Ok(plan);
         }
         plan.transform_down(|node| {
-            if node.downcast_ref::<IoGateExec>().is_some() {
+            if node.downcast_ref::<LendableVcoreExec>().is_some() {
                 return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
             }
-            if !self.should_gate(&node) {
+            if !self.should_wrap(&node) {
                 return Ok(Transformed::no(node));
             }
-            let gated: Arc<dyn ExecutionPlan> = Arc::new(IoGateExec::new(node));
-            Ok(Transformed::new(gated, true, TreeNodeRecursion::Jump))
+            let wrapped: Arc<dyn ExecutionPlan> = Arc::new(LendableVcoreExec::new(node));
+            Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump))
         })
         .map(|t| t.data)
     }
 
     fn name(&self) -> &'static str {
-        "io_gate"
+        "lendable_vcore"
     }
 
     fn schema_check(&self) -> bool {
@@ -101,7 +101,7 @@ impl PhysicalOptimizerRule for IoGateRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BALLISTA_IO_GATE_ENABLED;
+    use crate::config::BALLISTA_LEND_VCORE_ON_PENDING_TASK;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -110,7 +110,7 @@ mod tests {
 
     fn options(enabled: bool) -> ConfigOptions {
         SessionConfig::new_with_ballista()
-            .set_bool(BALLISTA_IO_GATE_ENABLED, enabled)
+            .set_bool(BALLISTA_LEND_VCORE_ON_PENDING_TASK, enabled)
             .options()
             .as_ref()
             .clone()
@@ -133,20 +133,19 @@ mod tests {
 
     #[test]
     fn wraps_every_leaf_once() {
-        let rule = IoGateRule::default();
+        let rule = LendableVcoreRule::default();
         let once = rule.optimize(plan(), &options(true)).expect("optimize");
         let twice = rule
             .optimize(Arc::clone(&once), &options(true))
             .expect("optimize");
-        let expected =
-            "UnionExec\n  IoGateExec\n    EmptyExec\n  IoGateExec\n    EmptyExec\n";
+        let expected = "UnionExec\n  LendableVcoreExec\n    EmptyExec\n  LendableVcoreExec\n    EmptyExec\n";
         assert_eq!(render(&once), expected);
         assert_eq!(render(&twice), expected);
     }
 
     #[test]
     fn disabled_leaves_plan_unchanged() {
-        let out = IoGateRule::default()
+        let out = LendableVcoreRule::default()
             .optimize(plan(), &options(false))
             .expect("optimize");
         assert_eq!(render(&out), "UnionExec\n  EmptyExec\n  EmptyExec\n");
@@ -154,7 +153,7 @@ mod tests {
 
     #[test]
     fn filter_skips_leaves() {
-        let rule = IoGateRule::default().with_filter(Arc::new(|_| false));
+        let rule = LendableVcoreRule::default().with_filter(Arc::new(|_| false));
         let out = rule.optimize(plan(), &options(true)).expect("optimize");
         assert_eq!(render(&out), "UnionExec\n  EmptyExec\n  EmptyExec\n");
     }
