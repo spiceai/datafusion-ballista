@@ -8,8 +8,8 @@
 //! Parquet, to measure the overhead and any false vcore releases.
 //!
 //! `AWAIT_POINTS=1` gives the standalone executor an `AwaitPointRule` over
-//! `DataSourceExec` leaves, running `INFLIGHT_FACTOR` tasks per vcore and
-//! releasing a suspended task's vcore after `SUSPEND_AFTER_MS`.
+//! `DataSourceExec` leaves, releasing a suspended task's vcore after
+//! `SUSPEND_AFTER_MS`.
 
 use ballista::datafusion::{
     common::Result,
@@ -204,7 +204,6 @@ async fn context(vcores: usize, target_partitions: usize) -> Result<SessionConte
         .with_ballista_standalone_parallelism(vcores);
     if await_points_enabled() {
         let rule = AwaitPointRule::new(Arc::new(|plan| plan.name() == "DataSourceExec"))
-            .with_inflight_tasks_per_vcore(env_u64("INFLIGHT_FACTOR", 4) as usize)
             .with_suspend_after(Duration::from_millis(env_u64("SUSPEND_AFTER_MS", 50)));
         config = config.with_extension(Arc::new(rule));
     }
@@ -435,9 +434,8 @@ async fn main() -> Result<()> {
     let vcores = env_u64("VCORES", 2) as usize;
     let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "io".to_string());
     println!(
-        "scenario={scenario} await_points={} vcores={vcores} inflight_factor={} suspend_after_ms={} slow_ms={} bg_loops={}",
+        "scenario={scenario} await_points={} vcores={vcores} suspend_after_ms={} slow_ms={} bg_loops={}",
         await_points_enabled(),
-        env_u64("INFLIGHT_FACTOR", 4),
         env_u64("SUSPEND_AFTER_MS", 50),
         env_u64("SLOW_MS", 1000),
         env_u64("BG_LOOPS", 2),
