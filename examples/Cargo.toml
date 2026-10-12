@@ -64,6 +64,8 @@ ballista-core = { path = "../ballista/core", version = "55.0.0", default-feature
 ] }
 ballista-executor = { path = "../ballista/executor", version = "55.0.0", default-features = false }
 ballista-scheduler = { path = "../ballista/scheduler", version = "55.0.0", default-features = false }
+async-trait = { workspace = true }
+bytes = "1"
 ctor = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
