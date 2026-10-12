@@ -27,6 +27,7 @@ use crate::runtime_cache::SessionRuntimeCache;
 use ballista_core::ConfigProducer;
 use ballista_core::JobId;
 use ballista_core::RuntimeProducer;
+use ballista_core::await_point::AwaitPointRule;
 use ballista_core::error::BallistaError;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
@@ -106,6 +107,10 @@ pub struct Executor {
     /// `produce_runtime_for_session` reuses read-side state across a session's
     /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
     session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
+
+    /// When set, tasks are suspended at the rule's await points and their
+    /// vcores released while suspended. See [`AwaitPointRule`].
+    pub(crate) await_point_rule: Option<Arc<AwaitPointRule>>,
 }
 
 impl Executor {
@@ -155,6 +160,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine,
             session_runtime_cache: None,
+            await_point_rule: None,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -180,6 +186,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
+            await_point_rule: None,
         }
     }
 }
@@ -206,6 +213,16 @@ impl Executor {
         cache: Option<Arc<dyn SessionRuntimeCache>>,
     ) -> Self {
         self.session_runtime_cache = cache;
+        self
+    }
+
+    /// Suspend tasks at the await points `rule` selects, releasing their
+    /// vcores while they wait so the executor can run other tasks; pull-based
+    /// scheduling only. `None` (the default) keeps a task's vcore for its whole
+    /// life.
+    #[must_use]
+    pub fn with_await_point_rule(mut self, rule: Option<Arc<AwaitPointRule>>) -> Self {
+        self.await_point_rule = rule;
         self
     }
 

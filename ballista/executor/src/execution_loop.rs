@@ -26,9 +26,9 @@ use crate::executor::Executor;
 use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
+use ballista_core::await_point::VcorePermit;
 use ballista_core::error::BallistaError;
-use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
-use ballista_core::lendable_vcore::{LendableVcore, LendableVcoreRule};
+use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
@@ -37,7 +37,6 @@ use ballista_core::serde::protobuf::{
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use ballista_core::utils::redact_key_value_pairs;
 use datafusion::execution::context::TaskContext;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -138,18 +137,18 @@ where
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.vcores as usize);
 
-    // Tasks whose vcore is lent (see `ballista_core::lendable_vcore`) still
-    // occupy the executor, so cap tasks in flight separately from vcores.
-    // Without a cap above the vcore count a lent vcore is never advertised.
-    let max_inflight = executor
-        .produce_config()
-        .ballista_config()
-        .max_inflight_tasks();
+    // Suspended tasks (see `ballista_core::await_point`) still occupy the
+    // executor, so cap tasks in flight separately from vcores. Without a cap
+    // above the vcore count a released vcore is never advertised.
+    let max_inflight = executor.await_point_rule.as_ref().map_or(0, |rule| {
+        (executor_specification.vcores as usize)
+            .saturating_mul(rule.inflight_tasks_per_vcore())
+    });
     let inflight = (max_inflight > executor_specification.vcores as usize)
         .then(|| Arc::new(Semaphore::new(max_inflight)));
     if let Some(inflight) = &inflight {
         info!(
-            "Vcore lending enabled: up to {} tasks in flight on {} vcores",
+            "Suspending tasks at await points: up to {} tasks in flight on {} vcores",
             inflight.available_permits(),
             executor_specification.vcores
         );
@@ -355,8 +354,8 @@ impl Drop for QueuedTask {
     }
 }
 
-/// What a task waits for before it runs: an in-flight slot when vcore lending
-/// is enabled on this executor, then a vcore.
+/// What a task waits for before it runs: an in-flight slot when the executor
+/// suspends tasks at await points, then a vcore.
 struct TaskSlot {
     vcores: Arc<Semaphore>,
     inflight: Option<Arc<Semaphore>>,
@@ -364,11 +363,11 @@ struct TaskSlot {
 }
 
 impl TaskSlot {
-    /// Wait for the task's in-flight slot and vcore. With `lendable` the vcore
-    /// is acquired through it so it can be lent while the task is pending.
+    /// Wait for the task's in-flight slot and vcore. With `permit` the vcore is
+    /// acquired through it so it can be released while the task is suspended.
     async fn acquire(
         self,
-        lendable: Option<Arc<LendableVcore>>,
+        permit: Option<Arc<VcorePermit>>,
     ) -> Result<HeldSlot, BallistaError> {
         let closed =
             |what: &str| BallistaError::Internal(format!("{what} semaphore closed"));
@@ -381,9 +380,9 @@ impl TaskSlot {
             ),
             None => None,
         };
-        let permit = match &lendable {
-            Some(lendable) => {
-                lendable.acquire().await.map_err(|_| closed("vcore"))?;
+        let vcore = match &permit {
+            Some(permit) => {
+                permit.acquire().await.map_err(|_| closed("vcore"))?;
                 None
             }
             None => Some(
@@ -394,8 +393,8 @@ impl TaskSlot {
             ),
         };
         Ok(HeldSlot {
-            _permit: permit,
-            lendable,
+            _vcore: vcore,
+            permit,
             _inflight: inflight,
         })
     }
@@ -403,23 +402,23 @@ impl TaskSlot {
 
 /// A running task's vcore and in-flight slot, returned when dropped.
 struct HeldSlot {
-    _permit: Option<OwnedSemaphorePermit>,
-    lendable: Option<Arc<LendableVcore>>,
+    _vcore: Option<OwnedSemaphorePermit>,
+    permit: Option<Arc<VcorePermit>>,
     _inflight: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for HeldSlot {
     fn drop(&mut self) {
         // Close explicitly: streams or the task context may outlive the task
-        // and keep the lendable vcore alive.
-        if let Some(lendable) = &self.lendable {
-            lendable.close();
+        // and keep the permit alive.
+        if let Some(permit) = &self.permit {
+            permit.close();
         }
     }
 }
 
-/// Vcores to advertise: free vcores, capped by free in-flight slots when vcore
-/// lending is enabled, minus bound tasks still waiting for a vcore.
+/// Vcores to advertise: free vcores, capped by free in-flight slots when the
+/// executor suspends tasks, minus bound tasks still waiting for a vcore.
 fn free_slots(vcores: &Semaphore, inflight: Option<&Semaphore>, queued: usize) -> u32 {
     let free = inflight.map_or(vcores.available_permits(), |inflight| {
         vcores.available_permits().min(inflight.available_permits())
@@ -458,15 +457,14 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let session_config = executor.produce_config();
     let session_config = session_config.update_from_key_value_pair(&task.props);
 
-    let ballista_config = session_config.ballista_config();
-    let lendable = ballista_config.lend_vcore_on_pending_task().then(|| {
-        LendableVcore::new(
-            Arc::clone(&slot.vcores),
-            ballista_config.lend_vcore_pending_threshold(),
-        )
-    });
-    let session_config = match &lendable {
-        Some(lendable) => session_config.with_extension(Arc::clone(lendable)),
+    // Created before the plan is decoded because the task context needs it;
+    // dropped below if the plan has no await points.
+    let permit = executor
+        .await_point_rule
+        .as_ref()
+        .map(|rule| VcorePermit::new(Arc::clone(&slot.vcores), rule.suspend_after()));
+    let session_config = match &permit {
+        Some(permit) => session_config.with_extension(Arc::clone(permit)),
         None => session_config,
     };
 
@@ -500,9 +498,19 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         })?;
 
     // Runs here rather than on the scheduler so planning rules still see the
-    // unwrapped leaves; a no-op unless the task enabled vcore lending.
-    let plan = LendableVcoreRule::default()
-        .optimize(plan, task_context.session_config().options())?;
+    // unwrapped leaves.
+    let (plan, permit) = match (&executor.await_point_rule, permit) {
+        (Some(rule), Some(permit)) => {
+            let wrapped = rule.wrap(plan)?;
+            if wrapped.transformed {
+                (wrapped.data, Some(permit))
+            } else {
+                permit.close();
+                (wrapped.data, None)
+            }
+        }
+        (_, permit) => (plan, permit),
+    };
 
     let global_output_partition_ids: Vec<usize> = task
         .global_output_partition_ids
@@ -527,7 +535,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             task_id: task_id as usize,
         };
 
-        let held = slot.acquire(lendable).await;
+        let held = slot.acquire(permit).await;
         let task_start = Instant::now();
         let execution_result = match &held {
             Err(e) => Err(BallistaError::Internal(e.to_string())),
@@ -672,18 +680,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lendable_vcore_is_acquired_before_the_task_runs_and_closed_after() {
+    async fn vcore_permit_is_acquired_before_the_task_runs_and_closed_after() {
         let vcores = Arc::new(Semaphore::new(1));
         let queued = Arc::new(AtomicUsize::new(0));
-        let lendable = LendableVcore::new(Arc::clone(&vcores), Duration::from_millis(10));
+        let permit = VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(10));
         let held = slot(&vcores, &queued)
-            .acquire(Some(Arc::clone(&lendable)))
+            .acquire(Some(Arc::clone(&permit)))
             .await
             .expect("slot");
-        assert!(lendable.is_held());
+        assert!(permit.is_held());
         assert_eq!(vcores.available_permits(), 0);
         drop(held);
-        assert!(!lendable.is_held());
+        assert!(!permit.is_held());
         assert_eq!(vcores.available_permits(), 1);
     }
 }
