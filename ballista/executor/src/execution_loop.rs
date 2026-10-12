@@ -137,23 +137,6 @@ where
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.vcores as usize);
 
-    // Suspended tasks (see `ballista_core::await_point`) still occupy the
-    // executor, so cap tasks in flight separately from vcores. Without a cap
-    // above the vcore count a released vcore is never advertised.
-    let max_inflight = executor.await_point_rule.as_ref().map_or(0, |rule| {
-        (executor_specification.vcores as usize)
-            .saturating_mul(rule.inflight_tasks_per_vcore())
-    });
-    let inflight = (max_inflight > executor_specification.vcores as usize)
-        .then(|| Arc::new(Semaphore::new(max_inflight)));
-    if let Some(inflight) = &inflight {
-        info!(
-            "Suspending tasks at await points: up to {} tasks in flight on {} vcores",
-            inflight.available_permits(),
-            executor_specification.vcores
-        );
-    }
-
     // Tasks bound by the scheduler that are still waiting for their vcore.
     // They wait inside the task, never here, so a vcore taken back by a
     // resuming task cannot stall this loop (and with it the heartbeat).
@@ -196,7 +179,6 @@ where
                     metadata: Some(executor.metadata.clone()),
                     num_free_vcores: free_slots(
                         &free_vcores,
-                        inflight.as_deref(),
                         queued.load(Ordering::Acquire),
                     ),
                     task_status,
@@ -236,7 +218,6 @@ where
                     // never waits for one, because it is the heartbeat.
                     let slot = TaskSlot {
                         vcores: Arc::clone(&free_vcores),
-                        inflight: inflight.clone(),
                         _queued: QueuedTask::new(&queued),
                     };
 
@@ -354,57 +335,38 @@ impl Drop for QueuedTask {
     }
 }
 
-/// What a task waits for before it runs: an in-flight slot when the executor
-/// suspends tasks at await points, then a vcore.
+/// A task bound by the scheduler, waiting for its vcore before it runs.
 struct TaskSlot {
     vcores: Arc<Semaphore>,
-    inflight: Option<Arc<Semaphore>>,
     _queued: QueuedTask,
 }
 
 impl TaskSlot {
-    /// Wait for the task's in-flight slot and vcore. With `permit` the vcore is
-    /// acquired through it so it can be released while the task is suspended.
+    /// Wait for the task's vcore. With `permit` the vcore is acquired through
+    /// it so it can be released while the task is suspended.
     async fn acquire(
         self,
         permit: Option<Arc<VcorePermit>>,
     ) -> Result<HeldSlot, BallistaError> {
-        let closed =
-            |what: &str| BallistaError::Internal(format!("{what} semaphore closed"));
-        let inflight = match self.inflight {
-            Some(inflight) => Some(
-                inflight
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| closed("in-flight task"))?,
-            ),
-            None => None,
-        };
+        let closed = |_| BallistaError::Internal("vcore semaphore closed".to_string());
         let vcore = match &permit {
             Some(permit) => {
-                permit.acquire().await.map_err(|_| closed("vcore"))?;
+                permit.acquire().await.map_err(closed)?;
                 None
             }
-            None => Some(
-                self.vcores
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| closed("vcore"))?,
-            ),
+            None => Some(self.vcores.acquire_owned().await.map_err(closed)?),
         };
         Ok(HeldSlot {
             _vcore: vcore,
             permit,
-            _inflight: inflight,
         })
     }
 }
 
-/// A running task's vcore and in-flight slot, returned when dropped.
+/// A running task's vcore, returned when dropped.
 struct HeldSlot {
     _vcore: Option<OwnedSemaphorePermit>,
     permit: Option<Arc<VcorePermit>>,
-    _inflight: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for HeldSlot {
@@ -417,13 +379,10 @@ impl Drop for HeldSlot {
     }
 }
 
-/// Vcores to advertise: free vcores, capped by free in-flight slots when the
-/// executor suspends tasks, minus bound tasks still waiting for a vcore.
-fn free_slots(vcores: &Semaphore, inflight: Option<&Semaphore>, queued: usize) -> u32 {
-    let free = inflight.map_or(vcores.available_permits(), |inflight| {
-        vcores.available_permits().min(inflight.available_permits())
-    });
-    u32::try_from(free.saturating_sub(queued)).unwrap_or(u32::MAX)
+/// Vcores to advertise: free vcores, including those released by suspended
+/// tasks, minus bound tasks still waiting for a vcore.
+fn free_slots(vcores: &Semaphore, queued: usize) -> u32 {
+    u32::try_from(vcores.available_permits().saturating_sub(queued)).unwrap_or(u32::MAX)
 }
 
 async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
@@ -608,7 +567,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             },
         ));
 
-        // Release the vcore and in-flight slot after the work is done
+        // Release the vcore after the work is done
         drop(held);
     });
 
@@ -644,7 +603,6 @@ mod tests {
     fn slot(vcores: &Arc<Semaphore>, queued: &Arc<AtomicUsize>) -> TaskSlot {
         TaskSlot {
             vcores: Arc::clone(vcores),
-            inflight: None,
             _queued: QueuedTask::new(queued),
         }
     }
@@ -652,9 +610,8 @@ mod tests {
     #[test]
     fn free_slots_excludes_tasks_waiting_for_a_vcore() {
         let vcores = Semaphore::new(4);
-        assert_eq!(free_slots(&vcores, None, 1), 3);
-        assert_eq!(free_slots(&vcores, Some(&Semaphore::new(2)), 1), 1);
-        assert_eq!(free_slots(&vcores, None, 9), 0);
+        assert_eq!(free_slots(&vcores, 1), 3);
+        assert_eq!(free_slots(&vcores, 9), 0);
     }
 
     #[tokio::test]
@@ -668,7 +625,7 @@ mod tests {
         let waiting = tokio::spawn(slot(&vcores, &queued).acquire(None));
         tokio::task::yield_now().await;
         assert_eq!(queued.load(Ordering::Acquire), 1);
-        assert_eq!(free_slots(&vcores, None, queued.load(Ordering::Acquire)), 0);
+        assert_eq!(free_slots(&vcores, queued.load(Ordering::Acquire)), 0);
         assert!(!waiting.is_finished());
 
         drop(busy);

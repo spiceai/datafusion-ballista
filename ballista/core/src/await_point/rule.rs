@@ -32,17 +32,16 @@ pub type AwaitPointFilter = Arc<dyn Fn(&dyn ExecutionPlan) -> bool + Send + Sync
 /// carries the settings an executor needs to suspend tasks at them.
 ///
 /// Providing this rule to an executor (`Executor::with_await_point_rule`) is
-/// the opt-in: the executor applies it to every decoded stage plan, gives each
-/// task a [`VcorePermit`](super::VcorePermit), and lets
-/// [`inflight_tasks_per_vcore`](Self::inflight_tasks_per_vcore) tasks per vcore
-/// be in flight so suspended tasks' vcores can be used by others. The rule runs
-/// on the executor rather than the scheduler so scheduler rules still see the
-/// unwrapped leaves. Applying it twice is a no-op.
+/// the opt-in: the executor applies it to every decoded stage plan and gives
+/// each task a [`VcorePermit`](super::VcorePermit), whose vcore is released to
+/// other tasks while the task is suspended. The number of suspended tasks is
+/// not capped. The rule runs on the executor rather than the scheduler so
+/// scheduler rules still see the unwrapped leaves. Applying it twice is a
+/// no-op.
 #[derive(Clone)]
 pub struct AwaitPointRule {
     filter: AwaitPointFilter,
     suspend_after: Duration,
-    inflight_tasks_per_vcore: usize,
 }
 
 impl AwaitPointRule {
@@ -54,7 +53,6 @@ impl AwaitPointRule {
         Self {
             filter,
             suspend_after: Duration::from_millis(50),
-            inflight_tasks_per_vcore: 4,
         }
     }
 
@@ -67,24 +65,10 @@ impl AwaitPointRule {
         self
     }
 
-    /// Tasks the executor runs at once per vcore, counting suspended ones.
-    /// Default 4. Values of 1 or less disable releasing vcores.
-    #[must_use]
-    pub fn with_inflight_tasks_per_vcore(mut self, tasks: usize) -> Self {
-        self.inflight_tasks_per_vcore = tasks;
-        self
-    }
-
     /// See [`with_suspend_after`](Self::with_suspend_after).
     #[must_use]
     pub fn suspend_after(&self) -> Duration {
         self.suspend_after
-    }
-
-    /// See [`with_inflight_tasks_per_vcore`](Self::with_inflight_tasks_per_vcore).
-    #[must_use]
-    pub fn inflight_tasks_per_vcore(&self) -> usize {
-        self.inflight_tasks_per_vcore
     }
 
     /// Wrap the selected leaves of `plan`, reporting whether any were wrapped.
@@ -113,7 +97,6 @@ impl fmt::Debug for AwaitPointRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AwaitPointRule")
             .field("suspend_after", &self.suspend_after)
-            .field("inflight_tasks_per_vcore", &self.inflight_tasks_per_vcore)
             .finish_non_exhaustive()
     }
 }
