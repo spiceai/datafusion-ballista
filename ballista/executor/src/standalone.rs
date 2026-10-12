@@ -23,6 +23,7 @@
 use crate::metrics::LoggingMetricsCollector;
 use crate::{execution_loop, executor::Executor, flight_service::BallistaFlightService};
 use arrow_flight::flight_service_server::FlightServiceServer;
+use ballista_core::await_point::AwaitPointRule;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::utils::{GrpcServerConfig, default_config_producer};
@@ -115,21 +116,27 @@ pub async fn new_standalone_executor_from_builder(
 
     let config = config_producer();
     let max_message_size = config.ballista_grpc_client_max_message_size();
+    // A standalone executor is built inside the client, so the opt-in to
+    // suspending tasks at await points travels as a session config extension.
+    let await_point_rule = config.get_extension::<AwaitPointRule>();
 
     let work_dir = TempDir::new()?.path().to_str().unwrap().to_string();
 
     info!("work_dir: {work_dir}");
 
-    let executor = Arc::new(Executor::new(
-        executor_meta,
-        &work_dir,
-        runtime_producer,
-        config_producer,
-        Arc::new(function_registry),
-        Arc::new(LoggingMetricsCollector::default()),
-        vcores,
-        None,
-    ));
+    let executor = Arc::new(
+        Executor::new(
+            executor_meta,
+            &work_dir,
+            runtime_producer,
+            config_producer,
+            Arc::new(function_registry),
+            Arc::new(LoggingMetricsCollector::default()),
+            vcores,
+            None,
+        )
+        .with_await_point_rule(await_point_rule),
+    );
 
     let service = BallistaFlightService::new();
     let server = FlightServiceServer::new(service)

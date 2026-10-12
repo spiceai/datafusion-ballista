@@ -1,4 +1,4 @@
-//! Prototype lab for `ballista_core::lendable_vcore` (lending vcores of pending tasks).
+//! Prototype lab for `ballista_core::await_point` (suspending tasks that wait).
 //!
 //! `SCENARIO=io`: background loops scan a table whose object store answers
 //! after `SLOW_MS` (an async sleep standing in for a slow HTTP origin) while a
@@ -7,8 +7,9 @@
 //! `SCENARIO=cpu`: concurrent loops run a CPU-heavy aggregate over local
 //! Parquet, to measure the overhead and any false vcore releases.
 //!
-//! `LEND_VCORE=1` enables vcore lending for the session and lets the executor run
-//! `INFLIGHT_FACTOR` x vcores tasks at once.
+//! `AWAIT_POINTS=1` gives the standalone executor an `AwaitPointRule` over
+//! `DataSourceExec` leaves, running `INFLIGHT_FACTOR` tasks per vcore and
+//! releasing a suspended task's vcore after `SUSPEND_AFTER_MS`.
 
 use ballista::datafusion::{
     common::Result,
@@ -16,11 +17,7 @@ use ballista::datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use ballista::prelude::{SessionConfigExt, SessionContextExt};
-use ballista_core::config::{
-    BALLISTA_EXECUTOR_MAX_INFLIGHT_TASKS, BALLISTA_LEND_VCORE_ON_PENDING_TASK,
-    BALLISTA_LEND_VCORE_PENDING_THRESHOLD_MS,
-};
-use ballista_core::lendable_vcore::global_stats;
+use ballista_core::await_point::{AwaitPointRule, global_stats};
 use ballista_examples::test_util;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -126,8 +123,8 @@ fn env_u64(k: &str, d: u64) -> u64 {
         .unwrap_or(d)
 }
 
-fn lending_enabled() -> bool {
-    std::env::var("LEND_VCORE").ok().as_deref() == Some("1")
+fn await_points_enabled() -> bool {
+    std::env::var("AWAIT_POINTS").ok().as_deref() == Some("1")
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -162,17 +159,17 @@ fn cpu_secs() -> f64 {
     ticks / 100.0
 }
 
-fn print_lending_stats() {
+fn print_await_point_stats() {
     let s = global_stats();
     let ms = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
     println!(
-        "lending: pending_parks={} yields={} releases={} reacquires={} reacquire_wait={:.1}ms lent={:.1}ms slow_store_calls={}",
-        s.parks.load(Ordering::Relaxed),
-        s.self_wakes.load(Ordering::Relaxed),
+        "await points: suspensions={} yields={} releases={} resume_waits={} resume_wait={:.1}ms released={:.1}ms slow_store_calls={}",
+        s.suspensions.load(Ordering::Relaxed),
+        s.yields.load(Ordering::Relaxed),
         s.releases.load(Ordering::Relaxed),
-        s.reacquire_waits.load(Ordering::Relaxed),
-        ms(&s.reacquire_wait_nanos),
-        ms(&s.lent_nanos),
+        s.resume_waits.load(Ordering::Relaxed),
+        ms(&s.resume_wait_nanos),
+        ms(&s.released_nanos),
         SLOW_CALLS.load(Ordering::Relaxed),
     );
 }
@@ -205,15 +202,11 @@ async fn context(vcores: usize, target_partitions: usize) -> Result<SessionConte
     let mut config = SessionConfig::new_with_ballista()
         .with_target_partitions(target_partitions)
         .with_ballista_standalone_parallelism(vcores);
-    if lending_enabled() {
-        let factor = env_u64("INFLIGHT_FACTOR", 4) as usize;
-        config = config
-            .set_bool(BALLISTA_LEND_VCORE_ON_PENDING_TASK, true)
-            .set_usize(BALLISTA_EXECUTOR_MAX_INFLIGHT_TASKS, vcores * factor)
-            .set_u64(
-                BALLISTA_LEND_VCORE_PENDING_THRESHOLD_MS,
-                env_u64("RELEASE_MS", 50),
-            );
+    if await_points_enabled() {
+        let rule = AwaitPointRule::new(Arc::new(|plan| plan.name() == "DataSourceExec"))
+            .with_inflight_tasks_per_vcore(env_u64("INFLIGHT_FACTOR", 4) as usize)
+            .with_suspend_after(Duration::from_millis(env_u64("SUSPEND_AFTER_MS", 50)));
+        config = config.with_extension(Arc::new(rule));
     }
     let state = SessionStateBuilder::new()
         .with_config(config)
@@ -369,7 +362,7 @@ async fn cpu_scenario(vcores: usize) -> Result<()> {
     Ok(())
 }
 
-/// CPU-heavy loops and slow-I/O loops at the same time: what lending costs
+/// CPU-heavy loops and slow-I/O loops at the same time: what suspension costs
 /// the I/O-bound queries when they must win a vcore back from CPU work.
 async fn mixed_scenario(vcores: usize) -> Result<()> {
     let dir = std::env::var("DATA_DIR").expect("DATA_DIR for SCENARIO=mixed");
@@ -442,10 +435,10 @@ async fn main() -> Result<()> {
     let vcores = env_u64("VCORES", 2) as usize;
     let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "io".to_string());
     println!(
-        "scenario={scenario} lend_vcore={} vcores={vcores} inflight_factor={} release_ms={} slow_ms={} bg_loops={}",
-        lending_enabled(),
+        "scenario={scenario} await_points={} vcores={vcores} inflight_factor={} suspend_after_ms={} slow_ms={} bg_loops={}",
+        await_points_enabled(),
         env_u64("INFLIGHT_FACTOR", 4),
-        env_u64("RELEASE_MS", 50),
+        env_u64("SUSPEND_AFTER_MS", 50),
         env_u64("SLOW_MS", 1000),
         env_u64("BG_LOOPS", 2),
     );
@@ -455,6 +448,6 @@ async fn main() -> Result<()> {
         "mixed" => mixed_scenario(vcores).await?,
         other => panic!("unknown SCENARIO {other}"),
     }
-    print_lending_stats();
+    print_await_point_stats();
     Ok(())
 }

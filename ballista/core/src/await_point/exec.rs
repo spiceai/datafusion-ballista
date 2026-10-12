@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::vcore::{LendableVcore, Resume};
+use super::permit::{Resume, VcorePermit};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -38,21 +38,22 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
-/// Pass-through node that lets its input's task lend out its vcore while the
-/// input is parked on I/O.
+/// An await point: a pass-through node whose input's `Pending` suspends the
+/// task, so its vcore can be released while the input waits.
 ///
-/// At execution time it looks for a [`LendableVcore`] in the task's
+/// At execution time it looks for a [`VcorePermit`] in the task's
 /// `SessionConfig`. Without one (plain `DataFusion`, push-based Ballista
-/// executors) the input stream is returned unchanged. With one, the stream
-/// reports every `Pending` that did not wake itself as "parked", and before
-/// polling the input after a park it re-acquires the vcore if it was lent.
+/// executors) the input stream is returned unchanged. With one, every
+/// `Pending` that is neither a self-wake nor a coop-budget yield suspends the
+/// task, and after a suspension the stream acquires the vcore again, if it was
+/// released, before polling its input.
 #[derive(Debug)]
-pub struct LendableVcoreExec {
+pub struct AwaitPointExec {
     input: Arc<dyn ExecutionPlan>,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl LendableVcoreExec {
+impl AwaitPointExec {
     /// Wrap `input`.
     #[must_use]
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
@@ -69,19 +70,19 @@ impl LendableVcoreExec {
     }
 }
 
-impl DisplayAs for LendableVcoreExec {
+impl DisplayAs for AwaitPointExec {
     fn fmt_as(
         &self,
         _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "LendableVcoreExec")
+        write!(f, "AwaitPointExec")
     }
 }
 
-impl ExecutionPlan for LendableVcoreExec {
+impl ExecutionPlan for AwaitPointExec {
     fn name(&self) -> &'static str {
-        "LendableVcoreExec"
+        "AwaitPointExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -106,7 +107,7 @@ impl ExecutionPlan for LendableVcoreExec {
         if let (Some(input), true) = (children.pop(), children.is_empty()) {
             Ok(Arc::new(Self::new(input)))
         } else {
-            internal_err!("LendableVcoreExec expects exactly one child")
+            internal_err!("AwaitPointExec expects exactly one child")
         }
     }
 
@@ -115,13 +116,13 @@ impl ExecutionPlan for LendableVcoreExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let lease = LendableVcore::from_task_context(&context);
+        let permit = VcorePermit::from_task_context(&context);
         let input = self.input.execute(partition, context)?;
-        let Some(lease) = lease else {
+        let Some(permit) = permit else {
             return Ok(input);
         };
-        let metrics = LendMetrics::new(&self.metrics, partition);
-        Ok(Box::pin(LendableVcoreStream::new(input, lease, metrics)))
+        let metrics = AwaitMetrics::new(&self.metrics, partition);
+        Ok(Box::pin(AwaitPointStream::new(input, permit, metrics)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -129,26 +130,27 @@ impl ExecutionPlan for LendableVcoreExec {
     }
 }
 
-struct LendMetrics {
+struct AwaitMetrics {
     /// Time spent inside the input's `poll_next`.
     poll_time: Time,
-    /// Time between a park and the next poll.
-    parked_time: Time,
-    /// Time waiting to get a lent vcore back.
-    reacquire_time: Time,
-    parks: Count,
-    self_wakes: Count,
+    /// Time between a suspension and the next poll.
+    suspended_time: Time,
+    /// Time waiting to get a released vcore back.
+    resume_wait_time: Time,
+    suspensions: Count,
+    yields: Count,
 }
 
-impl LendMetrics {
+impl AwaitMetrics {
     fn new(set: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             poll_time: MetricBuilder::new(set).subset_time("input_poll_time", partition),
-            parked_time: MetricBuilder::new(set).subset_time("pending_time", partition),
-            reacquire_time: MetricBuilder::new(set)
-                .subset_time("vcore_reacquire_time", partition),
-            parks: MetricBuilder::new(set).counter("pending_parks", partition),
-            self_wakes: MetricBuilder::new(set).counter("yields", partition),
+            suspended_time: MetricBuilder::new(set)
+                .subset_time("suspended_time", partition),
+            resume_wait_time: MetricBuilder::new(set)
+                .subset_time("resume_wait_time", partition),
+            suspensions: MetricBuilder::new(set).counter("suspensions", partition),
+            yields: MetricBuilder::new(set).counter("yields", partition),
         }
     }
 }
@@ -186,29 +188,29 @@ enum Phase {
     /// Runnable: the input is being polled or returned a batch.
     Running,
     /// The input returned `Pending` without waking itself.
-    Parked(Instant),
+    Suspended(Instant),
     /// Waiting for a vcore before polling the input again.
-    Reacquiring(
+    Acquiring(
         BoxFuture<'static, Result<OwnedSemaphorePermit, AcquireError>>,
         Instant,
     ),
     Done,
 }
 
-struct LendableVcoreStream {
+struct AwaitPointStream {
     input: SendableRecordBatchStream,
-    lease: Arc<LendableVcore>,
+    permit: Arc<VcorePermit>,
     phase: Phase,
     flag: Arc<FlagWaker>,
     waker: Waker,
-    metrics: LendMetrics,
+    metrics: AwaitMetrics,
 }
 
-impl LendableVcoreStream {
+impl AwaitPointStream {
     fn new(
         input: SendableRecordBatchStream,
-        lease: Arc<LendableVcore>,
-        metrics: LendMetrics,
+        permit: Arc<VcorePermit>,
+        metrics: AwaitMetrics,
     ) -> Self {
         let flag = Arc::new(FlagWaker {
             woken: AtomicBool::new(false),
@@ -217,7 +219,7 @@ impl LendableVcoreStream {
         let waker = Waker::from(Arc::clone(&flag));
         Self {
             input,
-            lease,
+            permit,
             phase: Phase::New,
             flag,
             waker,
@@ -228,24 +230,24 @@ impl LendableVcoreStream {
     /// Move to `Running`, or to `Reacquiring` if the vcore was lent.
     fn resume(&mut self) {
         let resume = match std::mem::replace(&mut self.phase, Phase::Running) {
-            Phase::New => self.lease.stream_started(),
-            Phase::Parked(since) => {
-                self.metrics.parked_time.add_duration(since.elapsed());
-                self.lease.stream_resumed()
+            Phase::New => self.permit.start(),
+            Phase::Suspended(since) => {
+                self.metrics.suspended_time.add_duration(since.elapsed());
+                self.permit.resume()
             }
             other => {
                 self.phase = other;
                 return;
             }
         };
-        if resume == Resume::Reacquire {
-            let acquire = self.lease.semaphore().acquire_owned().boxed();
-            self.phase = Phase::Reacquiring(acquire, Instant::now());
+        if resume == Resume::Acquire {
+            let acquire = self.permit.semaphore().acquire_owned().boxed();
+            self.phase = Phase::Acquiring(acquire, Instant::now());
         }
     }
 
-    fn poll_reacquire(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        let Phase::Reacquiring(acquire, since) = &mut self.phase else {
+    fn poll_acquire(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let Phase::Acquiring(acquire, since) = &mut self.phase else {
             return Poll::Ready(Ok(()));
         };
         let permit = match acquire.poll_unpin(cx) {
@@ -256,8 +258,8 @@ impl LendableVcoreStream {
             }
         };
         let waited = since.elapsed();
-        self.metrics.reacquire_time.add_duration(waited);
-        drop(self.lease.install(permit, waited));
+        self.metrics.resume_wait_time.add_duration(waited);
+        drop(self.permit.install(permit, waited));
         self.phase = Phase::Running;
         Poll::Ready(Ok(()))
     }
@@ -281,17 +283,17 @@ impl LendableVcoreStream {
                 if self.flag.woken.load(Ordering::Acquire)
                     || !tokio::task::coop::has_budget_remaining() =>
             {
-                self.metrics.self_wakes.add(1);
-                self.lease.record_self_wake();
+                self.metrics.yields.add(1);
+                self.permit.record_yield();
             }
             Poll::Pending => {
-                self.metrics.parks.add(1);
-                self.phase = Phase::Parked(Instant::now());
-                self.lease.stream_parked();
+                self.metrics.suspensions.add(1);
+                self.phase = Phase::Suspended(Instant::now());
+                self.permit.suspend();
             }
             Poll::Ready(None) => {
                 self.phase = Phase::Done;
-                self.lease.stream_finished();
+                self.permit.finish();
             }
             Poll::Ready(Some(_)) => {}
         }
@@ -299,7 +301,7 @@ impl LendableVcoreStream {
     }
 }
 
-impl Stream for LendableVcoreStream {
+impl Stream for AwaitPointStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -308,7 +310,7 @@ impl Stream for LendableVcoreStream {
             return Poll::Ready(None);
         }
         this.resume();
-        match this.poll_reacquire(cx) {
+        match this.poll_acquire(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
             Poll::Ready(Ok(())) => {}
@@ -317,17 +319,17 @@ impl Stream for LendableVcoreStream {
     }
 }
 
-impl RecordBatchStream for LendableVcoreStream {
+impl RecordBatchStream for AwaitPointStream {
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 }
 
-impl Drop for LendableVcoreStream {
+impl Drop for AwaitPointStream {
     fn drop(&mut self) {
         match self.phase {
-            Phase::Running | Phase::Reacquiring(..) => self.lease.stream_finished(),
-            Phase::Parked(_) => self.lease.parked_stream_dropped(),
+            Phase::Running | Phase::Acquiring(..) => self.permit.finish(),
+            Phase::Suspended(_) => self.permit.drop_suspended(),
             Phase::New | Phase::Done => {}
         }
     }
@@ -336,7 +338,6 @@ impl Drop for LendableVcoreStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lendable_vcore::cpu_wait;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionConfig;
@@ -344,46 +345,52 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
-    fn ctx(lease: &Arc<LendableVcore>) -> Arc<TaskContext> {
+    fn ctx(permit: &Arc<VcorePermit>) -> Arc<TaskContext> {
         Arc::new(
             TaskContext::default().with_session_config(
-                SessionConfig::new().with_extension(Arc::clone(lease)),
+                SessionConfig::new().with_extension(Arc::clone(permit)),
             ),
         )
     }
 
     fn wrap(
         stream: impl Stream<Item = Result<RecordBatch>> + Send + 'static,
-        lease: &Arc<LendableVcore>,
-    ) -> LendableVcoreStream {
+        permit: &Arc<VcorePermit>,
+    ) -> AwaitPointStream {
         let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(Schema::empty()),
             stream,
         ));
         let set = ExecutionPlanMetricsSet::new();
-        LendableVcoreStream::new(input, Arc::clone(lease), LendMetrics::new(&set, 0))
+        AwaitPointStream::new(input, Arc::clone(permit), AwaitMetrics::new(&set, 0))
     }
 
-    async fn new_lease(threshold_ms: u64) -> (Arc<Semaphore>, Arc<LendableVcore>) {
+    async fn new_permit(threshold_ms: u64) -> (Arc<Semaphore>, Arc<VcorePermit>) {
         let sem = Arc::new(Semaphore::new(1));
-        let lease =
-            LendableVcore::new(Arc::clone(&sem), Duration::from_millis(threshold_ms));
-        lease.acquire().await.expect("fresh semaphore has a permit");
-        (sem, lease)
+        let permit =
+            VcorePermit::new(Arc::clone(&sem), Duration::from_millis(threshold_ms));
+        permit
+            .acquire()
+            .await
+            .expect("fresh semaphore has a permit");
+        (sem, permit)
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_input_lends_vcore_and_reacquires_before_resuming() {
-        let (sem, lease) = new_lease(10).await;
+    async fn slow_input_releases_vcore_and_acquires_before_resuming() {
+        let (sem, permit) = new_permit(10).await;
         let slow = futures::stream::once(async {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = wrap(slow, &lease);
+        let mut stream = wrap(slow, &permit);
         let next = tokio::spawn(async move { stream.next().await.map(|r| r.is_ok()) });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!lease.is_held(), "vcore not lent while input was parked");
+        assert!(
+            !permit.is_held(),
+            "vcore not released while input was suspended"
+        );
         let borrowed = Arc::clone(&sem)
             .try_acquire_owned()
             .expect("lent vcore is available to other tasks");
@@ -393,19 +400,19 @@ mod tests {
 
         drop(borrowed);
         assert_eq!(next.await.expect("stream task"), Some(true));
-        assert!(lease.is_held(), "vcore not re-acquired");
+        assert!(permit.is_held(), "vcore not acquired again");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn coop_budget_yields_do_not_park() {
-        let (_sem, lease) = new_lease(0).await;
+    async fn coop_budget_yields_do_not_suspend() {
+        let (_sem, permit) = new_permit(0).await;
         // Consumes tokio coop budget per batch, like DataFusion's
         // `CooperativeStream`, so the task is forced to yield periodically.
         let yielding = futures::stream::iter(0..1000).then(|_| async {
             tokio::task::consume_budget().await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = wrap(yielding, &lease);
+        let mut stream = wrap(yielding, &permit);
         let task = tokio::spawn(async move {
             while let Some(batch) = stream.next().await {
                 batch.expect("batch");
@@ -413,30 +420,27 @@ mod tests {
             stream
         });
         let stream = task.await.expect("stream task");
-        assert!(
-            stream.metrics.self_wakes.value() > 0,
-            "no coop yields observed"
-        );
-        assert_eq!(stream.metrics.parks.value(), 0);
-        assert!(lease.is_held());
+        assert!(stream.metrics.yields.value() > 0, "no coop yields observed");
+        assert_eq!(stream.metrics.suspensions.value(), 0);
+        assert!(permit.is_held());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn yield_now_parks_briefly_but_keeps_vcore() {
-        let (_sem, lease) = new_lease(10).await;
+    async fn yield_now_suspends_briefly_but_keeps_vcore() {
+        let (_sem, permit) = new_permit(10).await;
         // `yield_now` wakes only after the task's poll returns and uses no
-        // budget, so it looks like a park; the release threshold absorbs it.
+        // budget, so it looks like a suspension; `suspend_after` absorbs it.
         let yielding = futures::stream::iter(0..100).then(|_| async {
             tokio::task::yield_now().await;
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
         });
-        let mut stream = wrap(yielding, &lease);
+        let mut stream = wrap(yielding, &permit);
         while let Some(batch) = stream.next().await {
             batch.expect("batch");
         }
-        assert_eq!(stream.metrics.parks.value(), 100);
-        assert!(lease.is_held());
-        assert_eq!(lease.stats().releases.load(Ordering::Relaxed), 0);
+        assert_eq!(stream.metrics.suspensions.value(), 100);
+        assert!(permit.is_held());
+        assert_eq!(permit.stats().releases.load(Ordering::Relaxed), 0);
     }
 
     fn busy_for(d: Duration) {
@@ -458,57 +462,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_on_offloaded_cpu_work_is_mistaken_for_io() {
-        let (_sem, lease) = new_lease(10).await;
-        let mut stream = wrap(offloaded_cpu_source(), &lease);
+    async fn waiting_on_offloaded_cpu_work_is_mistaken_for_io() {
+        let (_sem, permit) = new_permit(10).await;
+        let mut stream = wrap(offloaded_cpu_source(), &permit);
         stream.next().await.expect("batch").expect("ok");
         assert_eq!(
-            lease.stats().releases.load(Ordering::Relaxed),
+            permit.stats().releases.load(Ordering::Relaxed),
             1,
-            "lending cannot tell CPU work on another thread from I/O"
+            "suspension cannot tell CPU work on another thread from I/O"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cpu_wait_keeps_vcore_for_offloaded_cpu_work() {
-        let (_sem, lease) = new_lease(10).await;
-        let task_ctx = ctx(&lease);
-        let source = futures::stream::once(async move {
-            cpu_wait(
-                &task_ctx,
-                tokio::task::spawn_blocking(|| busy_for(Duration::from_millis(200))),
-            )
-            .await
-            .expect("blocking task");
-            Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
-        });
-        let mut stream = wrap(source, &lease);
-        stream.next().await.expect("batch").expect("ok");
-        assert_eq!(lease.stats().releases.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_io_inside_poll_is_invisible() {
-        let (_sem, lease) = new_lease(10).await;
+        let (_sem, permit) = new_permit(10).await;
         // Blocking inside `poll_next` (a sync client, `std::fs`) never returns
         // `Pending`, so it looks like CPU work and the vcore stays held.
         let source = futures::stream::poll_fn(|_| {
             std::thread::sleep(Duration::from_millis(200));
             Poll::Ready(None::<Result<RecordBatch>>)
         });
-        let mut stream = wrap(source, &lease);
+        let mut stream = wrap(source, &permit);
         assert!(stream.next().await.is_none());
-        assert_eq!(stream.metrics.parks.value(), 0);
+        assert_eq!(stream.metrics.suspensions.value(), 0);
         assert!(stream.metrics.poll_time.value() >= 200_000_000);
-        assert_eq!(lease.stats().releases.load(Ordering::Relaxed), 0);
+        assert_eq!(permit.stats().releases.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn without_lease_execute_returns_input_unchanged() {
+    async fn without_permit_execute_returns_input_unchanged() {
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
             Schema::empty(),
         )));
-        let exec = LendableVcoreExec::new(input);
+        let exec = AwaitPointExec::new(input);
         let stream = exec
             .execute(0, Arc::new(TaskContext::default()))
             .expect("execute");
@@ -517,13 +503,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn execute_with_lease_registers_metrics() {
-        let (_sem, lease) = new_lease(10).await;
+    async fn execute_with_permit_registers_metrics() {
+        let (_sem, permit) = new_permit(10).await;
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
             Schema::empty(),
         )));
-        let exec = LendableVcoreExec::new(input);
-        let mut stream = exec.execute(0, ctx(&lease)).expect("execute");
+        let exec = AwaitPointExec::new(input);
+        let mut stream = exec.execute(0, ctx(&permit)).expect("execute");
         while stream.next().await.is_some() {}
         assert!(exec.metrics().expect("metrics").iter().next().is_some());
     }
