@@ -214,6 +214,19 @@ pub const BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK: &str =
 pub const BALLISTA_SCHEDULER_SHARE_FILE_STATISTICS_CACHE: &str =
     "ballista.scheduler.share_file_statistics_cache";
 
+/// Configuration key enabling vcore lending for a task: the executor wraps the
+/// stage plan's leaves in `IoGateExec` and lends the task's vcore while every
+/// leaf is parked on I/O.
+pub const BALLISTA_IO_GATE_ENABLED: &str = "ballista.executor.io_gate.enabled";
+/// Configuration key for how long every gated stream of a task must stay
+/// parked before its vcore is lent.
+pub const BALLISTA_IO_GATE_RELEASE_THRESHOLD_MS: &str =
+    "ballista.executor.io_gate.release_threshold_ms";
+/// Configuration key, read from the executor's own config at startup, for the
+/// most tasks the executor runs at once including tasks whose vcore is lent.
+pub const BALLISTA_IO_GATE_MAX_INFLIGHT_TASKS: &str =
+    "ballista.executor.io_gate.max_inflight_tasks";
+
 /// Result type for configuration parsing operations.
 pub type ParseResult<T> = result::Result<T, String>;
 use std::sync::LazyLock;
@@ -514,6 +527,33 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                 .to_string(),
             DataType::Boolean,
             Some(true.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_IO_GATE_ENABLED.to_string(),
+            "Lends a task's vcore back to the executor while every leaf of the \
+             task's plan is waiting on I/O, and makes the task get a vcore back \
+             before it resumes. Only pull-based executors with \
+             max_inflight_tasks above their vcore count can use the lent vcore."
+                .to_string(),
+            DataType::Boolean,
+            Some(false.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_IO_GATE_RELEASE_THRESHOLD_MS.to_string(),
+            "How long, in milliseconds, every gated stream of a task must stay \
+             waiting before the task's vcore is lent."
+                .to_string(),
+            DataType::UInt64,
+            Some(50.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_IO_GATE_MAX_INFLIGHT_TASKS.to_string(),
+            "Executor-level cap on tasks running at once, counting tasks whose \
+             vcore is lent. 0 (default) means the vcore count, which disables \
+             lending."
+                .to_string(),
+            DataType::UInt64,
+            Some(0.to_string()),
         ),
     ];
     entries
@@ -893,6 +933,23 @@ impl BallistaConfig {
     /// statistics cache it shares across sessions.
     pub fn share_file_statistics_cache(&self) -> bool {
         self.get_bool_setting(BALLISTA_SCHEDULER_SHARE_FILE_STATISTICS_CACHE)
+    }
+
+    /// Returns whether tasks lend their vcore while waiting on I/O.
+    pub fn io_gate_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_IO_GATE_ENABLED)
+    }
+
+    /// Returns how long a task must stay parked before its vcore is lent.
+    pub fn io_gate_release_threshold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.get_usize_setting(BALLISTA_IO_GATE_RELEASE_THRESHOLD_MS) as u64,
+        )
+    }
+
+    /// Returns the executor's cap on in-flight tasks; 0 means the vcore count.
+    pub fn io_gate_max_inflight_tasks(&self) -> usize {
+        self.get_usize_setting(BALLISTA_IO_GATE_MAX_INFLIGHT_TASKS)
     }
 
     /// Returns whether chaos-monkey execution injection is enabled.

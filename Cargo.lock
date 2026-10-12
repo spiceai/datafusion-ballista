@@ -1154,10 +1154,12 @@ name = "ballista-examples"
 version = "55.0.0"
 dependencies = [
  "arrow-flight",
+ "async-trait",
  "ballista",
  "ballista-core",
  "ballista-executor",
  "ballista-scheduler",
+ "bytes",
  "ctor",
  "datafusion",
  "datafusion-proto",

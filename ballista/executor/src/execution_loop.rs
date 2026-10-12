@@ -27,7 +27,8 @@ use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
 use ballista_core::JobId;
 use ballista_core::error::BallistaError;
-use ballista_core::extension::SessionConfigHelperExt;
+use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
+use ballista_core::io_gate::{IoGateRule, VcoreLease};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
@@ -36,6 +37,7 @@ use ballista_core::serde::protobuf::{
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use ballista_core::utils::redact_key_value_pairs;
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -135,6 +137,23 @@ where
     let dedicated_executor =
         DedicatedExecutor::new("task_runner", executor_specification.vcores as usize);
 
+    // Tasks whose vcore is lent (see `ballista_core::io_gate`) still occupy
+    // the executor, so cap tasks in flight separately from vcores. Without a
+    // cap above the vcore count a lent vcore is never advertised.
+    let max_inflight = executor
+        .produce_config()
+        .ballista_config()
+        .io_gate_max_inflight_tasks();
+    let inflight = (max_inflight > executor_specification.vcores as usize)
+        .then(|| Arc::new(Semaphore::new(max_inflight)));
+    if let Some(inflight) = &inflight {
+        info!(
+            "Lending idle vcores enabled: up to {} tasks in flight on {} vcores",
+            inflight.available_permits(),
+            executor_specification.vcores
+        );
+    }
+
     loop {
         // Wait for a vcore permit before asking for new work, but cap the wait
         // so a fully-busy executor still polls the scheduler periodically.
@@ -170,7 +189,7 @@ where
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_vcores: free_vcores.available_permits() as u32,
+                    num_free_vcores: free_slots(&free_vcores, inflight.as_deref()),
                     task_status,
                 })
                 .await;
@@ -204,11 +223,28 @@ where
                 for task in tasks {
                     let task_status_sender = task_status_sender.clone();
 
-                    // Acquire a vcore permit for the task.
-                    let permit =
-                        free_vcores.clone().acquire_owned().await.map_err(|_| {
+                    // Acquire a vcore permit for the task. With vcore lending
+                    // a lent vcore may have been taken back since it was
+                    // advertised, so don't wait here (this loop is the
+                    // heartbeat); the task acquires one when it first runs.
+                    let permit = if inflight.is_some() {
+                        free_vcores.clone().try_acquire_owned().ok()
+                    } else {
+                        Some(free_vcores.clone().acquire_owned().await.map_err(|_| {
                             BallistaError::Internal("vcore semaphore closed".to_string())
-                        })?;
+                        })?)
+                    };
+
+                    let inflight_permit = match &inflight {
+                        Some(inflight) => Some(
+                            inflight.clone().acquire_owned().await.map_err(|_| {
+                                BallistaError::Internal(
+                                    "in-flight task semaphore closed".to_string(),
+                                )
+                            })?,
+                        ),
+                        None => None,
+                    };
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -217,7 +253,11 @@ where
 
                     match run_received_task(
                         executor.clone(),
-                        permit,
+                        TaskSlot {
+                            vcores: &free_vcores,
+                            permit,
+                            inflight_permit,
+                        },
                         task_status_sender.clone(),
                         task.clone(),
                         &codec,
@@ -308,9 +348,59 @@ pub(crate) fn any_to_string(any: &Box<dyn Any + Send>) -> String {
     }
 }
 
+/// What the poll loop hands a task: its vcore and, when vcore lending is
+/// enabled on this executor, its in-flight slot.
+struct TaskSlot<'a> {
+    vcores: &'a Arc<Semaphore>,
+    /// `None` when vcore lending is enabled and no vcore was free at bind time.
+    permit: Option<OwnedSemaphorePermit>,
+    inflight_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// A running task's vcore, either held outright or lendable.
+enum HeldVcore {
+    /// The vcore, or the semaphore to take one from before the task runs.
+    Permit(Result<OwnedSemaphorePermit, Arc<Semaphore>>),
+    Lease(Arc<VcoreLease>),
+}
+
+impl HeldVcore {
+    /// Make sure an ungated task holds its vcore before it runs. A closed
+    /// semaphore means the executor is shutting down; run without one.
+    async fn acquire(self) -> Self {
+        match self {
+            Self::Permit(Err(vcores)) => {
+                match Arc::clone(&vcores).acquire_owned().await {
+                    Ok(permit) => Self::Permit(Ok(permit)),
+                    Err(_) => Self::Permit(Err(vcores)),
+                }
+            }
+            held => held,
+        }
+    }
+
+    fn release(self) {
+        match self {
+            Self::Permit(permit) => drop(permit),
+            // Close explicitly: streams or the task context may outlive the
+            // task and keep the lease alive.
+            Self::Lease(lease) => lease.close(),
+        }
+    }
+}
+
+/// Vcores to advertise: free vcores, further capped by free in-flight slots
+/// when vcore lending is enabled.
+fn free_slots(vcores: &Semaphore, inflight: Option<&Semaphore>) -> u32 {
+    let free = inflight.map_or(vcores.available_permits(), |inflight| {
+        vcores.available_permits().min(inflight.available_permits())
+    });
+    u32::try_from(free).unwrap_or(u32::MAX)
+}
+
 async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     executor: Arc<Executor>,
-    permit: OwnedSemaphorePermit,
+    slot: TaskSlot<'_>,
     task_status_sender: Sender<TaskStatus>,
     task: TaskDefinition,
     codec: &BallistaCodec<T, U>,
@@ -338,6 +428,27 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     );
     let session_config = executor.produce_config();
     let session_config = session_config.update_from_key_value_pair(&task.props);
+
+    let ballista_config = session_config.ballista_config();
+    let TaskSlot {
+        vcores,
+        permit,
+        inflight_permit,
+    } = slot;
+    let (session_config, vcore) = if ballista_config.io_gate_enabled() {
+        let lease = VcoreLease::new(
+            Arc::clone(vcores),
+            permit,
+            ballista_config.io_gate_release_threshold(),
+        );
+        (
+            session_config.with_extension(Arc::clone(&lease)),
+            HeldVcore::Lease(lease),
+        )
+    } else {
+        let permit = permit.ok_or_else(|| Arc::clone(vcores));
+        (session_config, HeldVcore::Permit(permit))
+    };
 
     let task_scalar_functions = executor.function_registry.scalar_functions.clone();
     let task_aggregate_functions = executor.function_registry.aggregate_functions.clone();
@@ -368,6 +479,11 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
 
+    // Runs here rather than on the scheduler so planning rules still see the
+    // unwrapped leaves; a no-op unless the task enabled the io gate.
+    let plan =
+        IoGateRule::default().optimize(plan, task_context.session_config().options())?;
+
     let global_output_partition_ids: Vec<usize> = task
         .global_output_partition_ids
         .iter()
@@ -385,6 +501,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
+        let vcore = vcore.acquire().await;
         let key = TaskKey {
             job_id: job_id.clone(),
             stage_id: stage_id as usize,
@@ -461,7 +578,8 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         ));
 
         // Release the permit after the work is done
-        drop(permit);
+        vcore.release();
+        drop(inflight_permit);
     });
 
     Ok(())

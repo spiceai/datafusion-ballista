@@ -85,6 +85,8 @@ pub mod extension;
 pub mod flight_proxy_service;
 /// Strongly-typed string identifiers (job ids, job names, ...).
 pub mod ids;
+/// Lending a task's vcore back to the executor while it waits on I/O.
+pub mod io_gate;
 /// KLL quantile sketch (Karnin-Lang-Liberty), generic over `Ord` items.
 pub mod kll;
 #[cfg(feature = "build-binary")]
