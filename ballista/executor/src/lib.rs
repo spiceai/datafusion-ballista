@@ -50,6 +50,8 @@ pub mod terminate;
 
 mod cpu_bound_executor;
 mod standalone;
+/// Lending a task's vcore while all of the task waits on remote I/O.
+pub mod vcore_permit;
 
 use ballista_core::error::BallistaError;
 use log::debug;
@@ -58,6 +60,7 @@ use std::net::SocketAddr;
 pub use standalone::new_standalone_executor;
 pub use standalone::new_standalone_executor_from_builder;
 pub use standalone::new_standalone_executor_from_state;
+pub use vcore_permit::VcoreHook;
 
 use crate::shutdown::Shutdown;
 use ballista_core::serde::protobuf::{
