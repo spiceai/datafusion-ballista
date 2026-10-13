@@ -521,14 +521,17 @@ async fn drive_shuffle_writer_stage(
     for n in 0..k {
         let plan = plan.clone();
         let ctx = context.clone();
-        stream_futures.push(tokio::spawn(async move {
-            let mut stream = plan.execute(n, ctx)?;
-            let mut batches = Vec::new();
-            while let Some(batch) = stream.try_next().await? {
-                batches.push(batch);
-            }
-            metadata_batches_to_summaries(batches, is_sort_shuffle)
-        }));
+        // Carried: each partition's drain is the task's own work.
+        stream_futures.push(tokio::spawn(ballista_core::vcore_permit::carry(
+            async move {
+                let mut stream = plan.execute(n, ctx)?;
+                let mut batches = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    batches.push(batch);
+                }
+                metadata_batches_to_summaries(batches, is_sort_shuffle)
+            },
+        )));
     }
 
     let mut summaries = Vec::with_capacity(k);

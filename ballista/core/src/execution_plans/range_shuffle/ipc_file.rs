@@ -218,8 +218,8 @@ where
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
 
-    let handle =
-        tokio::task::spawn_blocking(move || -> Result<(u64, usize, FileLayout)> {
+    let handle = tokio::task::spawn_blocking(crate::vcore_permit::carry_blocking(
+        move || -> Result<(u64, usize, FileLayout)> {
             let file = File::create(&path_owned).map_err(|e| {
                 error!("Failed to create partition file at {:?}: {e:?}", path_owned);
                 BallistaError::IoError(e)
@@ -251,7 +251,8 @@ where
                 batches_written,
                 layout,
             ))
-        });
+        },
+    ));
 
     let mut num_rows = 0;
     let mut num_batches = 0;

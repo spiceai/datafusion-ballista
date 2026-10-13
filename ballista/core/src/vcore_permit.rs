@@ -34,7 +34,7 @@ use datafusion::common::runtime::IoWaitHook;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::FutureExt;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Either};
 use pin_project_lite::pin_project;
 use std::any::Any;
 use std::future::Future;
@@ -61,7 +61,7 @@ tokio::task_local! {
 /// The application sets it once at startup, or wraps it in its own hook:
 ///
 /// ```no_run
-/// datafusion::common::runtime::set_io_wait_hook(&ballista_executor::VcoreHook)
+/// datafusion::common::runtime::set_io_wait_hook(&ballista_core::vcore_permit::VcoreHook)
 ///     .expect("hook set once");
 /// ```
 ///
@@ -101,6 +101,35 @@ impl IoWaitHook for VcoreHook {
             }),
             Err(_) => f,
         }
+    }
+}
+
+/// Runs `fut` as part of the task being polled, if there is one.
+///
+/// DataFusion's spawns reach [`VcoreHook::carry_future`] on their own. Ballista's
+/// own spawns on a task's execution path (the shuffle writers) wrap their
+/// futures with this instead, so a wait inside them is counted on the task's
+/// permit and the spawned work takes a vcore back before it runs.
+pub fn carry<F: Future>(fut: F) -> impl Future<Output = F::Output> + use<F> {
+    match VCORE.try_with(Arc::clone) {
+        Ok(permit) => Either::Left(permit.run(fut)),
+        Err(_) => Either::Right(fut),
+    }
+}
+
+/// Counts a blocking closure spawned on a task's execution path as the task
+/// running, as [`carry`] does for futures.
+pub fn carry_blocking<F, R>(f: F) -> impl FnOnce() -> R + Send + use<F, R>
+where
+    F: FnOnce() -> R + Send,
+{
+    let permit = VCORE.try_with(Arc::clone).ok();
+    move || match permit {
+        Some(permit) => {
+            let _running = Running::start(&permit);
+            VCORE.sync_scope(Arc::clone(&permit), f)
+        }
+        None => f(),
     }
 }
 
@@ -588,6 +617,43 @@ mod tests {
         assert!(
             vcore_frees_within(&vcores, Duration::from_millis(150)).await,
             "a wait inside a DataFusion spawn should lend the vcore"
+        );
+        assert_eq!(task.await.expect("task"), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_wait_in_a_carried_tokio_spawn_lends_the_vcore() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let task = tokio::spawn(permit.run(async {
+            // How the shuffle writers spawn a stage's partitions.
+            tokio::spawn(carry(remote_call(200).io_wait()))
+                .await
+                .expect("spawned")
+        }));
+        assert!(
+            vcore_frees_within(&vcores, Duration::from_millis(150)).await,
+            "a wait inside a carried tokio::spawn should lend the vcore"
+        );
+        assert_eq!(task.await.expect("task"), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carried_blocking_closure_keeps_the_vcore() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let task = tokio::spawn(permit.run(async {
+            let waiting = SpawnedTask::spawn(remote_call(150).io_wait());
+            let writing = tokio::task::spawn_blocking(carry_blocking(|| {
+                let until = Instant::now() + Duration::from_millis(150);
+                while Instant::now() < until {
+                    std::hint::black_box((0..1_000u64).sum::<u64>());
+                }
+            }));
+            writing.await.expect("writing");
+            waiting.join().await.expect("waiting")
+        }));
+        assert!(
+            !vcore_frees_within(&vcores, Duration::from_millis(120)).await,
+            "lent while a carried blocking closure was running"
         );
         assert_eq!(task.await.expect("task"), 7);
     }

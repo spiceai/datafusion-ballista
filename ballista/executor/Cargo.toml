@@ -72,7 +72,6 @@ lru = "0.18"
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 mimalloc = { workspace = true, optional = true }
 parking_lot = { workspace = true }
-pin-project-lite = "0.2"
 serde = { workspace = true, features = ["derive"] }
 sysinfo = { version = "0.38" }
 tempfile = { workspace = true }

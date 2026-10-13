@@ -652,7 +652,7 @@ impl ShuffleWriterExec {
                 let mut stream = plan.execute(local_input_partition, context.clone())?;
                 let job_id = self.job_id.clone();
                 let stage_id = self.stage_id;
-                handles.spawn(async move {
+                handles.spawn(crate::vcore_permit::carry(async move {
                     let (stats, path) = match target {
                         ShuffleTarget::Disk(path) => {
                             let stats = write_partition_disk(
@@ -703,7 +703,7 @@ impl ShuffleWriterExec {
                         stats,
                         path,
                     ))
-                });
+                }));
             }
 
             let mut results = Vec::with_capacity(num_partitions);
@@ -1122,9 +1122,11 @@ impl ExecutionPlan for ShuffleWriterExec {
             }
             let writer = self.clone();
             let ctx = context.clone();
-            tokio::spawn(async move {
+            // Carried: the coordinator polls the stage's input, which is the
+            // task's own work.
+            tokio::spawn(crate::vcore_permit::carry(async move {
                 run_coordinator(writer.execute_shuffle_write(ctx), senders).await;
-            });
+            }));
         }
 
         let rx = state

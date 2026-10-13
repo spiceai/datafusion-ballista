@@ -78,10 +78,11 @@ md-5 = { version = "^0.10.0" }
 object_store = { workspace = true, features = ["aws", "azure", "http"] }
 parking_lot = { workspace = true }
 pastey = { workspace = true }
+pin-project-lite = "0.2"
 prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

@@ -290,7 +290,7 @@ impl RangeShuffleWriterExec {
                 let stream = plan.execute(global_partition, context.clone())?;
                 let index_schema = index_schema.clone();
                 let ordering = self.ordering.clone();
-                handles.spawn(async move {
+                handles.spawn(crate::vcore_permit::carry(async move {
                     // The keys are collected from the batches on their way to
                     // the writer, so a key and the block it describes come from
                     // the same batch rather than from two passes that could
@@ -325,7 +325,7 @@ impl RangeShuffleWriterExec {
                         layout.dictionaries.len(),
                     );
                     Ok::<_, DataFusionError>((global_partition, stats))
-                });
+                }));
             }
 
             let mut results = Vec::with_capacity(num_partitions);
@@ -458,9 +458,11 @@ impl ExecutionPlan for RangeShuffleWriterExec {
             }
             let writer = self.clone();
             let ctx = context.clone();
-            tokio::spawn(async move {
+            // Carried: the coordinator polls the stage's input, which is the
+            // task's own work.
+            tokio::spawn(crate::vcore_permit::carry(async move {
                 run_coordinator(writer.execute_shuffle_write(ctx), senders).await;
-            });
+            }));
         }
 
         let rx = state

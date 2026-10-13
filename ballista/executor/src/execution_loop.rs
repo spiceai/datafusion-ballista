@@ -30,7 +30,6 @@ use ballista_core::JobId;
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 
-use crate::vcore_permit::{LEND_AFTER, MemoryHeadroom, VcorePermit};
 use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::BallistaCodec;
@@ -39,6 +38,7 @@ use ballista_core::serde::protobuf::{
     scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
+use ballista_core::vcore_permit::{LEND_AFTER, MemoryHeadroom, VcorePermit};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
