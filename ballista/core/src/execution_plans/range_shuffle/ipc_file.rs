@@ -233,7 +233,11 @@ where
             )?;
 
             let mut batches_written = 0;
-            while let Some(batch) = rx.blocking_recv() {
+            // Waiting for the next batch is the input's time, not the
+            // writer's, so it doesn't keep the task's vcore.
+            while let Some(batch) =
+                crate::vcore_permit::wait_blocking(|| rx.blocking_recv())
+            {
                 let timer = write_metric.timer();
                 writer.write(&batch)?;
                 batches_written += 1;
@@ -491,5 +495,54 @@ mod tests {
             !is_ipc_file(&dir.path().join("absent.arrow")),
             "a missing file is not an IPC file",
         );
+    }
+
+    /// The writer's blocking side waits on the channel while the input waits
+    /// on remote I/O, so the task's vcore is lent like any other wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_waiting_on_its_input_lends_the_vcore() {
+        use crate::vcore_permit::{VcorePermit, install_hook_for_tests};
+        use datafusion::common::runtime::IoWaitExt;
+        use std::time::{Duration, Instant};
+        use tokio::sync::Semaphore;
+
+        install_hook_for_tests();
+        let vcores = Arc::new(Semaphore::new(1));
+        let permit =
+            VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(20), None);
+        permit.acquire().await.expect("vcore");
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data-0.arrow");
+        let input = batch(&[1, 2, 3]);
+        let schema = input.schema();
+        let task = tokio::spawn(permit.run(async move {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
+            // One batch, which arrives from a remote source after 300 ms.
+            let remote = async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(input)
+            };
+            let mut stream = RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::once(Box::pin(remote).io_wait()),
+            );
+            write_stream_to_ipc_file(&mut stream, &path, &write_time, 8, None)
+                .await
+                .unwrap()
+        }));
+
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while vcores.available_permits() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            vcores.available_permits(),
+            1,
+            "the vcore was not lent while the writer waited on its input"
+        );
+        let (stats, _layout) = task.await.expect("task");
+        assert_eq!(stats.num_rows, Some(3));
     }
 }

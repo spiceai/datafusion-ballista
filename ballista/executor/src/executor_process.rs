@@ -73,7 +73,8 @@ use crate::flight_service::BallistaFlightService;
 use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::metrics::LoggingMetricsCollector;
 use crate::runtime_cache::{
-    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+    DefaultSessionRuntimeCache, ExecutorMemory, MemoryPoolPolicy, SessionRuntimeCache,
+    TaskMemoryPool,
 };
 use crate::shutdown::Shutdown;
 use crate::shutdown::ShutdownNotifier;
@@ -219,19 +220,24 @@ fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
 /// and object-store registry are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`].
 ///
+/// Every task's pool is also counted in the returned [`ExecutorMemory`], which
+/// the executor reads before lending a waiting task's vcore.
+///
 /// Returns an error if the per-task share would be zero (i.e. `total_bytes <
 /// vcores`).
 fn memory_pool_policy(
     total_bytes: u64,
     vcores: usize,
-) -> Result<MemoryPoolPolicy, BallistaError> {
+) -> Result<(MemoryPoolPolicy, Arc<ExecutorMemory>), BallistaError> {
     let per_vcore = (total_bytes / vcores as u64) as usize;
     if per_vcore == 0 {
         return Err(BallistaError::Configuration(format!(
             "memory_pool_size ({total_bytes} bytes) is smaller than vcores ({vcores})"
         )));
     }
-    Ok(Arc::new(
+    let executor_memory = Arc::new(ExecutorMemory::new(total_bytes as usize));
+    let counted_in = Arc::clone(&executor_memory);
+    let policy: MemoryPoolPolicy = Arc::new(
         move |base: Arc<RuntimeEnv>, _config: &SessionConfig, vcores_consumed: u32| {
             // Multi-partition tasks that claim N vcores get N × per-vcore
             // share of the executor's memory pool. A collapse task with
@@ -239,12 +245,16 @@ fn memory_pool_policy(
             // single-vcore share it uses; a 4-partition task gets 4×,
             // matching the parallelism DataFusion will actually drive.
             let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
-            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(size));
+            let pool: Arc<dyn MemoryPool> = Arc::new(TaskMemoryPool::new(
+                Arc::new(FairSpillPool::new(size)),
+                Arc::clone(&counted_in),
+            ));
             RuntimeEnvBuilder::from_runtime_env(&base)
                 .with_memory_pool(pool)
                 .build_arc()
         },
-    ))
+    );
+    Ok((policy, executor_memory))
 }
 
 /// A no-op policy: the task uses the shared base env unchanged (DataFusion's
@@ -483,6 +493,7 @@ pub async fn start_executor_process(
         });
 
     let fraction = opt.memory_pool_fraction;
+    let mut executor_memory: Option<Arc<dyn MemoryPool>> = None;
     let pool_policy: MemoryPoolPolicy =
         match detect_pool(memory_budget_from_cli(opt.memory_pool_size, fraction)) {
             ResolvedPool::Bounded { bytes, source } => {
@@ -504,7 +515,9 @@ pub async fn start_executor_process(
                     bytesize::ByteSize::b(bytes),
                     bytesize::ByteSize::b(per_vcore),
                 );
-                memory_pool_policy(bytes, vcores)?
+                let (policy, memory) = memory_pool_policy(bytes, vcores)?;
+                executor_memory = Some(memory as Arc<dyn MemoryPool>);
+                policy
             }
             ResolvedPool::Unbounded(reason) => {
                 match reason {
@@ -579,7 +592,8 @@ pub async fn start_executor_process(
                 }
             })),
         )
-        .with_session_runtime_cache(Some(session_runtime_cache)),
+        .with_session_runtime_cache(Some(session_runtime_cache))
+        .with_executor_memory(executor_memory),
     );
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
@@ -1380,7 +1394,7 @@ mod memory_pool_tests {
         let vcores = 8usize;
         let per_vcore = (total / vcores as u64) as usize;
 
-        let policy = memory_pool_policy(total, vcores).unwrap();
+        let (policy, _) = memory_pool_policy(total, vcores).unwrap();
         let base = Arc::new(RuntimeEnv::default());
 
         // A 1-vcore task gets the per-vcore share; a 4-vcore task gets 4×.
@@ -1399,6 +1413,51 @@ mod memory_pool_tests {
         }
     }
 
+    /// Each task has its own pool, so only the executor's count of every
+    /// task's memory can say whether another task fits.
+    #[test]
+    fn lending_checks_the_memory_of_every_task() {
+        use crate::executor::Executor;
+        use crate::runtime_cache::DefaultSessionRuntimeCache;
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        // Two vcores with 500 bytes each.
+        let (policy, executor_memory) = memory_pool_policy(1_000, 2).unwrap();
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        let executor = Executor::new_basic(
+            ExecutorRegistration::default(),
+            "/tmp",
+            base_producer.clone(),
+            Arc::new(default_config_producer),
+            2,
+        )
+        .with_session_runtime_cache(Some(Arc::new(DefaultSessionRuntimeCache::new(
+            base_producer,
+            policy,
+            4,
+        ))))
+        .with_executor_memory(Some(executor_memory));
+        let config = SessionConfig::new();
+        let suspended = executor
+            .produce_runtime_for_session("s", &config, 1)
+            .unwrap();
+        let running = executor
+            .produce_runtime_for_session("s", &config, 1)
+            .unwrap();
+
+        let held = MemoryConsumer::new("suspended").register(&suspended.memory_pool);
+        held.try_grow(100).unwrap();
+        let busy = MemoryConsumer::new("running").register(&running.memory_pool);
+        busy.try_grow(500).unwrap();
+        // 400 of the executor's 1,000 bytes are free, less than a task's 500,
+        // although the suspended task's own pool has 400 of its 500 free.
+        assert!(!executor.memory_headroom(&suspended).has_room_for_a_task());
+
+        busy.shrink(200);
+        assert!(executor.memory_headroom(&suspended).has_room_for_a_task());
+    }
+
     #[test]
     fn preserves_base_object_store_registry() {
         let registry: Arc<dyn datafusion::execution::object_store::ObjectStoreRegistry> =
@@ -1410,7 +1469,7 @@ mod memory_pool_tests {
                 .unwrap(),
         );
 
-        let policy = memory_pool_policy(1024, 1).unwrap();
+        let (policy, _) = memory_pool_policy(1024, 1).unwrap();
         let env = policy(base, &SessionConfig::new(), 1).unwrap();
 
         assert!(Arc::ptr_eq(&env.object_store_registry, &registry));

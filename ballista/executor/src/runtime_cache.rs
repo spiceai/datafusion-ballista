@@ -17,10 +17,13 @@
 
 //! Session-scoped reuse of executor runtime state.
 
+use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ballista_core::RuntimeProducer;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
 use lru::LruCache;
@@ -47,6 +50,133 @@ pub type MemoryPoolPolicy = Arc<
         + Send
         + Sync,
 >;
+
+/// The memory every task's pool holds, against the executor's whole memory
+/// budget.
+///
+/// Each task's own pool enforces its limit; this only adds them up, so the
+/// executor can tell whether it has room for another task before lending a
+/// waiting task's vcore. It never refuses a reservation.
+#[derive(Debug)]
+pub struct ExecutorMemory {
+    budget: usize,
+    reserved: AtomicUsize,
+}
+
+impl ExecutorMemory {
+    /// Counts against an executor budget of `budget` bytes.
+    pub fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            reserved: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Display for ExecutorMemory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "executor(reserved: {}, budget: {})",
+            self.reserved(),
+            self.budget
+        )
+    }
+}
+
+impl MemoryPool for ExecutorMemory {
+    fn name(&self) -> &str {
+        "executor"
+    }
+
+    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+        self.reserved.fetch_add(additional, Ordering::Relaxed);
+    }
+
+    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
+        self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.grow(reservation, additional);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.reserved.load(Ordering::Relaxed)
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.budget)
+    }
+}
+
+/// A task's own memory pool, whose reservations are also counted in the
+/// executor's [`ExecutorMemory`].
+#[derive(Debug)]
+pub struct TaskMemoryPool {
+    task: Arc<dyn MemoryPool>,
+    executor: Arc<ExecutorMemory>,
+}
+
+impl TaskMemoryPool {
+    /// Wraps the task's `task` pool, counting what it holds in `executor`.
+    pub fn new(task: Arc<dyn MemoryPool>, executor: Arc<ExecutorMemory>) -> Self {
+        Self { task, executor }
+    }
+}
+
+impl Display for TaskMemoryPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task({}, {})", self.task, self.executor)
+    }
+}
+
+impl MemoryPool for TaskMemoryPool {
+    fn name(&self) -> &str {
+        self.task.name()
+    }
+
+    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.task.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.task.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.task.grow(reservation, additional);
+        self.executor.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.task.shrink(reservation, shrink);
+        self.executor.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.task.try_grow(reservation, additional)?;
+        self.executor.grow(reservation, additional);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.task.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.task.memory_limit()
+    }
+}
 
 /// Produces a task's [`RuntimeEnv`], optionally reusing read-side state across
 /// the tasks of a session.

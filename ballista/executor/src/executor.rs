@@ -32,8 +32,10 @@ use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
 use ballista_core::serde::scheduler::TaskKey;
+use ballista_core::vcore_permit::MemoryHeadroom;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
@@ -261,6 +263,11 @@ pub struct Executor {
     /// `produce_runtime_for_session` reuses read-side state across a session's
     /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
     session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
+
+    /// The executor's whole memory, when each task has its own pool. Decides
+    /// whether a waiting task's vcore can be lent; when `None`, each task's
+    /// runtime pool is the executor's.
+    executor_memory: Option<Arc<dyn MemoryPool>>,
 }
 
 impl Executor {
@@ -313,6 +320,7 @@ impl Executor {
             execution_engine: execution_engine
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
+            executor_memory: None,
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -338,6 +346,7 @@ impl Executor {
             tasks_drained_waker: Default::default(),
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
+            executor_memory: None,
         }
     }
 }
@@ -365,6 +374,24 @@ impl Executor {
     ) -> Self {
         self.session_runtime_cache = cache;
         self
+    }
+
+    /// Sets (or clears) the executor's whole memory, for when each task's
+    /// runtime has its own pool (see [`ExecutorMemory`](crate::runtime_cache::ExecutorMemory)).
+    pub fn with_executor_memory(mut self, memory: Option<Arc<dyn MemoryPool>>) -> Self {
+        self.executor_memory = memory;
+        self
+    }
+
+    /// The memory a task running on `runtime` checks before lending its vcore:
+    /// the executor's whole memory, or the task's pool when that is shared by
+    /// every task.
+    pub fn memory_headroom(&self, runtime: &RuntimeEnv) -> MemoryHeadroom {
+        let pool = self
+            .executor_memory
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&runtime.memory_pool));
+        MemoryHeadroom::new(pool, self.vcores)
     }
 
     /// Produces the runtime for a task, reusing the session's shared read-side

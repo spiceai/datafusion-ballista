@@ -38,7 +38,7 @@ use ballista_core::serde::protobuf::{
     scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
-use ballista_core::vcore_permit::{LEND_AFTER, MemoryHeadroom, VcorePermit};
+use ballista_core::vcore_permit::{LEND_AFTER, VcorePermit};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -499,10 +499,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let permit = VcorePermit::new(
         Arc::clone(&slot.vcores),
         LEND_AFTER,
-        Some(MemoryHeadroom::new(
-            Arc::clone(&runtime.memory_pool),
-            executor.vcores,
-        )),
+        Some(executor.memory_headroom(&runtime)),
     );
 
     let session_id = task.session_id.clone();

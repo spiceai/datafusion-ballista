@@ -34,7 +34,7 @@ use datafusion::common::runtime::IoWaitHook;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::FutureExt;
-use futures::future::{BoxFuture, Either};
+use futures::future::{BoxFuture, Either, LocalBoxFuture};
 use pin_project_lite::pin_project;
 use std::any::Any;
 use std::future::Future;
@@ -88,20 +88,34 @@ impl IoWaitHook for VcoreHook {
         }
     }
 
+    fn carry_local_future(
+        &self,
+        fut: LocalBoxFuture<'static, Box<dyn Any>>,
+    ) -> LocalBoxFuture<'static, Box<dyn Any>> {
+        match VCORE.try_with(Arc::clone) {
+            Ok(permit) => permit.run(fut).boxed_local(),
+            Err(_) => fut,
+        }
+    }
+
     fn carry_block(
         &self,
         f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
     ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
         match VCORE.try_with(Arc::clone) {
-            Ok(permit) => Box::new(move || {
-                // A blocking closure is the task doing work, so it keeps the
-                // vcore while it runs.
-                let _running = Running::start(&permit);
-                VCORE.sync_scope(Arc::clone(&permit), f)
-            }),
+            Ok(permit) => Box::new(move || run_blocking(&permit, f)),
             Err(_) => f,
         }
     }
+}
+
+/// Runs a blocking closure as part of the task. It is the task doing work,
+/// so it takes the task's vcore back first if it was lent, blocking the
+/// thread until one is free, and keeps it while it runs.
+fn run_blocking<R>(permit: &Arc<VcorePermit>, f: impl FnOnce() -> R) -> R {
+    permit.enter_blocking();
+    let _running = Running { permit };
+    VCORE.sync_scope(Arc::clone(permit), f)
 }
 
 /// Runs `fut` as part of the task being polled, if there is one.
@@ -125,21 +139,49 @@ where
 {
     let permit = VCORE.try_with(Arc::clone).ok();
     move || match permit {
-        Some(permit) => {
-            let _running = Running::start(&permit);
-            VCORE.sync_scope(Arc::clone(&permit), f)
-        }
+        Some(permit) => run_blocking(&permit, f),
         None => f(),
+    }
+}
+
+/// Runs `f`, a blocking wait on another part of the task (a channel fed by
+/// the task's own futures), without counting it as the task running, so a
+/// carried blocking closure waiting on input that waits on remote I/O lets
+/// the vcore be lent. Takes the vcore back before returning, as
+/// [`carry_blocking`] does before the closure starts.
+///
+/// Outside a carried blocking closure it just runs `f`.
+pub fn wait_blocking<R>(f: impl FnOnce() -> R) -> R {
+    let Ok(permit) = VCORE.try_with(Arc::clone) else {
+        return f();
+    };
+    permit.leave();
+    let _resume = ResumeBlocking { permit: &permit };
+    f()
+}
+
+/// Counts the blocking closure as running again when a [`wait_blocking`]
+/// ends.
+struct ResumeBlocking<'a> {
+    permit: &'a Arc<VcorePermit>,
+}
+
+impl Drop for ResumeBlocking<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Unwinding to the closure's own guard: only restore the count.
+            self.permit.enter();
+        } else {
+            self.permit.enter_blocking();
+        }
     }
 }
 
 /// Counters for one task's permit.
 #[derive(Debug, Default)]
 pub struct VcoreStats {
-    /// Waits on remote I/O that started.
-    pub suspensions: AtomicU64,
     /// Times the vcore was lent.
-    pub releases: AtomicU64,
+    pub suspensions: AtomicU64,
     /// Nanoseconds the vcore was lent.
     pub suspended_nanos: AtomicU64,
     /// Times the task waited to take a vcore back.
@@ -165,7 +207,8 @@ impl MemoryHeadroom {
         }
     }
 
-    fn has_room_for_a_task(&self) -> bool {
+    /// Whether the pool has one task's share free.
+    pub fn has_room_for_a_task(&self) -> bool {
         match self.pool.memory_limit() {
             MemoryLimit::Finite(limit) => {
                 limit.saturating_sub(self.pool.reserved()) >= limit / self.vcores
@@ -318,7 +361,6 @@ impl VcorePermit {
     }
 
     fn wait_started(&self) {
-        self.stats.suspensions.fetch_add(1, Ordering::Relaxed);
         self.waits.fetch_add(1, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -391,7 +433,7 @@ impl VcorePermit {
         }
         held.vcore = None;
         held.lent_at = Some(Instant::now());
-        self.stats.releases.fetch_add(1, Ordering::Relaxed);
+        self.stats.suspensions.fetch_add(1, Ordering::Relaxed);
         LendAttempt::Done
     }
 
@@ -425,6 +467,39 @@ impl VcorePermit {
         }
         let held = self.lock();
         !held.closed && held.vcore.is_none()
+    }
+
+    /// A part of the task started running.
+    fn enter(&self) {
+        self.polling.fetch_add(1, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A part of the task stopped running.
+    fn leave(self: &Arc<Self>) {
+        self.polling.fetch_sub(1, Ordering::SeqCst);
+        self.went_idle();
+    }
+
+    /// [`enter`](Self::enter) from blocking code, first taking the vcore back
+    /// if it was lent. Blocks the thread until a vcore is free.
+    fn enter_blocking(self: &Arc<Self>) {
+        loop {
+            // Entered before checking, as the gate does, so a lend either
+            // sees this part running or is seen here.
+            self.enter();
+            if !self.needs_vcore() {
+                return;
+            }
+            self.leave();
+            let started = Instant::now();
+            // The semaphore needs no runtime, so this can wait on any thread.
+            match futures::executor::block_on(Arc::clone(&self.vcores).acquire_owned()) {
+                Ok(vcore) => drop(self.install(vcore, started.elapsed())),
+                // A closed semaphore means shutdown: run without a vcore.
+                Err(_) => self.close(),
+            }
+        }
     }
 
     fn end_lend(&self, held: &mut Held) {
@@ -478,16 +553,14 @@ struct Running<'a> {
 
 impl<'a> Running<'a> {
     fn start(permit: &'a Arc<VcorePermit>) -> Self {
-        permit.polling.fetch_add(1, Ordering::SeqCst);
-        permit.epoch.fetch_add(1, Ordering::SeqCst);
+        permit.enter();
         Self { permit }
     }
 }
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        self.permit.polling.fetch_sub(1, Ordering::SeqCst);
-        self.permit.went_idle();
+        self.permit.leave();
     }
 }
 
@@ -515,9 +588,11 @@ impl<F: Future> Future for Gate<F> {
                 };
                 let waited = started.elapsed();
                 *this.acquiring = None;
-                // A closed semaphore means shutdown: run without a vcore.
-                if let Ok(vcore) = vcore {
-                    drop(permit.install(vcore, waited));
+                match vcore {
+                    Ok(vcore) => drop(permit.install(vcore, waited)),
+                    // A closed semaphore means shutdown: run without a vcore
+                    // from now on, rather than asking again.
+                    Err(_) => permit.close(),
                 }
             }
             let running = Running::start(permit);
@@ -536,16 +611,24 @@ impl<F: Future> Future for Gate<F> {
     }
 }
 
+/// Sets [`VcoreHook`] for this crate's tests, whichever module gets there
+/// first.
+#[cfg(test)]
+pub(crate) fn install_hook_for_tests() {
+    use datafusion::common::runtime::{IoWaitHookError, set_io_wait_hook};
+    match set_io_wait_hook(&VcoreHook) {
+        Ok(()) | Err(IoWaitHookError::AlreadySet) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::common::runtime::{IoWaitExt, SpawnedTask, set_io_wait_hook};
+    use datafusion::common::runtime::{IoWaitExt, SpawnedTask};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
     use std::sync::LazyLock;
 
-    static INSTALL: LazyLock<()> = LazyLock::new(|| {
-        set_io_wait_hook(&VcoreHook).expect("only these tests set the hook");
-    });
+    static INSTALL: LazyLock<()> = LazyLock::new(install_hook_for_tests);
 
     const LEND: Duration = Duration::from_millis(20);
 
@@ -592,7 +675,6 @@ mod tests {
         );
         assert_eq!(task.await.expect("task"), 7);
         assert!(permit.is_held(), "took the vcore back before finishing");
-        assert_eq!(permit.stats().releases.load(Ordering::SeqCst), 1);
         assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 1);
     }
 
@@ -602,7 +684,7 @@ mod tests {
         let task = tokio::spawn(permit.run(remote_call(100)));
         assert!(!vcore_frees_within(&vcores, Duration::from_millis(80)).await);
         assert_eq!(task.await.expect("task"), 7);
-        assert_eq!(permit.stats().releases.load(Ordering::SeqCst), 0);
+        assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -700,7 +782,7 @@ mod tests {
         );
         assert_eq!(task.await.expect("task"), 7);
         // A lend taken straight back is churn the 1 ms probe above can miss.
-        assert_eq!(permit.stats().releases.load(Ordering::SeqCst), 0);
+        assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -765,7 +847,7 @@ mod tests {
         }));
         task.await.expect("task");
         assert_eq!(permit.waits.load(Ordering::SeqCst), 0);
-        assert_eq!(permit.stats().releases.load(Ordering::SeqCst), 0);
+        assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 0);
         assert_eq!(vcores.available_permits(), 0, "the task kept its vcore");
     }
 
@@ -801,6 +883,64 @@ mod tests {
         assert_eq!(permit.run(remote_call(30).io_wait()).await, 7);
         assert!(!permit.is_held());
         assert_eq!(vcores.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_shorter_than_lend_after_is_no_suspension() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        assert_eq!(permit.run(remote_call(2).io_wait()).await, 7);
+        assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 0);
+        assert_eq!(vcores.available_permits(), 0, "the task kept its vcore");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_closure_started_after_a_lend_takes_the_vcore_back() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let ran = Arc::new(Mutex::new(None));
+        let ran_in_closure = Arc::clone(&ran);
+        let permit_in_closure = Arc::clone(&permit);
+        // Carried while the task holds its vcore and started only after the
+        // vcore was lent, like a closure queued behind a busy blocking pool.
+        let closure = permit
+            .run(async move {
+                carry_blocking(move || {
+                    *ran_in_closure.lock().expect("lock") =
+                        Some((Instant::now(), permit_in_closure.is_held()));
+                })
+            })
+            .await;
+        let waiting = tokio::spawn(permit.run(remote_call(300).io_wait()));
+        assert!(vcore_frees_within(&vcores, Duration::from_millis(100)).await);
+        // Another task takes the lent vcore.
+        let other = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
+        let blocking = tokio::task::spawn_blocking(closure);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            ran.lock().expect("lock").is_none(),
+            "a blocking closure started without a vcore"
+        );
+        let released_at = Instant::now();
+        drop(other);
+        blocking.await.expect("blocking");
+        let (ran_at, held) = ran.lock().expect("lock").expect("closure ran");
+        assert!(ran_at >= released_at, "ran before the vcore was free");
+        assert!(held, "ran without the task's vcore");
+        assert_eq!(waiting.await.expect("waiting"), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lent_task_finishes_after_the_executor_closes_its_vcores() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let task = tokio::spawn(permit.run(remote_call(100).io_wait()));
+        assert!(vcore_frees_within(&vcores, Duration::from_millis(80)).await);
+        // Shutdown: the task can never take a vcore back.
+        vcores.close();
+        let v = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the task should finish without a vcore after shutdown")
+            .expect("task");
+        assert_eq!(v, 7);
+        assert!(!permit.is_held());
     }
 
     #[test]
