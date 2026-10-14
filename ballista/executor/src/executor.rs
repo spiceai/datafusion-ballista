@@ -32,8 +32,9 @@ use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
 use ballista_core::serde::scheduler::TaskKey;
-use ballista_core::vcore_permit::MemoryHeadroom;
+use ballista_core::vcore_permit::{MemoryHeadroom, VcorePermit};
 use dashmap::DashMap;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -46,9 +47,10 @@ use log::error;
 use log::warn;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 /// Categorize a BallistaError into a short string suitable for use as a metric label.
 ///
@@ -432,23 +434,73 @@ impl Executor {
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<ShuffleWritePartition>, BallistaError> {
-        let start_time = std::time::Instant::now();
+        let started = OnceLock::new();
+        self.record_task_started(&key, &started);
+        let work = query_stage_exec.execute_query_stage(key.task_id, task_ctx);
+        self.run_query_stage(key, Arc::clone(&query_stage_exec), &started, work)
+            .await
+    }
 
-        // Record task start for metrics tracking
+    /// [`execute_query_stage`](Self::execute_query_stage) for a task that
+    /// first waits for its vcore through `acquire`, then runs through
+    /// `permit`'s gate. The task can be cancelled, and is waited for by
+    /// [`TasksDrainedFuture`], from before it waits for its vcore, and a
+    /// cancelled task unwinds without taking a lent vcore back. Returns what
+    /// `acquire` resolved to, if it did.
+    pub(crate) async fn execute_query_stage_on_vcore<H: Send>(
+        &self,
+        key: TaskKey,
+        query_stage_exec: Arc<dyn QueryStageExecutor>,
+        task_ctx: Arc<TaskContext>,
+        permit: &Arc<VcorePermit>,
+        acquire: impl Future<Output = Result<H, BallistaError>> + Send,
+    ) -> (Option<H>, Result<Vec<ShuffleWritePartition>, BallistaError>) {
+        let started = OnceLock::new();
+        let mut held = None;
+        let work = async {
+            held = Some(
+                acquire
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            );
+            self.record_task_started(&key, &started);
+            permit
+                .run(query_stage_exec.execute_query_stage(key.task_id, task_ctx))
+                .await
+        };
+        let result = self
+            .run_query_stage(key.clone(), Arc::clone(&query_stage_exec), &started, work)
+            .await;
+        (held, result)
+    }
+
+    fn record_task_started(&self, key: &TaskKey, started: &OnceLock<Instant>) {
+        let _ = started.set(Instant::now());
         self.metrics_collector.record_task_started(
             &key.job_id,
             key.stage_id,
             key.task_id,
         );
+    }
 
-        let (task, abort_handle) = futures::future::abortable(
-            query_stage_exec.execute_query_stage(key.task_id, task_ctx),
-        );
+    /// Runs `work`, the task's execution, as task `key`: cancellable through
+    /// [`cancel_task`](Self::cancel_task) until it ends, recording its
+    /// outcome. `started` holds when the stage started, if it did.
+    async fn run_query_stage(
+        &self,
+        key: TaskKey,
+        query_stage_exec: Arc<dyn QueryStageExecutor>,
+        started: &OnceLock<Instant>,
+        work: impl Future<Output = datafusion::error::Result<Vec<ShuffleWritePartition>>>,
+    ) -> Result<Vec<ShuffleWritePartition>, BallistaError> {
+        let (task, abort_handle) = futures::future::abortable(work);
 
         self.abort_handles.insert(key.clone(), abort_handle);
 
         let result = std::panic::AssertUnwindSafe(task).catch_unwind().await;
-        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let duration_ms = started
+            .get()
+            .map_or(0, |started| started.elapsed().as_millis() as u64);
 
         // cancel_task only signals the abort; this task owns removal after unwinding.
         self.abort_handles.remove(&key);
@@ -556,7 +608,8 @@ impl Executor {
         &self.work_dir
     }
 
-    /// Returns the number of tasks currently executing on this executor.
+    /// Returns the number of tasks on this executor that have not ended,
+    /// including those still waiting for a vcore.
     pub fn active_task_count(&self) -> usize {
         self.abort_handles.len()
     }

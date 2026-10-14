@@ -563,6 +563,11 @@ impl VcorePermit {
     /// otherwise wait forever for a vcore its task already holds.
     fn resume(self: &Arc<Self>) -> Resume {
         let mut held = self.lock();
+        // A sibling may have taken the vcore back, or the task ended, since
+        // this part saw it lent.
+        if held.closed || held.vcore.is_some() {
+            return futures::future::ready(()).boxed().shared();
+        }
         if let Some(resume) = &held.resume
             && resume.peek().is_none()
         {
@@ -1054,6 +1059,28 @@ mod tests {
         assert_eq!(v, 14);
         assert!(permit.is_held());
         assert_eq!(permit.stats().resume_waits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn part_resuming_after_a_sibling_took_the_vcore_back_runs_on_it() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let task = tokio::spawn(permit.run(remote_call(60_000).io_wait()));
+        assert!(
+            vcore_frees_within(&vcores, Duration::from_millis(500)).await,
+            "never lent"
+        );
+        // Two parts both see the vcore lent, then one takes it back before
+        // the other asks for it.
+        assert!(permit.needs_vcore());
+        assert!(permit.needs_vcore());
+        permit.resume().await;
+        assert!(permit.is_held());
+        tokio::time::timeout(Duration::from_secs(2), permit.resume())
+            .await
+            .expect("a part waited for a second vcore while its task held one");
+        assert!(permit.is_held());
+        assert_eq!(vcores.available_permits(), 0);
+        task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
