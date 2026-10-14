@@ -47,6 +47,7 @@ use log::warn;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 
 /// Categorize a BallistaError into a short string suitable for use as a metric label.
@@ -268,6 +269,10 @@ pub struct Executor {
     /// whether a waiting task's vcore can be lent; when `None`, each task's
     /// runtime pool is the executor's.
     executor_memory: Option<Arc<dyn MemoryPool>>,
+
+    /// Memory set aside for tasks started on lent vcores, shared by every
+    /// task's [`MemoryHeadroom`].
+    lend_promises: Arc<AtomicUsize>,
 }
 
 impl Executor {
@@ -321,6 +326,7 @@ impl Executor {
                 .unwrap_or_else(|| Arc::new(DefaultExecutionEngine::new())),
             session_runtime_cache: None,
             executor_memory: None,
+            lend_promises: Arc::default(),
         }
     }
     /// Creates new Executor with default `ExecutionEngine`.
@@ -347,6 +353,7 @@ impl Executor {
             execution_engine: Arc::new(DefaultExecutionEngine::new()),
             session_runtime_cache: None,
             executor_memory: None,
+            lend_promises: Arc::default(),
         }
     }
 }
@@ -391,7 +398,7 @@ impl Executor {
             .executor_memory
             .clone()
             .unwrap_or_else(|| Arc::clone(&runtime.memory_pool));
-        MemoryHeadroom::new(pool, self.vcores)
+        MemoryHeadroom::new(pool, self.vcores, Arc::clone(&self.lend_promises))
     }
 
     /// Produces the runtime for a task, reusing the session's shared read-side
