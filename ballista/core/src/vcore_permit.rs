@@ -19,13 +19,14 @@
 //!
 //! Code that awaits a remote system marks the wait with DataFusion's
 //! [`IoWaitExt::io_wait`](datafusion::common::runtime::IoWaitExt::io_wait).
-//! When an application sets [`VcoreHook`] as DataFusion's
-//! [`IoWaitHook`](datafusion::common::runtime::IoWaitHook), every task the
-//! executor runs counts those waits on its [`VcorePermit`]. Once a wait has
-//! been in flight for [`LEND_AFTER`] with no part of the task being polled,
-//! the task's vcore goes back to the executor, which can start another task
-//! on it. Before any part of the task runs again it takes a vcore back,
-//! waiting for one if none is free.
+//! When an application sets [`VcoreHook`](crate::vcore_permit::VcoreHook) as
+//! DataFusion's [`IoWaitHook`](datafusion::common::runtime::IoWaitHook), every
+//! task the executor runs counts those waits on its
+//! [`VcorePermit`](crate::vcore_permit::VcorePermit). Once a wait has been in
+//! flight for [`LEND_AFTER`](crate::vcore_permit::LEND_AFTER) with no part of
+//! the task being polled, the task's vcore goes back to the executor, which
+//! can start another task on it. Before any part of the task runs again it
+//! takes a vcore back, waiting for one if none is free.
 //!
 //! Without the hook nothing is counted, and a task keeps its vcore for its
 //! whole life.
