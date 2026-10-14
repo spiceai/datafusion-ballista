@@ -34,7 +34,7 @@ use datafusion::common::runtime::IoWaitHook;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::FutureExt;
-use futures::future::{BoxFuture, Either, LocalBoxFuture};
+use futures::future::{BoxFuture, Either, LocalBoxFuture, Shared};
 use pin_project_lite::pin_project;
 use std::any::Any;
 use std::future::Future;
@@ -44,6 +44,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+
+/// A task taking its lent vcore back, shared by every part of the task that
+/// needs it.
+type Resume = Shared<BoxFuture<'static, ()>>;
 
 /// How long every part of a task must be idle, with a wait in flight, before
 /// its vcore is lent.
@@ -271,6 +275,8 @@ struct Held {
     lent_at: Option<Instant>,
     /// Memory set aside in the executor's headroom for the lend in flight.
     promised: usize,
+    /// The task taking its vcore back, while one is on the way.
+    resume: Option<Resume>,
     closed: bool,
 }
 
@@ -341,6 +347,7 @@ impl VcorePermit {
     pub fn close(&self) {
         let mut held = self.lock();
         held.closed = true;
+        held.resume = None;
         self.end_lend(&mut held);
         held.vcore = None;
     }
@@ -500,6 +507,7 @@ impl VcorePermit {
             .resume_wait_nanos
             .fetch_add(duration_nanos(waited), Ordering::Relaxed);
         let mut held = self.lock();
+        held.resume = None;
         if held.closed || held.vcore.is_some() {
             return Some(vcore);
         }
@@ -543,14 +551,41 @@ impl VcorePermit {
                 return;
             }
             self.leave();
-            let started = Instant::now();
             // The semaphore needs no runtime, so this can wait on any thread.
-            match futures::executor::block_on(Arc::clone(&self.vcores).acquire_owned()) {
-                Ok(vcore) => drop(self.install(vcore, started.elapsed())),
-                // A closed semaphore means shutdown: run without a vcore.
-                Err(_) => self.close(),
+            futures::executor::block_on(self.resume());
+        }
+    }
+
+    /// Takes the lent vcore back for every part of the task that needs it:
+    /// parts resuming together wait in the executor's queue once, and all
+    /// run once the vcore is back. A part waiting on its own acquire could
+    /// otherwise wait forever for a vcore its task already holds.
+    fn resume(self: &Arc<Self>) -> Resume {
+        let mut held = self.lock();
+        if let Some(resume) = &held.resume
+            && resume.peek().is_none()
+        {
+            return resume.clone();
+        }
+        let permit = Arc::downgrade(self);
+        let vcores = Arc::clone(&self.vcores);
+        let resume = async move {
+            let started = Instant::now();
+            let vcore = vcores.acquire_owned().await;
+            let Some(permit) = permit.upgrade() else {
+                return;
+            };
+            match vcore {
+                Ok(vcore) => drop(permit.install(vcore, started.elapsed())),
+                // A closed semaphore means shutdown: run without a vcore from
+                // now on, rather than asking again.
+                Err(_) => permit.close(),
             }
         }
+        .boxed()
+        .shared();
+        held.resume = Some(resume.clone());
+        resume
     }
 
     fn release_promise(&self, bytes: usize) {
@@ -629,7 +664,7 @@ pin_project! {
         #[pin]
         inner: F,
         permit: Arc<VcorePermit>,
-        acquiring: Option<(BoxFuture<'static, Result<OwnedSemaphorePermit, AcquireError>>, Instant)>,
+        acquiring: Option<Resume>,
     }
 }
 
@@ -640,26 +675,16 @@ impl<F: Future> Future for Gate<F> {
         let this = self.project();
         let permit: &Arc<VcorePermit> = this.permit;
         loop {
-            if let Some((acquire, started)) = this.acquiring.as_mut() {
-                let Poll::Ready(vcore) = acquire.as_mut().poll(cx) else {
+            if let Some(resume) = this.acquiring.as_mut() {
+                if resume.poll_unpin(cx).is_pending() {
                     return Poll::Pending;
-                };
-                let waited = started.elapsed();
-                *this.acquiring = None;
-                match vcore {
-                    Ok(vcore) => drop(permit.install(vcore, waited)),
-                    // A closed semaphore means shutdown: run without a vcore
-                    // from now on, rather than asking again.
-                    Err(_) => permit.close(),
                 }
+                *this.acquiring = None;
             }
             let running = Running::start(permit);
             if permit.needs_vcore() {
                 drop(running);
-                *this.acquiring = Some((
-                    Arc::clone(&permit.vcores).acquire_owned().boxed(),
-                    Instant::now(),
-                ));
+                *this.acquiring = Some(permit.resume());
                 continue;
             }
             let poll = this.inner.poll(cx);
@@ -1003,6 +1028,31 @@ mod tests {
             .expect("task");
         assert_eq!(v, 7);
         assert!(!permit.is_held());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_resuming_together_take_one_vcore_back() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let task = tokio::spawn(permit.run(async {
+            // `a` waits on a remote call; `b` on a timer, which keeps no wait
+            // in flight once `a` is back, so nothing lends the vcore to it.
+            let a = SpawnedTask::spawn(remote_call(100).io_wait());
+            let b = SpawnedTask::spawn(remote_call(120));
+            a.join().await.expect("a") + b.join().await.expect("b")
+        }));
+        assert!(vcore_frees_within(&vcores, Duration::from_millis(80)).await);
+        // Another task holds the lent vcore until both parts have woken, so
+        // each wakes needing a vcore, `a` first.
+        let other = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
+        tokio::time::sleep(Duration::from_millis(170)).await;
+        drop(other);
+        let v = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("parts of the task waited for a vcore the task already held")
+            .expect("task");
+        assert_eq!(v, 14);
+        assert!(permit.is_held());
+        assert_eq!(permit.stats().resume_waits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
