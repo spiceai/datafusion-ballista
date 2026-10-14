@@ -196,7 +196,9 @@ pub fn create_write_options(
 ///
 /// Batches are read from the async stream and forwarded through a bounded
 /// channel to a `spawn_blocking` task that performs all synchronous file I/O,
-/// keeping the tokio worker thread unblocked.
+/// keeping the tokio worker thread unblocked. The blocking task is carried
+/// into the calling task's vcore scope, so its writes count as the task
+/// running.
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
     path: &Path,
@@ -210,27 +212,33 @@ pub async fn write_stream_to_disk(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
 
-    let handle = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
-            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
-            BallistaError::IoError(e)
-        })?);
+    let handle = tokio::task::spawn_blocking(crate::vcore_permit::carry_blocking(
+        move || -> Result<u64> {
+            let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
+                error!("Failed to create partition file at {:?}: {e:?}", path_owned);
+                BallistaError::IoError(e)
+            })?);
 
-        let options = create_write_options(compression_type)?;
+            let options = create_write_options(compression_type)?;
 
-        let mut writer =
-            StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
+            let mut writer =
+                StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
 
-        while let Some(batch) = rx.blocking_recv() {
+            // Waiting for the next batch is the input's time, not the
+            // writer's, so it doesn't keep the task's vcore.
+            while let Some(batch) =
+                crate::vcore_permit::wait_blocking(|| rx.blocking_recv())
+            {
+                let timer = write_metric.timer();
+                writer.write(&batch)?;
+                timer.done();
+            }
             let timer = write_metric.timer();
-            writer.write(&batch)?;
+            writer.finish()?;
             timer.done();
-        }
-        let timer = write_metric.timer();
-        writer.finish()?;
-        timer.done();
-        Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
-    });
+            Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
+        },
+    ));
 
     let mut num_rows = 0;
     let mut num_batches = 0;
@@ -551,5 +559,93 @@ mod tests {
 
         let result = create_grpc_server_incoming(addr, &GrpcServerConfig::default());
         assert!(result.is_err());
+    }
+
+    /// The disk writer's work counts as the task running: while it writes a
+    /// batch, the vcore stays with the task even if the input is waiting on
+    /// remote I/O, and is lent only once the writer waits for input.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disk_writer_keeps_the_vcore_while_it_writes() {
+        use crate::vcore_permit::{VcorePermit, install_hook_for_tests};
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::runtime::IoWaitExt;
+        use datafusion::physical_plan::metrics::{
+            ExecutionPlanMetricsSet, MetricBuilder,
+        };
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use std::time::Instant;
+        use tokio::sync::Semaphore;
+
+        const LEND: Duration = Duration::from_millis(20);
+        install_hook_for_tests();
+        let vcores = Arc::new(Semaphore::new(1));
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+        permit.acquire().await.expect("vcore");
+
+        // A batch whose compressed write takes many lend windows.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        let values: Vec<i64> = (0..8_000_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as i64
+            })
+            .collect();
+        let big = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap();
+        let small = big.slice(0, 1);
+        // The input then waits on a remote source for the next batch.
+        let remote = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(small)
+        })
+        .io_wait();
+        let input = futures::stream::iter([Ok(big)]).chain(futures::stream::once(remote));
+        let mut stream: Pin<Box<dyn RecordBatchStream + Send>> =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.arrow");
+        let metrics = ExecutionPlanMetricsSet::new();
+        let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
+        let writing = write_time.clone();
+        let task = tokio::spawn(permit.run(async move {
+            write_stream_to_disk(
+                &mut stream,
+                &path,
+                &writing,
+                8,
+                Some(CompressionType::ZSTD),
+            )
+            .await
+            .unwrap()
+        }));
+
+        let deadline = Instant::now() + Duration::from_millis(2_500);
+        while vcores.available_permits() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let written = write_time.value();
+        assert_eq!(
+            vcores.available_permits(),
+            1,
+            "never lent while the writer waited for input"
+        );
+        assert!(
+            written > 0,
+            "lent while the disk writer was still writing the first batch"
+        );
+        assert!(
+            Duration::from_nanos(written as u64) > LEND * 5,
+            "the first write took {written} ns, too short to tell"
+        );
+        let stats = task.await.expect("task");
+        assert_eq!(stats.num_rows, Some(8_000_001));
     }
 }
