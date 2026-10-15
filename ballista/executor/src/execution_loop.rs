@@ -22,6 +22,7 @@
 //! where the scheduler sends tasks to executors.
 
 use crate::cpu_bound_executor::DedicatedExecutor;
+use crate::execution_engine::QueryStageExecutor;
 use crate::executor::Executor;
 use crate::executor_process::remove_job_data;
 use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
@@ -34,10 +35,11 @@ use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
+    PollWorkParams, PollWorkResult, ShuffleWritePartition, TaskDefinition, TaskStatus,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
+use ballista_core::vcore_permit::{LEND_AFTER, VcorePermit};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -49,10 +51,11 @@ use std::cell::LazyCell;
 use std::convert::TryInto;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Sender as OneShotSender;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 use tonic::codegen::{Body, Bytes, StdError};
 
 /// Idle sleep between polls when polling is the only way to learn of new work.
@@ -185,6 +188,11 @@ where
     // once, so at-least-once delivery is safe.
     let mut pending_status: Vec<TaskStatus> = Vec::new();
 
+    // Tasks bound by the scheduler that are still waiting for their vcore.
+    // They wait inside the task, never here, so a vcore taken back by a
+    // resuming task cannot stall this loop (and with it the heartbeat).
+    let queued = Arc::new(AtomicUsize::new(0));
+
     loop {
         // Wait for a vcore permit before asking for new work, but cap the wait
         // so a fully-busy executor still polls the scheduler periodically.
@@ -216,7 +224,10 @@ where
             scheduler
                 .poll_work(PollWorkParams {
                     metadata: Some(executor.metadata.clone()),
-                    num_free_vcores: free_vcores.available_permits() as u32,
+                    num_free_vcores: free_slots(
+                        &free_vcores,
+                        queued.load(Ordering::Acquire),
+                    ),
                     task_status: task_status.clone(),
                 })
                 .await;
@@ -265,11 +276,12 @@ where
                 for task in tasks {
                     let task_status_sender = task_status_sender.clone();
 
-                    // Acquire a vcore permit for the task.
-                    let permit =
-                        free_vcores.clone().acquire_owned().await.map_err(|_| {
-                            BallistaError::Internal("vcore semaphore closed".to_string())
-                        })?;
+                    // The task waits for its vcore before it runs; this loop
+                    // never waits for one, because it is the heartbeat.
+                    let slot = TaskSlot {
+                        vcores: Arc::clone(&free_vcores),
+                        _queued: QueuedTask::new(&queued),
+                    };
 
                     let start_exec_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -278,7 +290,7 @@ where
 
                     match run_received_task(
                         executor.clone(),
-                        permit,
+                        slot,
                         task_status_sender.clone(),
                         task.clone(),
                         &codec,
@@ -388,9 +400,62 @@ pub(crate) fn any_to_string(any: &Box<dyn Any + Send>) -> String {
     }
 }
 
+/// Counts a task as bound but still waiting for its vcore while alive.
+struct QueuedTask(Arc<AtomicUsize>);
+
+impl QueuedTask {
+    fn new(queued: &Arc<AtomicUsize>) -> Self {
+        queued.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(queued))
+    }
+}
+
+impl Drop for QueuedTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A task bound by the scheduler, waiting for its vcore before it runs.
+struct TaskSlot {
+    vcores: Arc<Semaphore>,
+    _queued: QueuedTask,
+}
+
+impl TaskSlot {
+    /// Wait for the task's vcore, through `permit` so it can be lent while
+    /// the task waits on remote I/O.
+    async fn acquire(self, permit: Arc<VcorePermit>) -> Result<HeldSlot, BallistaError> {
+        permit
+            .acquire()
+            .await
+            .map_err(|_| BallistaError::Internal("vcore semaphore closed".to_string()))?;
+        Ok(HeldSlot { permit })
+    }
+}
+
+/// A running task's vcore, returned when dropped.
+struct HeldSlot {
+    permit: Arc<VcorePermit>,
+}
+
+impl Drop for HeldSlot {
+    fn drop(&mut self) {
+        // Close explicitly: streams or the task context may outlive the task
+        // and keep the permit alive.
+        self.permit.close();
+    }
+}
+
+/// Vcores to advertise: free vcores, including those released by suspended
+/// tasks, minus bound tasks still waiting for a vcore.
+fn free_slots(vcores: &Semaphore, queued: usize) -> u32 {
+    u32::try_from(vcores.available_permits().saturating_sub(queued)).unwrap_or(u32::MAX)
+}
+
 async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     executor: Arc<Executor>,
-    permit: OwnedSemaphorePermit,
+    slot: TaskSlot,
     task_status_sender: Sender<TaskStatus>,
     task: TaskDefinition,
     codec: &BallistaCodec<T, U>,
@@ -430,6 +495,14 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         task.vcores_consumed,
     )?;
 
+    // Lent only while all of the task waits on remote I/O marked with
+    // `io_wait()`, and only if the application set `VcoreHook`.
+    let permit = VcorePermit::new(
+        Arc::clone(&slot.vcores),
+        LEND_AFTER,
+        Some(executor.memory_headroom(&runtime)),
+    );
+
     let session_id = task.session_id.clone();
     let task_context = Arc::new(TaskContext::new(
         Some(task_identity.clone()),
@@ -463,29 +536,21 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         task_context.session_config(),
     )?;
     dedicated_executor.spawn(async move {
-        use std::panic::AssertUnwindSafe;
         let key = TaskKey {
             job_id: job_id.clone(),
             stage_id: stage_id as usize,
             task_id: task_id as usize,
         };
 
-        let task_start = Instant::now();
-        let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
+        let (held, task_start, execution_result) = execute_task(
+            &executor,
             key.clone(),
-            query_stage_exec.clone(),
+            Arc::clone(&query_stage_exec),
             task_context,
-        ))
-        .catch_unwind()
-        .await
-        {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(r)) => Err(r),
-            Err(r) => {
-                error!("Error executing task: {:?}", any_to_string(&r));
-                Err(BallistaError::Internal(format!("{:#?}", any_to_string(&r))))
-            }
-        };
+            slot,
+            &permit,
+        )
+        .await;
 
         info!(
             "Finished task : [{task_identity}] in {:?}",
@@ -493,7 +558,11 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         );
         debug!("Task statistics: [{task_identity}] {execution_result:?}");
 
-        let plan_metrics = query_stage_exec.collect_plan_metrics();
+        let mut plan_metrics = query_stage_exec.collect_plan_metrics();
+        // The stage root's metrics carry the task's vcore counters.
+        if let Some(root) = plan_metrics.first_mut() {
+            permit.add_metrics(root, task_id as usize);
+        }
         let operator_metrics = plan_metrics
             .into_iter()
             .map(|m| m.try_into())
@@ -539,11 +608,50 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             },
         ));
 
-        // Release the permit after the work is done
-        drop(permit);
+        // Release the vcore after the work is done
+        drop(held);
     });
 
     Ok(())
+}
+
+/// Waits for the task's vcore, then runs its stage through `permit`, both
+/// cancellable as the task. Returns the vcore, which the caller holds until
+/// it has reported the task's status, and when the stage started.
+async fn execute_task(
+    executor: &Executor,
+    key: TaskKey,
+    query_stage_exec: Arc<dyn QueryStageExecutor>,
+    task_context: Arc<TaskContext>,
+    slot: TaskSlot,
+    permit: &Arc<VcorePermit>,
+) -> (
+    Option<HeldSlot>,
+    Instant,
+    Result<Vec<ShuffleWritePartition>, BallistaError>,
+) {
+    use std::panic::AssertUnwindSafe;
+    let task_start = Instant::now();
+    let execution_result = AssertUnwindSafe(executor.execute_query_stage_on_vcore(
+        key,
+        query_stage_exec,
+        task_context,
+        permit,
+        slot.acquire(Arc::clone(permit)),
+    ))
+    .catch_unwind()
+    .await;
+    match execution_result {
+        Ok((held, result)) => (held, task_start, result),
+        Err(r) => {
+            error!("Error executing task: {:?}", any_to_string(&r));
+            (
+                None,
+                task_start,
+                Err(BallistaError::Internal(format!("{:#?}", any_to_string(&r)))),
+            )
+        }
+    }
 }
 
 async fn sample_tasks_status(
@@ -569,4 +677,244 @@ async fn sample_tasks_status(
     }
 
     task_status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::TasksDrainedFuture;
+    use ballista_core::serde::protobuf::ExecutorRegistration;
+    use ballista_core::utils::default_config_producer;
+    use ballista_core::vcore_permit::VcoreHook;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::common::runtime::{IoWaitExt, IoWaitHookError, set_io_wait_hook};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::prelude::SessionContext;
+    use std::fmt;
+
+    /// A stage that waits on remote I/O forever, so its vcore is lent.
+    #[derive(Debug)]
+    struct RemoteWaitStage(EmptyExec);
+
+    impl fmt::Display for RemoteWaitStage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "RemoteWaitStage")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueryStageExecutor for RemoteWaitStage {
+        async fn execute_query_stage(
+            &self,
+            _task_id: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::error::Result<Vec<ShuffleWritePartition>> {
+            futures::future::pending::<()>().io_wait().await;
+            Ok(Vec::new())
+        }
+
+        fn collect_plan_metrics(
+            &self,
+        ) -> Vec<datafusion::physical_plan::metrics::MetricsSet> {
+            Vec::new()
+        }
+
+        fn plan(&self) -> &dyn ExecutionPlan {
+            &self.0
+        }
+    }
+
+    const LEND: Duration = Duration::from_millis(20);
+    const UNWIND_WITHIN: Duration = Duration::from_secs(2);
+
+    fn install_vcore_hook() {
+        match set_io_wait_hook(&VcoreHook) {
+            Ok(()) | Err(IoWaitHookError::AlreadySet) => {}
+        }
+    }
+
+    fn one_vcore_executor(work_dir: &str) -> Arc<Executor> {
+        let runtime = SessionContext::new().runtime_env();
+        Arc::new(Executor::new_basic(
+            ExecutorRegistration {
+                id: "executor".to_string(),
+                ..Default::default()
+            },
+            work_dir,
+            Arc::new(move |_| Ok(Arc::clone(&runtime))),
+            Arc::new(default_config_producer),
+            1,
+        ))
+    }
+
+    fn task_key() -> TaskKey {
+        TaskKey {
+            job_id: "job".into(),
+            stage_id: 1,
+            task_id: 0,
+        }
+    }
+
+    /// Runs a [`RemoteWaitStage`] the way a task bound by the scheduler runs.
+    fn spawn_task(
+        executor: &Arc<Executor>,
+        vcores: &Arc<Semaphore>,
+        queued: &Arc<AtomicUsize>,
+    ) -> tokio::task::JoinHandle<Result<Vec<ShuffleWritePartition>, BallistaError>> {
+        let executor = Arc::clone(executor);
+        let slot = slot(vcores, queued);
+        let permit = VcorePermit::new(Arc::clone(vcores), LEND, None);
+        tokio::spawn(async move {
+            let (_held, _started, result) = execute_task(
+                &executor,
+                task_key(),
+                Arc::new(RemoteWaitStage(EmptyExec::new(Arc::new(Schema::empty())))),
+                SessionContext::new().task_ctx(),
+                slot,
+                &permit,
+            )
+            .await;
+            result
+        })
+    }
+
+    async fn until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        condition()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_waiting_for_its_vcore_can_be_cancelled_and_is_drained() {
+        let work_dir = tempfile::TempDir::new().expect("work dir");
+        let executor = one_vcore_executor(work_dir.path().to_str().expect("path"));
+        let vcores = Arc::new(Semaphore::new(1));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let busy = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
+
+        let task = spawn_task(&executor, &vcores, &queued);
+        assert!(
+            until(UNWIND_WITHIN, || executor.active_task_count() == 1).await,
+            "a task waiting for its vcore is not tracked by the executor"
+        );
+        let mut drained = Box::pin(TasksDrainedFuture(Arc::clone(&executor)));
+        assert!(futures::poll!(drained.as_mut()).is_pending());
+
+        assert!(
+            executor
+                .cancel_task("job".into(), 1, 0)
+                .await
+                .expect("cancel")
+        );
+        let result = tokio::time::timeout(UNWIND_WITHIN, task)
+            .await
+            .expect("cancelled task unwinding while the vcore is busy")
+            .expect("join");
+        assert!(
+            matches!(result, Err(BallistaError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(executor.active_task_count(), 0);
+        assert!(futures::poll!(drained.as_mut()).is_ready());
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        drop(busy);
+        assert_eq!(vcores.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_lent_task_unwinds_while_every_vcore_is_busy() {
+        install_vcore_hook();
+        let work_dir = tempfile::TempDir::new().expect("work dir");
+        let executor = one_vcore_executor(work_dir.path().to_str().expect("path"));
+        let vcores = Arc::new(Semaphore::new(1));
+        let queued = Arc::new(AtomicUsize::new(0));
+
+        let task = spawn_task(&executor, &vcores, &queued);
+        assert!(
+            until(UNWIND_WITHIN, || executor.active_task_count() == 1).await,
+            "task never started"
+        );
+        assert!(
+            until(UNWIND_WITHIN, || vcores.available_permits() == 1).await,
+            "task waiting on remote I/O never lent its vcore"
+        );
+        // Another task takes the lent vcore.
+        let busy = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
+
+        assert!(
+            executor
+                .cancel_task("job".into(), 1, 0)
+                .await
+                .expect("cancel")
+        );
+        let result = tokio::time::timeout(UNWIND_WITHIN, task)
+            .await
+            .expect("cancelled task unwinding while every vcore is busy")
+            .expect("join");
+        assert!(
+            matches!(result, Err(BallistaError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(executor.active_task_count(), 0);
+        drop(busy);
+        assert_eq!(vcores.available_permits(), 1);
+    }
+
+    fn slot(vcores: &Arc<Semaphore>, queued: &Arc<AtomicUsize>) -> TaskSlot {
+        TaskSlot {
+            vcores: Arc::clone(vcores),
+            _queued: QueuedTask::new(queued),
+        }
+    }
+
+    #[test]
+    fn free_slots_excludes_tasks_waiting_for_a_vcore() {
+        let vcores = Semaphore::new(4);
+        assert_eq!(free_slots(&vcores, 1), 3);
+        assert_eq!(free_slots(&vcores, 9), 0);
+    }
+
+    #[tokio::test]
+    async fn bound_task_waits_for_its_vcore_inside_the_task() {
+        let vcores = Arc::new(Semaphore::new(1));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let busy = Arc::clone(&vcores).acquire_owned().await.expect("permit");
+
+        // Binding the task does not wait: it is counted as queued and waits
+        // for the vcore in its own future.
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER, None);
+        let waiting = tokio::spawn(slot(&vcores, &queued).acquire(permit));
+        tokio::task::yield_now().await;
+        assert_eq!(queued.load(Ordering::Acquire), 1);
+        assert_eq!(free_slots(&vcores, queued.load(Ordering::Acquire)), 0);
+        assert!(!waiting.is_finished());
+
+        drop(busy);
+        let held = waiting.await.expect("join").expect("slot");
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert_eq!(vcores.available_permits(), 0);
+        drop(held);
+        assert_eq!(vcores.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn vcore_permit_is_acquired_before_the_task_runs_and_closed_after() {
+        let vcores = Arc::new(Semaphore::new(1));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER, None);
+        let held = slot(&vcores, &queued)
+            .acquire(Arc::clone(&permit))
+            .await
+            .expect("slot");
+        assert!(permit.is_held());
+        assert_eq!(vcores.available_permits(), 0);
+        drop(held);
+        assert!(!permit.is_held());
+        assert_eq!(vcores.available_permits(), 1);
+    }
 }

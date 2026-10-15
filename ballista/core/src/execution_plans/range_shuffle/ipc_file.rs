@@ -53,12 +53,11 @@ use datafusion::arrow::ipc::writer::FileWriter;
 use datafusion::arrow::ipc::{Block, CompressionType, root_as_footer};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::{RecordBatchStream, metrics};
-use futures::StreamExt;
 use log::{debug, error};
 
 use crate::error::{BallistaError, Result};
 use crate::serde::scheduler::PartitionStats;
-use crate::utils::create_write_options;
+use crate::utils::{create_write_options, run_blocking_io, write_batches_blocking};
 
 /// Leading bytes of an Arrow IPC file: the `ARROW1` magic plus two padding
 /// bytes. An IPC stream opens with a continuation marker instead, so the two
@@ -199,9 +198,9 @@ pub fn open_ipc_file(path: &Path) -> Result<FileReader<BufReader<File>>> {
 /// Stream data to disk in Arrow IPC file format, returning where each batch
 /// landed alongside the usual stats.
 ///
-/// Structured like [`crate::utils::write_stream_to_disk`]: batches cross a
-/// bounded channel into a `spawn_blocking` task that owns every synchronous
-/// file operation, so no tokio worker blocks on I/O.
+/// Structured like [`crate::utils::write_stream_to_disk`]: every synchronous
+/// file operation runs on the blocking pool, so no tokio worker blocks on
+/// I/O.
 pub async fn write_stream_to_ipc_file<S>(
     stream: &mut S,
     path: &Path,
@@ -214,74 +213,54 @@ where
 {
     let schema = stream.schema();
     let path_owned = path.to_owned();
+    let writer = run_blocking_io(move || {
+        let file = File::create(&path_owned).map_err(|e| {
+            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
+            BallistaError::IoError(e)
+        })?;
+        let options = create_write_options(compression_type)?;
+        Ok(FileWriter::try_new_with_options(
+            BufWriter::new(file),
+            schema.as_ref(),
+            options,
+        )?)
+    })
+    .await?;
+
     let write_metric = disk_write_metric.clone();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
-
-    let handle =
-        tokio::task::spawn_blocking(move || -> Result<(u64, usize, FileLayout)> {
-            let file = File::create(&path_owned).map_err(|e| {
-                error!("Failed to create partition file at {:?}: {e:?}", path_owned);
-                BallistaError::IoError(e)
-            })?;
-
-            let options = create_write_options(compression_type)?;
-            let mut writer = FileWriter::try_new_with_options(
-                BufWriter::new(file),
-                schema.as_ref(),
-                options,
-            )?;
-
-            let mut batches_written = 0;
-            while let Some(batch) = rx.blocking_recv() {
-                let timer = write_metric.timer();
-                writer.write(&batch)?;
-                batches_written += 1;
-                timer.done();
-            }
+    let written = write_batches_blocking(
+        stream,
+        (writer, 0_usize),
+        channel_capacity,
+        move |(writer, batches_written): &mut (FileWriter<BufWriter<File>>, usize),
+              batch: &RecordBatch| {
             let timer = write_metric.timer();
-            writer.finish()?;
+            writer.write(batch)?;
+            *batches_written += 1;
             timer.done();
+            Ok(())
+        },
+    )
+    .await?;
+    let num_rows = written.num_rows;
+    let num_batches = written.num_batches as u64;
+    let (mut writer, batches_written) = written.writer;
 
-            // Only readable once the footer is on disk, which `finish` above
-            // is what guarantees.
-            let layout = read_file_layout(&path_owned)?;
-            Ok((
-                std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0),
-                batches_written,
-                layout,
-            ))
-        });
-
-    let mut num_rows = 0;
-    let mut num_batches = 0;
-
-    let stream_err = loop {
-        match stream.next().await {
-            Some(Ok(batch)) => {
-                num_batches += 1;
-                num_rows += batch.num_rows();
-                if tx.send(batch).await.is_err() {
-                    break None;
-                }
-            }
-            Some(Err(e)) => break Some(e),
-            None => break None,
-        }
-    };
-    drop(tx);
-
-    let write_result = handle
-        .await
-        .map_err(|e| BallistaError::General(format!("Disk writer task failed: {e}")))?;
-
-    if let Some(e) = stream_err {
-        if let Err(write_err) = &write_result {
-            error!("Disk writer also failed: {write_err}");
-        }
-        return Err(e.into());
-    }
-    let (num_bytes, batches_written, layout) = write_result?;
+    let write_metric = disk_write_metric.clone();
+    let path_owned = path.to_owned();
+    let (num_bytes, layout) = run_blocking_io(move || {
+        let timer = write_metric.timer();
+        writer.finish()?;
+        timer.done();
+        // Only readable once the footer is on disk, which `finish` above is
+        // what guarantees.
+        let layout = read_file_layout(&path_owned)?;
+        Ok((
+            std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0),
+            layout,
+        ))
+    })
+    .await?;
 
     // Record blocks are addressed positionally by the index that follows, so
     // one block per batch written is the invariant that makes that mapping
@@ -490,5 +469,54 @@ mod tests {
             !is_ipc_file(&dir.path().join("absent.arrow")),
             "a missing file is not an IPC file",
         );
+    }
+
+    /// The writer's blocking side waits on the channel while the input waits
+    /// on remote I/O, so the task's vcore is lent like any other wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_waiting_on_its_input_lends_the_vcore() {
+        use crate::vcore_permit::{VcorePermit, install_hook_for_tests};
+        use datafusion::common::runtime::IoWaitExt;
+        use std::time::{Duration, Instant};
+        use tokio::sync::Semaphore;
+
+        install_hook_for_tests();
+        let vcores = Arc::new(Semaphore::new(1));
+        let permit =
+            VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(20), None);
+        permit.acquire().await.expect("vcore");
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data-0.arrow");
+        let input = batch(&[1, 2, 3]);
+        let schema = input.schema();
+        let task = tokio::spawn(permit.run(async move {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
+            // One batch, which arrives from a remote source after 300 ms.
+            let remote = async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(input)
+            };
+            let mut stream = RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::once(Box::pin(remote).io_wait()),
+            );
+            write_stream_to_ipc_file(&mut stream, &path, &write_time, 8, None)
+                .await
+                .unwrap()
+        }));
+
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while vcores.available_permits() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            vcores.available_permits(),
+            1,
+            "the vcore was not lent while the writer waited on its input"
+        );
+        let (stats, _layout) = task.await.expect("task");
+        assert_eq!(stats.num_rows, Some(3));
     }
 }

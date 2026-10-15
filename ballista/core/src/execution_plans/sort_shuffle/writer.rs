@@ -1041,9 +1041,11 @@ impl ExecutionPlan for SortShuffleWriterExec {
             }
             let writer = self.clone();
             let ctx = context.clone();
-            tokio::spawn(async move {
+            // Carried: the coordinator polls the stage's input, which is the
+            // task's own work.
+            tokio::spawn(crate::vcore_permit::carry(async move {
                 run_coordinator(writer, ctx, senders).await;
-            });
+            }));
         }
 
         let rx = state
@@ -1155,7 +1157,9 @@ async fn run_coordinator(
     for input_partition in 0..num_input_partitions {
         let w = writer.clone();
         let c = ctx.clone();
-        writes.spawn(async move { w.execute_shuffle_write(input_partition, c).await });
+        writes.spawn(crate::vcore_permit::carry(async move {
+            w.execute_shuffle_write(input_partition, c).await
+        }));
     }
 
     let mut grouped: Vec<Vec<ShuffleWritePartition>> =

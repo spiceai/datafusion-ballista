@@ -55,6 +55,8 @@ use ballista_core::error::BallistaError;
 use log::debug;
 use std::net::SocketAddr;
 
+pub use ballista_core::vcore_permit;
+pub use ballista_core::vcore_permit::VcoreHook;
 pub use standalone::new_standalone_executor;
 pub use standalone::new_standalone_executor_from_builder;
 pub use standalone::new_standalone_executor_from_state;

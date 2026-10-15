@@ -107,6 +107,8 @@ pub mod shuffle_storage;
 pub mod sort_key;
 /// General utility functions for Ballista operations.
 pub mod utils;
+/// Lending a task's vcore while all of the task waits on remote I/O.
+pub mod vcore_permit;
 /// Version checks between Ballista clients and schedulers.
 pub mod version;
 
