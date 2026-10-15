@@ -28,6 +28,10 @@
 //! can start another task on it. Before any part of the task runs again it
 //! takes a vcore back, waiting for one if none is free.
 //!
+//! Blocking work a task spawns counts as the task running from when it is
+//! spawned until it ends, so the vcore is never lent while it is queued or
+//! running, and a blocking thread never waits for a vcore.
+//!
 //! Without the hook nothing is counted, and a task keeps its vcore for its
 //! whole life.
 
@@ -35,7 +39,7 @@ use datafusion::common::runtime::IoWaitHook;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::FutureExt;
-use futures::future::{BoxFuture, Either, LocalBoxFuture, Shared};
+use futures::future::{AbortHandle, Aborted, BoxFuture, Either, LocalBoxFuture, Shared};
 use pin_project_lite::pin_project;
 use std::any::Any;
 use std::future::Future;
@@ -107,20 +111,42 @@ impl IoWaitHook for VcoreHook {
         &self,
         f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
     ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
-        match VCORE.try_with(Arc::clone) {
-            Ok(permit) => Box::new(move || run_blocking(&permit, f)),
-            Err(_) => f,
+        match Carried::start() {
+            Some(carried) => Box::new(move || carried.run(f)),
+            None => f,
         }
     }
 }
 
-/// Runs a blocking closure as part of the task. It is the task doing work,
-/// so it takes the task's vcore back first if it was lent, blocking the
-/// thread until one is free, and keeps it while it runs.
-fn run_blocking<R>(permit: &Arc<VcorePermit>, f: impl FnOnce() -> R) -> R {
-    permit.enter_blocking();
-    let _running = Running { permit };
-    VCORE.sync_scope(Arc::clone(permit), f)
+/// A blocking closure spawned by a part of the task, counted as the task
+/// running from when it is spawned until it ends or is dropped unrun.
+///
+/// The part spawning it holds the task's vcore, so counting from the spawn
+/// keeps the vcore with the task until the closure is done: the closure never
+/// has to take a vcore back, and so never parks a blocking thread waiting for
+/// one, which a task holding a vcore may need for its own blocking work.
+struct Carried {
+    permit: Arc<VcorePermit>,
+}
+
+impl Carried {
+    /// Counts a closure spawned now as part of the task being polled, if
+    /// there is one.
+    fn start() -> Option<Self> {
+        let permit = VCORE.try_with(Arc::clone).ok()?;
+        permit.enter();
+        Some(Self { permit })
+    }
+
+    fn run<R>(self, f: impl FnOnce() -> R) -> R {
+        VCORE.sync_scope(Arc::clone(&self.permit), f)
+    }
+}
+
+impl Drop for Carried {
+    fn drop(&mut self) {
+        self.permit.leave();
+    }
 }
 
 /// Runs `fut` as part of the task being polled, if there is one.
@@ -137,48 +163,15 @@ pub fn carry<F: Future>(fut: F) -> impl Future<Output = F::Output> + use<F> {
 }
 
 /// Counts a blocking closure spawned on a task's execution path as the task
-/// running, as [`carry`] does for futures.
+/// running, from now until the closure ends, as [`carry`] does for futures.
 pub fn carry_blocking<F, R>(f: F) -> impl FnOnce() -> R + Send + use<F, R>
 where
     F: FnOnce() -> R + Send,
 {
-    let permit = VCORE.try_with(Arc::clone).ok();
-    move || match permit {
-        Some(permit) => run_blocking(&permit, f),
+    let carried = Carried::start();
+    move || match carried {
+        Some(carried) => carried.run(f),
         None => f(),
-    }
-}
-
-/// Runs `f`, a blocking wait on another part of the task (a channel fed by
-/// the task's own futures), without counting it as the task running, so a
-/// carried blocking closure waiting on input that waits on remote I/O lets
-/// the vcore be lent. Takes the vcore back before returning, as
-/// [`carry_blocking`] does before the closure starts.
-///
-/// Outside a carried blocking closure it just runs `f`.
-pub fn wait_blocking<R>(f: impl FnOnce() -> R) -> R {
-    let Ok(permit) = VCORE.try_with(Arc::clone) else {
-        return f();
-    };
-    permit.leave();
-    let _resume = ResumeBlocking { permit: &permit };
-    f()
-}
-
-/// Counts the blocking closure as running again when a [`wait_blocking`]
-/// ends.
-struct ResumeBlocking<'a> {
-    permit: &'a Arc<VcorePermit>,
-}
-
-impl Drop for ResumeBlocking<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            // Unwinding to the closure's own guard: only restore the count.
-            self.permit.enter();
-        } else {
-            self.permit.enter_blocking();
-        }
     }
 }
 
@@ -278,6 +271,9 @@ struct Held {
     promised: usize,
     /// The task taking its vcore back, while one is on the way.
     resume: Option<Resume>,
+    /// Ends `resume` when the task ends, so parts waiting on it run without
+    /// a vcore rather than wait for executor capacity.
+    resume_abort: Option<AbortHandle>,
     closed: bool,
 }
 
@@ -349,6 +345,9 @@ impl VcorePermit {
         let mut held = self.lock();
         held.closed = true;
         held.resume = None;
+        if let Some(abort) = held.resume_abort.take() {
+            abort.abort();
+        }
         self.end_lend(&mut held);
         held.vcore = None;
     }
@@ -450,9 +449,15 @@ impl VcorePermit {
         {
             return;
         }
+        // A blocking closure dropped while the runtime shuts down has no
+        // runtime to lend on, and nothing left to lend to.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.timer_armed.store(false, Ordering::SeqCst);
+            return;
+        };
         let permit = Arc::downgrade(self);
         let lend_after = self.lend_after;
-        tokio::spawn(lend_when_idle(permit, lend_after));
+        runtime.spawn(lend_when_idle(permit, lend_after));
     }
 
     /// Lend the vcore if the task stayed idle with a wait in flight since
@@ -509,6 +514,7 @@ impl VcorePermit {
             .fetch_add(duration_nanos(waited), Ordering::Relaxed);
         let mut held = self.lock();
         held.resume = None;
+        held.resume_abort = None;
         if held.closed || held.vcore.is_some() {
             return Some(vcore);
         }
@@ -541,22 +547,6 @@ impl VcorePermit {
         self.went_idle();
     }
 
-    /// [`enter`](Self::enter) from blocking code, first taking the vcore back
-    /// if it was lent. Blocks the thread until a vcore is free.
-    fn enter_blocking(self: &Arc<Self>) {
-        loop {
-            // Entered before checking, as the gate does, so a lend either
-            // sees this part running or is seen here.
-            self.enter();
-            if !self.needs_vcore() {
-                return;
-            }
-            self.leave();
-            // The semaphore needs no runtime, so this can wait on any thread.
-            futures::executor::block_on(self.resume());
-        }
-    }
-
     /// Takes the lent vcore back for every part of the task that needs it:
     /// parts resuming together wait in the executor's queue once, and all
     /// run once the vcore is back. A part waiting on its own acquire could
@@ -574,23 +564,27 @@ impl VcorePermit {
             return resume.clone();
         }
         let permit = Arc::downgrade(self);
-        let vcores = Arc::clone(&self.vcores);
+        let (vcore, abort) =
+            futures::future::abortable(Arc::clone(&self.vcores).acquire_owned());
         let resume = async move {
             let started = Instant::now();
-            let vcore = vcores.acquire_owned().await;
+            let vcore = vcore.await;
             let Some(permit) = permit.upgrade() else {
                 return;
             };
             match vcore {
-                Ok(vcore) => drop(permit.install(vcore, started.elapsed())),
+                Ok(Ok(vcore)) => drop(permit.install(vcore, started.elapsed())),
                 // A closed semaphore means shutdown: run without a vcore from
                 // now on, rather than asking again.
-                Err(_) => permit.close(),
+                Ok(Err(_)) => permit.close(),
+                // The task ended.
+                Err(Aborted) => {}
             }
         }
         .boxed()
         .shared();
         held.resume = Some(resume.clone());
+        held.resume_abort = Some(abort);
         resume
     }
 
@@ -987,37 +981,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_closure_started_after_a_lend_takes_the_vcore_back() {
+    async fn queued_blocking_closure_keeps_the_vcore_until_it_ends() {
         let (vcores, permit) = one_vcore_task(None).await;
         let ran = Arc::new(Mutex::new(None));
         let ran_in_closure = Arc::clone(&ran);
         let permit_in_closure = Arc::clone(&permit);
-        // Carried while the task holds its vcore and started only after the
-        // vcore was lent, like a closure queued behind a busy blocking pool.
+        // Carried while the task holds its vcore and not yet started, like a
+        // closure queued behind a busy blocking pool.
         let closure = permit
             .run(async move {
                 carry_blocking(move || {
                     *ran_in_closure.lock().expect("lock") =
-                        Some((Instant::now(), permit_in_closure.is_held()));
+                        Some(permit_in_closure.is_held());
                 })
             })
             .await;
         let waiting = tokio::spawn(permit.run(remote_call(300).io_wait()));
-        assert!(vcore_frees_within(&vcores, Duration::from_millis(100)).await);
-        // Another task takes the lent vcore.
-        let other = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
-        let blocking = tokio::task::spawn_blocking(closure);
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            ran.lock().expect("lock").is_none(),
-            "a blocking closure started without a vcore"
+            !vcore_frees_within(&vcores, Duration::from_millis(100)).await,
+            "lent while a carried blocking closure was queued"
         );
-        let released_at = Instant::now();
-        drop(other);
-        blocking.await.expect("blocking");
-        let (ran_at, held) = ran.lock().expect("lock").expect("closure ran");
-        assert!(ran_at >= released_at, "ran before the vcore was free");
-        assert!(held, "ran without the task's vcore");
+        tokio::task::spawn_blocking(closure)
+            .await
+            .expect("blocking");
+        assert_eq!(
+            *ran.lock().expect("lock"),
+            Some(true),
+            "ran without the vcore"
+        );
+        assert!(
+            vcore_frees_within(&vcores, Duration::from_millis(150)).await,
+            "never lent once the blocking closure ended"
+        );
+        assert_eq!(waiting.await.expect("waiting"), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_unrun_blocking_closure_stops_counting() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let closure = permit.run(async { carry_blocking(|| ()) }).await;
+        let waiting = tokio::spawn(permit.run(remote_call(300).io_wait()));
+        assert!(!vcore_frees_within(&vcores, Duration::from_millis(60)).await);
+        drop(closure);
+        assert!(
+            vcore_frees_within(&vcores, Duration::from_millis(150)).await,
+            "a dropped closure kept the vcore"
+        );
         assert_eq!(waiting.await.expect("waiting"), 7);
     }
 
@@ -1081,6 +1090,34 @@ mod tests {
         assert!(permit.is_held());
         assert_eq!(vcores.available_permits(), 0);
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_lent_permit_lets_parts_waiting_for_a_vcore_finish() {
+        let (vcores, permit) = one_vcore_task(None).await;
+        let waiting = tokio::spawn(permit.run(remote_call(60_000).io_wait()));
+        assert!(
+            vcore_frees_within(&vcores, Duration::from_millis(500)).await,
+            "never lent"
+        );
+        // Another task takes the lent vcore, so a part resuming must wait.
+        let other = Arc::clone(&vcores).acquire_owned().await.expect("vcore");
+        let part = tokio::spawn(permit.run(async { 7 }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!part.is_finished(), "ran without a vcore");
+
+        // The task ends: its parts run without a vcore from now on.
+        permit.close();
+        let v = tokio::time::timeout(Duration::from_secs(2), part)
+            .await
+            .expect("a part of a closed task kept waiting for a vcore")
+            .expect("part");
+        assert_eq!(v, 7);
+        assert!(!permit.is_held());
+        assert_eq!(vcores.available_permits(), 0);
+        drop(other);
+        assert_eq!(vcores.available_permits(), 1);
+        waiting.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

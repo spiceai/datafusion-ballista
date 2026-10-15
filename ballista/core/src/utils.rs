@@ -30,7 +30,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use log::error;
 use std::io::BufWriter;
 use std::net::SocketAddr;
@@ -192,13 +192,124 @@ pub fn create_write_options(
         })
 }
 
+/// Batches a stream fed to a blocking writer.
+pub(crate) struct Written<W> {
+    pub(crate) writer: W,
+    pub(crate) num_rows: usize,
+    pub(crate) num_batches: usize,
+}
+
+/// Feeds `stream`'s batches to `writer` with `write`, on the blocking pool,
+/// keeping up to `capacity` batches buffered while a write is in flight.
+///
+/// A blocking job only writes batches already received; it never waits for
+/// input. A task whose input waits on remote I/O lends its vcore and needs one
+/// back before it can feed its writer, so a writer waiting for input on a
+/// blocking thread could hold that thread from the task holding the vcore.
+///
+/// A stream error is returned once the write in flight has ended, which is
+/// logged if it failed too.
+pub(crate) async fn write_batches_blocking<S, W, F>(
+    stream: &mut S,
+    writer: W,
+    capacity: usize,
+    write: F,
+) -> Result<Written<W>>
+where
+    S: Stream<Item = datafusion::error::Result<RecordBatch>> + Unpin + ?Sized,
+    W: Send + 'static,
+    F: Fn(&mut W, &RecordBatch) -> Result<()> + Clone + Send + 'static,
+{
+    async fn join<W>(job: tokio::task::JoinHandle<Result<W>>) -> Result<W> {
+        job.await.map_err(|e| {
+            BallistaError::General(format!("Disk writer task failed: {e}"))
+        })?
+    }
+
+    let capacity = capacity.max(1);
+    let mut writer = Some(writer);
+    let mut job = None;
+    let mut buffered = Vec::new();
+    let mut num_rows = 0;
+    let mut num_batches = 0;
+    loop {
+        let input = stream.next().await;
+        let ended = match input {
+            Some(Ok(batch)) => {
+                num_rows += batch.num_rows();
+                num_batches += 1;
+                buffered.push(batch);
+                false
+            }
+            Some(Err(e)) => {
+                if let Some(job) = job.take()
+                    && let Err(write_err) = join(job).await
+                {
+                    error!("Disk writer also failed: {write_err}");
+                }
+                return Err(e.into());
+            }
+            None => true,
+        };
+        // Take the writer back once its write is done, waiting for it when
+        // the buffer is full or the input has ended.
+        if let Some(running) =
+            job.take_if(|j: &mut tokio::task::JoinHandle<Result<W>>| {
+                ended || j.is_finished() || buffered.len() >= capacity
+            })
+        {
+            writer = Some(join(running).await?);
+        }
+        if !buffered.is_empty()
+            && let Some(mut w) = writer.take()
+        {
+            let batches = std::mem::take(&mut buffered);
+            let write = write.clone();
+            job = Some(tokio::task::spawn_blocking(
+                crate::vcore_permit::carry_blocking(move || {
+                    for batch in &batches {
+                        write(&mut w, batch)?;
+                    }
+                    Ok(w)
+                }),
+            ));
+        }
+        if ended {
+            let writer = match (job, writer) {
+                (Some(job), _) => join(job).await?,
+                (None, Some(writer)) => writer,
+                (None, None) => {
+                    return Err(BallistaError::Internal(
+                        "disk writer lost its writer".to_string(),
+                    ));
+                }
+            };
+            return Ok(Written {
+                writer,
+                num_rows,
+                num_batches,
+            });
+        }
+    }
+}
+
+/// Runs `f`, a synchronous file operation, on the blocking pool as part of
+/// the calling task.
+pub(crate) async fn run_blocking_io<R: Send + 'static>(
+    f: impl FnOnce() -> Result<R> + Send + 'static,
+) -> Result<R> {
+    tokio::task::spawn_blocking(crate::vcore_permit::carry_blocking(f))
+        .await
+        .map_err(|e| BallistaError::General(format!("Disk writer task failed: {e}")))?
+}
+
 /// Stream data to disk in Arrow IPC format.
 ///
-/// Batches are read from the async stream and forwarded through a bounded
-/// channel to a `spawn_blocking` task that performs all synchronous file I/O,
-/// keeping the tokio worker thread unblocked. The blocking task is carried
-/// into the calling task's vcore scope, so its writes count as the task
-/// running.
+/// Every synchronous file operation runs on the blocking pool, keeping the
+/// tokio worker thread unblocked, and is carried into the calling task's
+/// vcore scope, so the writes count as the task running. A blocking job
+/// only writes batches already received and never waits for input, so a lent
+/// task's writer holds no blocking thread while its input waits.
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send>>,
     path: &Path,
@@ -208,71 +319,48 @@ pub async fn write_stream_to_disk(
 ) -> Result<PartitionStats> {
     let schema = stream.schema();
     let path_owned = path.to_owned();
+    let writer = run_blocking_io(move || {
+        let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
+            error!("Failed to create partition file at {:?}: {e:?}", path_owned);
+            BallistaError::IoError(e)
+        })?);
+        let options = create_write_options(compression_type)?;
+        Ok(StreamWriter::try_new_with_options(
+            file,
+            schema.as_ref(),
+            options,
+        )?)
+    })
+    .await?;
+
     let write_metric = disk_write_metric.clone();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
-
-    let handle = tokio::task::spawn_blocking(crate::vcore_permit::carry_blocking(
-        move || -> Result<u64> {
-            let file = BufWriter::new(File::create(&path_owned).map_err(|e| {
-                error!("Failed to create partition file at {:?}: {e:?}", path_owned);
-                BallistaError::IoError(e)
-            })?);
-
-            let options = create_write_options(compression_type)?;
-
-            let mut writer =
-                StreamWriter::try_new_with_options(file, schema.as_ref(), options)?;
-
-            // Waiting for the next batch is the input's time, not the
-            // writer's, so it doesn't keep the task's vcore.
-            while let Some(batch) =
-                crate::vcore_permit::wait_blocking(|| rx.blocking_recv())
-            {
-                let timer = write_metric.timer();
-                writer.write(&batch)?;
-                timer.done();
-            }
+    let written = write_batches_blocking(
+        stream,
+        writer,
+        channel_capacity,
+        move |writer: &mut StreamWriter<BufWriter<File>>, batch: &RecordBatch| {
             let timer = write_metric.timer();
-            writer.finish()?;
+            writer.write(batch)?;
             timer.done();
-            Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
+            Ok(())
         },
-    ));
+    )
+    .await?;
 
-    let mut num_rows = 0;
-    let mut num_batches = 0;
-
-    let stream_err = loop {
-        match stream.next().await {
-            Some(Ok(batch)) => {
-                num_batches += 1;
-                num_rows += batch.num_rows();
-                if tx.send(batch).await.is_err() {
-                    break None;
-                }
-            }
-            Some(Err(e)) => break Some(e),
-            None => break None,
-        }
-    };
-    drop(tx);
-
-    let write_result = handle
-        .await
-        .map_err(|e| BallistaError::General(format!("Disk writer task failed: {e}")))?;
-
-    if let Some(e) = stream_err {
-        if let Err(write_err) = &write_result {
-            error!("Disk writer also failed: {write_err}");
-        }
-        return Err(e.into());
-    }
-    let num_bytes = write_result?;
+    let mut writer = written.writer;
+    let write_metric = disk_write_metric.clone();
+    let path_owned = path.to_owned();
+    let num_bytes = run_blocking_io(move || {
+        let timer = write_metric.timer();
+        writer.finish()?;
+        timer.done();
+        Ok(std::fs::metadata(&path_owned).map(|m| m.len()).unwrap_or(0))
+    })
+    .await?;
 
     Ok(PartitionStats::new(
-        Some(num_rows as u64),
-        Some(num_batches),
+        Some(written.num_rows as u64),
+        Some(written.num_batches as u64),
         Some(num_bytes),
     ))
 }
@@ -647,5 +735,98 @@ mod tests {
         );
         let stats = task.await.expect("task");
         assert_eq!(stats.num_rows, Some(8_000_001));
+    }
+
+    /// A task holding a vcore can always get a blocking thread for its disk
+    /// writer, even when a lent task's writer is open and every blocking
+    /// thread is otherwise taken. A lent task needs that vcore before it can
+    /// feed its writer, so a writer parked on a blocking thread while it waits
+    /// would deadlock the two.
+    #[test]
+    fn lent_task_writer_leaves_blocking_threads_for_the_task_holding_the_vcore() {
+        use crate::vcore_permit::{VcorePermit, install_hook_for_tests};
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::runtime::IoWaitExt;
+        use datafusion::physical_plan::metrics::{
+            ExecutionPlanMetricsSet, MetricBuilder,
+        };
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use std::time::Instant;
+        use tokio::sync::Semaphore;
+
+        const LEND: Duration = Duration::from_millis(20);
+        const WITHIN: Duration = Duration::from_secs(5);
+        install_hook_for_tests();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+            )
+            .expect("batch");
+            let dir = tempfile::tempdir().expect("dir");
+            let metrics = ExecutionPlanMetricsSet::new();
+            let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
+            let write = |input, name: &str| {
+                let mut stream: Pin<Box<dyn RecordBatchStream + Send>> =
+                    Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input));
+                let path = dir.path().join(name);
+                let write_time = write_time.clone();
+                async move {
+                    write_stream_to_disk(&mut stream, &path, &write_time, 8, None)
+                        .await
+                        .expect("write")
+                        .num_rows
+                }
+            };
+            let vcores = Arc::new(Semaphore::new(1));
+
+            // Its input waits on a remote source, so its vcore is lent with its
+            // writer open.
+            let lent = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            lent.acquire().await.expect("vcore");
+            let remote_batch = batch.clone();
+            let remote = Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(remote_batch)
+            })
+            .io_wait();
+            let lent_task = tokio::spawn(
+                lent.run(write(futures::stream::once(remote).boxed(), "lent.arrow")),
+            );
+            let deadline = Instant::now() + WITHIN;
+            while vcores.available_permits() == 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(vcores.available_permits(), 1, "never lent");
+
+            // Another task takes the lent vcore and writes.
+            let holder = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            holder.acquire().await.expect("vcore");
+            let holder_task = tokio::spawn(holder.run(write(
+                futures::stream::iter([Ok(batch.clone())]).boxed(),
+                "holder.arrow",
+            )));
+
+            let rows = tokio::time::timeout(WITHIN, holder_task)
+                .await
+                .expect("the task holding the vcore never got a blocking thread")
+                .expect("join");
+            assert_eq!(rows, Some(3));
+            holder.close();
+            let rows = tokio::time::timeout(WITHIN, lent_task)
+                .await
+                .expect("the lent task never finished")
+                .expect("join");
+            assert_eq!(rows, Some(3));
+        });
     }
 }
