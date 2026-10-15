@@ -30,6 +30,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, metrics};
+use futures::future::Either;
 use futures::{Stream, StreamExt};
 use log::error;
 use std::io::BufWriter;
@@ -228,38 +229,13 @@ where
 
     let capacity = capacity.max(1);
     let mut writer = Some(writer);
-    let mut job = None;
+    let mut job: Option<tokio::task::JoinHandle<Result<W>>> = None;
     let mut buffered = Vec::new();
+    let mut ended = false;
     let mut num_rows = 0;
     let mut num_batches = 0;
     loop {
-        let input = stream.next().await;
-        let ended = match input {
-            Some(Ok(batch)) => {
-                num_rows += batch.num_rows();
-                num_batches += 1;
-                buffered.push(batch);
-                false
-            }
-            Some(Err(e)) => {
-                if let Some(job) = job.take()
-                    && let Err(write_err) = join(job).await
-                {
-                    error!("Disk writer also failed: {write_err}");
-                }
-                return Err(e.into());
-            }
-            None => true,
-        };
-        // Take the writer back once its write is done, waiting for it when
-        // the buffer is full or the input has ended.
-        if let Some(running) =
-            job.take_if(|j: &mut tokio::task::JoinHandle<Result<W>>| {
-                ended || j.is_finished() || buffered.len() >= capacity
-            })
-        {
-            writer = Some(join(running).await?);
-        }
+        // Hand whatever is buffered to the writer as soon as it is free.
         if !buffered.is_empty()
             && let Some(mut w) = writer.take()
         {
@@ -274,21 +250,64 @@ where
                 }),
             ));
         }
-        if ended {
-            let writer = match (job, writer) {
-                (Some(job), _) => join(job).await?,
-                (None, Some(writer)) => writer,
-                (None, None) => {
-                    return Err(BallistaError::Internal(
-                        "disk writer lost its writer".to_string(),
-                    ));
+        let read = !ended && buffered.len() < capacity;
+        let input = match (read, job.as_mut()) {
+            // Wait for whichever comes first: the next batch, or the write in
+            // flight, so batches buffered behind it go out without waiting for
+            // more input.
+            (true, Some(running)) => {
+                match futures::future::select(running, stream.next()).await {
+                    Either::Left((joined, _)) => {
+                        job = None;
+                        writer = Some(joined.map_err(|e| {
+                            BallistaError::General(format!(
+                                "Disk writer task failed: {e}"
+                            ))
+                        })??);
+                        continue;
+                    }
+                    Either::Right((input, _)) => input,
                 }
-            };
-            return Ok(Written {
-                writer,
-                num_rows,
-                num_batches,
-            });
+            }
+            (true, None) => stream.next().await,
+            // The buffer is full or the input has ended: wait for the writer.
+            (false, Some(_)) => {
+                if let Some(running) = job.take() {
+                    writer = Some(join(running).await?);
+                }
+                continue;
+            }
+            (false, None) => {
+                // Nothing in flight and the input has ended, so everything
+                // buffered has been written.
+                let (true, true, Some(writer)) = (ended, buffered.is_empty(), writer)
+                else {
+                    return Err(BallistaError::Internal(
+                        "disk writer stopped with batches unwritten".to_string(),
+                    ));
+                };
+                return Ok(Written {
+                    writer,
+                    num_rows,
+                    num_batches,
+                });
+            }
+        };
+        match input {
+            Some(Ok(batch)) => {
+                num_rows += batch.num_rows();
+                num_batches += 1;
+                buffered.push(batch);
+            }
+            Some(Err(e)) => {
+                if let Some(running) = job.take()
+                    && let Err(write_err) = join(running).await
+                {
+                    error!("Disk writer also failed: {write_err}");
+                }
+                return Err(e.into());
+            }
+            None => ended = true,
         }
     }
 }
@@ -828,5 +847,64 @@ mod tests {
                 .expect("join");
             assert_eq!(rows, Some(3));
         });
+    }
+
+    /// A batch received while the previous write was in flight is written as
+    /// soon as that write ends, not once the next batch arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_batch_is_written_while_the_input_waits() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::metrics::{
+            ExecutionPlanMetricsSet, MetricBuilder,
+        };
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use std::time::Instant;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..1_000_000))],
+        )
+        .expect("batch");
+        let batch_bytes = batch.get_array_memory_size() as u64;
+        // A and B arrive together, so B is buffered while A is written; C then
+        // waits on a slow source.
+        let last = batch.clone();
+        let slow = futures::stream::once(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(last)
+        });
+        let input =
+            futures::stream::iter([Ok(batch.clone()), Ok(batch.clone())]).chain(slow);
+        let mut stream: Pin<Box<dyn RecordBatchStream + Send>> =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input));
+
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("data.arrow");
+        let metrics = ExecutionPlanMetricsSet::new();
+        let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
+        let writing_path = path.clone();
+        let task = tokio::spawn(async move {
+            write_stream_to_disk(&mut stream, &writing_path, &write_time, 8, None)
+                .await
+                .expect("write")
+        });
+
+        let file_len = || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while file_len() < 2 * batch_bytes && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            file_len() >= 2 * batch_bytes,
+            "only {} of {} bytes on disk while the input waited",
+            file_len(),
+            2 * batch_bytes
+        );
+        assert!(!task.is_finished(), "the slow batch arrived early");
+        let stats = task.await.expect("task");
+        assert_eq!(stats.num_rows(), Some(3_000_000));
+        assert_eq!(stats.num_batches(), Some(3));
     }
 }
