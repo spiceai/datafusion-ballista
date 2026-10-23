@@ -20,10 +20,12 @@
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ballista_core::RuntimeProducer;
-use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+use datafusion::execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool,
+    MemoryReservation,
+};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
 use lru::LruCache;
@@ -35,7 +37,8 @@ use parking_lot::Mutex;
 /// (footer) cache are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`](datafusion::execution::runtime_env::RuntimeEnvBuilder::from_runtime_env)
 /// — the outer `CacheManager` is rebuilt around that same inner cache — so
-/// read-side state is shared while the memory pool stays per task.
+/// read-side state is shared while the spill policy stays per task. The built-in
+/// policy also enforces a shared executor budget on actual allocations.
 ///
 /// `vcores_consumed` is the number of vcores this task claims from the
 /// executor's budget (`min(input_partition_ids.len(), budget)` for non-collapse
@@ -51,88 +54,27 @@ pub type MemoryPoolPolicy = Arc<
         + Sync,
 >;
 
-/// The memory every task's pool holds, against the executor's whole memory
-/// budget.
-///
-/// Each task's own pool enforces its limit; this only adds them up, so the
-/// executor can tell whether it has room for another task before lending a
-/// waiting task's vcore. It never refuses a reservation.
+/// Enforces a task's spill policy and the executor's shared allocation budget.
+/// Only actual reservations are charged; creating a task or lending its vcore
+/// consumes no memory budget. The shared pool outlives cached base runtimes.
 #[derive(Debug)]
-pub struct ExecutorMemory {
-    budget: usize,
-    reserved: AtomicUsize,
-}
-
-impl ExecutorMemory {
-    /// Counts against an executor budget of `budget` bytes.
-    pub fn new(budget: usize) -> Self {
-        Self {
-            budget,
-            reserved: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Display for ExecutorMemory {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "executor(reserved: {}, budget: {})",
-            self.reserved(),
-            self.budget
-        )
-    }
-}
-
-impl MemoryPool for ExecutorMemory {
-    fn name(&self) -> &str {
-        "executor"
-    }
-
-    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
-        self.reserved.fetch_add(additional, Ordering::Relaxed);
-    }
-
-    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
-        self.reserved.fetch_sub(shrink, Ordering::Relaxed);
-    }
-
-    fn try_grow(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<()> {
-        self.grow(reservation, additional);
-        Ok(())
-    }
-
-    fn reserved(&self) -> usize {
-        self.reserved.load(Ordering::Relaxed)
-    }
-
-    fn memory_limit(&self) -> MemoryLimit {
-        MemoryLimit::Finite(self.budget)
-    }
-}
-
-/// A task's own memory pool, whose reservations are also counted in the
-/// executor's [`ExecutorMemory`].
-#[derive(Debug)]
-pub struct TaskMemoryPool {
-    task: Arc<dyn MemoryPool>,
-    executor: Arc<ExecutorMemory>,
+pub(crate) struct TaskMemoryPool {
+    task: FairSpillPool,
+    executor: Arc<GreedyMemoryPool>,
 }
 
 impl TaskMemoryPool {
-    /// Wraps the task's `task` pool, counting what it holds in `executor`.
-    pub fn new(task: Arc<dyn MemoryPool>, executor: Arc<ExecutorMemory>) -> Self {
-        Self { task, executor }
+    pub(crate) fn new(size: usize, executor: Arc<GreedyMemoryPool>) -> Self {
+        Self {
+            task: FairSpillPool::new(size),
+            executor,
+        }
     }
 }
 
 impl Display for TaskMemoryPool {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "task({}, {})", self.task, self.executor)
+        write!(f, "task({}, executor: {})", self.task, self.executor)
     }
 }
 
@@ -141,17 +83,19 @@ impl MemoryPool for TaskMemoryPool {
         self.task.name()
     }
 
-    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+    fn register(&self, consumer: &MemoryConsumer) {
         self.task.register(consumer);
     }
 
-    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+    fn unregister(&self, consumer: &MemoryConsumer) {
         self.task.unregister(consumer);
     }
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.task.grow(reservation, additional);
+        // MemoryPool::grow must succeed, even beyond the limit. Account for
+        // these reservations so subsequent try_grow calls see their usage.
         self.executor.grow(reservation, additional);
+        self.task.grow(reservation, additional);
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
@@ -164,8 +108,13 @@ impl MemoryPool for TaskMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> datafusion::error::Result<()> {
-        self.task.try_grow(reservation, additional)?;
-        self.executor.grow(reservation, additional);
+        // Atomically claim actual bytes across every task before checking the
+        // local spill policy. Roll back if the local allocation is refused.
+        self.executor.try_grow(reservation, additional)?;
+        if let Err(error) = self.task.try_grow(reservation, additional) {
+            self.executor.shrink(reservation, additional);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -207,8 +156,9 @@ pub trait SessionRuntimeCache: Send + Sync {
 /// `DiskManager` too; this is safe because spill temp files are uniquely
 /// named, matching the standard one-`RuntimeEnv`-per-`SessionContext` model.
 /// Each task's real runtime is produced by applying [`MemoryPoolPolicy`] to
-/// the shared base, which installs a fresh per-task memory pool — so memory
-/// isolation is unchanged.
+/// the shared base, which installs a fresh per-task memory pool. The built-in
+/// policy shares its aggregate allocation budget across all of these pools,
+/// independently of the base runtime cache.
 ///
 /// The cache is bounded by an LRU of `capacity` sessions. A capacity of `0`
 /// disables caching entirely: every call builds a fresh base env, matching the

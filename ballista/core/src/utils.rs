@@ -676,84 +676,100 @@ mod tests {
         use crate::vcore_permit::{VcorePermit, install_hook_for_tests};
         use datafusion::arrow::array::Int64Array;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::reader::StreamReader;
         use datafusion::common::runtime::IoWaitExt;
-        use datafusion::physical_plan::metrics::{
-            ExecutionPlanMetricsSet, MetricBuilder,
-        };
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use std::time::Instant;
-        use tokio::sync::Semaphore;
+        use tokio::sync::{Semaphore, oneshot};
 
         const LEND: Duration = Duration::from_millis(20);
+        const WITHIN: Duration = Duration::from_secs(5);
         install_hook_for_tests();
         let vcores = Arc::new(Semaphore::new(1));
-        let permit = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND);
         permit.acquire().await.expect("vcore");
 
-        // A batch whose compressed write takes many lend windows.
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
-        let values: Vec<i64> = (0..8_000_000)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as i64
-            })
-            .collect();
-        let big = RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(values))],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
         )
-        .unwrap();
-        let small = big.slice(0, 1);
-        // The input then waits on a remote source for the next batch.
+        .expect("batch");
+        let expected = vec![batch.clone(), batch.clone()];
+        let (remote_started, remote_waiting) = oneshot::channel();
+        let (release_remote, remote_ready) = oneshot::channel();
         let remote = Box::pin(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            Ok(small)
+            remote_started.send(()).expect("remote started");
+            remote_ready.await.expect("release remote");
+            Ok(batch)
         })
         .io_wait();
-        let input = futures::stream::iter([Ok(big)]).chain(futures::stream::once(remote));
-        let mut stream: Pin<Box<dyn RecordBatchStream + Send>> =
-            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), input));
+        let mut stream = futures::stream::iter([Ok(expected[0].clone())])
+            .chain(futures::stream::once(remote));
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("data.arrow");
-        let metrics = ExecutionPlanMetricsSet::new();
-        let write_time = MetricBuilder::new(&metrics).subset_time("write_time", 0);
-        let writing = write_time.clone();
+        let options = create_write_options(Some(CompressionType::ZSTD)).unwrap();
+        let writer = StreamWriter::try_new_with_options(
+            BufWriter::new(File::create(&path).unwrap()),
+            schema.as_ref(),
+            options,
+        )
+        .unwrap();
+        let (write_started, writing) = oneshot::channel();
+        let (release_write, write_ready) = std::sync::mpsc::channel();
+        // Hold the first write inside the real blocking writer until the test
+        // releases it. Its duration no longer depends on compression speed.
+        let writer = (writer, Some((write_started, write_ready)));
         let task = tokio::spawn(permit.run(async move {
-            write_stream_to_disk(
-                &mut stream,
-                &path,
-                &writing,
-                8,
-                Some(CompressionType::ZSTD),
-            )
+            write_batches_blocking(&mut stream, writer, 8, |(writer, gate), batch| {
+                if let Some((started, ready)) = gate.take() {
+                    started.send(()).expect("write started");
+                    ready.recv().expect("release write");
+                }
+                writer.write(batch)?;
+                Ok(())
+            })
             .await
-            .unwrap()
+            .expect("write batches")
         }));
 
-        let deadline = Instant::now() + Duration::from_millis(2_500);
-        while vcores.available_permits() == 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let written = write_time.value();
-        assert_eq!(
-            vcores.available_permits(),
-            1,
-            "never lent while the writer waited for input"
-        );
+        tokio::time::timeout(WITHIN, writing)
+            .await
+            .expect("writer starts")
+            .expect("writer signal");
+        tokio::time::timeout(WITHIN, remote_waiting)
+            .await
+            .expect("input waits on remote source")
+            .expect("remote signal");
         assert!(
-            written > 0,
-            "lent while the disk writer was still writing the first batch"
+            tokio::time::timeout(LEND * 5, Arc::clone(&vcores).acquire_owned())
+                .await
+                .is_err(),
+            "lent the vcore while the blocking writer was active"
         );
-        assert!(
-            Duration::from_nanos(written as u64) > LEND * 5,
-            "the first write took {written} ns, too short to tell"
-        );
-        let stats = task.await.expect("task");
-        assert_eq!(stats.num_rows, Some(8_000_001));
+
+        release_write.send(()).expect("release first write");
+        let lent = tokio::time::timeout(WITHIN, Arc::clone(&vcores).acquire_owned())
+            .await
+            .expect("never lent while the writer waited for input")
+            .expect("lent vcore");
+        drop(lent);
+        release_remote.send(()).expect("release second batch");
+        let written = tokio::time::timeout(WITHIN, task)
+            .await
+            .expect("writer finishes")
+            .expect("task");
+        assert_eq!(written.num_rows, 6);
+        assert_eq!(written.num_batches, 2);
+        let (mut writer, _) = written.writer;
+        writer.finish().expect("finish IPC stream");
+        drop(writer);
+        let actual: Vec<_> = StreamReader::try_new(File::open(path).unwrap(), None)
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .expect("read batches");
+        assert_eq!(actual, expected);
+        permit.close();
+        assert_eq!(vcores.available_permits(), 1);
     }
 
     /// A task holding a vcore can always get a blocking thread for its disk
@@ -810,7 +826,7 @@ mod tests {
 
             // Its input waits on a remote source, so its vcore is lent with its
             // writer open.
-            let lent = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            let lent = VcorePermit::new(Arc::clone(&vcores), LEND);
             lent.acquire().await.expect("vcore");
             let remote_batch = batch.clone();
             let remote = Box::pin(async move {
@@ -828,7 +844,7 @@ mod tests {
             assert_eq!(vcores.available_permits(), 1, "never lent");
 
             // Another task takes the lent vcore and writes.
-            let holder = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            let holder = VcorePermit::new(Arc::clone(&vcores), LEND);
             holder.acquire().await.expect("vcore");
             let holder_task = tokio::spawn(holder.run(write(
                 futures::stream::iter([Ok(batch.clone())]).boxed(),

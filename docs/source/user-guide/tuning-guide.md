@@ -132,11 +132,17 @@ pre-auto-sizing behavior.
 
 Whether the budget comes from auto-detection or `--memory-pool-size`, it is
 divided equally across the executor's vcores: each task receives its own
-`FairSpillPool` of size `memory_pool_size / vcores`. With
-`--memory-pool-size 8GB --vcores 8`, every task sees a 1 GB pool, fully
-isolated from other tasks. Idle slots do not lend their share to busy ones,
-which keeps task memory predictable at the cost of some unused capacity when
-the executor is under-utilized.
+`FairSpillPool` of size `memory_pool_size / vcores` per claimed vcore. With
+`--memory-pool-size 8GB --vcores 8`, a one-vcore task has a 1 GB limit and a
+four-vcore task has a 4 GB limit. Idle slots do not increase those limits.
+
+Actual reservations also count against one shared executor budget across all
+tasks and sessions. Fallible allocations must fit both the task's spill policy
+and that shared budget; allocation errors let operators spill or fail the task.
+Applications enabling `VcoreHook` can therefore lend vcores while many tasks
+wait for I/O without reserving hypothetical memory shares for replacement tasks.
+As with DataFusion's underlying pools, infallible `grow` calls are accounted for
+but cannot be rejected; these limits do not bound untracked allocations.
 
 The executor refuses to start if the per-task share would round to zero (i.e.
 `memory_pool_size < vcores`).
@@ -145,8 +151,8 @@ Use `--memory-pool-fraction` to tune how much of the detected memory limit
 the auto-sized pool uses; it accepts a value in `(0.0, 1.0]` and defaults to
 `0.70`. It is ignored when `--memory-pool-size` is set.
 
-Because operators spill to disk rather than fail, make sure the executor's
-`--work-dir` has enough scratch space to absorb spills under memory pressure.
+Make sure the executor's `--work-dir` has enough scratch space for spillable
+operators to spill to disk under memory pressure.
 
 ## Join Strategy
 

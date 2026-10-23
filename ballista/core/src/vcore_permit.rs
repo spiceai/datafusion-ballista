@@ -36,7 +36,6 @@
 //! whole life.
 
 use datafusion::common::runtime::IoWaitHook;
-use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::metrics::{Count, Metric, MetricValue, MetricsSet, Time};
 use futures::FutureExt;
 use futures::future::{AbortHandle, Aborted, BoxFuture, Either, LocalBoxFuture, Shared};
@@ -188,87 +187,10 @@ pub struct VcoreStats {
     pub resume_wait_nanos: AtomicU64,
 }
 
-/// Lends a vcore only while the executor's memory pool can give another task
-/// its share. Each lend sets that share aside until it ends, so tasks lending
-/// at once cannot all count the same free memory.
-#[derive(Debug, Clone)]
-pub struct MemoryHeadroom {
-    pool: Arc<dyn MemoryPool>,
-    vcores: usize,
-    promised: Arc<AtomicUsize>,
-}
-
-impl MemoryHeadroom {
-    /// A task's share is the pool's limit divided by the executor's vcores.
-    /// `promised` holds the shares set aside for lends in flight; every task
-    /// on the executor must share it.
-    pub fn new(
-        pool: Arc<dyn MemoryPool>,
-        vcores: usize,
-        promised: Arc<AtomicUsize>,
-    ) -> Self {
-        Self {
-            pool,
-            vcores: vcores.max(1),
-            promised,
-        }
-    }
-
-    /// Whether the pool has one task's share free, beyond the shares set
-    /// aside for lends in flight.
-    pub fn has_room_for_a_task(&self) -> bool {
-        match self.pool.memory_limit() {
-            MemoryLimit::Finite(limit) => {
-                self.free(limit, self.promised.load(Ordering::SeqCst))
-                    >= limit / self.vcores
-            }
-            MemoryLimit::Infinite | MemoryLimit::Unknown => true,
-        }
-    }
-
-    fn free(&self, limit: usize, promised: usize) -> usize {
-        limit
-            .saturating_sub(self.pool.reserved())
-            .saturating_sub(promised)
-    }
-
-    /// Sets one task's share aside for a lend, if it is free. Returns the
-    /// bytes set aside, `0` for an unbounded pool.
-    fn promise(&self) -> Option<usize> {
-        let MemoryLimit::Finite(limit) = self.pool.memory_limit() else {
-            return Some(0);
-        };
-        let share = limit / self.vcores;
-        let mut current = self.promised.load(Ordering::SeqCst);
-        loop {
-            if self.free(limit, current) < share {
-                return None;
-            }
-            match self.promised.compare_exchange_weak(
-                current,
-                current + share,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Some(share),
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    fn release(&self, bytes: usize) {
-        if bytes > 0 {
-            self.promised.fetch_sub(bytes, Ordering::SeqCst);
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct Held {
     vcore: Option<OwnedSemaphorePermit>,
     lent_at: Option<Instant>,
-    /// Memory set aside in the executor's headroom for the lend in flight.
-    promised: usize,
     /// The task taking its vcore back, while one is on the way.
     resume: Option<Resume>,
     /// Ends `resume` when the task ends, so parts waiting on it run without
@@ -282,11 +204,14 @@ struct Held {
 /// The executor creates one per task, [`acquire`](Self::acquire)s it before
 /// the task runs, runs the task through [`run`](Self::run), and
 /// [`close`](Self::close)s it when the task ends.
+///
+/// Lending controls CPU concurrency only. Tasks retain their actual memory
+/// reservations while suspended and allocate through their runtime's memory
+/// pool; lending does not reserve memory for hypothetical replacement tasks.
 #[derive(Debug)]
 pub struct VcorePermit {
     vcores: Arc<Semaphore>,
     lend_after: Duration,
-    memory: Option<MemoryHeadroom>,
     held: Mutex<Held>,
     /// Mirrors `held.vcore.is_none()` for the poll path; written under `held`.
     lent: AtomicBool,
@@ -304,15 +229,10 @@ pub struct VcorePermit {
 impl VcorePermit {
     /// A permit drawing from `vcores`. It holds no vcore until
     /// [`acquire`](Self::acquire) succeeds.
-    pub fn new(
-        vcores: Arc<Semaphore>,
-        lend_after: Duration,
-        memory: Option<MemoryHeadroom>,
-    ) -> Arc<Self> {
+    pub fn new(vcores: Arc<Semaphore>, lend_after: Duration) -> Arc<Self> {
         Arc::new(Self {
             vcores,
             lend_after,
-            memory,
             held: Mutex::new(Held::default()),
             lent: AtomicBool::new(true),
             polling: AtomicUsize::new(0),
@@ -476,13 +396,6 @@ impl VcorePermit {
         if self.epoch.load(Ordering::SeqCst) != epoch {
             return LendAttempt::Retry;
         }
-        let promised = match &self.memory {
-            Some(memory) => match memory.promise() {
-                Some(bytes) => bytes,
-                None => return LendAttempt::Retry,
-            },
-            None => 0,
-        };
         // Publish the lend before re-checking that nothing started polling:
         // a gate increments `polling` before it reads `lent`, so either the
         // gate sees the lend or this sees the gate.
@@ -491,12 +404,10 @@ impl VcorePermit {
             || self.epoch.load(Ordering::SeqCst) != epoch
         {
             self.lent.store(false, Ordering::SeqCst);
-            self.release_promise(promised);
             return LendAttempt::Retry;
         }
         held.vcore = None;
         held.lent_at = Some(Instant::now());
-        held.promised = promised;
         self.stats.suspensions.fetch_add(1, Ordering::Relaxed);
         LendAttempt::Done
     }
@@ -588,14 +499,7 @@ impl VcorePermit {
         resume
     }
 
-    fn release_promise(&self, bytes: usize) {
-        if let Some(memory) = &self.memory {
-            memory.release(bytes);
-        }
-    }
-
     fn end_lend(&self, held: &mut Held) {
-        self.release_promise(std::mem::take(&mut held.promised));
         if let Some(since) = held.lent_at.take() {
             self.stats
                 .suspended_nanos
@@ -708,7 +612,6 @@ pub(crate) fn install_hook_for_tests() {
 mod tests {
     use super::*;
     use datafusion::common::runtime::{IoWaitExt, SpawnedTask};
-    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
     use std::sync::LazyLock;
 
     static INSTALL: LazyLock<()> = LazyLock::new(install_hook_for_tests);
@@ -721,12 +624,10 @@ mod tests {
     }
 
     /// A one-vcore executor and a permit for a task that holds the vcore.
-    async fn one_vcore_task(
-        memory: Option<MemoryHeadroom>,
-    ) -> (Arc<Semaphore>, Arc<VcorePermit>) {
+    async fn one_vcore_task() -> (Arc<Semaphore>, Arc<VcorePermit>) {
         LazyLock::force(&INSTALL);
         let vcores = Arc::new(Semaphore::new(1));
-        let permit = VcorePermit::new(Arc::clone(&vcores), LEND, memory);
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND);
         permit.acquire().await.expect("vcore");
         (vcores, permit)
     }
@@ -746,7 +647,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_io_wait_lends_the_vcore_after_lend_after_not_before() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(remote_call(200).io_wait()));
         assert!(
             !vcore_frees_within(&vcores, LEND / 2).await,
@@ -763,7 +664,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unmarked_wait_keeps_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(remote_call(100)));
         assert!(!vcore_frees_within(&vcores, Duration::from_millis(80)).await);
         assert_eq!(task.await.expect("task"), 7);
@@ -772,7 +673,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_wait_in_a_spawned_task_lends_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             SpawnedTask::spawn(remote_call(200).io_wait())
                 .join()
@@ -788,7 +689,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_wait_in_a_carried_tokio_spawn_lends_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             // How the shuffle writers spawn a stage's partitions.
             tokio::spawn(carry(remote_call(200).io_wait()))
@@ -804,7 +705,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn carried_blocking_closure_keeps_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             let waiting = SpawnedTask::spawn(remote_call(150).io_wait());
             let writing = tokio::task::spawn_blocking(carry_blocking(|| {
@@ -825,7 +726,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn computing_sibling_keeps_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             let waiting = SpawnedTask::spawn(remote_call(150).io_wait());
             let computing = SpawnedTask::spawn(async {
@@ -847,7 +748,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn task_polled_within_every_lend_window_keeps_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             // Wakes every 5 ms, well inside `LEND`, so the task is never idle
             // for a whole window even though it mostly waits.
@@ -870,7 +771,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_sibling_keeps_the_vcore() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             let waiting = SpawnedTask::spawn(remote_call(150).io_wait());
             let computing = SpawnedTask::spawn_blocking(|| {
@@ -891,7 +792,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resuming_task_waits_for_a_vcore_before_it_runs() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let ran_at = Arc::new(Mutex::new(None));
         let ran_at_in_task = Arc::clone(&ran_at);
         let task = tokio::spawn(permit.run(async move {
@@ -917,7 +818,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_pending_wait_ends_the_wait() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             let timed_out = tokio::time::timeout(
                 Duration::from_millis(5),
@@ -935,36 +836,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_lend_without_memory_for_another_task() {
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000));
-        // Two vcores, so a task's share is 500 bytes; leave 400 free.
-        let reservation = MemoryConsumer::new("held by a suspended task").register(&pool);
-        reservation.grow(600);
-        let (vcores, permit) = one_vcore_task(Some(MemoryHeadroom::new(
-            Arc::clone(&pool),
-            2,
-            Arc::new(AtomicUsize::new(0)),
-        )))
-        .await;
-        let task = tokio::spawn(permit.run(remote_call(150).io_wait()));
-        assert!(
-            !vcore_frees_within(&vcores, Duration::from_millis(100)).await,
-            "lent without memory for another task"
-        );
-        assert_eq!(task.await.expect("task"), 7);
-
-        reservation.shrink(200);
-        let task = tokio::spawn(permit.run(remote_call(150).io_wait()));
-        assert!(
-            vcore_frees_within(&vcores, Duration::from_millis(100)).await,
-            "never lent with room for another task"
-        );
-        assert_eq!(task.await.expect("task"), 7);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_permit_returns_the_vcore_and_never_takes_one_back() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         permit.close();
         assert_eq!(vcores.available_permits(), 1);
         assert_eq!(permit.run(remote_call(30).io_wait()).await, 7);
@@ -974,7 +847,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_shorter_than_lend_after_is_no_suspension() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         assert_eq!(permit.run(remote_call(2).io_wait()).await, 7);
         assert_eq!(permit.stats().suspensions.load(Ordering::SeqCst), 0);
         assert_eq!(vcores.available_permits(), 0, "the task kept its vcore");
@@ -982,7 +855,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_blocking_closure_keeps_the_vcore_until_it_ends() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let ran = Arc::new(Mutex::new(None));
         let ran_in_closure = Arc::clone(&ran);
         let permit_in_closure = Arc::clone(&permit);
@@ -1018,7 +891,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_unrun_blocking_closure_stops_counting() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let closure = permit.run(async { carry_blocking(|| ()) }).await;
         let waiting = tokio::spawn(permit.run(remote_call(300).io_wait()));
         assert!(!vcore_frees_within(&vcores, Duration::from_millis(60)).await);
@@ -1032,7 +905,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lent_task_finishes_after_the_executor_closes_its_vcores() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(remote_call(100).io_wait()));
         assert!(vcore_frees_within(&vcores, Duration::from_millis(80)).await);
         // Shutdown: the task can never take a vcore back.
@@ -1047,7 +920,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parts_resuming_together_take_one_vcore_back() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(async {
             // `a` waits on a remote call; `b` on a timer, which keeps no wait
             // in flight once `a` is back, so nothing lends the vcore to it.
@@ -1072,7 +945,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn part_resuming_after_a_sibling_took_the_vcore_back_runs_on_it() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let task = tokio::spawn(permit.run(remote_call(60_000).io_wait()));
         assert!(
             vcore_frees_within(&vcores, Duration::from_millis(500)).await,
@@ -1094,7 +967,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_a_lent_permit_lets_parts_waiting_for_a_vcore_finish() {
-        let (vcores, permit) = one_vcore_task(None).await;
+        let (vcores, permit) = one_vcore_task().await;
         let waiting = tokio::spawn(permit.run(remote_call(60_000).io_wait()));
         assert!(
             vcore_frees_within(&vcores, Duration::from_millis(500)).await,
@@ -1120,52 +993,10 @@ mod tests {
         waiting.abort();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tasks_lending_at_once_share_the_memory_for_one_task() {
-        LazyLock::force(&INSTALL);
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000));
-        // Two vcores, so a task's share is 500 bytes; leave 600 free, room
-        // for one more task but not two.
-        let reservation = MemoryConsumer::new("held").register(&pool);
-        reservation.grow(400);
-        let promised = Arc::new(AtomicUsize::new(0));
-        let headroom = MemoryHeadroom::new(Arc::clone(&pool), 2, Arc::clone(&promised));
-        let vcores = Arc::new(Semaphore::new(2));
-        let mut tasks = Vec::new();
-        let mut permits = Vec::new();
-        for _ in 0..2 {
-            let permit =
-                VcorePermit::new(Arc::clone(&vcores), LEND, Some(headroom.clone()));
-            permit.acquire().await.expect("vcore");
-            tasks.push(tokio::spawn(permit.run(remote_call(200).io_wait())));
-            permits.push(permit);
-        }
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert_eq!(
-            vcores.available_permits(),
-            1,
-            "both waiting tasks lent although memory had room for one more task"
-        );
-        assert_eq!(promised.load(Ordering::SeqCst), 500);
-        for task in tasks {
-            assert_eq!(task.await.expect("task"), 7);
-        }
-        let lends: u64 = permits
-            .iter()
-            .map(|p| p.stats().suspensions.load(Ordering::SeqCst))
-            .sum();
-        assert_eq!(lends, 1);
-        assert_eq!(
-            promised.load(Ordering::SeqCst),
-            0,
-            "a finished lend keeps its share"
-        );
-    }
-
     #[test]
     fn task_counters_become_metrics() {
         let vcores = Arc::new(Semaphore::new(1));
-        let permit = VcorePermit::new(vcores, LEND, None);
+        let permit = VcorePermit::new(vcores, LEND);
         permit.stats.suspensions.store(3, Ordering::SeqCst);
         permit
             .stats
