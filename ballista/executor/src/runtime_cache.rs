@@ -17,10 +17,15 @@
 
 //! Session-scoped reuse of executor runtime state.
 
+use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use ballista_core::RuntimeProducer;
+use datafusion::execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool,
+    MemoryReservation,
+};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionConfig;
 use lru::LruCache;
@@ -32,7 +37,8 @@ use parking_lot::Mutex;
 /// (footer) cache are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`](datafusion::execution::runtime_env::RuntimeEnvBuilder::from_runtime_env)
 /// — the outer `CacheManager` is rebuilt around that same inner cache — so
-/// read-side state is shared while the memory pool stays per task.
+/// read-side state is shared while the spill policy stays per task. The built-in
+/// policy also enforces a shared executor budget on actual allocations.
 ///
 /// `vcores_consumed` is the number of vcores this task claims from the
 /// executor's budget (`min(input_partition_ids.len(), budget)` for non-collapse
@@ -47,6 +53,79 @@ pub type MemoryPoolPolicy = Arc<
         + Send
         + Sync,
 >;
+
+/// Enforces a task's spill policy and the executor's shared allocation budget.
+/// Only actual reservations are charged; creating a task or lending its vcore
+/// consumes no memory budget. The shared pool outlives cached base runtimes.
+#[derive(Debug)]
+pub(crate) struct TaskMemoryPool {
+    task: FairSpillPool,
+    executor: Arc<GreedyMemoryPool>,
+}
+
+impl TaskMemoryPool {
+    pub(crate) fn new(size: usize, executor: Arc<GreedyMemoryPool>) -> Self {
+        Self {
+            task: FairSpillPool::new(size),
+            executor,
+        }
+    }
+}
+
+impl Display for TaskMemoryPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task({}, executor: {})", self.task, self.executor)
+    }
+}
+
+impl MemoryPool for TaskMemoryPool {
+    fn name(&self) -> &str {
+        self.task.name()
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.task.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.task.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        // MemoryPool::grow must succeed, even beyond the limit. Account for
+        // these reservations so subsequent try_grow calls see their usage.
+        self.executor.grow(reservation, additional);
+        self.task.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.task.shrink(reservation, shrink);
+        self.executor.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        // Atomically claim actual bytes across every task before checking the
+        // local spill policy. Roll back if the local allocation is refused.
+        self.executor.try_grow(reservation, additional)?;
+        if let Err(error) = self.task.try_grow(reservation, additional) {
+            self.executor.shrink(reservation, additional);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.task.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.task.memory_limit()
+    }
+}
 
 /// Produces a task's [`RuntimeEnv`], optionally reusing read-side state across
 /// the tasks of a session.
@@ -77,8 +156,9 @@ pub trait SessionRuntimeCache: Send + Sync {
 /// `DiskManager` too; this is safe because spill temp files are uniquely
 /// named, matching the standard one-`RuntimeEnv`-per-`SessionContext` model.
 /// Each task's real runtime is produced by applying [`MemoryPoolPolicy`] to
-/// the shared base, which installs a fresh per-task memory pool — so memory
-/// isolation is unchanged.
+/// the shared base, which installs a fresh per-task memory pool. The built-in
+/// policy shares its aggregate allocation budget across all of these pools,
+/// independently of the base runtime cache.
 ///
 /// The cache is bounded by an LRU of `capacity` sessions. A capacity of `0`
 /// disables caching entirely: every call builds a fresh base env, matching the

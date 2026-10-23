@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::{fs, time};
 
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionConfig;
 
@@ -73,7 +73,7 @@ use crate::flight_service::BallistaFlightService;
 use crate::metrics::ExecutorMetricCollectionPolicy;
 use crate::metrics::LoggingMetricsCollector;
 use crate::runtime_cache::{
-    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache, TaskMemoryPool,
 };
 use crate::shutdown::Shutdown;
 use crate::shutdown::ShutdownNotifier;
@@ -214,14 +214,15 @@ fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
 }
 
 /// Builds a per-task memory-pool policy: each task's runtime is rebuilt from the
-/// shared base env with a fresh [`FairSpillPool`] of size
-/// `total_bytes / vcores`. The base env's disk manager, cache manager,
+/// shared base env with a fresh per-task fair spill pool, sized to its vcore
+/// claim, and a shared executor budget enforced on actual allocations.
+/// The base env's disk manager, cache manager,
 /// and object-store registry are preserved via
 /// [`RuntimeEnvBuilder::from_runtime_env`].
 ///
 /// Returns an error if the per-task share would be zero (i.e. `total_bytes <
 /// vcores`).
-fn memory_pool_policy(
+pub(crate) fn memory_pool_policy(
     total_bytes: u64,
     vcores: usize,
 ) -> Result<MemoryPoolPolicy, BallistaError> {
@@ -231,6 +232,7 @@ fn memory_pool_policy(
             "memory_pool_size ({total_bytes} bytes) is smaller than vcores ({vcores})"
         )));
     }
+    let executor_memory = Arc::new(GreedyMemoryPool::new(total_bytes as usize));
     let policy: MemoryPoolPolicy = Arc::new(
         move |base: Arc<RuntimeEnv>, _config: &SessionConfig, vcores_consumed: u32| {
             // Multi-partition tasks that claim N vcores get N × per-vcore
@@ -240,7 +242,10 @@ fn memory_pool_policy(
             // matching the parallelism DataFusion will actually drive.
             let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
             RuntimeEnvBuilder::from_runtime_env(&base)
-                .with_memory_pool(Arc::new(FairSpillPool::new(size)))
+                .with_memory_pool(Arc::new(TaskMemoryPool::new(
+                    size,
+                    Arc::clone(&executor_memory),
+                )))
                 .build_arc()
         },
     );
@@ -1412,6 +1417,139 @@ mod memory_pool_tests {
         assert_eq!(runtime.memory_pool.reserved(), 500);
         drop(allocation);
         assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn task_pools_share_actual_budget_across_sessions_and_cache_evictions() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        for capacity in [0, 1, 4] {
+            let cache = DefaultSessionRuntimeCache::new(
+                Arc::new(|_| Ok(Arc::new(RuntimeEnv::default()))),
+                memory_pool_policy(1_000, 2).unwrap(),
+                capacity,
+            );
+            let config = SessionConfig::new();
+            let pools: Vec<_> = ["a", "a", "b", "a", "c", "c"]
+                .into_iter()
+                .map(|session| cache.produce_runtime(session, &config, 1).unwrap())
+                .collect();
+            let allocations: Vec<_> = pools
+                .iter()
+                .map(|env| MemoryConsumer::new("task").register(&env.memory_pool))
+                .collect();
+            allocations[0].try_grow(500).unwrap();
+            allocations[1].try_grow(500).unwrap();
+            for allocation in &allocations[2..] {
+                assert!(allocation.try_grow(1).is_err(), "aggregate budget exceeded");
+                assert_eq!(allocation.size(), 0);
+            }
+            allocations[0].shrink(200);
+            allocations[2].try_grow(200).unwrap();
+            assert!(allocations[3].try_grow(1).is_err());
+            drop(allocations);
+
+            // Releasing reservations returns the entire shared budget, even
+            // when their base runtimes have been evicted from the cache.
+            let env = cache.produce_runtime("all", &config, 2).unwrap();
+            let all = MemoryConsumer::new("all").register(&env.memory_pool);
+            all.try_grow(1_000).unwrap();
+        }
+    }
+
+    #[test]
+    fn task_spill_limits_roll_back_shared_reservations_on_failure() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let policy = memory_pool_policy(1_000, 2).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+        let config = SessionConfig::new();
+        let task = policy(Arc::clone(&base), &config, 1).unwrap();
+        let other = policy(base, &config, 2).unwrap();
+        let first = MemoryConsumer::new("first spiller")
+            .with_can_spill(true)
+            .register(&task.memory_pool);
+        let second = MemoryConsumer::new("second spiller")
+            .with_can_spill(true)
+            .register(&task.memory_pool);
+        let other = MemoryConsumer::new("other task").register(&other.memory_pool);
+
+        // Each spiller gets half the task's 500-byte pool. A local refusal
+        // must return the bytes tentatively claimed from the executor pool.
+        assert!(first.try_grow(251).is_err());
+        assert_eq!(task.memory_pool.reserved(), 0);
+        first.try_grow(250).unwrap();
+        second.try_grow(250).unwrap();
+        assert!(second.try_grow(1).is_err());
+        other.try_grow(500).unwrap();
+        assert!(other.try_grow(1).is_err());
+        other.shrink(500);
+        drop(first);
+        // Unregistering the first spiller gives the second its full local
+        // share, while still charging only its actual bytes globally.
+        second.try_grow(250).unwrap();
+        drop(second);
+        other.try_grow(1_000).unwrap();
+    }
+
+    #[test]
+    fn concurrent_task_allocations_cannot_exceed_shared_budget() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        use std::sync::Barrier;
+
+        let policy = memory_pool_policy(1_000, 2).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+        let config = SessionConfig::new();
+        let ready = Barrier::new(6);
+        let allocated = Barrier::new(6);
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let runtime = policy(Arc::clone(&base), &config, 1).unwrap();
+                    let ready = &ready;
+                    let allocated = &allocated;
+                    scope.spawn(move || {
+                        let allocation = MemoryConsumer::new("concurrent task")
+                            .register(&runtime.memory_pool);
+                        ready.wait();
+                        let success = allocation.try_grow(500).is_ok();
+                        // Retain every successful reservation until all six
+                        // threads have attempted their allocations.
+                        allocated.wait();
+                        success
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(successes, 2);
+        let runtime = policy(base, &config, 2).unwrap();
+        let recovered = MemoryConsumer::new("recovered").register(&runtime.memory_pool);
+        recovered.try_grow(1_000).unwrap();
+    }
+
+    #[test]
+    fn infallible_growth_is_counted_against_other_tasks() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let policy = memory_pool_policy(1_000, 2).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+        let config = SessionConfig::new();
+        let task = policy(Arc::clone(&base), &config, 1).unwrap();
+        let other = policy(base, &config, 1).unwrap();
+        let allocation = MemoryConsumer::new("infallible").register(&task.memory_pool);
+        let other = MemoryConsumer::new("fallible").register(&other.memory_pool);
+        allocation.grow(1_100);
+        assert_eq!(task.memory_pool.reserved(), 1_100);
+        assert!(other.try_grow(1).is_err());
+        allocation.shrink(600);
+        other.try_grow(500).unwrap();
+        assert_eq!(task.memory_pool.reserved(), 500);
+        drop(allocation);
+        assert_eq!(task.memory_pool.reserved(), 0);
     }
 
     #[test]

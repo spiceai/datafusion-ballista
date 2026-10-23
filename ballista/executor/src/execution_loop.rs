@@ -875,6 +875,8 @@ mod tests {
         assert_eq!(free_slots(&vcores, 9), 0);
     }
 
+    const HTTP_BUFFER_BYTES: usize = 128;
+
     /// Reads a real HTTP response while retaining a small, accounted buffer.
     #[derive(Debug)]
     struct HttpWaitStage {
@@ -901,7 +903,7 @@ mod tests {
 
             let buffer =
                 MemoryConsumer::new("HTTP response").register(context.memory_pool());
-            buffer.try_grow(128)?;
+            buffer.try_grow(HTTP_BUFFER_BYTES)?;
             let mut socket = tokio::net::TcpStream::connect(self.origin)
                 .io_wait()
                 .await?;
@@ -929,6 +931,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_waits_beyond_twice_the_vcores_leave_capacity_for_another_task() {
+        check_http_lending(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_lending_with_task_pools_enforces_actual_aggregate_memory() {
+        check_http_lending(true).await;
+    }
+
+    async fn check_http_lending(per_task_pools: bool) {
+        use crate::executor_process::memory_pool_policy;
+        use crate::runtime_cache::DefaultSessionRuntimeCache;
         use datafusion::execution::memory_pool::{
             GreedyMemoryPool, MemoryConsumer, MemoryPool,
         };
@@ -975,25 +988,44 @@ mod tests {
             .with_memory_pool(Arc::clone(&pool))
             .build_arc()
             .expect("finite runtime");
-        let producer = Arc::clone(&runtime);
+        let base = Arc::clone(&runtime);
+        let producer: ballista_core::RuntimeProducer =
+            Arc::new(move |_| Ok(Arc::clone(&base)));
         let work_dir = tempfile::TempDir::new().expect("work dir");
-        let executor = Arc::new(Executor::new_basic(
+        let mut executor = Executor::new_basic(
             ExecutorRegistration::default(),
             work_dir.path().to_str().expect("path"),
-            Arc::new(move |_| Ok(Arc::clone(&producer))),
+            Arc::clone(&producer),
             Arc::new(default_config_producer),
             VCORES,
-        ));
-        let context = SessionContext::new_with_config_rt(
-            default_config_producer(),
-            Arc::clone(&runtime),
-        )
-        .task_ctx();
+        );
+        if per_task_pools {
+            executor = executor.with_session_runtime_cache(Some(Arc::new(
+                DefaultSessionRuntimeCache::new(
+                    producer,
+                    memory_pool_policy(MEMORY_LIMIT as u64, VCORES).unwrap(),
+                    4,
+                ),
+            )));
+        }
+        let executor = Arc::new(executor);
+        let pressure_runtime = executor
+            .produce_runtime_for_session(
+                "pressure",
+                &default_config_producer(),
+                VCORES as u32,
+            )
+            .unwrap();
         let vcores = Arc::new(Semaphore::new(VCORES));
         let queued = Arc::new(AtomicUsize::new(0));
         let run = |task_id, slow| {
             let executor = Arc::clone(&executor);
-            let context = Arc::clone(&context);
+            let runtime = executor
+                .produce_runtime_for_session("http", &default_config_producer(), 1)
+                .unwrap();
+            let context =
+                SessionContext::new_with_config_rt(default_config_producer(), runtime)
+                    .task_ctx();
             let slot = slot(&vcores, &queued);
             let permit = VcorePermit::new(Arc::clone(&vcores), LEND);
             async move {
@@ -1027,8 +1059,11 @@ mod tests {
             // Exhaust the actual pool while the slow tasks retain their buffers.
             // A new task must fail its allocation, then leave capacity for a
             // subsequent task once memory is available again.
-            let allocation = MemoryConsumer::new("remaining memory").register(&pool);
-            allocation.try_grow(MEMORY_LIMIT - pool.reserved()).unwrap();
+            let allocation = MemoryConsumer::new("remaining memory")
+                .register(&pressure_runtime.memory_pool);
+            allocation
+                .try_grow(MEMORY_LIMIT - SLOW_TASKS * HTTP_BUFFER_BYTES)
+                .unwrap();
             let over_budget = tokio::time::timeout(WITHIN, run(SLOW_TASKS, false)).await;
             drop(allocation);
             let fast = tokio::time::timeout(WITHIN, run(SLOW_TASKS + 1, false)).await;
@@ -1063,6 +1098,11 @@ mod tests {
         assert_eq!(executor.active_task_count(), 0);
         assert_eq!(vcores.available_permits(), VCORES);
         assert_eq!(pool.reserved(), 0);
+        let recovered =
+            MemoryConsumer::new("recovered").register(&pressure_runtime.memory_pool);
+        recovered
+            .try_grow(MEMORY_LIMIT)
+            .expect("all memory released");
     }
 
     #[tokio::test]
