@@ -687,7 +687,7 @@ mod tests {
         const LEND: Duration = Duration::from_millis(20);
         install_hook_for_tests();
         let vcores = Arc::new(Semaphore::new(1));
-        let permit = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND);
         permit.acquire().await.expect("vcore");
 
         // A batch whose compressed write takes many lend windows.
@@ -810,7 +810,7 @@ mod tests {
 
             // Its input waits on a remote source, so its vcore is lent with its
             // writer open.
-            let lent = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            let lent = VcorePermit::new(Arc::clone(&vcores), LEND);
             lent.acquire().await.expect("vcore");
             let remote_batch = batch.clone();
             let remote = Box::pin(async move {
@@ -828,7 +828,7 @@ mod tests {
             assert_eq!(vcores.available_permits(), 1, "never lent");
 
             // Another task takes the lent vcore and writes.
-            let holder = VcorePermit::new(Arc::clone(&vcores), LEND, None);
+            let holder = VcorePermit::new(Arc::clone(&vcores), LEND);
             holder.acquire().await.expect("vcore");
             let holder_task = tokio::spawn(holder.run(write(
                 futures::stream::iter([Ok(batch.clone())]).boxed(),

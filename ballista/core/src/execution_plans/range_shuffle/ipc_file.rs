@@ -482,8 +482,7 @@ mod tests {
 
         install_hook_for_tests();
         let vcores = Arc::new(Semaphore::new(1));
-        let permit =
-            VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(20), None);
+        let permit = VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(20));
         permit.acquire().await.expect("vcore");
 
         let dir = tempdir().unwrap();

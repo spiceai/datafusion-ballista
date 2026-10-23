@@ -497,11 +497,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
 
     // Lent only while all of the task waits on remote I/O marked with
     // `io_wait()`, and only if the application set `VcoreHook`.
-    let permit = VcorePermit::new(
-        Arc::clone(&slot.vcores),
-        LEND_AFTER,
-        Some(executor.memory_headroom(&runtime)),
-    );
+    let permit = VcorePermit::new(Arc::clone(&slot.vcores), LEND_AFTER);
 
     let session_id = task.session_id.clone();
     let task_context = Arc::new(TaskContext::new(
@@ -763,7 +759,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<Result<Vec<ShuffleWritePartition>, BallistaError>> {
         let executor = Arc::clone(executor);
         let slot = slot(vcores, queued);
-        let permit = VcorePermit::new(Arc::clone(vcores), LEND, None);
+        let permit = VcorePermit::new(Arc::clone(vcores), LEND);
         tokio::spawn(async move {
             let (_held, _started, result) = execute_task(
                 &executor,
@@ -879,6 +875,196 @@ mod tests {
         assert_eq!(free_slots(&vcores, 9), 0);
     }
 
+    /// Reads a real HTTP response while retaining a small, accounted buffer.
+    #[derive(Debug)]
+    struct HttpWaitStage {
+        plan: EmptyExec,
+        origin: std::net::SocketAddr,
+        slow: bool,
+    }
+
+    impl fmt::Display for HttpWaitStage {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "HttpWaitStage")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueryStageExecutor for HttpWaitStage {
+        async fn execute_query_stage(
+            &self,
+            _task_id: usize,
+            context: Arc<TaskContext>,
+        ) -> datafusion::error::Result<Vec<ShuffleWritePartition>> {
+            use datafusion::execution::memory_pool::MemoryConsumer;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let buffer =
+                MemoryConsumer::new("HTTP response").register(context.memory_pool());
+            buffer.try_grow(128)?;
+            let mut socket = tokio::net::TcpStream::connect(self.origin)
+                .io_wait()
+                .await?;
+            let path = if self.slow { "slow" } else { "fast" };
+            socket
+                .write_all(format!("GET /{path} HTTP/1.0\r\n\r\n").as_bytes())
+                .io_wait()
+                .await?;
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).io_wait().await?;
+            assert_eq!(response, b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            Ok(Vec::new())
+        }
+
+        fn collect_plan_metrics(
+            &self,
+        ) -> Vec<datafusion::physical_plan::metrics::MetricsSet> {
+            Vec::new()
+        }
+
+        fn plan(&self) -> &dyn ExecutionPlan {
+            &self.plan
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_waits_beyond_twice_the_vcores_leave_capacity_for_another_task() {
+        use datafusion::execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::task::JoinSet;
+
+        install_vcore_hook();
+        const VCORES: usize = 2;
+        const SLOW_TASKS: usize = 3 * VCORES;
+        const MEMORY_LIMIT: usize = 1024 * 1024;
+        const WITHIN: Duration = Duration::from_secs(5);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP origin");
+        let origin = listener.local_addr().expect("origin address");
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&arrived);
+        let (release, released) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut released = released.clone();
+                let count = Arc::clone(&count);
+                connections.spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.expect("request"));
+                    }
+                    if request.starts_with(b"GET /slow ") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        released.wait_for(|ready| *ready).await.expect("release");
+                    }
+                    socket
+                        .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .expect("response");
+                });
+            }
+        });
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(MEMORY_LIMIT));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("finite runtime");
+        let producer = Arc::clone(&runtime);
+        let work_dir = tempfile::TempDir::new().expect("work dir");
+        let executor = Arc::new(Executor::new_basic(
+            ExecutorRegistration::default(),
+            work_dir.path().to_str().expect("path"),
+            Arc::new(move |_| Ok(Arc::clone(&producer))),
+            Arc::new(default_config_producer),
+            VCORES,
+        ));
+        let context = SessionContext::new_with_config_rt(
+            default_config_producer(),
+            Arc::clone(&runtime),
+        )
+        .task_ctx();
+        let vcores = Arc::new(Semaphore::new(VCORES));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let run = |task_id, slow| {
+            let executor = Arc::clone(&executor);
+            let context = Arc::clone(&context);
+            let slot = slot(&vcores, &queued);
+            let permit = VcorePermit::new(Arc::clone(&vcores), LEND);
+            async move {
+                let (_held, _, result) = execute_task(
+                    &executor,
+                    TaskKey {
+                        task_id,
+                        ..task_key()
+                    },
+                    Arc::new(HttpWaitStage {
+                        plan: EmptyExec::new(Arc::new(Schema::empty())),
+                        origin,
+                        slow,
+                    }),
+                    context,
+                    slot,
+                    &permit,
+                )
+                .await;
+                result
+            }
+        };
+        let mut tasks = JoinSet::new();
+        for task_id in 0..SLOW_TASKS {
+            tasks.spawn(run(task_id, true));
+        }
+        let all_arrived =
+            until(WITHIN, || arrived.load(Ordering::SeqCst) == SLOW_TASKS).await;
+        let before_release = arrived.load(Ordering::SeqCst);
+        let (over_budget, fast) = if all_arrived {
+            // Exhaust the actual pool while the slow tasks retain their buffers.
+            // A new task must fail its allocation, then leave capacity for a
+            // subsequent task once memory is available again.
+            let allocation = MemoryConsumer::new("remaining memory").register(&pool);
+            allocation.try_grow(MEMORY_LIMIT - pool.reserved()).unwrap();
+            let over_budget = tokio::time::timeout(WITHIN, run(SLOW_TASKS, false)).await;
+            drop(allocation);
+            let fast = tokio::time::timeout(WITHIN, run(SLOW_TASKS + 1, false)).await;
+            (Some(over_budget), Some(fast))
+        } else {
+            (None, None)
+        };
+        release.send(true).expect("release slow responses");
+        while let Some(result) = tokio::time::timeout(WITHIN, tasks.join_next())
+            .await
+            .expect("slow tasks finish")
+        {
+            result.expect("task join").expect("HTTP task");
+        }
+        server.abort();
+        assert!(
+            all_arrived,
+            "only {before_release}/{SLOW_TASKS} HTTP requests reached the origin with {VCORES} vcores"
+        );
+        let error = over_budget
+            .expect("over-budget task attempted")
+            .expect("over-budget task finishes")
+            .expect_err("over-budget task must fail its allocation");
+        assert!(matches!(
+            error,
+            BallistaError::DataFusionError(ref error)
+                if matches!(error.as_ref(), datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ));
+        fast.expect("fast task attempted")
+            .expect("fast task runs before slow responses are released")
+            .expect("fast HTTP task");
+        assert_eq!(executor.active_task_count(), 0);
+        assert_eq!(vcores.available_permits(), VCORES);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     #[tokio::test]
     async fn bound_task_waits_for_its_vcore_inside_the_task() {
         let vcores = Arc::new(Semaphore::new(1));
@@ -887,7 +1073,7 @@ mod tests {
 
         // Binding the task does not wait: it is counted as queued and waits
         // for the vcore in its own future.
-        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER, None);
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER);
         let waiting = tokio::spawn(slot(&vcores, &queued).acquire(permit));
         tokio::task::yield_now().await;
         assert_eq!(queued.load(Ordering::Acquire), 1);
@@ -906,7 +1092,7 @@ mod tests {
     async fn vcore_permit_is_acquired_before_the_task_runs_and_closed_after() {
         let vcores = Arc::new(Semaphore::new(1));
         let queued = Arc::new(AtomicUsize::new(0));
-        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER, None);
+        let permit = VcorePermit::new(Arc::clone(&vcores), LEND_AFTER);
         let held = slot(&vcores, &queued)
             .acquire(Arc::clone(&permit))
             .await
